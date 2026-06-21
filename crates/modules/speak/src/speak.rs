@@ -1672,12 +1672,6 @@ impl Module for SpeakModule {
         Some("Speak is the outward expression path for admitted cognition.")
     }
 
-    fn allocation_hint() -> Option<&'static str> {
-        Some(
-            "Raise speak when current cognition, or fresh evidence that should be admitted now, is grounded enough for an outward answer, address, warning, or expression of intent. For direct questions or advice requests to the agent, keep speak available alongside any registered evidence retrieval or admission path; those paths support an answer, not replace outward speech. Keep it low when evidence is unsettled, no addressee or focus is clear, or silence is better.",
-        )
-    }
-
     async fn next_batch(&mut self) -> Result<Self::Batch> {
         SpeakModule::next_batch(self).await
     }
@@ -1748,7 +1742,7 @@ mod tests {
     };
     use nuillu_blackboard::{
         ActivationRatio, Blackboard, BlackboardCommand, CognitionLogEntry, CognitionLogOrigin,
-        IdentityMemoryRecord, ModuleConfig, ResourceAllocation,
+        IdentityMemoryRecord, ResourceAllocation,
     };
     use nuillu_module::ports::{Clock, NoopCognitionLogRepository, PortError, SystemClock};
     use nuillu_module::{
@@ -2349,7 +2343,6 @@ mod tests {
             &[],
             &[],
             &[],
-            &[],
             nuillu_module::SessionCompactionRuntime::new(
                 compaction_lutum.lutum().clone(),
                 nuillu_module::LlmConcurrencyLimiter::new(None),
@@ -2366,7 +2359,6 @@ mod tests {
         cognition: impl Into<String>,
     ) -> Result<(Blackboard, Rc<RefCell<Vec<(String, String)>>>)> {
         let mut allocation = ResourceAllocation::default();
-        allocation.set(builtin::speak(), ModuleConfig::default());
         allocation.set_activation(builtin::speak(), ActivationRatio::ONE);
         let blackboard = Blackboard::with_allocation(allocation);
         let completed = Rc::new(RefCell::new(Vec::new()));
@@ -2684,7 +2676,6 @@ mod tests {
             .with_text_scenario(decline_speech_now_scenario("not enough to say yet"))
             .with_text_scenario(decline_speech_now_scenario("still not enough to say"));
         let mut allocation = ResourceAllocation::default();
-        allocation.set(builtin::speak(), ModuleConfig::default());
         allocation.set_activation(builtin::speak(), ActivationRatio::ONE);
         let blackboard = Blackboard::with_allocation(allocation);
         let sink: Rc<dyn crate::utterance::UtteranceSink> = Rc::new(CapturingUtteranceSink {
@@ -2794,7 +2785,6 @@ mod tests {
         let capture = CapturingAdapter::new(adapter);
         let observed = capture.clone();
         let mut allocation = ResourceAllocation::default();
-        allocation.set(builtin::speak(), ModuleConfig::default());
         allocation.set_activation(builtin::speak(), ActivationRatio::ONE);
         let blackboard = Blackboard::with_allocation(allocation);
         let completed = Rc::new(RefCell::new(Vec::new()));
@@ -2846,7 +2836,6 @@ mod tests {
         let capture = CapturingAdapter::new(adapter);
         let observed = capture.clone();
         let mut allocation = ResourceAllocation::default();
-        allocation.set(builtin::speak(), ModuleConfig::default());
         allocation.set_activation(builtin::speak(), ActivationRatio::ONE);
         let blackboard = Blackboard::with_allocation(allocation);
         let completed = Rc::new(RefCell::new(Vec::new()));
@@ -3035,7 +3024,6 @@ mod tests {
         let capture = CapturingAdapter::new(adapter);
         let observed = capture.clone();
         let mut allocation = ResourceAllocation::default();
-        allocation.set(builtin::speak(), ModuleConfig::default());
         allocation.set_activation(builtin::speak(), ActivationRatio::ONE);
         let blackboard = Blackboard::with_allocation(allocation);
         let completed = Rc::new(RefCell::new(Vec::new()));
@@ -3075,7 +3063,6 @@ mod tests {
         let clock = SystemClock;
         let cx = nuillu_module::ActivateCx::new(
             &catalog,
-            &[],
             &identity_memories,
             &[],
             nuillu_module::SessionCompactionRuntime::new(
@@ -3145,7 +3132,6 @@ mod tests {
         let capture = CapturingAdapter::new(adapter);
         let observed = capture.clone();
         let mut allocation = ResourceAllocation::default();
-        allocation.set(builtin::speak(), ModuleConfig::default());
         allocation.set_activation(builtin::speak(), ActivationRatio::ONE);
         let blackboard = Blackboard::with_allocation(allocation);
         let sink: Rc<dyn crate::utterance::UtteranceSink> = Rc::new(CapturingUtteranceSink {
@@ -3243,7 +3229,6 @@ mod tests {
             ),
         );
         let mut allocation = ResourceAllocation::default();
-        allocation.set(builtin::speak(), ModuleConfig::default());
         allocation.set_activation(builtin::speak(), ActivationRatio::ONE);
         let blackboard = Blackboard::with_allocation(allocation);
         let deltas = Rc::new(RefCell::new(Vec::new()));
@@ -3279,7 +3264,6 @@ mod tests {
         let release_completion = Arc::new(tokio::sync::Notify::new());
         let adapter = DelayedGenerationAdapter::generation_only(Arc::clone(&release_completion));
         let mut allocation = ResourceAllocation::default();
-        allocation.set(builtin::speak(), ModuleConfig::default());
         allocation.set_activation(builtin::speak(), ActivationRatio::ONE);
         let blackboard = Blackboard::with_allocation(allocation);
         let deltas = Rc::new(RefCell::new(Vec::new()));
@@ -3340,7 +3324,6 @@ mod tests {
             ),
         );
         let mut allocation = ResourceAllocation::default();
-        allocation.set(builtin::speak(), ModuleConfig::default());
         allocation.set_activation(builtin::speak(), ActivationRatio::ONE);
         let blackboard = Blackboard::with_allocation(allocation);
         let deltas = Rc::new(RefCell::new(Vec::new()));
@@ -3386,7 +3369,6 @@ mod tests {
             ),
         );
         let mut allocation = ResourceAllocation::default();
-        allocation.set(builtin::speak(), ModuleConfig::default());
         allocation.set_activation(builtin::speak(), ActivationRatio::ONE);
         let blackboard = Blackboard::with_allocation(allocation);
         let deltas = Rc::new(RefCell::new(Vec::new()));
@@ -3431,7 +3413,6 @@ mod tests {
             ),
         );
         let mut allocation = ResourceAllocation::default();
-        allocation.set(builtin::speak(), ModuleConfig::default());
         allocation.set_activation(builtin::speak(), ActivationRatio::ONE);
         let blackboard = Blackboard::with_allocation(allocation);
         let deltas = Rc::new(RefCell::new(Vec::new()));
@@ -3466,7 +3447,6 @@ mod tests {
     async fn short_generation_flushes_delta_before_complete_event() {
         let adapter = MockLlmAdapter::new().with_text_scenario(generation_text_scenario("hi!"));
         let mut allocation = ResourceAllocation::default();
-        allocation.set(builtin::speak(), ModuleConfig::default());
         allocation.set_activation(builtin::speak(), ActivationRatio::ONE);
         let blackboard = Blackboard::with_allocation(allocation);
         let events = Rc::new(RefCell::new(Vec::new()));
@@ -3508,7 +3488,6 @@ mod tests {
                 FinishReason::Stop,
             ));
         let mut allocation = ResourceAllocation::default();
-        allocation.set(builtin::speak(), ModuleConfig::default());
         allocation.set_activation(builtin::speak(), ActivationRatio::ONE);
         let blackboard = Blackboard::with_allocation(allocation);
         let deltas = Rc::new(RefCell::new(Vec::new()));
@@ -3554,7 +3533,6 @@ mod tests {
             ),
         );
         let mut allocation = ResourceAllocation::default();
-        allocation.set(builtin::speak(), ModuleConfig::default());
         allocation.set_activation(builtin::speak(), ActivationRatio::ONE);
         let blackboard = Blackboard::with_allocation(allocation);
         let deltas = Rc::new(RefCell::new(Vec::new()));
@@ -3603,7 +3581,6 @@ mod tests {
                 FinishReason::Stop,
             ));
         let mut allocation = ResourceAllocation::default();
-        allocation.set(builtin::speak(), ModuleConfig::default());
         allocation.set_activation(builtin::speak(), ActivationRatio::ONE);
         let blackboard = Blackboard::with_allocation(allocation);
         let completed = Rc::new(RefCell::new(Vec::new()));
@@ -3644,7 +3621,6 @@ mod tests {
                 FinishReason::Stop,
             ));
         let mut allocation = ResourceAllocation::default();
-        allocation.set(builtin::speak(), ModuleConfig::default());
         allocation.set_activation(builtin::speak(), ActivationRatio::ONE);
         let blackboard = Blackboard::with_allocation(allocation);
         let completed = Rc::new(RefCell::new(Vec::new()));
@@ -3686,7 +3662,6 @@ mod tests {
             .with_text_scenario(prepare_speech_scenario("Koro", "Tell Koro to stay close."))
             .with_text_scenario(generation_text_then_error_scenario(&["Koro", ", st"]));
         let mut allocation = ResourceAllocation::default();
-        allocation.set(builtin::speak(), ModuleConfig::default());
         allocation.set_activation(builtin::speak(), ActivationRatio::ONE);
         let blackboard = Blackboard::with_allocation(allocation);
         let completed = Rc::new(RefCell::new(Vec::new()));
@@ -3752,7 +3727,6 @@ mod tests {
                 "K", "o", "r", "o", ",", " ", "s", "t",
             ]));
         let mut allocation = ResourceAllocation::default();
-        allocation.set(builtin::speak(), ModuleConfig::default());
         allocation.set_activation(builtin::speak(), ActivationRatio::ONE);
         let blackboard = Blackboard::with_allocation(allocation);
         let completed = Rc::new(RefCell::new(Vec::new()));
@@ -3820,7 +3794,6 @@ mod tests {
         let capture = CapturingAdapter::new(adapter);
         let observed = capture.clone();
         let mut allocation = ResourceAllocation::default();
-        allocation.set(builtin::speak(), ModuleConfig::default());
         allocation.set_activation(builtin::speak(), ActivationRatio::ONE);
         let blackboard = Blackboard::with_allocation(allocation);
         let completed = Rc::new(RefCell::new(Vec::new()));
@@ -3931,7 +3904,6 @@ mod tests {
                 "a", "y", " ", "c", "l", "o", "s", "e",
             ]));
         let mut allocation = ResourceAllocation::default();
-        allocation.set(builtin::speak(), ModuleConfig::default());
         allocation.set_activation(builtin::speak(), ActivationRatio::ONE);
         let blackboard = Blackboard::with_allocation(allocation);
         let completed = Rc::new(RefCell::new(Vec::new()));
@@ -4012,7 +3984,6 @@ mod tests {
             ))
             .with_text_scenario(generation_text_scenario("ase."));
         let mut allocation = ResourceAllocation::default();
-        allocation.set(builtin::speak(), ModuleConfig::default());
         allocation.set_activation(builtin::speak(), ActivationRatio::ONE);
         let blackboard = Blackboard::with_allocation(allocation);
         let completed = Rc::new(RefCell::new(Vec::new()));
@@ -4120,7 +4091,6 @@ mod tests {
         let capture = CapturingAdapter::new(adapter);
         let observed = capture.clone();
         let mut allocation = ResourceAllocation::default();
-        allocation.set(builtin::speak(), ModuleConfig::default());
         allocation.set_activation(builtin::speak(), ActivationRatio::ONE);
         let blackboard = Blackboard::with_allocation(allocation);
         let completed = Rc::new(RefCell::new(Vec::new()));
@@ -4208,7 +4178,6 @@ mod tests {
         let capture = CapturingAdapter::new(adapter);
         let observed = capture.clone();
         let mut allocation = ResourceAllocation::default();
-        allocation.set(builtin::speak(), ModuleConfig::default());
         allocation.set_activation(builtin::speak(), ActivationRatio::ONE);
         let blackboard = Blackboard::with_allocation(allocation);
         let completed = Rc::new(RefCell::new(Vec::new()));
@@ -4310,7 +4279,6 @@ mod tests {
         let capture = CapturingAdapter::new(adapter);
         let observed = capture.clone();
         let mut allocation = ResourceAllocation::default();
-        allocation.set(builtin::speak(), ModuleConfig::default());
         allocation.set_activation(builtin::speak(), ActivationRatio::ONE);
         let blackboard = Blackboard::with_allocation(allocation);
         let completed = Rc::new(RefCell::new(Vec::new()));
@@ -4393,7 +4361,6 @@ mod tests {
         let capture = CapturingAdapter::new(adapter);
         let observed = capture.clone();
         let mut allocation = ResourceAllocation::default();
-        allocation.set(builtin::speak(), ModuleConfig::default());
         allocation.set_activation(builtin::speak(), ActivationRatio::ONE);
         let blackboard = Blackboard::with_allocation(allocation);
         let completed = Rc::new(RefCell::new(Vec::new()));
@@ -4483,7 +4450,6 @@ mod tests {
                 Some(inhibit_reason),
             ));
         let mut allocation = ResourceAllocation::default();
-        allocation.set(builtin::speak(), ModuleConfig::default());
         allocation.set_activation(builtin::speak(), ActivationRatio::ONE);
         let blackboard = Blackboard::with_allocation(allocation);
         let completed = Rc::new(RefCell::new(Vec::new()));
@@ -4546,7 +4512,6 @@ mod tests {
         let adapter =
             MockLlmAdapter::new().with_text_scenario(finish_without_planning_tool_scenario());
         let mut allocation = ResourceAllocation::default();
-        allocation.set(builtin::speak(), ModuleConfig::default());
         allocation.set_activation(builtin::speak(), ActivationRatio::ONE);
         let blackboard = Blackboard::with_allocation(allocation);
         let sink: Rc<dyn crate::utterance::UtteranceSink> = Rc::new(CapturingUtteranceSink {

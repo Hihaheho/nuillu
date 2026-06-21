@@ -54,7 +54,7 @@ participants = ["Peer"]
   pass-score = 0.85
   judge-inputs = ["output", "memo-contents", "tool-calls"]
   rubric = ```
-  Pass if the allocation decision treats the direct participant greeting as current social evidence that needs the outward speech path, raises speak materially, and keeps any guidance grounded in the greeting.
+  Pass if the allocation decision treats the direct participant greeting as current social evidence that needs the outward speech path, raises speak materially, and keeps the allocation memo grounded in the greeting.
   Fail if speak is omitted or left idle, if the tool call uses malformed priority arguments instead of priority_module_ids, if the allocation only raises attention or cognition while leaving no path to an acknowledgement, or if the memo leaks hidden eval/runtime mechanics.
   ```
 
@@ -76,6 +76,6 @@ participants = ["Peer"]
     name: grounded-in-greeting
     weight = 1
     pass-score = 0.85
-    description: The allocation memo and hints are about the current Peer greeting rather than unrelated housekeeping.
+    description: The allocation memo is about the current Peer greeting rather than unrelated housekeeping.
   }
 }

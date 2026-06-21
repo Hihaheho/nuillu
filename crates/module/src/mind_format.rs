@@ -384,46 +384,35 @@ fn format_current_allocation_lines(
     allocation: &ResourceAllocation,
     header: &'static str,
 ) -> Option<String> {
-    let mut entries = BTreeMap::<&str, (ActivationRatio, &str)>::new();
-    for (id, config) in allocation.iter() {
-        entries
-            .entry(id.as_str())
-            .or_insert((ActivationRatio::ZERO, ""))
-            .1 = config.guidance.trim();
-    }
+    let mut entries = BTreeMap::<&str, ActivationRatio>::new();
     for (id, ratio) in allocation.iter_activation() {
         entries
             .entry(id.as_str())
-            .or_insert((ActivationRatio::ZERO, ""))
-            .0 = ratio;
+            .or_insert(ActivationRatio::ZERO)
+            .clone_from(&ratio);
     }
 
     let mut entries = entries
         .into_iter()
-        .filter(|(_, (ratio, guidance))| *ratio > ActivationRatio::ZERO || !guidance.is_empty())
+        .filter(|(_, ratio)| *ratio > ActivationRatio::ZERO)
         .collect::<Vec<_>>();
     if entries.is_empty() {
         return None;
     }
 
-    entries.sort_by(|(left_id, (left_ratio, _)), (right_id, (right_ratio, _))| {
+    entries.sort_by(|(left_id, left_ratio), (right_id, right_ratio)| {
         right_ratio
             .cmp(left_ratio)
             .then_with(|| left_id.cmp(right_id))
     });
 
     let mut out = String::from(header);
-    for (id, (ratio, guidance)) in &entries {
+    for (id, ratio) in &entries {
         out.push_str("\n- ");
         out.push_str(id);
         out.push_str(" (");
         out.push_str(attention_strength_label(*ratio));
-        out.push_str("): ");
-        if guidance.is_empty() {
-            out.push_str("active without specific guidance");
-        } else {
-            out.push_str(&single_line(guidance));
-        }
+        out.push(')');
     }
     Some(out)
 }
@@ -673,7 +662,7 @@ fn format_bounded_lines(
 mod tests {
     use super::*;
     use chrono::TimeZone as _;
-    use nuillu_blackboard::{CognitionLogEntry, CognitionLogOrigin, MemoLogRecord, ModuleConfig};
+    use nuillu_blackboard::{CognitionLogEntry, CognitionLogOrigin, MemoLogRecord};
     use nuillu_types::{MemoryContent, ReplicaIndex, builtin};
 
     fn now() -> DateTime<Utc> {
@@ -958,17 +947,11 @@ mod tests {
     #[test]
     fn focused_context_formatters_return_plain_sections() {
         let mut allocation = ResourceAllocation::default();
-        allocation.set(
-            builtin::sensory(),
-            ModuleConfig {
-                guidance: "keep watching".into(),
-            },
-        );
         allocation.set_activation(builtin::sensory(), ActivationRatio::ONE);
 
         assert_eq!(
             format_current_allocation_state(&allocation),
-            Some("Current allocation state:\n- sensory (strong): keep watching".to_owned())
+            Some("Current allocation state:\n- sensory (strong)".to_owned())
         );
         assert_eq!(
             format_available_faculties(&[(builtin::sensory(), "observes the world")]),

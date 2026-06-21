@@ -375,12 +375,6 @@ impl Module for MemoryAssociationModule {
         None
     }
 
-    fn allocation_hint() -> Option<&'static str> {
-        Some(
-            "Raise memory-association during offline reflection when memories should be connected, contrasted, or summarized into useful relationships. Keep it low for direct recall, immediate action, or when there is no related memory material to associate.",
-        )
-    }
-
     async fn next_batch(&mut self) -> Result<Self::Batch> {
         MemoryAssociationModule::next_batch(self).await
     }

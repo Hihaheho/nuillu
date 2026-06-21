@@ -349,14 +349,8 @@ impl CapabilityProviders {
             .await;
     }
 
-    pub(crate) fn set_module_contexts(
-        &self,
-        peer_contexts: Vec<(ModuleId, &'static str)>,
-        allocation_hints: Vec<(ModuleId, &'static str)>,
-    ) {
-        self.inner
-            .blackboard
-            .set_module_contexts(peer_contexts, allocation_hints);
+    pub(crate) fn set_module_contexts(&self, peer_contexts: Vec<(ModuleId, &'static str)>) {
+        self.inner.blackboard.set_module_contexts(peer_contexts);
     }
 
     pub(crate) async fn apply_runtime_policy(&self) {
@@ -582,13 +576,6 @@ impl AgentRuntimeControl {
     /// each `activate` call.
     pub fn peer_contexts(&self) -> Vec<(ModuleId, &'static str)> {
         self.blackboard.peer_contexts().to_vec()
-    }
-
-    /// Snapshot of the registered-module allocation-hint catalog. Cheap
-    /// synchronous read; the scheduler turns this into an [`ActivateCx`] for
-    /// each `activate` call.
-    pub fn allocation_hints(&self) -> Vec<(ModuleId, &'static str)> {
-        self.blackboard.allocation_hints().to_vec()
     }
 
     pub async fn identity_memories(&self) -> Vec<nuillu_blackboard::IdentityMemoryRecord> {
@@ -1287,7 +1274,6 @@ impl fmt::Debug for ModuleRegistry {
 struct ModuleRegistration {
     module: ModuleId,
     peer_context: Option<&'static str>,
-    allocation_hint: Option<&'static str>,
     policy: ModulePolicy,
     replica_capacity: u8,
     builder: ErasedModuleBuilder,
@@ -1298,7 +1284,6 @@ impl fmt::Debug for ModuleRegistration {
         f.debug_struct("ModuleRegistration")
             .field("module", &self.module)
             .field("peer_context", &self.peer_context)
-            .field("allocation_hint", &self.allocation_hint)
             .field("policy", &self.policy)
             .field("replica_capacity", &self.replica_capacity)
             .finish_non_exhaustive()
@@ -1366,8 +1351,8 @@ impl ModuleRegistry {
     }
 
     /// Register a module type with its boot-time policy. The module's identity
-    /// and prompt/allocation catalogs come from [`Module::id`],
-    /// [`Module::peer_context`], and [`Module::allocation_hint`].
+    /// and peer prompt catalog entry come from [`Module::id`] and
+    /// [`Module::peer_context`].
     pub fn register<B>(
         mut self,
         policy: ModulePolicy,
@@ -1378,7 +1363,6 @@ impl ModuleRegistry {
     {
         let module = ModuleId::new(<B::Module as Module>::id())?;
         let peer_context = <B::Module as Module>::peer_context();
-        let allocation_hint = <B::Module as Module>::allocation_hint();
         if self
             .registrations
             .iter()
@@ -1390,7 +1374,6 @@ impl ModuleRegistry {
         self.registrations.push(ModuleRegistration {
             module,
             peer_context,
-            allocation_hint,
             policy,
             replica_capacity,
             builder: Rc::new(move |caps| {
@@ -1416,7 +1399,6 @@ impl ModuleRegistry {
     {
         let module = ModuleId::new(<B::Module as Module>::id())?;
         let peer_context = <B::Module as Module>::peer_context();
-        let allocation_hint = <B::Module as Module>::allocation_hint();
         if self
             .registrations
             .iter()
@@ -1441,7 +1423,6 @@ impl ModuleRegistry {
         self.registrations.push(ModuleRegistration {
             module,
             peer_context,
-            allocation_hint,
             policy,
             replica_capacity,
             builder: Rc::new(move |caps| {
@@ -1493,14 +1474,6 @@ impl ModuleRegistry {
                     registration
                         .peer_context
                         .map(|context| (registration.module.clone(), context))
-                })
-                .collect(),
-            self.registrations
-                .iter()
-                .filter_map(|registration| {
-                    registration
-                        .allocation_hint
-                        .map(|hint| (registration.module.clone(), hint))
                 })
                 .collect(),
         );
@@ -1675,7 +1648,7 @@ mod tests {
     use chrono::{DateTime, Utc};
     use nuillu_blackboard::{
         ActivationRatio, AllocationCommand, AllocationEffectLevel, Blackboard, BlackboardCommand,
-        CognitionLogEntry, CognitionLogOrigin, ModuleConfig, ResourceAllocation,
+        CognitionLogEntry, CognitionLogOrigin, ResourceAllocation,
     };
     use nuillu_types::{ModuleId, ReplicaCapRange, builtin};
 
@@ -1964,22 +1937,18 @@ mod tests {
         Ok(NoopModule)
     }
 
-    struct AllocationHintOnlyModule;
+    struct NoPeerContextModule;
 
     #[async_trait(?Send)]
-    impl Module for AllocationHintOnlyModule {
+    impl Module for NoPeerContextModule {
         type Batch = ();
 
         fn id() -> &'static str {
-            "allocation-hint-only"
+            "no-peer-context"
         }
 
         fn peer_context() -> Option<&'static str> {
             None
-        }
-
-        fn allocation_hint() -> Option<&'static str> {
-            Some("test allocation hint")
         }
 
         async fn next_batch(&mut self) -> anyhow::Result<Self::Batch> {
@@ -1995,10 +1964,10 @@ mod tests {
         }
     }
 
-    async fn allocation_hint_only_builder(
+    async fn no_peer_context_builder(
         _: ModuleCapabilityFactory,
-    ) -> Result<AllocationHintOnlyModule, ModuleRegistryError> {
-        Ok(AllocationHintOnlyModule)
+    ) -> Result<NoPeerContextModule, ModuleRegistryError> {
+        Ok(NoPeerContextModule)
     }
 
     #[test]
@@ -2048,28 +2017,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn build_installs_separate_peer_and_allocation_catalogs() {
+    async fn build_installs_peer_context_catalog() {
         let blackboard = Blackboard::default();
         let caps = test_caps(blackboard.clone());
         ModuleRegistry::new()
             .register(test_policy(0..=0), noop_builder)
             .unwrap()
-            .register(test_policy(0..=0), allocation_hint_only_builder)
+            .register(test_policy(0..=0), no_peer_context_builder)
             .unwrap()
             .build(&caps)
             .await
             .unwrap();
 
         let noop = nuillu_types::ModuleId::new(NoopModule::id()).unwrap();
-        let allocation_only = nuillu_types::ModuleId::new(AllocationHintOnlyModule::id()).unwrap();
 
         assert_eq!(
             blackboard.peer_contexts().to_vec(),
             vec![(noop, "test stub")]
-        );
-        assert_eq!(
-            blackboard.allocation_hints().to_vec(),
-            vec![(allocation_only, "test allocation hint")]
         );
     }
 
@@ -2080,7 +2044,7 @@ mod tests {
         let allocated = ModuleRegistry::new()
             .register(test_policy(0..=1), noop_builder)
             .unwrap()
-            .register(test_policy(0..=1), allocation_hint_only_builder)
+            .register(test_policy(0..=1), no_peer_context_builder)
             .unwrap()
             .remove_module(nuillu_types::ModuleId::new(NoopModule::id()).unwrap())
             .build(&caps)
@@ -2088,7 +2052,7 @@ mod tests {
             .unwrap();
 
         let noop = nuillu_types::ModuleId::new(NoopModule::id()).unwrap();
-        let allocation_only = nuillu_types::ModuleId::new(AllocationHintOnlyModule::id()).unwrap();
+        let no_peer_context = nuillu_types::ModuleId::new(NoPeerContextModule::id()).unwrap();
 
         assert_eq!(allocated.len(), 1);
         let has_noop_policy = blackboard
@@ -2096,14 +2060,10 @@ mod tests {
             .await;
         assert!(!has_noop_policy);
         let has_allocation_only_policy = blackboard
-            .read(|bb| bb.module_policies().contains_key(&allocation_only))
+            .read(|bb| bb.module_policies().contains_key(&no_peer_context))
             .await;
         assert!(has_allocation_only_policy);
         assert_eq!(blackboard.peer_contexts().to_vec(), Vec::new());
-        assert_eq!(
-            blackboard.allocation_hints().to_vec(),
-            vec![(allocation_only, "test allocation hint")]
-        );
     }
 
     #[tokio::test]
@@ -2111,11 +2071,11 @@ mod tests {
         let blackboard = Blackboard::default();
         let caps = test_caps(blackboard);
         let dependent = nuillu_types::ModuleId::new(NoopModule::id()).unwrap();
-        let dependency = nuillu_types::ModuleId::new(AllocationHintOnlyModule::id()).unwrap();
+        let dependency = nuillu_types::ModuleId::new(NoPeerContextModule::id()).unwrap();
         let allocated = ModuleRegistry::new()
             .register(test_policy(0..=1), noop_builder)
             .unwrap()
-            .register(test_policy(0..=1), allocation_hint_only_builder)
+            .register(test_policy(0..=1), no_peer_context_builder)
             .unwrap()
             .depends_on(dependent.clone(), dependency.clone())
             .remove_modules([dependency.clone()])
@@ -2192,7 +2152,7 @@ mod tests {
         );
         let runtime = caps.runtime_control();
         let cx = runtime.with_session_checkpoint_runtime(
-            crate::ActivateCx::new(&[], &[], &[], &[], compaction, Utc::now()),
+            crate::ActivateCx::new(&[], &[], &[], compaction, Utc::now()),
             owner.clone(),
         );
 
@@ -2258,7 +2218,7 @@ mod tests {
         );
         let runtime = caps.runtime_control();
         let cx = runtime.with_session_checkpoint_runtime(
-            crate::ActivateCx::new(&[], &[], &[], &[], compaction, Utc::now()),
+            crate::ActivateCx::new(&[], &[], &[], compaction, Utc::now()),
             owner.clone(),
         );
 
@@ -2286,7 +2246,6 @@ mod tests {
         let sink = Rc::new(RecordingRuntimeEventSink::default());
         let owner = ModuleInstanceId::new(builtin::memory(), ReplicaIndex::ZERO);
         let cx = crate::ActivateCx::new(
-            &[],
             &[],
             &[],
             &[],
@@ -2512,7 +2471,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn allocation_writer_records_guidance_changes() {
+    async fn allocation_writer_records_activation_changes() {
         let blackboard = Blackboard::default();
         blackboard
             .apply(BlackboardCommand::SetModulePolicies {
@@ -2545,15 +2504,14 @@ mod tests {
         let commands = vec![AllocationCommand::target(
             builtin::cognition_gate(),
             AllocationEffectLevel::Max,
-            Some("promote current sensory memo into attention".into()),
         )];
 
         writer.submit(commands).await.unwrap();
 
         let allocation = blackboard.read(|bb| bb.allocation().clone()).await;
         assert_eq!(
-            allocation.for_module(&builtin::cognition_gate()).guidance,
-            "promote current sensory memo into attention"
+            allocation.activation_for(&builtin::cognition_gate()),
+            ActivationRatio::ONE
         );
     }
 
@@ -2569,11 +2527,7 @@ mod tests {
 
         writer
             .submit([
-                AllocationCommand::target(
-                    builtin::cognition_gate(),
-                    AllocationEffectLevel::Max,
-                    Some("promote current sensory memo into attention".into()),
-                ),
+                AllocationCommand::target(builtin::cognition_gate(), AllocationEffectLevel::Max),
                 AllocationCommand::suppression(builtin::speak(), AllocationEffectLevel::High),
             ])
             .await
@@ -2581,12 +2535,6 @@ mod tests {
 
         let mut targets = ResourceAllocation::default();
         targets.set_activation(builtin::cognition_gate(), ActivationRatio::ONE);
-        targets.set(
-            builtin::cognition_gate(),
-            ModuleConfig {
-                guidance: "promote current sensory memo into attention".to_owned(),
-            },
-        );
         let mut suppressions = ResourceAllocation::default();
         suppressions.set_activation(builtin::speak(), ActivationRatio::from_f64(0.10));
 
@@ -2604,15 +2552,9 @@ mod tests {
     async fn registry_build_restores_persisted_allocation_snapshots() {
         let owner =
             ModuleInstanceId::new(ModuleId::new(NoopModule::id()).unwrap(), ReplicaIndex::ZERO);
-        let target = ModuleId::new(AllocationHintOnlyModule::id()).unwrap();
+        let target = ModuleId::new(NoPeerContextModule::id()).unwrap();
         let mut targets = ResourceAllocation::default();
         targets.set_activation(target.clone(), ActivationRatio::ONE);
-        targets.set(
-            target.clone(),
-            ModuleConfig {
-                guidance: "restore this priority".to_owned(),
-            },
-        );
         let snapshot =
             PersistedAllocationSnapshot::new(owner.clone(), targets, ResourceAllocation::default());
         let store = RecordingAllocationStore::with_snapshots(vec![snapshot]);
@@ -2625,7 +2567,7 @@ mod tests {
         ModuleRegistry::new()
             .register(test_policy(0..=1), noop_builder)
             .unwrap()
-            .register(test_policy(0..=1), allocation_hint_only_builder)
+            .register(test_policy(0..=1), no_peer_context_builder)
             .unwrap()
             .build(&caps)
             .await
@@ -2633,10 +2575,6 @@ mod tests {
 
         let allocation = blackboard.read(|bb| bb.allocation().clone()).await;
         assert_eq!(allocation.activation_for(&target), ActivationRatio::ONE);
-        assert_eq!(
-            allocation.for_module(&target).guidance,
-            "restore this priority"
-        );
     }
 
     #[tokio::test]
@@ -2788,16 +2726,8 @@ mod tests {
 
         writer
             .submit([
-                AllocationCommand::target(
-                    builtin::speak(),
-                    AllocationEffectLevel::Max,
-                    Some("speak if attention is ready".into()),
-                ),
-                AllocationCommand::target(
-                    builtin::cognition_gate(),
-                    AllocationEffectLevel::Max,
-                    Some("disallowed target".into()),
-                ),
+                AllocationCommand::target(builtin::speak(), AllocationEffectLevel::Max),
+                AllocationCommand::target(builtin::cognition_gate(), AllocationEffectLevel::Max),
                 AllocationCommand::suppression(
                     builtin::cognition_gate(),
                     AllocationEffectLevel::High,
@@ -2813,16 +2743,8 @@ mod tests {
             ActivationRatio::ONE
         );
         assert_eq!(
-            allocation.for_module(&builtin::speak()).guidance,
-            "speak if attention is ready"
-        );
-        assert_eq!(
             allocation.activation_for(&builtin::cognition_gate()),
             ActivationRatio::from_f64(0.10)
-        );
-        assert_ne!(
-            allocation.for_module(&builtin::cognition_gate()).guidance,
-            "disallowed target"
         );
     }
 

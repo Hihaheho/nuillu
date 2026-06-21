@@ -24,8 +24,8 @@ This document is the implementation source of truth. It describes the desired ar
 13. **Tool-gated speech target selection** — Cognition-log updates wake Speak when allocation makes it active. Speak calls the optional `speak_to` tool to select a target and begin generation; if it does not call the tool, the activation completes silently.
 14. **Local deterministic inbox batching** — Modules batch transient inbox activations in `next_batch()` before LLM work. Batching is module-local, bounded by boot-time module registration, and deterministic; it does not add a shared runtime batch type or ask an LLM to decide batch membership. Because `activate(&batch)` may be retried with the same batch but `next_batch()` is not retried, modules must read from channels, inboxes, and custom queues only while building the batch in `next_batch()`, never during `activate()`.
 15. **Replica-capped persistent module instances** — Boot registers modules as `(module_id, cap_range, builder)`, creates module instances up to `cap_range.max`, and never destroys those instances when allocation lowers replica count. Allocation changes routing and event-loop scheduling.
-16. **Controller proposals with deterministic effective allocation** — Allocation replicas write allocation proposals. The runtime derives the effective `ResourceAllocation` by deterministic averaging of `activation_ratio`, `guidance`, and `tier`, computes active replicas from each module's boot-time cap range, then applies `RuntimePolicy` hard limits such as max total active replicas and max Premium replicas.
-17. **Registry-derived controller schema** — The allocation structured-output JSON Schema is generated from module registrations, enumerates module ids, and exposes only `activation_ratio`, `guidance`, and `tier`. Parsed ratios are still clamped to `0.0..=1.0` because LLM output is not a trust boundary.
+16. **Controller proposals with deterministic effective allocation** — Allocation replicas write priority proposals. The runtime derives the effective `ResourceAllocation` by deterministic averaging of activation ratios, computes active replicas and rates from each module's boot-time policy, then applies `RuntimePolicy` hard limits such as max total active replicas.
+17. **Registry-derived controller schema** — The allocation structured-output JSON Schema is generated from module registrations, enumerates module ids, and exposes only `memo` plus `priority_module_ids`. Priority positions are mapped through the host/base activation table because LLM output is not a trust boundary.
 18. **Free-form memo logs** — `Memo` appends durable module-output log entries. Each entry is plain free-form text, not JSON/YAML, a code-fenced format, or a structured data exchange protocol. Memo entries have an opt-in `cognitive` routing flag that defaults to false. Cognitive memo plaintext must already be safe evidence for cognition, while non-cognitive memo text remains ordinary bookkeeping. Modules consume this surface through unread memo logs and keep any needed durable context in their own persistent `Session` plus compaction; there is no latest-memo snapshot read API. Structured output is reserved for runtime control decisions whose fields are read by code.
 19. **Memory and learning are distinct reinforcement substrates** — Memory preserves *what happened* and is reinforced by **access**: rank rises when entries are read or queried, and this rule is owned by `MemoryStore` rather than by any module. Learning preserves *what worked* and *what failed* through a TD-0 (temporal-difference, one-step lookbehind, no discount) credit-assignment loop. `policy` is a read-only advisor/proposer: it searches stored policies by vector search over the `trigger` field only, synthesizes new `(trigger, behavior)` candidates when needed, predicts each candidate's current `predicted_expected_reward`, writes ordinary advice to its memo, and writes a structured `PolicyConsiderationPayload` through a reward-crate custom capability. `reward` settles custom-evicted policy considerations, aggregates the 6-source `ObservedReward`, computes `td_error = observed_scalar − predicted_expected_reward`, inserts credited synthetic candidates, and applies value, expected-reward, confidence, and reward-token deltas through the reward-owned `PolicyUpserter`. Rank crosses tiers only as a derived consequence of value × reward-tokens. Policies and memories never share a store, a rank enum, or a strengthening rule. The retrieval module that surfaces memories is named `query-memory`.
 20. **Interoception and homeostasis are separate** — `interoception` owns the canonical internal-state estimate: `wake_arousal`, `nrem_pressure`, `rem_pressure`, `affect_arousal`, `valence`, and untyped `emotion`. `homeostasis` reads that state and regulates allocation, but it does not estimate internal state. There is no separate `emotion` module in v1.
@@ -126,17 +126,14 @@ Replica identity is visible in runtime state and diagnostics, not in ordinary mo
 
 ### Resource allocation and proposals
 
-`ResourceAllocation` is keyed by `ModuleId` and has exactly three public allocation axes: activation ratio, controller guidance, and model tier.
+`ResourceAllocation` is keyed by `ModuleId` and stores activation priority state only.
 
 ```rust
-pub struct ModuleConfig {
-    pub activation_ratio: ActivationRatio,
-    pub guidance: String,
-    pub tier: ModelTier,
-}
-
 pub struct ResourceAllocation {
-    per_module: HashMap<ModuleId, ModuleConfig>,
+    activation: HashMap<ModuleId, ActivationRatio>,
+    activation_table: Vec<ActivationRatio>,
+    active_replicas: HashMap<ModuleId, u8>,
+    bpm: HashMap<ModuleId, Bpm>,
 }
 ```
 
@@ -156,8 +153,6 @@ This means `cap_range.min` remains a boot-time guarantee. `activation_ratio = 0.
 Allocation replicas do not directly replace the effective allocation. `AllocationWriter` records the holder's proposal. The runtime computes effective allocation from active controller proposals:
 
 - `activation_ratio`: clamp each proposal to `0.0..=1.0`, then take the arithmetic mean.
-- `guidance`: keep the single active controller's guidance as-is; for multiple active controller proposals, preserve every active guidance with owner labels in deterministic order.
-- `tier`: ordinal mean over `Cheap < Default < Premium`, rounded to nearest tier, then mapped back to `ModelTier`.
 
 If there are no active controller proposals for a module, the effective allocation falls back to the boot/base allocation for that module and is still clamped to its cap range. If there is only one active controller replica, effective allocation is equivalent to that replica's clamped proposal.
 
@@ -166,13 +161,12 @@ the background availability floor. Controller proposals add salience and drive. 
 controller suppression are explicit caps or low activation proposals. An omitted module in a
 controller proposal therefore falls back to base allocation; omission is not an implicit `Off`.
 
-The allocation structured-output schema is generated from the module registry at activation time. It enumerates registered module ids and exposes only:
+The allocation structured-output schema is generated from the module registry at activation time. It enumerates registered target module ids and exposes only:
 
-- `activation_ratio`: JSON number in `0.0..=1.0`,
-- `guidance`: natural-language controller guidance for that module,
-- `tier`: `Cheap | Default | Premium`.
+- `memo`: controller note explaining the allocation decision,
+- `priority_module_ids`: ranked known module ids.
 
-Runtime parsing still sanitizes output: unknown module ids are ignored, missing fields preserve the current proposal value, and out-of-range ratios are clamped because LLM output is not trusted. `replicas`, `period`, `context_budget`, `message_only`, and `period_ms` are not allocation fields.
+Runtime parsing still sanitizes output: unknown module ids are ignored, duplicate ids keep their first priority, and omitted modules fall back to the host/base allocation. `replicas`, `period`, `context_budget`, `message_only`, and `period_ms` are not allocation fields.
 
 ### Typed channel capabilities
 
@@ -324,7 +318,7 @@ cognition context and filter out memory-recombination entries from speech input.
 
 ### Allocation writes
 
-`AllocationWriter` records the holder controller replica's proposal. After each write, the blackboard recomputes effective allocation, including each module's `activation_ratio`, `guidance`, `tier`, and derived active replica count.
+`AllocationWriter` records the holder controller replica's proposal. After each write, the blackboard recomputes effective allocation, including each module's activation ratio and derived active replica/rate state.
 
 Allocation writes do not publish a typed wake signal and do not create module work. The scheduler uses the blackboard allocation-change waiter only to re-evaluate active/inactive replica gating. Modules reread allocation as durable context when another natural event wakes them.
 
@@ -342,7 +336,7 @@ Ok(batch)
 
 The awaited receive and ready drain are module-local and happen only while constructing the batch in `next_batch`. Active-replica gating happens outside the module in the event loop before `next_batch` starts and before `activate(&batch)` runs. The runtime does not retry `next_batch`; after it has a batch, it may retry `activate(&batch)` with the exact same batch. For that reason, `activate` must not read or drain channels, inboxes, or custom queues. Any work item that should participate in runtime retry must already be part of the batch returned from `next_batch`.
 
-Wake-only activations such as `CognitionLogUpdated`, `MemoUpdated`, and `InteroceptiveUpdated` may be collapsed into a single pending wake because the source of truth is durable state such as cognition logs, memo logs, or interoceptive state. Work-carrying activations such as `SensoryInput`, `AttentionControlRequest`, `MemoLogEvicted`, and `CognitionLogEvicted` must not be silently discarded by the transport because the payload is the work. `AttentionControlRequest` is controller-only: allocation may admit, defer, or reject it in its memo and allocation guidance; there is no durable pending queue after that judgement.
+Wake-only activations such as `CognitionLogUpdated`, `MemoUpdated`, and `InteroceptiveUpdated` may be collapsed into a single pending wake because the source of truth is durable state such as cognition logs, memo logs, or interoceptive state. Work-carrying activations such as `SensoryInput`, `AttentionControlRequest`, `MemoLogEvicted`, and `CognitionLogEvicted` must not be silently discarded by the transport because the payload is the work. `AttentionControlRequest` is controller-only: allocation may admit, defer, or reject it in its memo and express scheduling effects only through activation priority; there is no durable pending queue after that judgement.
 
 If a replica is disabled while it has no pending work, the event loop leaves it stored and does not start `next_batch`. If a batch is already available when the replica becomes inactive, the event loop holds that batch and defers activation until the replica is active again. Allocation changes do not preempt an already-running activation, including active Speak streams.
 
@@ -377,13 +371,13 @@ Rules:
 Module conventions:
 - Memo-update modules, such as allocation, collapse multiple ready memo updates into one wake activation and reread the blackboard as source of truth. Allocation also waits a bounded silent window so near-simultaneous memo wakes and attention-control requests share one allocation decision. `MemoUpdatedInbox` drops self-sent updates so a module cannot wake itself by writing its own memo.
 - Cognition-log-update modules, such as attention-schema, interpreter, predict, and surprise, collapse multiple ready cognition-log updates into one wake activation and reread the cognition log as source of truth. `CognitionLogUpdatedInbox` drops self-sent updates so a module cannot wake itself by appending to its own cognition log.
-- Query and self-model modules no longer receive explicit request payloads. They wake from cognition-log updates and write memo-authoritative results using allocation guidance plus blackboard context.
-- Memory wakes from cognition-log eviction events. Evicted cognition entries are work-carrying payloads and are collected with a bounded silent window before the LLM turn. Preservation guidance is read during that activation as context only. Memo-log entries are not valid direct memory evidence.
+- Query and self-model modules no longer receive explicit request payloads. They wake from cognition-log updates and write memo-authoritative results using blackboard context.
+- Memory wakes from cognition-log eviction events. Evicted cognition entries are work-carrying payloads and are collected with a bounded silent window before the LLM turn. Memo-log entries are not valid direct memory evidence.
 - Policy wakes from memo and cognition-log updates, then writes ordinary memo advice and a structured policy-consideration payload through a reward-crate custom capability.
-- Memory-compaction, memory-association, memory-recombination, and policy-compaction wake from `InteroceptiveUpdated`, letting homeostasis update allocation before they read compaction/recombination guidance.
+- Memory-compaction, memory-association, memory-recombination, and policy-compaction wake from `InteroceptiveUpdated`, letting homeostasis update activation priority before they run.
 - Reward wakes from policy-consideration custom evictions. These evictions are work-carrying payloads and are collected into a batch in `next_batch`; reward activation does not drain the custom queue.
 - Speak batches ready `CognitionLogUpdated` wake signals, then uses its optional `speak_to` tool to decide whether that activation emits. Cognition-log updates received during a generation stream remain queued for the next Speak batch.
-- Sensory coalesces raw sensory inputs with a bounded silent window before salience scoring. Allocation controls sensory activation and tier externally, but sensory does not read allocation guidance.
+- Sensory coalesces raw sensory inputs with a bounded silent window before salience scoring. Allocation controls sensory activation externally, but sensory does not read allocation priority state as work context.
 
 ### Replica-owned blackboard views
 
@@ -551,13 +545,13 @@ memory, publish query/self-model requests, or emit utterances.
 
 The sensory module is deliberately a pre-attentive filter, not the conversation owner and not a work router. It maintains local stimulus state keyed by a normalized signature such as source/direction plus content or appearance. Habituation and decay are calculated, not delegated to the LLM: repeated low-change stimuli lose salience, old stimuli decay, and novel/user-directed/intense/changed stimuli gain salience.
 
-The LLM stage receives persisted assistant-side sensory ledger entries for one-shots and ambient add/update/remove diffs, plus ephemeral assistant context containing the full current ambient field. It also receives detailed relative age and current observation details. Its durable shared output is constrained to tool calls: ignore the observation/diff or write a memo observation. The memo is the contract with the rest of the system. It should contain filtered observed scene facts, not ambient field mechanics, guidance, row state, or implementation detail. Raw sensory events and full ambient snapshots are transient and should not be mirrored wholesale into durable shared state.
+The LLM stage receives persisted assistant-side sensory ledger entries for one-shots and ambient add/update/remove diffs, plus ephemeral assistant context containing the full current ambient field. It also receives detailed relative age and current observation details. Its durable shared output is constrained to tool calls: ignore the observation/diff or write a memo observation. The memo is the contract with the rest of the system. It should contain filtered observed scene facts, not ambient field mechanics, prompt instructions, row state, or implementation detail. Raw sensory events and full ambient snapshots are transient and should not be mirrored wholesale into durable shared state.
 
 ### Cognition Gate
 
 Capabilities: `MemoUpdatedInbox`, `BlackboardReader`, `AllocationReader`, `CognitionWriter`, `TimeDivision`, `LlmAccess`.
 
-Reads unread cognitive memo records and current allocation guidance, then appends concise, novel,
+Reads unread cognitive memo records, then appends concise, novel,
 currently relevant events to this replica's cognition log. It advances through non-cognitive memo
 updates without forming a batch. It has no `Memo` capability; its only durable output is the
 cognition log. If exactly one total candidate is pending, including retry-pending candidates, it
@@ -575,9 +569,9 @@ Capabilities: `MemoUpdatedInbox`, `AttentionControlRequestInbox`, `BlackboardRea
 
 Wakes on memo updates, excluding its own memo writes, and internal `AttentionControlRequest` bids. It reads unread memo-log entries into a persistent `Session`, plus current attention-control requests, memory metadata, cognition-log set, effective allocation, interoceptive state, and registry cap metadata. It writes this controller replica's allocation proposal; the runtime averages active proposals into the effective allocation.
 
-The controller prompt receives a registry-derived JSON Schema. The schema enumerates known module ids and exposes exactly `activation_ratio`, `guidance`, and `tier` for each allocation entry. Runtime parsing clamps `activation_ratio` to `0.0..=1.0`; active replicas are derived later from the target module's `cap_range`.
+The controller prompt receives a registry-derived JSON Schema. The schema enumerates known module ids and exposes exactly `memo` and `priority_module_ids`. Runtime maps priority positions through the current activation table; active replicas are derived later from the target module's policy.
 
-When current memo logs and cognition logs suggest that the agent should gather evidence before speaking, the controller enters an evidence-gathering allocation phase: it keeps or raises query and cognition-gate activation ratios/tier, and writes guidance for the modules that can gather or promote the missing evidence. Query modules continue to write memo-authoritative results as log entries; cognition-gate may later promote useful query memo-log content into cognition logs. Once cognition-log state indicates that enough evidence is available for a user-visible answer, the controller can allocate Speak; Speak still remains silent if its target-selection turn does not call `speak_to`.
+When current memo logs and cognition logs suggest that the agent should gather evidence before speaking, the controller enters an evidence-gathering allocation phase: it keeps or raises query and cognition-gate activation priority. Query modules continue to write memo-authoritative results as log entries; cognition-gate may later promote useful query memo-log content into cognition logs. Once cognition-log state indicates that enough evidence is available for a user-visible answer, the controller can allocate Speak; Speak still remains silent if its target-selection turn does not call `speak_to`.
 
 This is not a request/response wait and not a query-completion correlation protocol. The controller allocates work from memo logs, attention-control requests, cognition logs, and allocation state, while query results remain durable only through query-module memo logs. Attention-control requests are admitted, deferred, or rejected in the controller memo; deferred requests are not stored in a separate pending queue.
 
@@ -587,7 +581,7 @@ Capabilities: `MemoUpdatedInbox`, `CognitionLogUpdatedInbox`, `BlackboardReader`
 
 Reads only unread cognitive memo-log and cognition-log deltas collected for the current activation
 into a persistent `Session`. The activation turn renders those deltas source-blind, without module
-owner, replica, allocation guidance, or cognitive routing metadata; previous context is retained
+owner, replica, allocation priority state, or cognitive routing metadata; previous context is retained
 only through session history and compaction. Its tool set offers an append operation whose input
 payload contains plaintext and a no-change operation. Appending writes a concise first-person
 attention experience to this replica's cognitive memo log; no-change writes nothing. It does not
@@ -607,11 +601,11 @@ must be labeled as imagined/hypothetical/fictional/possible in the appended cogn
 
 ### Self Model
 
-Capabilities: `CognitionLogUpdatedInbox`, `AllocationReader`, `BlackboardReader` for memo-log/context reads, `CognitionLogReader`, `Memo`, `LlmAccess`.
+Capabilities: `CognitionLogUpdatedInbox`, `BlackboardReader` for memo-log/context reads, `CognitionLogReader`, `Memo`, `LlmAccess`.
 
 Maintains a current self-description by integrating attention-schema attention-experience memos or
-their promoted cognition-log entries, relevant module memo logs, self-related knowledge that query
-modules surface from memory, and the allocation guidance that requested self-model work. Non-empty
+their promoted cognition-log entries, relevant module memo logs, and self-related knowledge that query
+modules surface from memory. Non-empty
 output is appended to this replica's cognitive memo log, which is memo-authoritative for self-model
 answers.
 
@@ -619,11 +613,10 @@ Stable self-knowledge belongs in memory and is surfaced through query-module mem
 
 ### Query Memory
 
-Capabilities: `CognitionLogUpdatedInbox`, `BlackboardReader`, `AllocationReader`, `MemorySearcher`, `Memo`, `LlmAccess`.
+Capabilities: `CognitionLogUpdatedInbox`, `BlackboardReader`, `MemorySearcher`, `Memo`, `LlmAccess`.
 
 Handles memory retrieval (vector-memory/RAG backed in v1). Cognition-log updates wake it to retrieve
-memory relevant to the current cognitive surface; allocation guidance is context for search
-decisions during that activation. It does not handle self-referential or self-model integration,
+memory relevant to the current cognitive surface. It does not handle self-referential or self-model integration,
 and does not query the policy store. Output is appended to this replica's cognitive memo log, and
 those plaintext entries contain only retrieved or linked memory evidence copied from query results.
 Query intent and search bookkeeping stay in typed/session state. Reads count as memory access; rank
@@ -631,21 +624,21 @@ elevation is applied by `MemoryStore` and is not module-visible.
 
 ### Query Agentic
 
-Capabilities: `CognitionLogUpdatedInbox`, `BlackboardReader`, `AllocationReader`, `FileSearcher`, `Memo`, `LlmAccess`.
+Capabilities: `CognitionLogUpdatedInbox`, `BlackboardReader`, `FileSearcher`, `Memo`, `LlmAccess`.
 
-Handles read-only file-search retrieval. Cognition-log updates wake it; allocation guidance is context for search decisions during that activation. Its file-search tool exposes only ripgrep-like controls: `pattern`, `regex`, `invert_match`, `case_sensitive`, `context`, and `max_matches`. It does not receive raw filesystem or shell access. Output is appended to this replica's memo log, and those entries contain only retrieved file content/snippets copied from query results.
+Handles read-only file-search retrieval. Cognition-log updates wake it. Its file-search tool exposes only ripgrep-like controls: `pattern`, `regex`, `invert_match`, `case_sensitive`, `context`, and `max_matches`. It does not receive raw filesystem or shell access. Output is appended to this replica's memo log, and those entries contain only retrieved file content/snippets copied from query results.
 
 ### Memory
 
-Capabilities: `CognitionLogEvictedInbox`, `AllocationReader`, `MemoryMetadataReader`, `MemoryWriter`, `LlmAccess`.
+Capabilities: `CognitionLogEvictedInbox`, `MemoryMetadataReader`, `MemoryWriter`, `LlmAccess`.
 
-Decides whether useful information should be preserved and inserts memory entries. Cognition-log evictions are the wake path. Memo-log entries are non-conscious working traces and are not valid direct memory-ingest evidence; memory writes must be grounded in cognition-log evidence. The memory module evaluates evicted cognition-log entries and preservation guidance as candidates, with memory metadata available for deduplication; preservation guidance is durable context, not a trigger. It may reject, normalize, deduplicate, or merge candidates, and only persists records that the LLM chooses to write through `insert_memory`. The `insert_memory` tool accepts only content, kind, concepts, and tags. Every ordinary memory-module write is inserted as `MemoryRank::ShortTerm` with runtime-stamped decay and occurrence time. Concepts and tags are name newtypes serialized as simple string arrays. `MemoryWriter` stamps the current `InteroceptiveState` affect fields onto each new record before storage.
+Decides whether useful information should be preserved and inserts memory entries. Cognition-log evictions are the wake path. Memo-log entries are non-conscious working traces and are not valid direct memory-ingest evidence; memory writes must be grounded in cognition-log evidence. The memory module evaluates evicted cognition-log entries with memory metadata available for deduplication. It may reject, normalize, deduplicate, or merge candidates, and only persists records that the LLM chooses to write through `insert_memory`. The `insert_memory` tool accepts only content, kind, concepts, and tags. Every ordinary memory-module write is inserted as `MemoryRank::ShortTerm` with runtime-stamped decay and occurrence time. Concepts and tags are name newtypes serialized as simple string arrays. `MemoryWriter` stamps the current `InteroceptiveState` affect fields onto each new record before storage.
 
 ### Memory Compaction
 
-Capabilities: `InteroceptiveUpdatedInbox`, `BlackboardReader`, `AllocationReader`, `MemoryCompactor`, `LlmAccess`.
+Capabilities: `InteroceptiveUpdatedInbox`, `BlackboardReader`, `MemoryCompactor`, `LlmAccess`.
 
-Fetches related memory contents and merges redundant entries while accumulating remember tokens. Interoceptive updates wake it; allocation guidance is compaction context during that activation. `MemoryCompactor` stamps the current `InteroceptiveState` affect fields onto each summary record before storage.
+Fetches related memory contents and merges redundant entries while accumulating remember tokens. Interoceptive updates wake it. `MemoryCompactor` stamps the current `InteroceptiveState` affect fields onto each summary record before storage.
 
 ### Interoception
 
@@ -663,13 +656,13 @@ Regulates allocation from the current interoceptive state. It drives memory comp
 
 ### Policy
 
-Capabilities: `MemoUpdatedInbox`, `CognitionLogUpdatedInbox`, `BlackboardReader`, `CognitionLogReader`, `AllocationReader`, `InteroceptiveReader`, `PolicySearcher`, `Memo`, `PolicyConsiderationWriter`, `LlmAccess`.
+Capabilities: `MemoUpdatedInbox`, `CognitionLogUpdatedInbox`, `BlackboardReader`, `CognitionLogReader`, `InteroceptiveReader`, `PolicySearcher`, `Memo`, `PolicyConsiderationWriter`, `LlmAccess`.
 
-Reads current memo logs, cognition-log entries, allocation guidance, interoception, and the policy store to produce policy advice for the current context. Existing candidates come from `PolicySearcher`, which searches the `trigger` embedding only; `behavior`, stored `expected_reward`, `confidence`, and `value` are returned as context but not used as similarity keys. When existing records do not cover the situation, `policy` may synthesize reusable `(trigger, behavior)` candidates. It writes plaintext advice to ordinary `Memo`, and writes a structured `PolicyConsiderationPayload` containing the target context, existing hits or synthetic candidates, `predicted_expected_reward`, `confidence_hint`, advice, and rationale through `PolicyConsiderationWriter`. That structured payload is not blackboard memo state and does not use `TypedMemo`. Negative or low-value candidates are represented as caution / avoidance advice. The module has no policy-store write path and cannot insert, reinforce, delete, or mutate policies.
+Reads current memo logs, cognition-log entries, interoception, and the policy store to produce policy advice for the current context. Existing candidates come from `PolicySearcher`, which searches the `trigger` embedding only; `behavior`, stored `expected_reward`, `confidence`, and `value` are returned as context but not used as similarity keys. When existing records do not cover the situation, `policy` may synthesize reusable `(trigger, behavior)` candidates. It writes plaintext advice to ordinary `Memo`, and writes a structured `PolicyConsiderationPayload` containing the target context, existing hits or synthetic candidates, `predicted_expected_reward`, `confidence_hint`, advice, and rationale through `PolicyConsiderationWriter`. That structured payload is not blackboard memo state and does not use `TypedMemo`. Negative or low-value candidates are represented as caution / avoidance advice. The module has no policy-store write path and cannot insert, reinforce, delete, or mutate policies.
 
 ### Reward
 
-Capabilities: `PolicyConsiderationEvictedInbox`, `BlackboardReader`, `CognitionLogReader`, `AllocationReader`, `InteroceptiveReader`, `PolicySearcher`, `PolicyUpserter`, `Memo`, `LlmAccess`.
+Capabilities: `PolicyConsiderationEvictedInbox`, `BlackboardReader`, `CognitionLogReader`, `InteroceptiveReader`, `PolicySearcher`, `PolicyUpserter`, `Memo`, `LlmAccess`.
 
 Closes the TD loop. It wakes on reward-crate scoped custom evictions of `PolicyConsiderationPayload`, not on generic plaintext memo evictions. For each evicted consideration, it aggregates the v1 6-source `ObservedReward = { external, task, social, cost, risk, novelty }` from surprise memos, speak completion memos, sensory memos, controller context, recent memo/cognition context, and current interoception, then collapses the structured reward into a scalar `observed_scalar`. For each credited candidate, `td_error = observed_scalar − predicted_expected_reward`, where `predicted_expected_reward` is the baseline stored by `policy` in the evicted custom payload. It applies TD-0 deltas through `PolicyUpserter::reinforce(index, value_delta, reward_tokens_delta, expected_reward_delta, confidence_delta)`, where v1 deltas follow:
 
@@ -684,9 +677,9 @@ The coefficients `α`, `β`, `γ_c`, `scale`, and `settle_band` live in `configs
 
 ### Policy Compaction
 
-Capabilities: `InteroceptiveUpdatedInbox`, `AllocationReader`, `BlackboardReader`, `PolicyCompactor`, `LlmAccess`.
+Capabilities: `InteroceptiveUpdatedInbox`, `BlackboardReader`, `PolicyCompactor`, `LlmAccess`.
 
-Fetches policy content and conservatively removes redundant non-Core duplicates. Interoceptive updates wake it; allocation guidance is compaction context during that activation. `PolicyCompactor` can search and fetch policies, and can delete duplicate policies from the primary store with replica fan-out and blackboard metadata removal. The canonical policy may be any rank, including `Core`, but a duplicate must be non-`Core` and must not outrank the canonical policy before deletion. It cannot insert, reinforce, rewrite values, merge contradictory policies, or delete `Core` policies.
+Fetches policy content and conservatively removes redundant non-Core duplicates. Interoceptive updates wake it. `PolicyCompactor` can search and fetch policies, and can delete duplicate policies from the primary store with replica fan-out and blackboard metadata removal. The canonical policy may be any rank, including `Core`, but a duplicate must be non-`Core` and must not outrank the canonical policy before deletion. It cannot insert, reinforce, rewrite values, merge contradictory policies, or delete `Core` policies.
 
 ### Predict
 
@@ -697,7 +690,7 @@ near-future states of current cognition-log targets. Subjects are inferred from 
 entries. The default target class is external world/body/peer/object/environment state. The corner
 case is the agent's own conscious cognition flow when attention-schema or other cognition entries
 explicitly report self-directed attention, uncertainty, or expectation as the target. Predict does
-not read allocation guidance or blackboard memo logs. Non-empty memo output is cognitive and should
+not read allocation priority state or blackboard memo logs. Non-empty memo output is cognitive and should
 preserve the target subject, predicted state, estimated validity horizon, and rationale for each
 useful prediction without imposing a schema.
 
@@ -705,10 +698,10 @@ Predict does not detect divergence and does not write memory.
 
 ### Surprise
 
-Capabilities: `CognitionLogUpdatedInbox`, `CognitionLogReader`, `AllocationReader`, `BlackboardReader`, `Memo`, `AttentionControlRequestMailbox`, `LlmAccess`.
+Capabilities: `CognitionLogUpdatedInbox`, `CognitionLogReader`, `BlackboardReader`, `Memo`, `AttentionControlRequestMailbox`, `LlmAccess`.
 
 Activates on each cognition-log update. Uses an LLM to assess whether the updated cognition log is
-expected or surprising, with allocation guidance in context. When predict memo logs are available in
+expected or surprising from recent cognitive context. When predict memo logs are available in
 session context, the assessment is framed as divergence from pending predictions. When predict is
 absent, the assessment is framed as novelty from recent cognition-log history alone. Runtime reads
 the `significant` and `memory_request` decision fields for preservation side effects.
@@ -726,7 +719,7 @@ Capabilities: `CognitionLogUpdatedInbox`, `CognitionLogReader`, `SceneReader`, `
 
 Emits user-visible text. The module is named `speak`, not `talk`, because it represents the concrete speech action capability rather than the whole conversational process.
 
-Speak reads only the cognition-log set and current scene target hints — it has no `BlackboardReader`, no `AllocationReader`, and does not inspect other modules' memo logs or allocation guidance. This keeps the utterance boundary narrow: speak distills only the admitted cognitive surface.
+Speak reads only the cognition-log set and current scene target hints — it has no `BlackboardReader`, no `AllocationReader`, and does not inspect other modules' memo logs or allocation priority state. This keeps the utterance boundary narrow: speak distills only the admitted cognitive surface.
 
 Speak waits on `CognitionLogUpdatedInbox`; allocation determines when a ready batch activates. Speak first runs a short text turn with an optional `speak_to` tool. `SceneReader` provides preferred visible target hints, but any concrete non-empty target can be selected when cognition supports it. If the tool is called with a non-empty target, Speak streams text to that target. If the tool is not called, Speak writes nothing and emits nothing. During `text_turn().stream()`, each `TextTurnEvent::TextDelta { delta }` chunk is forwarded immediately via `emit_delta()` and mirrored into utterance progress as the current partial utterance. Cognition-log updates do not cancel an active stream; they remain queued for a later Speak batch.
 
@@ -736,13 +729,13 @@ controller should keep Speak inactive or let Speak's target-selection turn finis
 plain cognitive memos, such as "I am speaking to X..." and "I said to X...". Declined speech and
 ordinary abort bookkeeping remain non-cognitive. A completed utterance memo-log entry wakes the
 controller as ordinary output context, but speech start itself is not controlled through memo
-structure, memo JSON, or allocation guidance.
+structure, memo JSON, or allocation priority state.
 
 ---
 
 ## 5. Lutum Integration
 
-`LlmAccess::lutum()` returns a `lutum::Lutum` for the holder instance's module-level effective tier. Replica identity controls ownership and gating; tier and guidance are allocated per `ModuleId` and shared by all active replicas of that module. Modules build their own `Session` and choose the concrete turn shape (`structured_turn`, `text_turn().tools()`, etc.). The capability layer deliberately does not impose a shared session or agent-loop abstraction.
+`LlmAccess::lutum()` returns a `lutum::Lutum` for the holder instance's configured tier. Replica identity controls ownership and gating; allocation controls activation priority and derived scheduling, not model-tier or module-specific instructions. Modules build their own `Session` and choose the concrete turn shape (`structured_turn`, `text_turn().tools()`, etc.). The capability layer deliberately does not impose a shared session or agent-loop abstraction.
 
 Tool loops are written directly by each module so tool availability, round limits, result commits, and memo-writing remain local to the module role.
 
@@ -815,9 +808,9 @@ Implementations may persist utterances, stream deltas to UI, or both. The `on_co
 
 Full-agent boundary eval cases live under `eval-cases/full-agent/**/*.eure`. They model app input and therefore support batched `inputs[]` whose `heard`, `seen`, and `one-shot` variants all publish `SensoryInput::OneShot`. They may seed memories, but the user-facing request still enters only through sensory input; memory-required full-agent cases exercise whether controller/query/cognition-gate/speak can surface stored context without direct harness messages. The runner publishes all inputs through `CapabilityProviders::host_io().sensory_input_mailbox()`, yields the current-thread runtime while module tasks react to channel updates, waits until the latest completed action has been silent for one second, max loop iterations, or runtime-event shutdown, and returns the latest complete `Utterance` as `CaseArtifact::output`.
 
-Full-agent eval boot uses a minimal bootstrap allocation rather than waking every module. Sensory and allocation start with positive activation ratios; cognition-gate starts low and is raised by controller guidance after sensory memo writes; lower-priority speak, query-memory, memory, memory-compaction, policy, reward, prediction, surprise, attention-schema, interpreter, and self-model modules start at zero activation ratio until the allocation proposes an effective allocation. This keeps full-agent evals testing the controller path instead of bypassing it with an all-on static schedule.
+Full-agent eval boot uses a minimal bootstrap allocation rather than waking every module. Sensory and allocation start with positive activation ratios; cognition-gate starts low and is raised by allocation after sensory memo writes; lower-priority speak, query-memory, memory, memory-compaction, policy, reward, prediction, surprise, attention-schema, interpreter, and self-model modules start at zero activation ratio until allocation proposes an effective allocation. This keeps full-agent evals testing the controller path instead of bypassing it with an all-on static schedule.
 
-Module eval cases live under `eval-cases/modules/{query-memory,attention-schema,interpreter,self-model}/**/*.eure`. They are explicit internal harnesses, not app-facing scenarios. For target modules that read allocation, the runner may seed the target module's allocation guidance with the module prompt, but guidance is durable context only; it does not wake the module. The runner then publishes the target module's natural trigger, such as cognition-log or memo input, and scores the target module's memo-log entries as the artifact. Interpreter module cases instead score target-module cognition-log entries as the artifact and do not receive allocation guidance as LLM context. Module cases may seed `cognition-log[]` entries for cognition-log consumers, and may seed `memos[]` entries as input syntax; those seeds append memo-log entries rather than latest snapshots. Memo seeds are non-cognitive by default unless `cognitive = true` is specified or the target harness deliberately treats memo seeds as cognitive evidence. Query evals statically check that retrieved content reached the artifact, while rubrics can judge generated search/tool arguments by opting into `tool-calls` as a rubric `judge-inputs[]` value.
+Module eval cases live under `eval-cases/modules/**`. They are explicit internal harnesses, not app-facing scenarios. The runner publishes the target module's natural trigger, such as cognition-log, memo, sensory, eviction, or interoceptive input, and scores the target module's memo-log or cognition-log entries as the artifact depending on the module boundary. Module cases may seed `cognition-log[]` entries for cognition-log consumers, and may seed `memos[]` entries as input syntax; those seeds append memo-log entries rather than latest snapshots. Memo seeds are non-cognitive by default unless `cognitive = true` is specified or the target harness deliberately treats memo seeds as cognitive evidence. Query evals statically check that retrieved content reached the artifact, while rubrics can judge generated search/tool arguments by opting into `tool-calls` as a rubric `judge-inputs[]` value.
 
 Rubric checks choose their judge evidence with data-driven `judge-inputs[]` enum values in the `.eure` case. The broad compatibility inputs are `output`, `utterance`, `failure`, `trace`, `memory`, `memos`, and `cognition`; new cases should prefer granular inputs such as `memory-diff`, `memory-metadata`, `policy-diff`, `memo-contents`, `cognition-entries`, `tool-calls`, and `tool-results`. `memo-contents` and `cognition-entries` intentionally omit source/timing metadata so judges grade the visible entry content rather than harness plumbing. The rubric text and criteria are always included; the selected judge inputs control only evidence sections. This keeps full-agent rubrics focused on utterance/memory state and query rubrics focused on output plus tool-call evidence without always passing the whole artifact observation payload.
 
@@ -854,7 +847,7 @@ This keeps realistic artifacts observable without adding request/response correl
 | Speak cannot route work or mutate cognition | it receives no query/self-model mailbox, `CognitionWriter`, `AllocationWriter`, or memory capabilities |
 | Speak reads only cognition log and scene targets | it receives `CognitionLogReader`, `CognitionLogUpdatedInbox`, and `SceneReader`, not `BlackboardReader` or `AllocationReader` |
 | Speak start is allocation-controlled and target-tool-gated | allocation decides whether Speak activates; `speak_to` decides whether that activation emits |
-| Speak still does not route query work | evidence gathering is driven by allocation guidance, query memo logs, and cognition-log updates; speak receives no `AttentionControlRequestMailbox` |
+| Speak still does not route query work | evidence gathering is driven by allocation priority, query memo logs, and cognition-log updates; speak receives no `AttentionControlRequestMailbox` |
 | Speak does not interrupt active streams on cognition updates | cognition-log updates received during streaming remain queued for the next Speak batch |
 | Cognition-gate is the only cognitive-memo promotion path | boot-time wiring grants cognition-gate `MemoUpdatedInbox`, allocation read path, and `CognitionWriter`; interpreter also has `CognitionWriter` but no memo-promotion role |
 | Interpreter reads only cognition | it receives `CognitionLogUpdatedInbox`, `CognitionLogReader`, `CognitionWriter`, and `LlmAccess`, not `Memo`, `BlackboardReader`, `AllocationReader`, memory, attention-control, allocation-write, or utterance capabilities |
@@ -862,7 +855,7 @@ This keeps realistic artifacts observable without adding request/response correl
 | Cognition-log writes cannot wake controller directly | cognition-log appends publish `CognitionLogUpdated`, which the controller does not receive |
 | Only controller replicas write allocation proposals | boot-time wiring grants `AllocationWriter` only to allocation registrations; runtime computes effective allocation |
 | Attention schema models attention only | it receives memo and cognition-log wake capabilities, blackboard/cognition-log read capabilities, `Memo`, and `LlmAccess`, not `AllocationReader`, `CognitionWriter`, attention-control inbox, `AllocationWriter`, or memory capabilities |
-| Self-model handles self-report | allocation writes self-model guidance; self-model receives `CognitionLogUpdatedInbox`, reads allocation as context, and writes self-model answers to its own memo |
+| Self-model handles self-report | self-model receives `CognitionLogUpdatedInbox`, reads current memo/cognition context, and writes self-model answers to its own memo |
 | Self-model is not raw memory retrieval | stable self-knowledge is surfaced through query memo logs; self-model integrates that knowledge with attention-schema attention-experience memos or promoted cognition-log entries and current memo-log context |
 | Query memory is memory/RAG only | it receives `MemorySearcher`, not policy or self-model capabilities |
 | Policy is read-only against the policy store | it receives `PolicySearcher` and `PolicyConsiderationWriter`, not a policy-store insert/reinforce path |

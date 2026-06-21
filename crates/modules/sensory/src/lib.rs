@@ -1156,10 +1156,6 @@ impl Module for SensoryModule {
         None
     }
 
-    fn allocation_hint() -> Option<&'static str> {
-        None
-    }
-
     async fn next_batch(&mut self) -> Result<Self::Batch> {
         SensoryModule::next_batch(self).await
     }
@@ -1191,8 +1187,7 @@ mod tests {
         SharedPoolBudgetManager, SharedPoolBudgetOptions, TurnAdapter, Usage,
     };
     use nuillu_blackboard::{
-        ActivationRatio, Blackboard, BlackboardCommand, Bpm, ModuleConfig, ResourceAllocation,
-        linear_ratio_fn,
+        ActivationRatio, Blackboard, BlackboardCommand, Bpm, ResourceAllocation, linear_ratio_fn,
     };
     use nuillu_module::ports::{NoopCognitionLogRepository, SystemClock};
     use nuillu_module::{
@@ -1232,10 +1227,6 @@ mod tests {
 
         fn peer_context() -> Option<&'static str> {
             SensoryModule::peer_context()
-        }
-
-        fn allocation_hint() -> Option<&'static str> {
-            SensoryModule::allocation_hint()
         }
 
         async fn next_batch(&mut self) -> Result<Self::Batch> {
@@ -1380,7 +1371,6 @@ mod tests {
     fn sensory_allocation() -> ResourceAllocation {
         let mut allocation = ResourceAllocation::default();
         let module = builtin::sensory();
-        allocation.set(module.clone(), ModuleConfig::default());
         allocation.set_activation(module, ActivationRatio::ONE);
         allocation
     }
@@ -1536,7 +1526,6 @@ mod tests {
             SharedPoolBudgetManager::new(SharedPoolBudgetOptions::default()),
         );
         nuillu_module::ActivateCx::new(
-            &[],
             &[],
             &[],
             &[],
@@ -2726,9 +2715,7 @@ mod tests {
 
                 run_modules(modules, async {
                     let mut allocation = sensory_allocation();
-                    let mut config = allocation.for_module(&builtin::sensory());
-                    config.guidance = "keep watching the front".into();
-                    allocation.set(builtin::sensory(), config);
+                    allocation.set_activation(builtin::sensory(), ActivationRatio::ONE);
                     blackboard
                         .apply(BlackboardCommand::SetAllocation(allocation))
                         .await;

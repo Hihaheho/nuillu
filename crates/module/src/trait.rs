@@ -21,10 +21,9 @@ use crate::{PersistedSessionSnapshot, SessionCompactionRuntime, compact_session}
 /// information that is shared across all modules. **Capabilities are
 /// per-module and owner-stamped — they do not belong here.** Use this for
 /// agent-global state that any module may consult, such as registered peer
-/// contexts and allocation hints used to build module prompts.
+/// contexts used to build module prompts.
 pub struct ActivateCx<'a> {
     peer_contexts: &'a [(ModuleId, &'static str)],
-    allocation_hints: &'a [(ModuleId, &'static str)],
     identity_memories: &'a [IdentityMemoryRecord],
     core_policies: &'a [CorePolicyRecord],
     session_compaction: SessionCompactionRuntime,
@@ -37,7 +36,6 @@ pub struct ActivateCx<'a> {
 impl<'a> ActivateCx<'a> {
     pub fn new(
         peer_contexts: &'a [(ModuleId, &'static str)],
-        allocation_hints: &'a [(ModuleId, &'static str)],
         identity_memories: &'a [IdentityMemoryRecord],
         core_policies: &'a [CorePolicyRecord],
         session_compaction: SessionCompactionRuntime,
@@ -45,7 +43,6 @@ impl<'a> ActivateCx<'a> {
     ) -> Self {
         Self {
             peer_contexts,
-            allocation_hints,
             identity_memories,
             core_policies,
             session_compaction,
@@ -93,12 +90,6 @@ impl<'a> ActivateCx<'a> {
     /// system prompts: `(id, peer_context)`.
     pub fn peer_contexts(&self) -> &[(ModuleId, &'static str)] {
         self.peer_contexts
-    }
-
-    /// Allocation hints for modules that allocation may target:
-    /// `(id, allocation_hint)`.
-    pub fn allocation_hints(&self) -> &[(ModuleId, &'static str)] {
-        self.allocation_hints
     }
 
     /// Boot-time identity memory snapshot loaded from the primary memory
@@ -247,16 +238,6 @@ pub trait Module {
     fn peer_context() -> Option<&'static str>
     where
         Self: Sized;
-
-    /// Hint shown to allocation when this module is eligible as
-    /// an allocation target. Return `None` to keep this module out of the
-    /// allocation target catalog.
-    fn allocation_hint() -> Option<&'static str>
-    where
-        Self: Sized,
-    {
-        None
-    }
 
     async fn next_batch(&mut self) -> Result<Self::Batch>;
     async fn activate(&mut self, cx: &ActivateCx<'_>, batch: &Self::Batch) -> Result<()>;

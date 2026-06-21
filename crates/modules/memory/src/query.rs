@@ -26,10 +26,9 @@ when that count is greater than zero and linked context may help the question, c
 fetch_linked_memories for that hit index before broadcasting results. Pass only the seed memory indexes;
 the runtime applies default link direction, relation filter, and limit. Linked lookup is explicit; ordinary
 search results are flat and do not include hidden bundles.
-If the question contains allocation guidance or a speech evidence request, search for the concrete
-requested facts, proper nouns, species/body/peer/world terms, route rules, and the needed_fact
-phrases. Do not search for generic phrases such as "useful memory context" when a concrete guidance
-question is available.
+When the question contains a speech evidence request, search for the concrete requested facts,
+proper nouns, species/body/peer/world terms, route rules, and needed_fact phrases. Do not search for
+generic phrases such as "useful memory context" when a concrete question is available.
 You may call search_memory multiple times in the same turn when the input contains multiple
 distinct questions or evidence requests. Prefer multiple targeted searches in one turn over broad
 generic searches or later follow-up turns.
@@ -296,14 +295,9 @@ impl QueryMemoryModule {
         &mut self,
         cx: &nuillu_module::ActivateCx<'_>,
     ) -> Result<()> {
-        let owner = self.owner.clone();
         let question = self
             .blackboard
-            .read(move |bb| {
-                let guidance = bb.allocation().for_module(&owner).guidance;
-                if !guidance.trim().is_empty() {
-                    return guidance;
-                }
+            .read(|bb| {
                 let entries = bb.cognition_log().entries().to_vec();
                 let latest = entries
                     .last()
@@ -1037,12 +1031,6 @@ impl Module for QueryMemoryModule {
 
     fn peer_context() -> Option<&'static str> {
         Some("Query-memory brings relevant remembered experience into the current cognitive state.")
-    }
-
-    fn allocation_hint() -> Option<&'static str> {
-        Some(
-            "Raise query-memory when current cognition needs remembered context, past experience, identity facts, or learned background. Keep it low when the needed context is already present or the next step is interpretation rather than recall.",
-        )
     }
 
     async fn next_batch(&mut self) -> Result<Self::Batch> {

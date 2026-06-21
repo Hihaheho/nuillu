@@ -565,7 +565,7 @@ fn normalize_modality(value: &str) -> String {
 mod tests {
     use super::*;
 
-    use nuillu_blackboard::{ActivationRatio, BlackboardCommand, ModuleConfig, ResourceAllocation};
+    use nuillu_blackboard::{ActivationRatio, BlackboardCommand, ResourceAllocation};
     use nuillu_types::{ReplicaCapRange, builtin};
 
     use crate::test_support::{scoped, test_caps};
@@ -651,7 +651,6 @@ mod tests {
     #[tokio::test]
     async fn attention_control_load_balances_across_active_controller_replicas() {
         let mut alloc = ResourceAllocation::default();
-        alloc.set(builtin::allocation(), ModuleConfig::default());
         alloc.set_activation(builtin::allocation(), ActivationRatio::ONE);
         let blackboard = Blackboard::with_allocation(alloc);
         blackboard
@@ -694,7 +693,6 @@ mod tests {
     #[tokio::test]
     async fn attention_control_routes_to_replica_zero_when_controller_is_inactive() {
         let mut alloc = ResourceAllocation::default();
-        alloc.set(builtin::allocation(), ModuleConfig::default());
         alloc.set_activation(builtin::allocation(), ActivationRatio::ZERO);
         let blackboard = Blackboard::with_allocation(alloc);
         blackboard

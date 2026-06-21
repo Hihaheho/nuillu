@@ -512,12 +512,6 @@ impl Module for MemoryCompactionModule {
         None
     }
 
-    fn allocation_hint() -> Option<&'static str> {
-        Some(
-            "Raise memory-compaction during NREM-like maintenance when memories should be consolidated or redundant memory content should be reduced. Keep it low during active perception, speech, direct recall, or when there is no consolidation pressure.",
-        )
-    }
-
     async fn next_batch(&mut self) -> Result<Self::Batch> {
         MemoryCompactionModule::next_batch(self).await
     }
@@ -820,7 +814,6 @@ mod tests {
 
     fn activate_cx(lutum: &Lutum, now: DateTime<Utc>) -> ActivateCx<'static> {
         ActivateCx::new(
-            &[],
             &[],
             &[],
             &[],

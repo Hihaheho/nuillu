@@ -10,7 +10,7 @@ The agent is built as a small society of cooperating cognitive modules. The defa
 
 Modules cooperate through a non-cognitive blackboard, per-module memo logs, typed transient channels, and an admitted **cognition log**. The cognition-gate promotes selected memo/blackboard state into that cognitive surface; attention-schema may append concise first-person attention-experience entries; self-model integrates those attention entries with stable and current context in its own memo log. Durable module output is memo- or log-authoritative rather than request/response traffic.
 
-Resource allocation is durable context rather than a wake path. Allocation wakes from memo updates and internal attention-control bids, then writes activation priorities and guidance for modules. Effective allocation controls active replicas and rate limiting, while model tier is resolved through the allocation snapshot when a module requests LLM access. Homeostatic control can also drive or cap allocation from interoceptive state.
+Resource allocation is durable priority state rather than a wake path. Allocation wakes from memo updates and internal attention-control bids, then writes activation priorities for modules. Effective allocation controls active replicas and rate limiting. Homeostatic control can also drive or cap allocation from interoceptive state.
 
 Two characteristics shape the implementation:
 

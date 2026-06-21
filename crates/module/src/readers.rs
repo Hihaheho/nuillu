@@ -195,8 +195,8 @@ impl CognitionLogReader {
 }
 
 /// Read-only access to the resource-allocation snapshot. Modules may inspect
-/// allocation guidance for themselves and for other modules, but only holders
-/// of `AllocationWriter` can change it.
+/// activation priority and derived scheduling state, but only holders of
+/// `AllocationWriter` can change it.
 #[derive(Clone)]
 pub struct AllocationReader {
     blackboard: Blackboard,

@@ -469,12 +469,6 @@ impl Module for CognitionGateModule {
         None
     }
 
-    fn allocation_hint() -> Option<&'static str> {
-        Some(
-            "Raise cognition-gate when fresh candidates may deserve promotion into cognition. Keep it low for background noise or material that should remain outside conscious cognition.",
-        )
-    }
-
     async fn next_batch(&mut self) -> Result<Self::Batch> {
         CognitionGateModule::next_batch(self).await
     }
@@ -502,8 +496,7 @@ mod tests {
         RawTextTurnEvent, SharedPoolBudgetManager, SharedPoolBudgetOptions, TurnAdapter, Usage,
     };
     use nuillu_blackboard::{
-        ActivationRatio, Blackboard, Bpm, IdentityMemoryRecord, ModuleConfig, ResourceAllocation,
-        linear_ratio_fn,
+        ActivationRatio, Blackboard, Bpm, IdentityMemoryRecord, ResourceAllocation, linear_ratio_fn,
     };
     use nuillu_module::ports::{Clock, NoopCognitionLogRepository, SystemClock};
     use nuillu_module::{
@@ -581,7 +574,6 @@ mod tests {
     fn test_allocation() -> ResourceAllocation {
         let mut allocation = ResourceAllocation::default();
         for module in [builtin::cognition_gate(), builtin::sensory()] {
-            allocation.set(module.clone(), ModuleConfig::default());
             allocation.set_activation(module, ActivationRatio::ONE);
         }
         allocation
@@ -609,10 +601,6 @@ mod tests {
 
                 fn peer_context() -> Option<&'static str> {
                     Some("test stub")
-                }
-
-                fn allocation_hint() -> Option<&'static str> {
-                    Some("test allocation target")
                 }
 
                 async fn next_batch(&mut self) -> Result<Self::Batch> {
@@ -970,7 +958,6 @@ mod tests {
         let identity_memories = Vec::new();
         let cx = nuillu_module::ActivateCx::new(
             &[],
-            &[],
             &identity_memories,
             &[],
             compaction_runtime(&lutum),
@@ -1032,7 +1019,6 @@ mod tests {
         let identity_memories = Vec::new();
         let cx = nuillu_module::ActivateCx::new(
             &[],
-            &[],
             &identity_memories,
             &[],
             compaction_runtime(&lutum),
@@ -1081,7 +1067,6 @@ mod tests {
         let identity_memories: Vec<IdentityMemoryRecord> = Vec::new();
         let cx = nuillu_module::ActivateCx::new(
             &peer_contexts,
-            &[],
             &identity_memories,
             &[],
             compaction_runtime(&lutum),
@@ -1131,11 +1116,6 @@ mod tests {
             request_items,
             InputMessageRole::System,
             "Memory trace inventory"
-        ));
-        assert!(!has_message_with_role_containing(
-            request_items,
-            InputMessageRole::System,
-            "Current attention guidance"
         ));
         assert!(!has_message_with_role_containing(
             request_items,
@@ -1234,7 +1214,6 @@ mod tests {
         let identity_memories: Vec<IdentityMemoryRecord> = Vec::new();
         let cx = nuillu_module::ActivateCx::new(
             &[],
-            &[],
             &identity_memories,
             &[],
             compaction_runtime(&lutum),
@@ -1270,7 +1249,6 @@ mod tests {
         let lutum = fixture.gate.llm.lutum().await;
         let identity_memories: Vec<IdentityMemoryRecord> = Vec::new();
         let cx = nuillu_module::ActivateCx::new(
-            &[],
             &[],
             &identity_memories,
             &[],
@@ -1317,7 +1295,6 @@ mod tests {
         let lutum = fixture.gate.llm.lutum().await;
         let identity_memories: Vec<IdentityMemoryRecord> = Vec::new();
         let cx = nuillu_module::ActivateCx::new(
-            &[],
             &[],
             &identity_memories,
             &[],
@@ -1367,7 +1344,6 @@ mod tests {
         let lutum = fixture.gate.llm.lutum().await;
         let identity_memories = Vec::new();
         let cx = nuillu_module::ActivateCx::new(
-            &[],
             &[],
             &identity_memories,
             &[],
@@ -1463,7 +1439,6 @@ mod tests {
         let identity_memories = Vec::new();
         let cx = nuillu_module::ActivateCx::new(
             &[],
-            &[],
             &identity_memories,
             &[],
             compaction_runtime(&lutum),
@@ -1502,7 +1477,6 @@ mod tests {
         let identity_memories = Vec::new();
         let cx = nuillu_module::ActivateCx::new(
             &[],
-            &[],
             &identity_memories,
             &[],
             compaction_runtime(&lutum),
@@ -1538,7 +1512,6 @@ mod tests {
         let lutum = fixture.gate.llm.lutum().await;
         let identity_memories = Vec::new();
         let cx = nuillu_module::ActivateCx::new(
-            &[],
             &[],
             &identity_memories,
             &[],
@@ -1588,7 +1561,6 @@ mod tests {
         let identity_memories = Vec::new();
         let cx = nuillu_module::ActivateCx::new(
             &[],
-            &[],
             &identity_memories,
             &[],
             compaction_runtime(&lutum),
@@ -1628,7 +1600,6 @@ mod tests {
         let identity_memories: Vec<IdentityMemoryRecord> = Vec::new();
         let cx = nuillu_module::ActivateCx::new(
             &peer_contexts,
-            &[],
             &identity_memories,
             &[],
             compaction_runtime(&lutum),
@@ -1713,7 +1684,6 @@ mod tests {
         let identity_memories: Vec<IdentityMemoryRecord> = Vec::new();
         let cx = nuillu_module::ActivateCx::new(
             &peer_contexts,
-            &[],
             &identity_memories,
             &[],
             compaction_runtime(&lutum),
@@ -1782,7 +1752,6 @@ mod tests {
         let identity_memories: Vec<IdentityMemoryRecord> = Vec::new();
         let cx = nuillu_module::ActivateCx::new(
             &peer_contexts,
-            &[],
             &identity_memories,
             &[],
             compaction_runtime(&lutum),
@@ -1828,11 +1797,6 @@ mod tests {
             first_items,
             InputMessageRole::System,
             "Memory trace inventory"
-        ));
-        assert!(!has_message_with_role_containing(
-            first_items,
-            InputMessageRole::System,
-            "Current attention guidance"
         ));
         assert!(!has_message_with_role_containing(
             first_items,
@@ -1884,11 +1848,6 @@ mod tests {
             second_items,
             InputMessageRole::System,
             "Memory trace inventory"
-        ));
-        assert!(!has_message_with_role_containing(
-            second_items,
-            InputMessageRole::System,
-            "Current attention guidance"
         ));
         assert!(!has_message_with_role_containing(
             second_items,
@@ -1989,7 +1948,6 @@ mod tests {
         }];
         let cx = nuillu_module::ActivateCx::new(
             &peer_contexts,
-            &[],
             &identity_memories,
             &[],
             compaction_runtime(&lutum),

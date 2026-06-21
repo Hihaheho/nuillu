@@ -2,10 +2,10 @@ use anyhow::{Context, Result};
 use async_trait::async_trait;
 use lutum::Session;
 use nuillu_module::{
-    AllocationReader, BlackboardReader, CognitionLogReader, CognitionLogUpdatedInbox, LlmAccess,
-    LlmContextWindow, Memo, Module, SessionAutoCompaction, SessionCompactionConfig,
-    SessionCompactionProtectedPrefix, ensure_persistent_session_seeded,
-    push_formatted_cognition_log_batch, push_formatted_memo_log_batch,
+    BlackboardReader, CognitionLogReader, CognitionLogUpdatedInbox, LlmAccess, LlmContextWindow,
+    Memo, Module, SessionAutoCompaction, SessionCompactionConfig, SessionCompactionProtectedPrefix,
+    ensure_persistent_session_seeded, push_formatted_cognition_log_batch,
+    push_formatted_memo_log_batch,
 };
 use nuillu_types::builtin;
 
@@ -40,9 +40,7 @@ pub fn session_auto_compaction() -> SessionAutoCompaction {
 }
 
 pub struct SelfModelModule {
-    owner: nuillu_module::ModuleId,
     cognition_updates: CognitionLogUpdatedInbox,
-    allocation: AllocationReader,
     blackboard: BlackboardReader,
     cognition_log: CognitionLogReader,
     memo: Memo,
@@ -54,7 +52,6 @@ pub struct SelfModelModule {
 impl SelfModelModule {
     pub fn new(
         cognition_updates: CognitionLogUpdatedInbox,
-        allocation: AllocationReader,
         blackboard: BlackboardReader,
         cognition_log: CognitionLogReader,
         memo: Memo,
@@ -62,10 +59,7 @@ impl SelfModelModule {
         session: Session,
     ) -> Self {
         Self {
-            owner: nuillu_module::ModuleId::new(<Self as Module>::id())
-                .expect("self-model id is valid"),
             cognition_updates,
-            allocation,
             blackboard,
             cognition_log,
             memo,
@@ -92,16 +86,10 @@ impl SelfModelModule {
     }
 
     #[tracing::instrument(skip_all, err(Debug, level = "warn"))]
-    async fn answer_from_guidance(&mut self, cx: &nuillu_module::ActivateCx<'_>) -> Result<()> {
-        let guidance = self
-            .allocation
-            .snapshot()
-            .await
-            .for_module(&self.owner)
-            .guidance;
-        if guidance.trim().is_empty() {
-            return Ok(());
-        }
+    async fn update_from_current_context(
+        &mut self,
+        cx: &nuillu_module::ActivateCx<'_>,
+    ) -> Result<()> {
         let attention_schema_cognition = self
             .cognition_log
             .unread_events()
@@ -109,8 +97,12 @@ impl SelfModelModule {
             .into_iter()
             .filter(|record| record.source.module == builtin::attention_schema())
             .collect::<Vec<_>>();
-        self.ensure_session_seeded(cx);
         let unread_memo_logs = self.blackboard.unread_memo_logs().await;
+        if attention_schema_cognition.is_empty() && unread_memo_logs.is_empty() {
+            return Ok(());
+        }
+
+        self.ensure_session_seeded(cx);
         let lutum = self.llm.lutum().await;
         let memo = {
             push_formatted_memo_log_batch(
@@ -119,15 +111,14 @@ impl SelfModelModule {
                 cx.now(),
                 MEMO_CONTEXT_WINDOW,
             );
-            self.session.push_user(format!(
-                "Request for the next self-model memo:\n{}",
-                guidance.trim()
-            ));
             push_formatted_cognition_log_batch(
                 &mut self.session,
                 &attention_schema_cognition,
                 cx.now(),
                 COGNITION_CONTEXT_WINDOW,
+            );
+            self.session.push_user(
+                "Update the next self-model memo from the current self-relevant working notes and attention-schema cognition. Write nothing if there is no concrete self-related evidence.",
             );
             let result = self
                 .session
@@ -159,12 +150,6 @@ impl Module for SelfModelModule {
         )
     }
 
-    fn allocation_hint() -> Option<&'static str> {
-        Some(
-            "Raise self-model when identity, agency, intention, capability, or felt self-state is at issue. Keep it low for plain external facts or responses that do not need self-understanding.",
-        )
-    }
-
     async fn next_batch(&mut self) -> Result<Self::Batch> {
         SelfModelModule::next_batch(self).await
     }
@@ -175,7 +160,7 @@ impl Module for SelfModelModule {
         batch: &Self::Batch,
     ) -> Result<()> {
         if batch.cognition_updated {
-            self.answer_from_guidance(cx).await?;
+            self.update_from_current_context(cx).await?;
         }
         Ok(())
     }

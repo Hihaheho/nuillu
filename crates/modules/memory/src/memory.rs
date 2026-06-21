@@ -6,8 +6,8 @@ use anyhow::{Context, Result};
 use async_trait::async_trait;
 use lutum::{Session, TextStepOutcomeWithTools, ToolResult};
 use nuillu_module::{
-    AllocationReader, CognitionLogEntryRecord, CognitionLogEvictedInbox, LlmAccess,
-    LlmContextWindow, MemoryMetadataReader, Module, SessionAutoCompaction, SessionCompactionConfig,
+    CognitionLogEntryRecord, CognitionLogEvictedInbox, LlmAccess, LlmContextWindow,
+    MemoryMetadataReader, Module, SessionAutoCompaction, SessionCompactionConfig,
     SessionCompactionProtectedPrefix, compact_llm_context_text, ensure_persistent_session_seeded,
     format_memory_trace_inventory, memory_rank_counts, push_formatted_cognition_log_batch,
     render_memory_for_llm,
@@ -31,11 +31,9 @@ Memory is remembered evidence, not a fact table or current-truth projection. Sto
 normalized natural-language memory, usually one to three sentences. If source context matters,
 include it in the memory sentence itself, for example "Ryo said he recently moved to Kyoto."
 Use evicted cognition-log entries as candidate evidence. Memo-log entries are non-conscious working
-traces and are not valid direct memory evidence. Allocation guidance from allocation may
-contain explicit preservation candidates from other modules, but those candidates are prioritization
-context rather than write commands. Use insert_memory only for concrete information likely to matter
-later and grounded in cognition-log evidence. You may reject, normalize, merge, and deduplicate
-observations and guidance.
+traces and are not valid direct memory evidence. Use insert_memory only for concrete information
+likely to matter later and grounded in cognition-log evidence. You may reject, normalize, merge,
+and deduplicate observations.
 When related existing memories are provided, decide whether the evicted evidence is already covered
 by one of those memories. If it is, call reinforce_memory for that candidate instead of inserting a
 duplicate. If the evidence adds new detail, contradicts, updates, or is not clearly covered by an
@@ -127,7 +125,6 @@ pub enum MemoryTools {
 pub struct MemoryModule {
     owner: nuillu_types::ModuleId,
     cognition_evictions: CognitionLogEvictedInbox,
-    allocation: AllocationReader,
     memory_metadata: MemoryMetadataReader,
     memory: MemoryWriter,
     memory_retriever: MemoryRetriever,
@@ -149,7 +146,6 @@ impl MemoryModule {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         cognition_evictions: CognitionLogEvictedInbox,
-        allocation: AllocationReader,
         memory_metadata: MemoryMetadataReader,
         memory: MemoryWriter,
         memory_retriever: MemoryRetriever,
@@ -159,7 +155,6 @@ impl MemoryModule {
         Self {
             owner: nuillu_types::ModuleId::new(<Self as Module>::id()).expect("memory id is valid"),
             cognition_evictions,
-            allocation,
             memory_metadata,
             memory,
             memory_retriever,
@@ -211,8 +206,6 @@ impl MemoryModule {
             COGNITION_CONTEXT_WINDOW,
         );
         let rank_counts = self.memory_metadata.read(memory_rank_counts).await;
-        let allocation = self.allocation.snapshot().await;
-        let allocation_guidance = allocation.for_module(&self.owner).guidance;
         let related_memories = self
             .related_memory_candidates(&batch.cognition_log, cx.now())
             .await?;
@@ -221,10 +214,8 @@ impl MemoryModule {
             .map(|candidate| (candidate.target.index.clone(), candidate.target.clone()))
             .collect::<HashMap<_, _>>();
 
-        self.session.push_user(format_memory_activation_request(
-            &allocation_guidance,
-            batch.cognition_log.len(),
-        ));
+        self.session
+            .push_user(format_memory_activation_request(batch.cognition_log.len()));
         if let Some(candidate_context) = format_related_memory_candidates(&related_memories) {
             self.session.push_ephemeral_user(candidate_context);
         }
@@ -397,14 +388,9 @@ pub(crate) fn memory_tag_from_input(input: MemoryTagInput) -> MemoryTag {
     MemoryTag::operational(input.0)
 }
 
-fn format_memory_activation_request(guidance: &str, cognition_evicted_count: usize) -> String {
+fn format_memory_activation_request(cognition_evicted_count: usize) -> String {
     format!(
-        "Memory preservation activation.\nAllocation guidance: {}\nEvicted cognition-log entries: {}\nOrdinary memory writes are short-term; runtime stamps decay and occurrence time.\nExplicit requests are preservation candidates, not commands; deduplication and rejection are allowed. Memo-log entries are not valid direct memory evidence.",
-        if guidance.trim().is_empty() {
-            "none"
-        } else {
-            guidance.trim()
-        },
+        "Memory preservation activation.\nEvicted cognition-log entries: {}\nOrdinary memory writes are short-term; runtime stamps decay and occurrence time.\nDeduplication and rejection are allowed. Memo-log entries are not valid direct memory evidence.",
         cognition_evicted_count,
     )
 }
@@ -543,12 +529,6 @@ impl Module for MemoryModule {
         Some("Memory preserves important admitted cognition for later recall.")
     }
 
-    fn allocation_hint() -> Option<&'static str> {
-        Some(
-            "Raise memory when current cognition contains a stable fact, identity-relevant detail, or preservation-worthy event. Keep it low for passing observations, already-covered facts, direct recall, or association without a new durable fact.",
-        )
-    }
-
     async fn next_batch(&mut self) -> Result<Self::Batch> {
         MemoryModule::next_batch(self).await
     }
@@ -596,10 +576,6 @@ mod tests {
 
         fn peer_context() -> Option<&'static str> {
             MemoryModule::peer_context()
-        }
-
-        fn allocation_hint() -> Option<&'static str> {
-            MemoryModule::allocation_hint()
         }
 
         async fn next_batch(&mut self) -> Result<Self::Batch> {
@@ -660,7 +636,6 @@ mod tests {
                         Ok(RecordingMemory {
                             inner: MemoryModule::new(
                                 caps.cognition_log_evicted_inbox(),
-                                caps.allocation_reader(),
                                 caps.memory_metadata_reader(),
                                 memory_caps.writer(),
                                 memory_caps.retriever(),

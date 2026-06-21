@@ -59,20 +59,14 @@ pub struct AllocationCommand {
     pub effect: AllocationEffectKind,
     pub module: ModuleId,
     pub level: AllocationEffectLevel,
-    pub guidance: Option<String>,
 }
 
 impl AllocationCommand {
-    pub fn target(
-        module: ModuleId,
-        level: AllocationEffectLevel,
-        guidance: impl Into<Option<String>>,
-    ) -> Self {
+    pub fn target(module: ModuleId, level: AllocationEffectLevel) -> Self {
         Self {
             effect: AllocationEffectKind::Target,
             module,
             level,
-            guidance: guidance.into(),
         }
     }
 
@@ -81,7 +75,6 @@ impl AllocationCommand {
             effect: AllocationEffectKind::Suppression,
             module,
             level,
-            guidance: None,
         }
     }
 }
@@ -346,19 +339,9 @@ impl Default for ZeroReplicaWindowPolicy {
     }
 }
 
-/// Per-module guidance the attention controller writes from each priority
-/// entry's `hint`. The activation knob is stored separately on
-/// [`ResourceAllocation`] (see `set_activation`).
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
-pub struct ModuleConfig {
-    #[serde(default)]
-    pub guidance: String,
-}
-
 /// Snapshot of the resource allocation across all modules.
 ///
 /// Stores:
-/// - `per_module`: controller-written guidance per module (from priority hints).
 /// - `activation`: controller-derived `ActivationRatio` per module (mapped from
 ///   priority position via `activation_table`).
 /// - `activation_table`: host-set ratio table; index = priority position.
@@ -366,7 +349,6 @@ pub struct ModuleConfig {
 ///   when the blackboard knows the registered [`ModulePolicy`] per module.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct ResourceAllocation {
-    per_module: HashMap<ModuleId, ModuleConfig>,
     #[serde(default)]
     activation: HashMap<ModuleId, ActivationRatio>,
     #[serde(default)]
@@ -399,20 +381,12 @@ impl Default for AllocationLimits {
 }
 
 impl ResourceAllocation {
-    pub fn for_module(&self, id: &ModuleId) -> ModuleConfig {
-        self.per_module.get(id).cloned().unwrap_or_default()
-    }
-
-    pub fn get(&self, id: &ModuleId) -> Option<&ModuleConfig> {
-        self.per_module.get(id)
-    }
-
     pub fn has_activation(&self, id: &ModuleId) -> bool {
         self.activation.contains_key(id)
     }
 
     pub fn has_module_opinion(&self, id: &ModuleId) -> bool {
-        self.per_module.contains_key(id) || self.activation.contains_key(id)
+        self.activation.contains_key(id)
     }
 
     pub fn activation_for(&self, id: &ModuleId) -> ActivationRatio {
@@ -431,12 +405,6 @@ impl ResourceAllocation {
         owner.replica.get() < self.active_replicas(&owner.module)
     }
 
-    /// Write guidance/tier for a module. Activation is set separately via
-    /// [`set_activation`].
-    pub fn set(&mut self, id: ModuleId, config: ModuleConfig) {
-        self.per_module.insert(id, config);
-    }
-
     /// Write the controller's activation knob for a module.
     pub fn set_activation(&mut self, id: ModuleId, ratio: ActivationRatio) {
         self.activation.insert(id, ratio);
@@ -451,16 +419,15 @@ impl ResourceAllocation {
             .insert(id, ActivationRatio::from_raw(rounded as u16));
     }
 
-    pub fn iter(&self) -> impl Iterator<Item = (&ModuleId, &ModuleConfig)> {
-        self.per_module.iter()
-    }
-
     pub fn iter_activation(&self) -> impl Iterator<Item = (&ModuleId, ActivationRatio)> {
         self.activation.iter().map(|(id, r)| (id, *r))
     }
 
+    pub fn module_ids(&self) -> Vec<ModuleId> {
+        self.allocation_module_ids()
+    }
+
     pub fn retain_modules(&mut self, allowed: &std::collections::HashSet<ModuleId>) {
-        self.per_module.retain(|id, _| allowed.contains(id));
         self.activation.retain(|id, _| allowed.contains(id));
         self.bpm.retain(|id, _| allowed.contains(id));
         self.active_replicas.retain(|id, _| allowed.contains(id));
@@ -539,11 +506,11 @@ impl ResourceAllocation {
 
     fn allocation_module_ids(&self) -> Vec<ModuleId> {
         let mut ids = self
-            .per_module
+            .activation
             .keys()
             .cloned()
-            .chain(self.activation.keys().cloned())
             .chain(self.active_replicas.keys().cloned())
+            .chain(self.bpm.keys().cloned())
             .collect::<HashSet<_>>()
             .into_iter()
             .collect::<Vec<_>>();
@@ -570,7 +537,6 @@ mod tests {
 
     fn set(allocation: &mut ResourceAllocation, module: &str, ratio: f64) {
         let module = id(module);
-        allocation.set(module.clone(), ModuleConfig::default());
         allocation.set_activation(module, ActivationRatio::from_f64(ratio));
     }
 

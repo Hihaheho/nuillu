@@ -1,7 +1,7 @@
 id: module-predict-routine-eating-preserves-subject
 description: Predict should preserve the subject of the current cognition target while forecasting the next near-term world state.
 modules = ["predict"]
-prompt: active without specific guidance
+prompt: active without extra context
 context: This mirrors the first step of the full-agent surprise case at the cognition boundary. The artifact is predict's memo, which should keep Koro as the subject and forecast near-term world behavior.
 
 limits {

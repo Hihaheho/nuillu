@@ -354,12 +354,6 @@ impl Module for SurpriseModule {
         )
     }
 
-    fn allocation_hint() -> Option<&'static str> {
-        Some(
-            "Raise surprise when new cognition may violate expectation, break recent continuity, or deserve preservation because of novelty or significance. Keep it low for routine expected updates or when no expectation is available.",
-        )
-    }
-
     async fn next_batch(&mut self) -> Result<Self::Batch> {
         SurpriseModule::next_batch(self).await
     }
@@ -387,7 +381,7 @@ mod tests {
     };
     use nuillu_blackboard::{
         ActivationRatio, Blackboard, BlackboardCommand, Bpm, CognitionLogEntry, CognitionLogOrigin,
-        ModuleConfig, ResourceAllocation, linear_ratio_fn,
+        ResourceAllocation, linear_ratio_fn,
     };
     use nuillu_module::ports::{Clock, NoopCognitionLogRepository, SystemClock};
     use nuillu_module::{
@@ -400,7 +394,6 @@ mod tests {
 
     fn test_blackboard() -> Blackboard {
         let mut allocation = ResourceAllocation::default();
-        allocation.set(builtin::surprise(), ModuleConfig::default());
         allocation.set_activation(builtin::surprise(), ActivationRatio::ONE);
         Blackboard::with_allocation(allocation)
     }
@@ -647,7 +640,6 @@ mod tests {
     async fn activate_cx(module: &SurpriseModule) -> nuillu_module::ActivateCx<'static> {
         let lutum = module.llm.lutum().await;
         nuillu_module::ActivateCx::new(
-            &[],
             &[],
             &[],
             &[],

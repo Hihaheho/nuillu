@@ -146,10 +146,6 @@ mod tests {
             AllocationModule::peer_context()
         }
 
-        fn allocation_hint() -> Option<&'static str> {
-            AllocationModule::allocation_hint()
-        }
-
         async fn next_batch(&mut self) -> Result<Self::Batch> {
             let batch = self.inner.next_batch().await?;
             self.recorder.borrow_mut().push(batch.requests.len());

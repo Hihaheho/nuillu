@@ -3656,9 +3656,9 @@ mod tests {
         .await
         .unwrap();
         let store = agent.allocation_store();
-        let first = test_allocation_snapshot(0, "first priority");
-        let second = test_allocation_snapshot(0, "second priority");
-        let other_replica = test_allocation_snapshot(1, "replica one priority");
+        let first = test_allocation_snapshot(0, nuillu_blackboard::ActivationRatio::ONE);
+        let second = test_allocation_snapshot(0, nuillu_blackboard::ActivationRatio::ZERO);
+        let other_replica = test_allocation_snapshot(1, nuillu_blackboard::ActivationRatio::ONE);
 
         assert!(store.load_all().await.unwrap().is_empty());
         store.save(&first).await.unwrap();
@@ -5279,20 +5279,17 @@ mod tests {
         }
     }
 
-    fn test_allocation_snapshot(replica: u8, guidance: &str) -> PersistedAllocationSnapshot {
+    fn test_allocation_snapshot(
+        replica: u8,
+        activation_ratio: nuillu_blackboard::ActivationRatio,
+    ) -> PersistedAllocationSnapshot {
         let owner = nuillu_types::ModuleInstanceId::new(
             nuillu_types::ModuleId::new("allocation").unwrap(),
             nuillu_types::ReplicaIndex::new(replica),
         );
         let target = nuillu_types::ModuleId::new("cognition-gate").unwrap();
         let mut targets = nuillu_blackboard::ResourceAllocation::default();
-        targets.set_activation(target.clone(), nuillu_blackboard::ActivationRatio::ONE);
-        targets.set(
-            target,
-            nuillu_blackboard::ModuleConfig {
-                guidance: guidance.to_owned(),
-            },
-        );
+        targets.set_activation(target, activation_ratio);
         PersistedAllocationSnapshot::new(
             owner,
             targets,

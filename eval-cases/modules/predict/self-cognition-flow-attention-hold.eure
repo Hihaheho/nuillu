@@ -1,7 +1,7 @@
 id: module-predict-self-cognition-flow-attention-hold
 description: Predict should handle the corner case where the cognition target is Nui's own conscious attention flow.
 modules = ["predict"]
-prompt: active without specific guidance
+prompt: active without extra context
 context: This isolates predict when the cognition log explicitly describes Nui's own conscious attention and uncertainty as the target. The artifact should forecast the near-term cognition flow, not hidden module behavior.
 
 limits {

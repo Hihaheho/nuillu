@@ -26,10 +26,6 @@ pub fn ui(ui: &mut egui::Ui, snapshot: &BlackboardSnapshot) {
                                 &[("ratio", format!("{:.2}", item.activation_ratio).into())],
                             ));
                         });
-                        if !item.guidance.is_empty() {
-                            ui.add_space(4.0);
-                            wrapped_label(ui, &item.guidance);
-                        }
                     });
                 ui.add_space(6.0);
             }

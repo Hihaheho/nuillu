@@ -165,11 +165,7 @@ fn drive_commands(phase: HomeostaticPhase, allowed: &[ModuleId]) -> Vec<Allocati
         } else {
             continue;
         };
-        commands.push(AllocationCommand::target(
-            id.clone(),
-            level,
-            Some(phase_guidance(phase, id)),
-        ));
+        commands.push(AllocationCommand::target(id.clone(), level));
     }
     commands
 }
@@ -187,28 +183,6 @@ fn suppression_commands(phase: HomeostaticPhase, capped: &[ModuleId]) -> Vec<All
         .collect()
 }
 
-fn phase_guidance(phase: HomeostaticPhase, id: &ModuleId) -> String {
-    match (phase, id.as_str()) {
-        (HomeostaticPhase::Compacting, "memory-compaction") => {
-            "NREM-like memory consolidation: merge redundant memories and reduce nrem pressure."
-                .into()
-        }
-        (HomeostaticPhase::Compacting, "memory-association") => {
-            "NREM-like memory association: write non-destructive reflection summaries and memory links where source memories should remain live."
-                .into()
-        }
-        (HomeostaticPhase::Compacting, "policy-compaction") => {
-            "NREM-like policy cleanup: conservatively remove redundant non-Core policy duplicates."
-                .into()
-        }
-        (HomeostaticPhase::Recombining, "memory-recombination") => {
-            "REM-like internal simulation: recombine recent cognition with memory without treating it as verified fact."
-                .into()
-        }
-        _ => "Homeostatic controller keeps this sleep-phase module quiet now.".into(),
-    }
-}
-
 #[async_trait(?Send)]
 impl Module for HomeostasisModule {
     type Batch = ();
@@ -218,10 +192,6 @@ impl Module for HomeostasisModule {
     }
 
     fn peer_context() -> Option<&'static str> {
-        None
-    }
-
-    fn allocation_hint() -> Option<&'static str> {
         None
     }
 

@@ -68,8 +68,6 @@ activation-ratio = `float`
 active-replicas = `integer`
 period-ms = `$types.nullable-integer`
 period-ms.$optional = true
-tier = `$types.model-tier`
-guidance = `text`
 
 @ $types.allocation-proposal
 controller = `$types.module-instance`

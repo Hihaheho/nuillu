@@ -366,12 +366,6 @@ impl Module for MemoryRecombinationModule {
         None
     }
 
-    fn allocation_hint() -> Option<&'static str> {
-        Some(
-            "Raise memory-recombination during REM-like exploratory phases when memory fragments can be safely combined into imaginative simulations. Keep it low for factual recall, direct answers, urgent action, or when unverified imagery would disturb current cognition.",
-        )
-    }
-
     async fn next_batch(&mut self) -> Result<Self::Batch> {
         MemoryRecombinationModule::next_batch(self).await
     }

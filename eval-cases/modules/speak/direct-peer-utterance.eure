@@ -2,7 +2,7 @@ id: module-speak-direct-peer-utterance
 description: Speak should emit a concise targeted utterance using only cognition-log evidence.
 modules = ["speak"]
 prompt: Speak from the current cognition log.
-context: This isolates speak as the utterance boundary. No memo evidence or allocation guidance is available to speak; the artifact output is the completed utterance text.
+context: This isolates speak as the utterance boundary. No memo evidence or allocation context is available to speak; the artifact output is the completed utterance text.
 participants = ["Pibi"]
 
 limits {

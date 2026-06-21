@@ -23,8 +23,8 @@ const DEFAULT_COGNITION_LOG_RETAINED_ENTRIES: usize = 16;
 /// allocation snapshot. This is a cheap cloneable handle; locking is an
 /// implementation detail hidden behind its methods.
 ///
-/// `peer_contexts` and `allocation_hints` live outside the inner lock as
-/// write-once `OnceLock<Vec<(ModuleId, &'static str)>>` values: they are
+/// `peer_contexts` lives outside the inner lock as a write-once
+/// `OnceLock<Vec<(ModuleId, &'static str)>>` value: it is
 /// populated by `ModuleRegistry::build` before any module is constructed and
 /// never change afterwards, so module constructors can read them synchronously
 /// without taking the async lock.
@@ -35,7 +35,6 @@ pub struct Blackboard {
     activation_increase_waiters: Arc<Mutex<Vec<ActivationIncreaseWaiter>>>,
     allocation_change_waiters: Arc<Mutex<Vec<oneshot::Sender<()>>>>,
     peer_contexts: Arc<OnceLock<Vec<(ModuleId, &'static str)>>>,
-    allocation_hints: Arc<OnceLock<Vec<(ModuleId, &'static str)>>>,
 }
 
 /// Inner blackboard state. Public so read closures in other crates can
@@ -271,7 +270,6 @@ impl Blackboard {
             activation_increase_waiters: Arc::new(Mutex::new(Vec::new())),
             allocation_change_waiters: Arc::new(Mutex::new(Vec::new())),
             peer_contexts: Arc::new(OnceLock::new()),
-            allocation_hints: Arc::new(OnceLock::new()),
         }
     }
 
@@ -287,20 +285,14 @@ impl Blackboard {
             activation_increase_waiters: Arc::new(Mutex::new(Vec::new())),
             allocation_change_waiters: Arc::new(Mutex::new(Vec::new())),
             peer_contexts: Arc::new(OnceLock::new()),
-            allocation_hints: Arc::new(OnceLock::new()),
         }
     }
 
-    /// Install the registered-module peer context and allocation hint catalogs.
+    /// Install the registered-module peer context catalog.
     /// Idempotent on first call; subsequent calls are silently ignored to keep
     /// the post-boot snapshot stable for prompt caching.
-    pub fn set_module_contexts(
-        &self,
-        peer_contexts: Vec<(ModuleId, &'static str)>,
-        allocation_hints: Vec<(ModuleId, &'static str)>,
-    ) {
+    pub fn set_module_contexts(&self, peer_contexts: Vec<(ModuleId, &'static str)>) {
         let _ = self.peer_contexts.set(peer_contexts);
-        let _ = self.allocation_hints.set(allocation_hints);
     }
 
     /// Read the registered-module peer context catalog. Returns an empty slice
@@ -309,15 +301,6 @@ impl Blackboard {
     /// in that case.
     pub fn peer_contexts(&self) -> &[(ModuleId, &'static str)] {
         self.peer_contexts
-            .get()
-            .map(|v| v.as_slice())
-            .unwrap_or(&[])
-    }
-
-    /// Read the registered-module allocation hint catalog. Returns an empty
-    /// slice before the catalog is installed.
-    pub fn allocation_hints(&self) -> &[(ModuleId, &'static str)] {
-        self.allocation_hints
             .get()
             .map(|v| v.as_slice())
             .unwrap_or(&[])
@@ -1126,12 +1109,7 @@ impl BlackboardInner {
             .module_policies
             .keys()
             .cloned()
-            .chain(self.base_allocation.iter().map(|(id, _)| id.clone()))
-            .chain(
-                self.base_allocation
-                    .iter_activation()
-                    .map(|(id, _)| id.clone()),
-            )
+            .chain(self.base_allocation.module_ids())
             .collect();
 
         let mut effective = ResourceAllocation::default();
@@ -1143,7 +1121,6 @@ impl BlackboardInner {
                 .filter(|(_, proposal)| proposal.has_module_opinion(&id))
                 .collect::<Vec<_>>();
             if module_proposals.is_empty() {
-                effective.set(id.clone(), self.base_allocation.for_module(&id));
                 effective.set_activation(id.clone(), self.base_allocation.activation_for(&id));
                 continue;
             }
@@ -1161,20 +1138,6 @@ impl BlackboardInner {
                 .map(|ratio| u32::from(ratio.raw()))
                 .sum::<u32>();
 
-            let guidance = if module_proposals
-                .iter()
-                .any(|(_, proposal)| proposal.get(&id).is_some())
-            {
-                combine_guidance(module_proposals.iter().filter_map(|(owner, proposal)| {
-                    proposal
-                        .get(&id)
-                        .map(|cfg| (owner.to_string(), cfg.guidance.trim().to_owned()))
-                }))
-            } else {
-                self.base_allocation.for_module(&id).guidance
-            };
-
-            effective.set(id.clone(), crate::ModuleConfig { guidance });
             effective.set_activation(
                 id,
                 crate::ActivationRatio::from_raw(rounded_div(activation_sum, count) as u16),
@@ -1235,21 +1198,6 @@ fn rounded_div(sum: u32, count: u32) -> u32 {
         return 0;
     }
     (sum + count / 2) / count
-}
-
-fn combine_guidance(items: impl IntoIterator<Item = (String, String)>) -> String {
-    let mut items = items
-        .into_iter()
-        .filter(|(_, guidance)| !guidance.is_empty())
-        .collect::<Vec<_>>();
-    if items.len() == 1 {
-        return items.remove(0).1;
-    }
-    items
-        .into_iter()
-        .map(|(owner, guidance)| format!("{owner}: {guidance}"))
-        .collect::<Vec<_>>()
-        .join("\n")
 }
 
 #[cfg(test)]
@@ -1588,38 +1536,14 @@ mod tests {
         .await;
 
         let mut proposal_a = ResourceAllocation::default();
-        proposal_a.set(
-            builtin::query_memory(),
-            crate::ModuleConfig {
-                guidance: "query cheaply".into(),
-            },
-        );
         proposal_a.set_activation(
             builtin::query_memory(),
             crate::ActivationRatio::from_f64(1.0 / 3.0),
         );
-        proposal_a.set(
-            builtin::speak(),
-            crate::ModuleConfig {
-                guidance: "wait".into(),
-            },
-        );
         proposal_a.set_activation(builtin::speak(), crate::ActivationRatio::ZERO);
 
         let mut proposal_b = ResourceAllocation::default();
-        proposal_b.set(
-            builtin::query_memory(),
-            crate::ModuleConfig {
-                guidance: "query deeply".into(),
-            },
-        );
         proposal_b.set_activation(builtin::query_memory(), crate::ActivationRatio::ONE);
-        proposal_b.set(
-            builtin::speak(),
-            crate::ModuleConfig {
-                guidance: "respond if attention is ready".into(),
-            },
-        );
         proposal_b.set_activation(builtin::speak(), crate::ActivationRatio::ONE);
 
         bb.apply(BlackboardCommand::RecordAllocationProposal {
@@ -1634,14 +1558,9 @@ mod tests {
         .await;
 
         let effective = bb.read(|bb| bb.allocation().clone()).await;
-        let query = effective.for_module(&builtin::query_memory());
         let query_activation = effective.activation_for(&builtin::query_memory());
         assert_eq!(effective.active_replicas(&builtin::query_memory()), 2);
         assert!((query_activation.as_f64() - 0.6667).abs() < 0.001);
-        assert_eq!(
-            query.guidance,
-            "allocation: query cheaply\nallocation[1]: query deeply"
-        );
         assert_eq!(effective.active_replicas(&builtin::speak()), 1);
     }
 
@@ -1763,12 +1682,6 @@ mod tests {
 
         let unknown = ModuleId::new("invented-module").unwrap();
         let mut proposal = ResourceAllocation::default();
-        proposal.set(
-            unknown.clone(),
-            crate::ModuleConfig {
-                guidance: "ignore me".into(),
-            },
-        );
         proposal.set_activation(unknown.clone(), crate::ActivationRatio::ONE);
 
         bb.apply(BlackboardCommand::RecordAllocationProposal {
@@ -1778,7 +1691,7 @@ mod tests {
         .await;
 
         let effective = bb.read(|bb| bb.allocation().clone()).await;
-        assert!(effective.get(&unknown).is_none());
+        assert!(!effective.module_ids().contains(&unknown));
     }
 
     #[tokio::test]
@@ -1881,12 +1794,6 @@ mod tests {
         .await;
 
         let mut target_a = ResourceAllocation::default();
-        target_a.set(
-            builtin::speak(),
-            crate::ModuleConfig {
-                guidance: "target A".into(),
-            },
-        );
         target_a.set_activation(builtin::speak(), crate::ActivationRatio::from_f64(0.2));
         bb.apply(BlackboardCommand::RecordAllocationEffects {
             writer: ModuleInstanceId::new(builtin::allocation(), ReplicaIndex::ZERO),
@@ -1896,12 +1803,6 @@ mod tests {
         .await;
 
         let mut target_b = ResourceAllocation::default();
-        target_b.set(
-            builtin::speak(),
-            crate::ModuleConfig {
-                guidance: "target B".into(),
-            },
-        );
         target_b.set_activation(builtin::speak(), crate::ActivationRatio::from_f64(0.8));
         let mut suppression_b = ResourceAllocation::default();
         suppression_b.set_activation(builtin::speak(), crate::ActivationRatio::from_f64(0.5));
@@ -1930,10 +1831,6 @@ mod tests {
         assert_eq!(
             effective.bpm_for(&builtin::speak()),
             Some(crate::Bpm::from_f64(7.25))
-        );
-        assert_eq!(
-            effective.for_module(&builtin::speak()).guidance,
-            "allocation: target A\ninteroception: target B"
         );
     }
 
@@ -1988,7 +1885,6 @@ mod tests {
     async fn allocation_change_waiter_fires_when_policy_changes_derived_bpm() {
         let module = builtin::query_memory();
         let mut base = ResourceAllocation::default();
-        base.set(module.clone(), crate::ModuleConfig::default());
         base.set_activation(module.clone(), crate::ActivationRatio::ONE);
         let bb = Blackboard::with_allocation(base);
         bb.apply(BlackboardCommand::SetModulePolicies {

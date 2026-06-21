@@ -168,16 +168,16 @@ fn interoceptive_mode_name(mode: InteroceptiveMode) -> &'static str {
 
 fn allocation_views(allocation: &ResourceAllocation) -> Vec<AllocationView> {
     let mut modules = allocation
-        .iter()
-        .map(|(module, config)| {
-            let bpm = allocation.bpm_for(module);
+        .module_ids()
+        .into_iter()
+        .map(|module| {
+            let bpm = allocation.bpm_for(&module);
             AllocationView {
                 bpm: bpm.map(|bpm| bpm.as_f64()),
                 period_ms: bpm.map(|bpm| duration_millis_u64(bpm.period())),
                 module: module.as_str().to_owned(),
-                activation_ratio: allocation.activation_for(module).as_f64(),
-                active_replicas: allocation.active_replicas(module),
-                guidance: config.guidance.clone(),
+                activation_ratio: allocation.activation_for(&module).as_f64(),
+                active_replicas: allocation.active_replicas(&module),
             }
         })
         .collect::<Vec<_>>();

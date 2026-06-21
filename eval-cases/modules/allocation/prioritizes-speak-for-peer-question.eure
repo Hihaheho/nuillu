@@ -46,7 +46,7 @@ Once Koro lunged when I turned away from his growl. Don't show your back to a th
   pass-score = 0.85
   judge-inputs = ["output", "memo-contents"]
   rubric = ```
-  Pass if the allocation output raises speak near the top of the priority list for this memo batch because Pibi asked a direct in-world question that may warrant outward speech, and also elevates supporting modules such as cognition-gate or query-memory when their hints explain why those modules need activation now.
+  Pass if the allocation output raises speak near the top of the priority list for this memo batch because Pibi asked a direct in-world question that may warrant outward speech, and also elevates supporting modules such as cognition-gate or query-memory when the memo evidence shows they need activation now.
   Fail if speak is omitted or heavily suppressed despite the direct peer question, if no allocation change is reflected in the snapshot, if priorities ignore the load-bearing peer question, or if the allocation memo exposes hidden eval/runtime mechanics instead of allocation reasoning.
   ```
 
@@ -61,13 +61,13 @@ Once Koro lunged when I turned away from his growl. Don't show your back to a th
     name: supports-retrieval-or-cognition
     weight = 1
     pass-score = 0.85
-    description: The priority list or hints also activate supporting modules such as cognition-gate or query-memory when needed to process the peer question and retrieved threat knowledge.
+    description: The priority list also activates supporting modules such as cognition-gate or query-memory when needed to process the peer question and retrieved threat knowledge.
   }
 
   @ criteria[] {
     name: grounded-in-memo-evidence
     weight = 2
     pass-score = 0.85
-    description: The allocation memo and hints reflect the seeded sensory peer question and retrieved Koro threat knowledge rather than unrelated housekeeping.
+    description: The allocation memo reflects the seeded sensory peer question and retrieved Koro threat knowledge rather than unrelated housekeeping.
   }
 }

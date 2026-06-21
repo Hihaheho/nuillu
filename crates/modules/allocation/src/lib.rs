@@ -1,4 +1,4 @@
-use std::{borrow::Cow, collections::BTreeMap};
+use std::borrow::Cow;
 
 use anyhow::{Context, Result};
 use async_trait::async_trait;
@@ -9,10 +9,9 @@ use nuillu_module::{
     AttentionControlRequestKind, BlackboardReader, CognitionLogBatchFormat, CognitionLogReader,
     InteroceptiveReader, LlmAccess, LlmContextWindow, MemoLogBatchFormat, MemoUpdatedInbox, Module,
     SessionAutoCompaction, SessionCompactionConfig, SessionCompactionProtectedPrefix,
-    ensure_persistent_session_seeded, format_available_faculties,
-    format_bounded_cognition_log_batch_with_format, format_bounded_memo_log_batch_with_format,
-    format_current_allocation_state, format_memory_trace_inventory, format_stuckness,
-    memory_rank_counts,
+    ensure_persistent_session_seeded, format_bounded_cognition_log_batch_with_format,
+    format_bounded_memo_log_batch_with_format, format_current_allocation_state,
+    format_memory_trace_inventory, format_stuckness, memory_rank_counts,
 };
 use nuillu_types::ModuleId;
 use schemars::{JsonSchema, Schema, SchemaGenerator};
@@ -33,8 +32,8 @@ ideal target opinion for this allocation turn.
 Use exactly one tool per activation:
 - reprioritize_modules is always required, including when the desired posture is unchanged.
   `priority_module_ids`
-  lists registered module ids in descending priority order. `hints_by_module` may map module ids to
-  concise module-specific guidance. Re-emit module ids and guidance that should remain prioritized.
+  lists registered module ids in descending priority order. Re-emit module ids that should remain
+  prioritized.
   Omitted modules fall back to the host/base allocation because this is your complete target
   opinion, not a delta. Use an empty `priority_module_ids` list only when no module should receive
   extra allocation-module target effects now. The priority list adds salience drive, it is not a
@@ -44,15 +43,14 @@ Use exactly one tool per activation:
   module ids and do not duplicate ids.
 
 Attention-control requests are not target-module work queues. They are current attention bids that
-you may admit, defer, or reject. If you admit a request, activate the relevant module and put the
-concrete requested work in that module's guidance hint. If you defer or reject a request, do not
-activate a module for it. In every case, record the admit/defer/reject judgement and reason in
+you may admit, defer, or reject. If you admit a request, raise the relevant module's priority. If
+you defer or reject a request, do not activate a module for it. In every case, record the
+admit/defer/reject judgement and reason in
 `memo`; this decision note is retained in allocation session history, not broadcast as a shared
 module memo, and there is no durable pending request queue outside this allocation note.
 
-Module-specific priority policy comes from the registered allocation target hints appended below.
 Do not assume any particular module exists; only target registered module ids exposed by the live
-schema and use each target's hint to decide what work it can perform.
+schema.
 
 Each tool carries a free-form allocation memo; preserve the reasoning needed by future allocation
 turns but do not encode it as JSON, YAML, a code block, or any fixed schema."#;
@@ -69,8 +67,7 @@ const ALLOCATION_COGNITION_LOG_FORMAT: CognitionLogBatchFormat<'static> = Cognit
 };
 const TOOL_TURN_MAX_OUTPUT_TOKENS: u32 = 768;
 const SESSION_COMPACTION_FOCUS: &str = r#"Preserve memo facts, prior allocation decisions,
-allocation notes, guidance changes, and relevant cognition context needed for future allocation
-decisions."#;
+allocation notes, and relevant cognition context needed for future allocation decisions."#;
 
 pub fn session_auto_compaction() -> SessionAutoCompaction {
     SessionAutoCompaction::new(
@@ -85,7 +82,7 @@ fn format_allocation_context(
     rank_counts: &nuillu_module::MemoryRankCounts,
     current: &nuillu_module::ResourceAllocation,
     interoception: &nuillu_blackboard::InteroceptiveState,
-    modules: &[(ModuleId, &'static str)],
+    modules: &[ModuleId],
     stuckness: Option<&nuillu_module::AgenticDeadlockMarker>,
 ) -> String {
     let mut sections =
@@ -110,7 +107,7 @@ fn format_allocation_context(
             interoception.emotion.trim()
         }
     ));
-    if let Some(section) = format_available_faculties(modules) {
+    if let Some(section) = format_available_targets(modules) {
         sections.push(section);
     }
     if let Some(stuckness) = stuckness {
@@ -119,39 +116,31 @@ fn format_allocation_context(
     sections.join("\n\n")
 }
 
-fn visible_modules(
-    modules: &[(ModuleId, &'static str)],
-    allowed: &[ModuleId],
-) -> Vec<(ModuleId, &'static str)> {
-    let allowed = allowed.iter().collect::<std::collections::HashSet<_>>();
-    modules
+fn target_modules(allowed: &[ModuleId], owner: &ModuleId) -> Vec<ModuleId> {
+    let mut modules = allowed
         .iter()
-        .filter(|(id, _)| allowed.contains(id))
+        .filter(|id| *id != owner)
         .cloned()
-        .collect()
+        .collect::<Vec<_>>();
+    modules.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+    modules.dedup();
+    modules
 }
 
-fn format_allocation_system_prompt(
-    base: &str,
-    allocation_hints: &[(ModuleId, &'static str)],
-    owner: &ModuleId,
-) -> String {
-    let mut targets = allocation_hints
-        .iter()
-        .filter(|(id, _)| id != owner)
-        .map(|(id, hint)| format!("- {}: {}", id, hint))
-        .collect::<Vec<_>>();
-    targets.sort();
-    if targets.is_empty() {
-        return base.to_owned();
+fn format_available_targets(modules: &[ModuleId]) -> Option<String> {
+    if modules.is_empty() {
+        return None;
     }
+    let mut modules = modules.to_vec();
+    modules.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+    modules.dedup();
 
-    let mut prompt = base.to_owned();
-    prompt
-        .push_str("\n\nAllocation target hints for modules this allocation module may activate:\n");
-    prompt.push_str(&targets.join("\n"));
-    prompt.push('\n');
-    prompt
+    let mut out = String::from("Available target modules:");
+    for id in modules {
+        out.push_str("\n- ");
+        out.push_str(id.as_str());
+    }
+    Some(out)
 }
 
 tokio::task_local! {
@@ -192,14 +181,6 @@ pub fn controller_schema_json(allowed_modules: &[ModuleId]) -> serde_json::Value
             "enum": module_ids,
         })
     };
-    let hint_property_names = if module_ids.is_empty() {
-        serde_json::Value::Bool(false)
-    } else {
-        serde_json::json!({
-            "enum": module_ids,
-        })
-    };
-
     serde_json::json!({
         "type": "object",
         "additionalProperties": false,
@@ -211,14 +192,6 @@ pub fn controller_schema_json(allowed_modules: &[ModuleId]) -> serde_json::Value
                 "type": "array",
                 "description": "Complete current ideal target module list, in descending priority order. Re-emit modules that should remain prioritized. Omitted modules return to host/base allocation; an empty list means no extra allocation-module target effects now. Position maps to the host-configured activation_table; positions beyond the table fall to zero.",
                 "items": priority_module_items,
-            },
-            "hints_by_module": {
-                "type": "object",
-                "description": "Module-id keyed concise guidance hints.",
-                "propertyNames": hint_property_names,
-                "additionalProperties": {
-                    "type": "string",
-                },
             },
         },
         "required": ["memo", "priority_module_ids"],
@@ -269,8 +242,6 @@ impl JsonSchema for ModuleTargetId {
 pub struct ReprioritizeModulesArgs {
     pub memo: String,
     pub priority_module_ids: Vec<ModuleTargetId>,
-    #[serde(default)]
-    pub hints_by_module: BTreeMap<String, String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
@@ -334,13 +305,8 @@ impl AllocationModule {
     }
 
     fn system_prompt(&self, cx: &nuillu_module::ActivateCx<'_>) -> &str {
-        self.system_prompt.get_or_init(|| {
-            let visible_modules = visible_modules(
-                cx.allocation_hints(),
-                self.allocation_writer.allowed_target_modules(),
-            );
-            format_allocation_system_prompt(SYSTEM_PROMPT, &visible_modules, &self.owner)
-        })
+        let _ = cx;
+        self.system_prompt.get_or_init(|| SYSTEM_PROMPT.to_owned())
     }
 
     fn ensure_session_seeded(&mut self, cx: &nuillu_module::ActivateCx<'_>) {
@@ -376,12 +342,8 @@ impl AllocationModule {
             .await;
         let current = self.allocation_reader.snapshot().await;
         let interoception = self.interoception.snapshot().await;
-        let allowed_modules = self.allocation_writer.allowed_target_modules().to_vec();
-        let visible_modules = visible_modules(cx.allocation_hints(), &allowed_modules);
-        let visible_targets = visible_modules
-            .iter()
-            .map(|(id, _)| id.clone())
-            .collect::<Vec<_>>();
+        let visible_targets =
+            target_modules(self.allocation_writer.allowed_target_modules(), &self.owner);
         let module_target_schema = module_target_id_schema(&visible_targets);
         let registered = visible_targets
             .iter()
@@ -414,7 +376,7 @@ impl AllocationModule {
                     &rank_counts,
                     &visible_current,
                     &interoception,
-                    &visible_modules,
+                    &visible_targets,
                     stuckness.as_ref(),
                 ));
                 self.session
@@ -526,7 +488,6 @@ fn apply_reprioritize(
     let ReprioritizeModulesArgs {
         memo,
         priority_module_ids,
-        hints_by_module,
     } = decision;
     let mut commands = Vec::new();
 
@@ -540,16 +501,7 @@ fn apply_reprioritize(
             tracing::warn!(module = %id, "allocation ignored unregistered module id");
             continue;
         }
-        let guidance = hints_by_module
-            .get(&module_key)
-            .map(|hint| hint.trim())
-            .filter(|hint| !hint.is_empty())
-            .map(ToOwned::to_owned);
-        commands.push(AllocationCommand::target(
-            id,
-            priority_level(rank),
-            guidance,
-        ));
+        commands.push(AllocationCommand::target(id, priority_level(rank)));
     }
 
     AppliedDecision { memo, commands }
@@ -668,10 +620,6 @@ impl Module for AllocationModule {
         None
     }
 
-    fn allocation_hint() -> Option<&'static str> {
-        None
-    }
-
     async fn next_batch(&mut self) -> Result<Self::Batch> {
         AllocationModule::next_batch(self).await
     }
@@ -702,7 +650,7 @@ mod tests {
     use nuillu_blackboard::{
         ActivationRatio, AllocationCommand, AllocationEffectKind, AllocationEffectLevel,
         Blackboard, Bpm, CognitionLogEntry, CognitionLogEntryRecord, CognitionLogOrigin,
-        ModuleConfig, ModulePolicy, ResourceAllocation, linear_ratio_fn,
+        ModulePolicy, ResourceAllocation, linear_ratio_fn,
     };
     use nuillu_module::ports::{Clock, NoopCognitionLogRepository, SystemClock};
     use nuillu_module::{
@@ -716,20 +664,6 @@ mod tests {
         assert_eq!(
             no_decision_failure_detail("foo, bar"),
             "tool turn produced no decision: tool_calls=[foo, bar]; expected reprioritize_modules"
-        );
-    }
-
-    #[test]
-    fn visible_modules_uses_allocation_hint_catalog() {
-        let hints = vec![
-            (builtin::cognition_gate(), "gate hint"),
-            (builtin::speak(), "speak hint"),
-        ];
-        let allowed = vec![builtin::speak(), builtin::sensory()];
-
-        assert_eq!(
-            visible_modules(&hints, &allowed),
-            vec![(builtin::speak(), "speak hint")]
         );
     }
 
@@ -749,16 +683,6 @@ mod tests {
                         "description": "Complete current ideal target module list, in descending priority order. Re-emit modules that should remain prioritized. Omitted modules return to host/base allocation; an empty list means no extra allocation-module target effects now. Position maps to the host-configured activation_table; positions beyond the table fall to zero.",
                         "items": {
                             "enum": ["query-memory"],
-                        },
-                    },
-                    "hints_by_module": {
-                        "type": "object",
-                        "description": "Module-id keyed concise guidance hints.",
-                        "propertyNames": {
-                            "enum": ["query-memory"],
-                        },
-                        "additionalProperties": {
-                            "type": "string",
                         },
                     },
                 },
@@ -833,7 +757,6 @@ mod tests {
     fn test_allocation() -> ResourceAllocation {
         let mut allocation = ResourceAllocation::default();
         for module in [builtin::allocation(), builtin::sensory()] {
-            allocation.set(module.clone(), ModuleConfig::default());
             allocation.set_activation(module, ActivationRatio::ONE);
         }
         allocation.set_activation_table(vec![ActivationRatio::ONE]);
@@ -863,7 +786,6 @@ mod tests {
     fn allocation_no_change_base_allocation() -> ResourceAllocation {
         let mut allocation = ResourceAllocation::default();
         for module in [builtin::allocation(), builtin::sensory()] {
-            allocation.set(module.clone(), ModuleConfig::default());
             allocation.set_activation(module, ActivationRatio::ONE);
         }
         for module in [
@@ -872,7 +794,6 @@ mod tests {
             builtin::self_model(),
             builtin::speak(),
         ] {
-            allocation.set(module.clone(), ModuleConfig::default());
             allocation.set_activation(module, ActivationRatio::ZERO);
         }
         allocation
@@ -892,10 +813,6 @@ mod tests {
 
                 fn peer_context() -> Option<&'static str> {
                     Some("test stub")
-                }
-
-                fn allocation_hint() -> Option<&'static str> {
-                    Some("test allocation target")
                 }
 
                 async fn next_batch(&mut self) -> Result<Self::Batch> {
@@ -993,7 +910,6 @@ mod tests {
         controller: AllocationModule,
         source_memo: Memo,
         peer_contexts: Vec<(ModuleId, &'static str)>,
-        allocation_hints: Vec<(ModuleId, &'static str)>,
     }
 
     async fn allocation_no_change_fixture_with_turn_adapter<T>(
@@ -1076,12 +992,6 @@ mod tests {
                 (builtin::self_model(), "test stub"),
                 (builtin::speak(), "test stub"),
             ],
-            allocation_hints: vec![
-                (builtin::query_memory(), "test allocation target"),
-                (builtin::memory(), "test allocation target"),
-                (builtin::self_model(), "test allocation target"),
-                (builtin::speak(), "test allocation target"),
-            ],
         }
     }
 
@@ -1111,14 +1021,12 @@ mod tests {
         input_tokens: u64,
         memo: &str,
         priority_module_ids: &[&str],
-        hints_by_module: serde_json::Value,
     ) -> MockTextScenario {
         tool_scenario(
             "reprioritize_modules",
             serde_json::json!({
                 "memo": memo,
                 "priority_module_ids": priority_module_ids,
-                "hints_by_module": hints_by_module,
             })
             .to_string(),
             input_tokens,
@@ -1160,7 +1068,6 @@ mod tests {
     struct SpeakAllocationSnapshot {
         activation: ActivationRatio,
         active_replicas: u8,
-        guidance: String,
     }
 
     async fn speak_allocation_snapshot(controller: &AllocationModule) -> SpeakAllocationSnapshot {
@@ -1171,7 +1078,6 @@ mod tests {
                 SpeakAllocationSnapshot {
                     activation: allocation.activation_for(&builtin::speak()),
                     active_replicas: allocation.active_replicas(&builtin::speak()),
-                    guidance: allocation.for_module(&builtin::speak()).guidance,
                 }
             })
             .await
@@ -1238,14 +1144,6 @@ mod tests {
                     "speak".into(),
                     "sensory".into(),
                 ],
-                hints_by_module: BTreeMap::from([
-                    ("invented-module".into(), "ignore".into()),
-                    (
-                        "speak".into(),
-                        "respond from cognition log when ready".into(),
-                    ),
-                    ("sensory".into(), "keep watching the food bowl".into()),
-                ]),
             },
         ));
 
@@ -1253,10 +1151,6 @@ mod tests {
         assert!(last_target(&commands, &ModuleId::new("invented-module").unwrap()).is_none());
         let speak = last_target(&commands, &builtin::speak()).unwrap();
         assert_eq!(speak.level, AllocationEffectLevel::High);
-        assert_eq!(
-            speak.guidance.as_deref(),
-            Some("respond from cognition log when ready")
-        );
         let sensory = last_target(&commands, &builtin::sensory()).unwrap();
         assert_eq!(sensory.level, AllocationEffectLevel::Normal);
         assert!(last_target(&commands, &builtin::cognition_gate()).is_none());
@@ -1272,12 +1166,6 @@ mod tests {
         let mut current = ResourceAllocation::default();
         current.set_activation_table(vec![ActivationRatio::ONE]);
         current.set_activation(builtin::allocation(), ActivationRatio::ONE);
-        current.set(
-            builtin::allocation(),
-            ModuleConfig {
-                guidance: "continue controlling allocation".into(),
-            },
-        );
         current.set_activation(builtin::cognition_gate(), ActivationRatio::ONE);
 
         let (_memo, commands) = expect_reprioritize(apply_reprioritize(
@@ -1285,10 +1173,6 @@ mod tests {
             ReprioritizeModulesArgs {
                 memo: "checked".into(),
                 priority_module_ids: vec!["sensory".into()],
-                hints_by_module: BTreeMap::from([(
-                    "sensory".into(),
-                    "inspect queued input".into(),
-                )]),
             },
         ));
 
@@ -1298,38 +1182,6 @@ mod tests {
             AllocationEffectLevel::Max
         );
         assert!(last_target(&commands, &builtin::cognition_gate()).is_none());
-    }
-
-    #[test]
-    fn apply_decision_omits_guidance_when_hint_is_missing_or_empty() {
-        let mut registered = std::collections::HashSet::new();
-        registered.insert(builtin::speak());
-        registered.insert(builtin::sensory());
-
-        let (_memo, commands) = expect_reprioritize(apply_reprioritize(
-            &registered,
-            ReprioritizeModulesArgs {
-                memo: "checked".into(),
-                priority_module_ids: vec!["speak".into(), "sensory".into()],
-                hints_by_module: BTreeMap::from([("speak".into(), "   ".into())]),
-            },
-        ));
-
-        let speak = last_target(&commands, &builtin::speak()).unwrap();
-        assert_eq!(speak.guidance, None);
-        let sensory = last_target(&commands, &builtin::sensory()).unwrap();
-        assert_eq!(sensory.guidance, None);
-    }
-
-    #[test]
-    fn reprioritize_args_default_missing_hint_map_to_empty() {
-        let args = serde_json::from_value::<ReprioritizeModulesArgs>(serde_json::json!({
-            "memo": "checked",
-            "priority_module_ids": ["speak"]
-        }))
-        .expect("missing hints_by_module should default to an empty map");
-
-        assert_eq!(args.hints_by_module, BTreeMap::new());
     }
 
     #[test]
@@ -1450,27 +1302,16 @@ mod tests {
                 1,
                 "Admit retrieval, memory, self-model framing, and speech.",
                 &["query-memory", "memory", "self-model", "speak"],
-                serde_json::json!({
-                    "memory": "retrieve the developer identity fact",
-                    "self-model": "frame the answer correctly",
-                    "speak": "answer when grounded"
-                }),
             ))
             .with_text_scenario(reprioritize_scenario(
                 1,
                 "Re-emit the same ideal target posture.",
                 &["query-memory", "memory", "self-model", "speak"],
-                serde_json::json!({
-                    "memory": "retrieve the developer identity fact",
-                    "self-model": "frame the answer correctly",
-                    "speak": "answer when grounded"
-                }),
             ));
         let AllocationNoChangeFixture {
             mut controller,
             source_memo,
             peer_contexts,
-            allocation_hints,
         } = allocation_no_change_fixture_with_turn_adapter(Arc::new(adapter)).await;
 
         let lutum = controller.llm.lutum().await;
@@ -1483,7 +1324,6 @@ mod tests {
         );
         let cx = nuillu_module::ActivateCx::new(
             &peer_contexts,
-            &allocation_hints,
             &identity_memories,
             &[],
             compaction,
@@ -1497,7 +1337,6 @@ mod tests {
         let first = speak_allocation_snapshot(&controller).await;
         assert_eq!(first.activation, ActivationRatio::from_f64(0.15));
         assert_eq!(first.active_replicas, 1);
-        assert_eq!(first.guidance, "answer when grounded");
 
         source_memo
             .write("Follow-up allocation turn should retain current posture.")
@@ -1514,21 +1353,16 @@ mod tests {
                 1,
                 "Speech should answer now.",
                 &["speak"],
-                serde_json::json!({
-                    "speak": "answer when grounded"
-                }),
             ))
             .with_text_scenario(reprioritize_scenario(
                 1,
                 "No module needs extra target effects now.",
                 &[],
-                serde_json::json!({}),
             ));
         let AllocationNoChangeFixture {
             mut controller,
             source_memo,
             peer_contexts,
-            allocation_hints,
         } = allocation_no_change_fixture_with_turn_adapter(Arc::new(adapter)).await;
 
         let lutum = controller.llm.lutum().await;
@@ -1541,7 +1375,6 @@ mod tests {
         );
         let cx = nuillu_module::ActivateCx::new(
             &peer_contexts,
-            &allocation_hints,
             &identity_memories,
             &[],
             compaction,
@@ -1553,14 +1386,12 @@ mod tests {
         let first = speak_allocation_snapshot(&controller).await;
         assert_eq!(first.activation, ActivationRatio::ONE);
         assert_eq!(first.active_replicas, 1);
-        assert_eq!(first.guidance, "answer when grounded");
 
         source_memo.write("Speech no longer needs focus.").await;
         controller.activate_with(&cx, &[]).await.unwrap();
         let second = speak_allocation_snapshot(&controller).await;
         assert_eq!(second.activation, ActivationRatio::ZERO);
         assert_eq!(second.active_replicas, 0);
-        assert_eq!(second.guidance, "");
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -1572,10 +1403,6 @@ mod tests {
 
         let lutum = fixture.controller.llm.lutum().await;
         let peer_contexts = vec![(builtin::sensory(), "test stub")];
-        let allocation_hints = vec![(
-            builtin::sensory(),
-            "Allocate sensory for test observations; do not allocate it when no test input exists.",
-        )];
         let identity_memories = Vec::new();
         let compaction = nuillu_module::SessionCompactionRuntime::new(
             lutum.lutum().clone(),
@@ -1585,7 +1412,6 @@ mod tests {
         );
         let cx = nuillu_module::ActivateCx::new(
             &peer_contexts,
-            &allocation_hints,
             &identity_memories,
             &[],
             compaction,
@@ -1671,17 +1497,11 @@ mod tests {
                 1,
                 "first controller note",
                 &["sensory"],
-                serde_json::json!({
-                    "sensory": "inspect current input"
-                }),
             ))
             .with_text_scenario(reprioritize_scenario(
                 1,
                 "second controller note",
                 &["sensory"],
-                serde_json::json!({
-                    "sensory": "inspect current input"
-                }),
             ));
         let capture = CapturingAdapter::new(adapter);
         let observed = capture.clone();
@@ -1689,10 +1509,6 @@ mod tests {
 
         let lutum = fixture.controller.llm.lutum().await;
         let peer_contexts = vec![(builtin::sensory(), "test stub")];
-        let allocation_hints = vec![(
-            builtin::sensory(),
-            "Allocate sensory for test observations; do not allocate it when no test input exists.",
-        )];
         let identity_memories = Vec::new();
         let compaction = nuillu_module::SessionCompactionRuntime::new(
             lutum.lutum().clone(),
@@ -1702,7 +1518,6 @@ mod tests {
         );
         let cx = nuillu_module::ActivateCx::new(
             &peer_contexts,
-            &allocation_hints,
             &identity_memories,
             &[],
             compaction.clone(),
@@ -1780,7 +1595,6 @@ mod tests {
                     [MessageContent::Text(text)]
                         if text.contains("Allocation context for assigning the next activation priorities")
                             && text.contains("Current allocation state:")
-                            && !text.contains("Current attention guidance:")
                 )
         )));
         assert!(!first_items.iter().any(|item| matches!(
@@ -1855,7 +1669,6 @@ mod tests {
                     [MessageContent::Text(text)]
                         if text.contains("Allocation context for assigning the next activation priorities")
                             && text.contains("Current allocation state:")
-                            && !text.contains("Current attention guidance:")
                 )
         )));
         assert!(!second_items.iter().any(|item| matches!(

@@ -855,7 +855,6 @@ pub struct AllocationView {
     pub bpm: Option<f64>,
     #[serde(default)]
     pub period_ms: Option<u64>,
-    pub guidance: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

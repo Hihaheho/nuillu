@@ -553,10 +553,6 @@ impl Module for InteroceptionModule {
         None
     }
 
-    fn allocation_hint() -> Option<&'static str> {
-        None
-    }
-
     async fn next_batch(&mut self) -> Result<Self::Batch> {
         InteroceptionModule::next_batch(self).await
     }
@@ -982,7 +978,6 @@ mod tests {
         now: chrono::DateTime<chrono::Utc>,
     ) -> nuillu_module::ActivateCx<'static> {
         nuillu_module::ActivateCx::new(
-            &[],
             &[],
             &[],
             &[],

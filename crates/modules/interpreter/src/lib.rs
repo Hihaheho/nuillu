@@ -242,12 +242,6 @@ impl Module for InterpreterModule {
         )
     }
 
-    fn allocation_hint() -> Option<&'static str> {
-        Some(
-            "Raise interpreter when current cognition needs meaning-making, free thought, narrative generation, analogy, or interpretation before speech. Keep it low for direct factual response, routine action, or when extra inner thought would add noise.",
-        )
-    }
-
     async fn next_batch(&mut self) -> Result<Self::Batch> {
         InterpreterModule::next_batch(self).await
     }
@@ -324,7 +318,6 @@ mod tests {
 
     fn activate_cx(lutum: &Lutum, now: DateTime<Utc>) -> nuillu_module::ActivateCx<'static> {
         nuillu_module::ActivateCx::new(
-            &[],
             &[],
             &[],
             &[],

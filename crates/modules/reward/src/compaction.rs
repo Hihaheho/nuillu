@@ -3,9 +3,7 @@ use std::collections::HashMap;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use lutum::{ModelInput, TextStepOutcomeWithTools, ToolResult};
-use nuillu_module::{
-    AllocationReader, BlackboardReader, InteroceptiveUpdatedInbox, LlmAccess, Module,
-};
+use nuillu_module::{BlackboardReader, InteroceptiveUpdatedInbox, LlmAccess, Module};
 use nuillu_types::{ModuleId, PolicyIndex, PolicyRank};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -90,7 +88,6 @@ pub enum PolicyCompactionTools {
 pub struct PolicyCompactionModule {
     owner: ModuleId,
     interoception_updates: InteroceptiveUpdatedInbox,
-    allocation: AllocationReader,
     blackboard: BlackboardReader,
     compactor: PolicyCompactor,
     llm: LlmAccess,
@@ -100,7 +97,6 @@ pub struct PolicyCompactionModule {
 impl PolicyCompactionModule {
     pub fn new(
         interoception_updates: InteroceptiveUpdatedInbox,
-        allocation: AllocationReader,
         blackboard: BlackboardReader,
         compactor: PolicyCompactor,
         llm: LlmAccess,
@@ -108,7 +104,6 @@ impl PolicyCompactionModule {
         Self {
             owner: ModuleId::new(<Self as Module>::id()).expect("policy-compaction id is valid"),
             interoception_updates,
-            allocation,
             blackboard,
             compactor,
             llm,
@@ -144,18 +139,10 @@ impl PolicyCompactionModule {
             .into_iter()
             .map(|record| policy_record_to_view(record, &reinforcement_counts, None))
             .collect::<Vec<_>>();
-        let allocation = self.allocation.snapshot().await;
-        let allocation_guidance = allocation
-            .iter()
-            .filter_map(|(id, config)| {
-                let guidance = config.guidance.trim();
-                (!guidance.is_empty()).then(|| (id.to_string(), guidance.to_owned()))
-            })
-            .collect::<Vec<_>>();
 
-        let mut input = ModelInput::new().system(self.system_prompt(cx)).user(
-            format_policy_compaction_context(&policy_views, &allocation_guidance),
-        );
+        let mut input = ModelInput::new()
+            .system(self.system_prompt(cx))
+            .user(format_policy_compaction_context(&policy_views));
 
         for _ in 0..6 {
             let lutum = self.llm.lutum().await;
@@ -337,10 +324,7 @@ fn policy_record_to_view(
     }
 }
 
-fn format_policy_compaction_context(
-    policies: &[PolicyContentView],
-    allocation_guidance: &[(String, String)],
-) -> String {
+fn format_policy_compaction_context(policies: &[PolicyContentView]) -> String {
     let mut out = String::from("Policy compaction context.");
     out.push_str("\n\nPolicy candidates:");
     if policies.is_empty() {
@@ -362,14 +346,6 @@ fn format_policy_compaction_context(
             ));
         }
     }
-    out.push_str("\n\nCurrent compaction guidance:");
-    if allocation_guidance.is_empty() {
-        out.push_str("\n- none");
-    } else {
-        for (id, guidance) in allocation_guidance {
-            out.push_str(&format!("\n- {id}: {guidance}"));
-        }
-    }
     out
 }
 
@@ -383,12 +359,6 @@ impl Module for PolicyCompactionModule {
 
     fn peer_context() -> Option<&'static str> {
         None
-    }
-
-    fn allocation_hint() -> Option<&'static str> {
-        Some(
-            "Raise policy-compaction during maintenance when learned policies may contain redundant non-Core patterns. Keep it low when new guidance, outcome learning, or Core policy preservation is the issue.",
-        )
     }
 
     async fn next_batch(&mut self) -> Result<Self::Batch> {

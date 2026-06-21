@@ -173,8 +173,8 @@ mod tests {
 
     use async_trait::async_trait;
     use nuillu_blackboard::{
-        ActivationRatio, Blackboard, BlackboardCommand, Bpm, ModuleConfig, ModulePolicy,
-        ResourceAllocation, linear_ratio_fn,
+        ActivationRatio, Blackboard, BlackboardCommand, Bpm, ModulePolicy, ResourceAllocation,
+        linear_ratio_fn,
     };
     use nuillu_types::{ReplicaCapRange, ReplicaIndex};
 
@@ -238,7 +238,6 @@ mod tests {
     #[tokio::test]
     async fn dispatches_only_to_active_gate_replicas() {
         let mut allocation = ResourceAllocation::default();
-        allocation.set(gate_id(), ModuleConfig::default());
         allocation.set_activation(gate_id(), ActivationRatio::from_f64(0.5));
         let blackboard = Blackboard::with_allocation(allocation);
         install_gate_policy(&blackboard).await;
@@ -265,7 +264,6 @@ mod tests {
     #[tokio::test]
     async fn dispatch_skips_fully_disabled_gate_without_replica_zero_fallback() {
         let mut allocation = ResourceAllocation::default();
-        allocation.set(gate_id(), ModuleConfig::default());
         allocation.set_activation(gate_id(), ActivationRatio::ZERO);
         let blackboard = Blackboard::with_allocation(allocation);
         install_gate_policy(&blackboard).await;

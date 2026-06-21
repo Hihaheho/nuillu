@@ -127,12 +127,6 @@ impl Module for PredictModule {
         )
     }
 
-    fn allocation_hint() -> Option<&'static str> {
-        Some(
-            "Raise predict when current cognition needs an expectation about likely next states or what would count as surprising. Keep it low for static facts, resolved outcomes, or recall-only work.",
-        )
-    }
-
     async fn next_batch(&mut self) -> Result<Self::Batch> {
         PredictModule::next_batch(self).await
     }

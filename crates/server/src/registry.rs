@@ -1,8 +1,6 @@
 use std::rc::Rc;
 
-use nuillu_blackboard::{
-    ActivationRatio, Bpm, ModuleConfig, ModulePolicy, ResourceAllocation, linear_ratio_fn,
-};
+use nuillu_blackboard::{ActivationRatio, Bpm, ModulePolicy, ResourceAllocation, linear_ratio_fn};
 use nuillu_memory::MemoryCapabilities;
 use nuillu_module::ModuleRegistry;
 use nuillu_reward::PolicyCapabilities;
@@ -157,7 +155,6 @@ fn register_server_module(
             registry.register_server(spec, move |caps| async move {
                 Ok(nuillu_self_model::SelfModelModule::new(
                     caps.cognition_log_updated_inbox(),
-                    caps.allocation_reader(),
                     caps.blackboard_reader(),
                     caps.cognition_log_reader(),
                     caps.memo(),
@@ -198,7 +195,6 @@ fn register_server_module(
                 async move {
                     Ok(nuillu_memory::MemoryModule::new(
                         caps.cognition_log_evicted_inbox(),
-                        caps.allocation_reader(),
                         caps.memory_metadata_reader(),
                         memory_caps.writer(),
                         memory_caps.retriever(),
@@ -312,7 +308,6 @@ fn register_server_module(
                         caps.cognition_log_updated_inbox(),
                         caps.blackboard_reader(),
                         caps.cognition_log_reader(),
-                        caps.allocation_reader(),
                         caps.interoception_reader(),
                         policy_caps.searcher(),
                         caps.memo(),
@@ -334,7 +329,6 @@ fn register_server_module(
                 async move {
                     Ok(nuillu_reward::PolicyCompactionModule::new(
                         caps.interoception_updated_inbox(),
-                        caps.allocation_reader(),
                         caps.blackboard_reader(),
                         policy_caps.compactor(),
                         caps.llm("main").with_tier(main_tier).into(),
@@ -498,7 +492,6 @@ fn policy(module: &ServerModuleSpec) -> ModulePolicy {
 }
 
 fn set_allocation_module(allocation: &mut ResourceAllocation, id: ModuleId, activation_ratio: f64) {
-    allocation.set(id.clone(), ModuleConfig::default());
     allocation.set_activation(id, ActivationRatio::from_f64(activation_ratio));
 }
 
@@ -577,6 +570,6 @@ mod tests {
             allocation.activation_for(&builtin::speak()),
             ActivationRatio::from_f64(0.75)
         );
-        assert_eq!(allocation.get(&builtin::policy()), None);
+        assert!(!allocation.has_activation(&builtin::policy()));
     }
 }

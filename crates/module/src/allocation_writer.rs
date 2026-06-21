@@ -3,7 +3,7 @@ use std::rc::Rc;
 
 use nuillu_blackboard::{
     AllocationCommand, AllocationEffectKind, AllocationEffectPolicy, Blackboard, BlackboardCommand,
-    ModuleConfig, ResourceAllocation,
+    ResourceAllocation,
 };
 use nuillu_types::{ModuleId, ModuleInstanceId};
 
@@ -62,17 +62,9 @@ impl AllocationWriter {
                         continue;
                     }
                     targets.set_activation(
-                        command.module.clone(),
+                        command.module,
                         self.effect_policy.target_ratio(command.level),
                     );
-                    if let Some(guidance) = command.guidance {
-                        targets.set(
-                            command.module,
-                            ModuleConfig {
-                                guidance: guidance.trim().to_owned(),
-                            },
-                        );
-                    }
                 }
                 AllocationEffectKind::Suppression => {
                     if !self.is_allowed(

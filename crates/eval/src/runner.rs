@@ -21,9 +21,8 @@ use lutum_libsql_adapter::{LibsqlAgentStore, LibsqlAgentStoreConfig};
 use nuillu_agent::{AgentEventLoopConfig, run as run_agent};
 use nuillu_blackboard::{
     ActivationRatio, Blackboard, BlackboardCommand, BlackboardInner, Bpm, CognitionLogEntry,
-    CognitionLogEntryRecord, CognitionLogOrigin, MemoLogRecord, MemoryMetadata, ModuleConfig,
-    ModulePolicy, ModuleRunStatus, PolicyMetaPatch, ResourceAllocation, ZeroReplicaWindowPolicy,
-    linear_ratio_fn,
+    CognitionLogEntryRecord, CognitionLogOrigin, MemoLogRecord, MemoryMetadata, ModulePolicy,
+    ModuleRunStatus, PolicyMetaPatch, ResourceAllocation, ZeroReplicaWindowPolicy, linear_ratio_fn,
 };
 use nuillu_memory::{
     LinkedMemoryQuery, MemoryCapabilities, MemoryLinkDirection, MemoryLinkRelation, MemoryQuery,
@@ -2414,7 +2413,6 @@ async fn execute_module_case(
                         &blackboard,
                         &harness,
                         &prompt,
-                        &run_target_module,
                         step,
                         &case_id_for_activation,
                         &sensory,
@@ -2427,7 +2425,6 @@ async fn execute_module_case(
                         &blackboard,
                         &harness,
                         &prompt,
-                        &run_target_module,
                         &memo_seed_records,
                         &cognition_seed_records,
                         has_cognition_log_seed,
@@ -2468,7 +2465,6 @@ async fn execute_module_case(
                                 &blackboard,
                                 &harness,
                                 &prompt,
-                                &run_target_module,
                                 step,
                                 &case_id_for_activation,
                                 &sensory,
@@ -2481,7 +2477,6 @@ async fn execute_module_case(
                                 &blackboard,
                                 &harness,
                                 &prompt,
-                                &run_target_module,
                                 &memo_seed_records,
                                 &cognition_seed_records,
                                 has_cognition_log_seed,
@@ -2633,7 +2628,6 @@ async fn execute_module_case(
                             &blackboard,
                             &harness,
                             &prompt,
-                            &run_target_module,
                             &module_steps[module_step_index],
                             &case_id_for_activation,
                             &sensory,
@@ -2721,7 +2715,6 @@ async fn activate_module_case_target(
     blackboard: &Blackboard,
     harness: &InternalHarnessIo,
     prompt: &str,
-    run_target_module: &ModuleId,
     memo_seed_records: &[MemoLogRecord],
     cognition_seed_records: &[CognitionLogEntryRecord],
     has_cognition_log_seed: bool,
@@ -2732,23 +2725,9 @@ async fn activate_module_case_target(
 ) {
     match target {
         ModuleEvalTarget::Sensory => {
-            let mut allocation = blackboard.read(|bb| bb.allocation().clone()).await;
-            let mut config = allocation.for_module(run_target_module);
-            config.guidance = prompt.to_string();
-            allocation.set(run_target_module.clone(), config);
-            blackboard
-                .apply(BlackboardCommand::SetAllocation(allocation))
-                .await;
             publish_full_agent_inputs(case_id, inputs, sensory, clock, None).await;
         }
         ModuleEvalTarget::CognitionGate => {
-            let mut allocation = blackboard.read(|bb| bb.allocation().clone()).await;
-            let mut config = allocation.for_module(run_target_module);
-            config.guidance = prompt.to_string();
-            allocation.set(run_target_module.clone(), config);
-            blackboard
-                .apply(BlackboardCommand::SetAllocation(allocation))
-                .await;
             for record in memo_seed_records {
                 harness
                     .memo_updated_mailbox()
@@ -2772,13 +2751,6 @@ async fn activate_module_case_target(
                 .expect("module eval failed to publish MemoUpdated");
         }
         ModuleEvalTarget::QueryMemory => {
-            let mut allocation = blackboard.read(|bb| bb.allocation().clone()).await;
-            let mut config = allocation.for_module(run_target_module);
-            config.guidance = prompt.to_string();
-            allocation.set(run_target_module.clone(), config);
-            blackboard
-                .apply(BlackboardCommand::SetAllocation(allocation))
-                .await;
             harness
                 .cognition_log_updated_mailbox()
                 .publish(CognitionLogUpdated::EntryAppended {
@@ -2788,13 +2760,6 @@ async fn activate_module_case_target(
                 .expect("module eval failed to publish CognitionLogUpdated");
         }
         ModuleEvalTarget::AttentionSchema => {
-            let mut allocation = blackboard.read(|bb| bb.allocation().clone()).await;
-            let mut config = allocation.for_module(run_target_module);
-            config.guidance = prompt.to_string();
-            allocation.set(run_target_module.clone(), config);
-            blackboard
-                .apply(BlackboardCommand::SetAllocation(allocation))
-                .await;
             for record in memo_seed_records {
                 harness
                     .memo_updated_mailbox()
@@ -2833,13 +2798,6 @@ async fn activate_module_case_target(
             }
         }
         ModuleEvalTarget::SelfModel => {
-            let mut allocation = blackboard.read(|bb| bb.allocation().clone()).await;
-            let mut config = allocation.for_module(run_target_module);
-            config.guidance = prompt.to_string();
-            allocation.set(run_target_module.clone(), config);
-            blackboard
-                .apply(BlackboardCommand::SetAllocation(allocation))
-                .await;
             harness
                 .cognition_log_updated_mailbox()
                 .publish(CognitionLogUpdated::EntryAppended {
@@ -2849,13 +2807,6 @@ async fn activate_module_case_target(
                 .expect("module eval failed to publish CognitionLogUpdated");
         }
         ModuleEvalTarget::Memory => {
-            let mut allocation = blackboard.read(|bb| bb.allocation().clone()).await;
-            let mut config = allocation.for_module(run_target_module);
-            config.guidance = prompt.to_string();
-            allocation.set(run_target_module.clone(), config);
-            blackboard
-                .apply(BlackboardCommand::SetAllocation(allocation))
-                .await;
             if has_cognition_log_seed {
                 for record in cognition_seed_records {
                     harness
@@ -2870,13 +2821,6 @@ async fn activate_module_case_target(
         | ModuleEvalTarget::MemoryAssociation
         | ModuleEvalTarget::MemoryRecombination
         | ModuleEvalTarget::PolicyCompaction => {
-            let mut allocation = blackboard.read(|bb| bb.allocation().clone()).await;
-            let mut config = allocation.for_module(run_target_module);
-            config.guidance = prompt.to_string();
-            allocation.set(run_target_module.clone(), config);
-            blackboard
-                .apply(BlackboardCommand::SetAllocation(allocation))
-                .await;
             harness
                 .interoception_updated_mailbox()
                 .publish(nuillu_module::InteroceptiveUpdated)
@@ -2940,13 +2884,6 @@ async fn activate_module_case_target(
             }
         }
         ModuleEvalTarget::Surprise => {
-            let mut allocation = blackboard.read(|bb| bb.allocation().clone()).await;
-            let mut config = allocation.for_module(run_target_module);
-            config.guidance = prompt.to_string();
-            allocation.set(run_target_module.clone(), config);
-            blackboard
-                .apply(BlackboardCommand::SetAllocation(allocation))
-                .await;
             if has_cognition_log_seed {
                 harness
                     .cognition_log_updated_mailbox()
@@ -2961,13 +2898,6 @@ async fn activate_module_case_target(
             }
         }
         ModuleEvalTarget::Allocation => {
-            let mut allocation = blackboard.read(|bb| bb.allocation().clone()).await;
-            let mut config = allocation.for_module(run_target_module);
-            config.guidance = prompt.to_string();
-            allocation.set(run_target_module.clone(), config);
-            blackboard
-                .apply(BlackboardCommand::SetAllocation(allocation))
-                .await;
             for record in memo_seed_records {
                 harness
                     .memo_updated_mailbox()
@@ -2999,7 +2929,6 @@ async fn activate_module_case_step(
     blackboard: &Blackboard,
     harness: &InternalHarnessIo,
     prompt: &str,
-    run_target_module: &ModuleId,
     step: &ModuleEvalStep,
     case_id: &str,
     sensory: &SensoryInputMailbox,
@@ -3019,7 +2948,6 @@ async fn activate_module_case_step(
         blackboard,
         harness,
         prompt,
-        run_target_module,
         &memo_seed_records,
         &cognition_seed_records,
         !step.cognition_log.is_empty(),
@@ -3103,15 +3031,10 @@ fn format_allocation_snapshot(allocation: &ResourceAllocation) -> String {
         .into_iter()
         .map(|(module, obs)| {
             format!(
-                "{}: activation_ratio={:.2}, active_replicas={}, guidance={}",
+                "{}: activation_ratio={:.2}, active_replicas={}",
                 module,
                 obs.activation_ratio.as_f64(),
-                obs.active_replicas,
-                if obs.guidance.trim().is_empty() {
-                    "(none)".to_string()
-                } else {
-                    obs.guidance.trim().to_string()
-                }
+                obs.active_replicas
             )
         })
         .collect::<Vec<_>>()
@@ -5127,7 +5050,7 @@ fn register_eval_module(
                 )
                 .expect("eval module registration should be unique")
         }
-        // On-demand: fires on cognition-log updates and reads controller guidance as context.
+        // On-demand: fires on cognition-log updates and reads current context.
         EvalModule::SelfModel => {
             let main_tier = eval_session_tier(module, "main");
             registry
@@ -5137,7 +5060,6 @@ fn register_eval_module(
                     move |caps| async move {
                         Ok(nuillu_self_model::SelfModelModule::new(
                             caps.cognition_log_updated_inbox(),
-                            caps.allocation_reader(),
                             caps.blackboard_reader(),
                             caps.cognition_log_reader(),
                             caps.memo(),
@@ -5195,7 +5117,6 @@ fn register_eval_module(
                         async move {
                             Ok(nuillu_memory::MemoryModule::new(
                                 caps.cognition_log_evicted_inbox(),
-                                caps.allocation_reader(),
                                 caps.memory_metadata_reader(),
                                 memory_caps.writer(),
                                 memory_caps.retriever(),
@@ -5343,7 +5264,6 @@ fn register_eval_module(
                                 caps.cognition_log_updated_inbox(),
                                 caps.blackboard_reader(),
                                 caps.cognition_log_reader(),
-                                caps.allocation_reader(),
                                 caps.interoception_reader(),
                                 policy_caps.searcher(),
                                 caps.memo(),
@@ -5373,7 +5293,6 @@ fn register_eval_module(
                         async move {
                             Ok(nuillu_reward::PolicyCompactionModule::new(
                                 caps.interoception_updated_inbox(),
-                                caps.allocation_reader(),
                                 caps.blackboard_reader(),
                                 policy_caps.compactor(),
                                 caps.llm("main").with_tier(main_tier).into(),
@@ -5577,7 +5496,6 @@ fn module_allocation(
     for module in modules {
         let is_target = *module == target_module;
         let id = module.module_id();
-        allocation.set(id.clone(), ModuleConfig::default());
         allocation.set_activation(
             id,
             if is_target {
@@ -5591,7 +5509,6 @@ fn module_allocation(
 }
 
 fn set_allocation_module(allocation: &mut ResourceAllocation, id: ModuleId, activation_ratio: f64) {
-    allocation.set(id.clone(), ModuleConfig::default());
     allocation.set_activation(id, ActivationRatio::from_f64(activation_ratio));
 }
 
@@ -5790,7 +5707,6 @@ fn visualizer_blackboard_snapshot(bb: &BlackboardInner) -> BlackboardSnapshot {
                     module: module.module,
                     activation_ratio: module.activation_ratio,
                     active_replicas: module.active_replicas,
-                    guidance: module.guidance.as_str().to_owned(),
                 }
             })
             .collect(),
@@ -5879,15 +5795,15 @@ fn memo_log_dumps(bb: &BlackboardInner) -> Vec<MemoLogDump> {
 
 fn allocation_module_dumps(allocation: &ResourceAllocation) -> Vec<AllocationModuleDump> {
     let mut modules = allocation
-        .iter()
-        .map(|(module, config)| AllocationModuleDump {
+        .module_ids()
+        .into_iter()
+        .map(|module| AllocationModuleDump {
             module: module.as_str().to_owned(),
-            activation_ratio: allocation.activation_for(module).as_f64(),
-            active_replicas: allocation.active_replicas(module),
+            activation_ratio: allocation.activation_for(&module).as_f64(),
+            active_replicas: allocation.active_replicas(&module),
             period_ms: allocation
-                .bpm_for(module)
+                .bpm_for(&module)
                 .map(|bpm| duration_millis_u64(bpm.period())),
-            guidance: DumpText::new(config.guidance.clone()),
         })
         .collect::<Vec<_>>();
     modules.sort_by(|left, right| left.module.cmp(&right.module));
@@ -6050,7 +5966,6 @@ struct AllocationModuleObservation {
     activation_ratio: ActivationRatio,
     active_replicas: u8,
     period_ms: Option<u64>,
-    guidance: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -6134,17 +6049,17 @@ fn allocation_observation(
     allocation: &ResourceAllocation,
 ) -> BTreeMap<String, AllocationModuleObservation> {
     allocation
-        .iter()
-        .map(|(module, config)| {
+        .module_ids()
+        .into_iter()
+        .map(|module| {
             (
                 module.as_str().to_owned(),
                 AllocationModuleObservation {
-                    activation_ratio: allocation.activation_for(module),
-                    active_replicas: allocation.active_replicas(module),
+                    activation_ratio: allocation.activation_for(&module),
+                    active_replicas: allocation.active_replicas(&module),
                     period_ms: allocation
-                        .bpm_for(module)
+                        .bpm_for(&module)
                         .map(|bpm| duration_millis_u64(bpm.period())),
-                    guidance: config.guidance.clone(),
                 },
             )
         })
@@ -6172,7 +6087,7 @@ fn active_module_observations(bb: &BlackboardInner) -> Vec<ActiveModuleObservati
         .module_policies()
         .keys()
         .cloned()
-        .chain(bb.allocation().iter().map(|(module, _)| module.clone()))
+        .chain(bb.allocation().module_ids())
         .collect::<Vec<_>>();
     modules.sort_by(|left, right| left.as_str().cmp(right.as_str()));
     modules.dedup();
@@ -9574,12 +9489,6 @@ limits {
     async fn agent_observation_serializes_string_keyed_blackboard_maps() {
         let now = Utc.with_ymd_and_hms(2026, 5, 7, 0, 0, 0).unwrap();
         let mut allocation = ResourceAllocation::default();
-        allocation.set(
-            builtin::query_memory(),
-            ModuleConfig {
-                guidance: "test guidance".into(),
-            },
-        );
         allocation.set_activation(builtin::query_memory(), ActivationRatio::ONE);
         let blackboard = Blackboard::with_allocation(allocation.clone());
         let owner = ModuleInstanceId::new(builtin::query_memory(), ReplicaIndex::ZERO);
@@ -9675,7 +9584,6 @@ limits {
                     "activation_ratio": 1.0,
                     "active_replicas": 0,
                     "period_ms": 1000,
-                    "guidance": "test guidance",
                 },
             },
             "allocation_proposals": {
@@ -9684,7 +9592,6 @@ limits {
                         "activation_ratio": 1.0,
                         "active_replicas": 0,
                         "period_ms": null,
-                        "guidance": "test guidance",
                     },
                 },
             },
@@ -9805,14 +9712,12 @@ prompt = "Admit retrieved memory evidence only if it is load-bearing for the cur
     }
 
     #[tokio::test]
-    async fn allocation_eval_bootstrap_guidance_is_not_completion() {
+    async fn allocation_eval_bootstrap_activation_is_not_completion() {
         let blackboard = Blackboard::default();
         let controller = builtin::allocation();
 
         let mut allocation = blackboard.read(|bb| bb.allocation().clone()).await;
-        let mut config = allocation.for_module(&controller);
-        config.guidance = "Assign activation priorities for the current memo batch.".to_string();
-        allocation.set(controller.clone(), config);
+        allocation.set_activation(controller.clone(), ActivationRatio::ONE);
         blackboard
             .apply(BlackboardCommand::SetAllocation(allocation))
             .await;
@@ -10067,8 +9972,8 @@ prompt = "What am I attending to?"
             },
             &selected,
         );
-        assert!(allocation.get(&builtin::query_memory()).is_none());
-        assert!(allocation.get(&builtin::speak_gate()).is_none());
+        assert!(!allocation.has_activation(&builtin::query_memory()));
+        assert!(!allocation.has_activation(&builtin::speak_gate()));
 
         let blackboard = Blackboard::with_allocation(allocation);
         let caps = test_caps(blackboard.clone());
@@ -10108,8 +10013,9 @@ prompt = "What am I attending to?"
                 replica_caps.sort();
                 let mut allocation_modules = bb
                     .allocation()
-                    .iter()
-                    .map(|(module, _)| module.as_str().to_owned())
+                    .module_ids()
+                    .into_iter()
+                    .map(|module| module.as_str().to_owned())
                     .collect::<Vec<_>>();
                 allocation_modules.sort();
                 (replica_caps, allocation_modules)
@@ -10264,10 +10170,6 @@ prompt = "What am I attending to?"
         assert_eq!(
             allocation.activation_for(&builtin::interoception()),
             ActivationRatio::ONE
-        );
-        assert_eq!(
-            allocation.for_module(&builtin::interoception()).guidance,
-            ""
         );
         assert_eq!(
             allocation.activation_for(&builtin::homeostasis()),

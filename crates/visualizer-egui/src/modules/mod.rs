@@ -201,7 +201,6 @@ pub struct ModuleOverviewRow {
     pub activation_ratio: Option<f64>,
     pub active_replicas: Option<u8>,
     pub tier: Option<String>,
-    pub guidance: Option<String>,
     pub bpm: Option<f64>,
     pub period_ms: Option<u64>,
     pub policy: Option<ModulePolicyView>,
@@ -1694,7 +1693,7 @@ fn overview_row(
                 &row.activation_ratio
                     .map(|ratio| format!("{ratio:.2}"))
                     .unwrap_or_else(|| "-".to_string()),
-                row.guidance.as_deref(),
+                None,
                 ALLOCATION_COLUMN_WIDTH,
             );
             overview_label_cell(
@@ -2252,7 +2251,6 @@ fn upsert_overview_row<'a>(
             activation_ratio: None,
             active_replicas: None,
             tier: None,
-            guidance: None,
             bpm: None,
             period_ms: None,
             policy: None,
@@ -2277,7 +2275,6 @@ fn apply_allocation_to_row(row: &mut ModuleOverviewRow, allocation: &AllocationV
     row.active_replicas = Some(allocation.active_replicas);
     row.bpm = allocation.bpm;
     row.period_ms = allocation.period_ms;
-    row.guidance = (!allocation.guidance.is_empty()).then(|| allocation.guidance.clone());
 }
 
 fn overview_row_visible(row: &ModuleOverviewRow) -> bool {
@@ -3168,7 +3165,6 @@ mod tests {
             activation_ratio,
             active_replicas: active.then_some(1),
             tier: Some("Default".to_string()),
-            guidance: None,
             bpm: None,
             period_ms: None,
             policy: None,
@@ -4256,7 +4252,6 @@ mod tests {
                 active_replicas: 1,
                 bpm: Some(9.0),
                 period_ms: Some(6667),
-                guidance: String::new(),
             }],
             ..BlackboardSnapshot::default()
         };
@@ -4302,7 +4297,6 @@ mod tests {
                 active_replicas: 1,
                 bpm: Some(18.0),
                 period_ms: Some(3333),
-                guidance: String::new(),
             }],
             module_policies: vec![ModulePolicyView {
                 module: "sensory".to_string(),
@@ -4738,7 +4732,6 @@ mod tests {
                 active_replicas: 1,
                 bpm: None,
                 period_ms: None,
-                guidance: String::new(),
             }],
             ..BlackboardSnapshot::default()
         };
@@ -5260,7 +5253,6 @@ mod tests {
                 active_replicas: 1,
                 bpm: Some(20.0),
                 period_ms: Some(3000),
-                guidance: String::new(),
             }],
             ..BlackboardSnapshot::default()
         };
@@ -5311,7 +5303,6 @@ mod tests {
                 active_replicas: 1,
                 bpm: Some(20.0),
                 period_ms: Some(3000),
-                guidance: String::new(),
             }],
             ..BlackboardSnapshot::default()
         };
@@ -5444,7 +5435,6 @@ mod tests {
                 active_replicas: 1,
                 bpm: Some(12.5),
                 period_ms: Some(3000),
-                guidance: "inspect recent input".to_string(),
             }],
             ..BlackboardSnapshot::default()
         };
@@ -5466,7 +5456,6 @@ mod tests {
                 activation_ratio: Some(0.75),
                 active_replicas: Some(1),
                 tier: Some("Premium".to_string()),
-                guidance: Some("inspect recent input".to_string()),
                 bpm: Some(12.5),
                 period_ms: Some(3000),
                 policy: None,
@@ -5500,7 +5489,6 @@ mod tests {
             activation_ratio: Some(1.0),
             active_replicas: Some(2),
             tier: Some("Default".to_string()),
-            guidance: None,
             bpm: None,
             period_ms: None,
             policy: None,

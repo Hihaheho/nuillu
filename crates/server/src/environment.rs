@@ -697,7 +697,7 @@ mod tests {
         sync::atomic::{AtomicU64, Ordering},
     };
 
-    use nuillu_blackboard::{ActivationRatio, Bpm, ModuleConfig, ModulePolicy, linear_ratio_fn};
+    use nuillu_blackboard::{ActivationRatio, Bpm, ModulePolicy, linear_ratio_fn};
     use nuillu_types::{ModuleId, ReplicaCapRange, builtin};
 
     use super::*;
@@ -809,12 +809,6 @@ mod tests {
         ];
 
         for (rank, module) in priority_modules.iter().cloned().enumerate() {
-            allocation.set(
-                module.clone(),
-                ModuleConfig {
-                    guidance: format!("priority {rank}"),
-                },
-            );
             allocation.set_activation(
                 module,
                 table.get(rank).copied().unwrap_or(ActivationRatio::ZERO),

@@ -6,10 +6,10 @@ use lutum::{
 use nuillu_blackboard::{CognitionLogEntryRecord, MemoLogRecord};
 use nuillu_module::ports::Clock;
 use nuillu_module::{
-    AllocationReader, BlackboardReader, CognitionLogReader, CognitionLogUpdatedInbox,
-    InteroceptiveReader, LlmAccess, LlmContextWindow, Memo, MemoUpdatedInbox, Module,
-    SessionAutoCompaction, SessionCompactionConfig, SessionCompactionProtectedPrefix,
-    compact_llm_context_text, ensure_persistent_session_seeded, format_bounded_cognition_log_batch,
+    BlackboardReader, CognitionLogReader, CognitionLogUpdatedInbox, InteroceptiveReader, LlmAccess,
+    LlmContextWindow, Memo, MemoUpdatedInbox, Module, SessionAutoCompaction,
+    SessionCompactionConfig, SessionCompactionProtectedPrefix, compact_llm_context_text,
+    ensure_persistent_session_seeded, format_bounded_cognition_log_batch,
     format_bounded_memo_log_batch, format_policy_system_prompt, format_system_seed,
 };
 use nuillu_types::{ModuleId, ModuleInstanceId, PolicyIndex, PolicyRank};
@@ -180,7 +180,6 @@ pub struct PolicyModule {
     cognition_updates: CognitionLogUpdatedInbox,
     blackboard: BlackboardReader,
     cognition: CognitionLogReader,
-    allocation: AllocationReader,
     interoception: InteroceptiveReader,
     searcher: PolicySearcher,
     memo: Memo,
@@ -203,7 +202,6 @@ impl PolicyModule {
         cognition_updates: CognitionLogUpdatedInbox,
         blackboard: BlackboardReader,
         cognition: CognitionLogReader,
-        allocation: AllocationReader,
         interoception: InteroceptiveReader,
         searcher: PolicySearcher,
         memo: Memo,
@@ -217,7 +215,6 @@ impl PolicyModule {
             cognition_updates,
             blackboard,
             cognition,
-            allocation,
             interoception,
             searcher,
             memo,
@@ -245,8 +242,7 @@ impl PolicyModule {
 
     async fn activate(&mut self, cx: &nuillu_module::ActivateCx<'_>) -> Result<()> {
         self.ensure_session_seeded(cx);
-        let allocation = self.allocation.snapshot().await;
-        let context = self.activation_context(&allocation).await;
+        let context = self.activation_context().await;
         let hits = self
             .searcher
             .search(&context.query_text, POLICY_SEARCH_LIMIT)
@@ -266,13 +262,10 @@ impl PolicyModule {
         Ok(())
     }
 
-    async fn activation_context(
-        &self,
-        allocation: &nuillu_blackboard::ResourceAllocation,
-    ) -> PolicyActivationContext {
+    async fn activation_context(&self) -> PolicyActivationContext {
         let memos = self.blackboard.unread_memo_logs().await;
         let cognition = self.cognition.unread_events().await;
-        let query_text = self.build_query(allocation, &memos, &cognition).await;
+        let query_text = self.build_query(&memos, &cognition).await;
         PolicyActivationContext {
             query_text: compact_llm_context_text(&query_text, POLICY_QUERY_CONTEXT_CHARS),
             memos,
@@ -282,18 +275,9 @@ impl PolicyModule {
 
     async fn build_query(
         &self,
-        allocation: &nuillu_blackboard::ResourceAllocation,
         memos: &[MemoLogRecord],
         cognition: &[CognitionLogEntryRecord],
     ) -> String {
-        let guidance = allocation
-            .for_module(&self.owner)
-            .guidance
-            .trim()
-            .to_owned();
-        if !guidance.is_empty() {
-            return guidance;
-        }
         if let Some(entry) = cognition.last() {
             return entry.entry.text.clone();
         }
@@ -686,12 +670,6 @@ impl Module for PolicyModule {
         None
     }
 
-    fn allocation_hint() -> Option<&'static str> {
-        Some(
-            "Raise policy when current cognition needs behavioral guidance, a reusable response pattern, or value-based tradeoff judgment. Keep it low for plain recall, sensory filtering, memory maintenance, or already-settled action.",
-        )
-    }
-
     async fn next_batch(&mut self) -> Result<Self::Batch> {
         tokio::select! {
             result = self.memo_updates.next_item() => {
@@ -989,7 +967,6 @@ mod tests {
                         caps.cognition_log_updated_inbox(),
                         caps.blackboard_reader(),
                         caps.cognition_log_reader(),
-                        caps.allocation_reader(),
                         caps.interoception_reader(),
                         policy_caps.searcher(),
                         caps.memo(),
@@ -1016,7 +993,7 @@ mod tests {
         lutum: &Lutum,
         now: chrono::DateTime<chrono::Utc>,
     ) -> nuillu_module::ActivateCx<'static> {
-        nuillu_module::ActivateCx::new(&[], &[], &[], &[], compaction_runtime(lutum), now)
+        nuillu_module::ActivateCx::new(&[], &[], &[], compaction_runtime(lutum), now)
     }
 
     fn activate_cx_with_identity<'a>(
@@ -1024,14 +1001,7 @@ mod tests {
         now: chrono::DateTime<chrono::Utc>,
         identity_memories: &'a [IdentityMemoryRecord],
     ) -> nuillu_module::ActivateCx<'a> {
-        nuillu_module::ActivateCx::new(
-            &[],
-            &[],
-            identity_memories,
-            &[],
-            compaction_runtime(lutum),
-            now,
-        )
+        nuillu_module::ActivateCx::new(&[], identity_memories, &[], compaction_runtime(lutum), now)
     }
 
     fn all_input_text(input: &ModelInput) -> String {
@@ -1147,12 +1117,6 @@ mod tests {
         );
         let mut module = build_policy_module(&caps, policy_caps).await;
         let mut allocation = nuillu_blackboard::ResourceAllocation::default();
-        allocation.set(
-            builtin::policy(),
-            nuillu_blackboard::ModuleConfig {
-                guidance: "answer the current bounded policy query".into(),
-            },
-        );
         allocation.set_activation(builtin::policy(), nuillu_blackboard::ActivationRatio::ONE);
         blackboard
             .apply(nuillu_blackboard::BlackboardCommand::SetAllocation(
@@ -1187,7 +1151,14 @@ mod tests {
                     cognition_owner.clone(),
                     nuillu_blackboard::CognitionLogEntry {
                         at: now + chrono::Duration::seconds(index),
-                        text: format!("cognition {index} {}", "C".repeat(1_200)),
+                        text: if index == 9 {
+                            format!(
+                                "answer the current bounded policy query {}",
+                                "C".repeat(1_200)
+                            )
+                        } else {
+                            format!("cognition {index} {}", "C".repeat(1_200))
+                        },
                         origin: nuillu_blackboard::CognitionLogOrigin::direct(
                             cognition_owner.clone(),
                         ),

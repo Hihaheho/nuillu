@@ -835,12 +835,6 @@ impl Module for RewardModule {
         None
     }
 
-    fn allocation_hint() -> Option<&'static str> {
-        Some(
-            "Raise reward when recent action or policy guidance has outcome evidence that should update future behavior. Keep it low before any outcome is visible or when the context has no policy-relevant consequence.",
-        )
-    }
-
     async fn next_batch(&mut self) -> Result<Self::Batch> {
         let Some(first) = self.policy_evictions.next_item().await else {
             anyhow::bail!("policy-consideration eviction inbox closed");
@@ -1046,7 +1040,7 @@ mod tests {
         lutum: &Lutum,
         now: chrono::DateTime<chrono::Utc>,
     ) -> nuillu_module::ActivateCx<'static> {
-        nuillu_module::ActivateCx::new(&[], &[], &[], &[], compaction_runtime(lutum), now)
+        nuillu_module::ActivateCx::new(&[], &[], &[], compaction_runtime(lutum), now)
     }
 
     fn all_input_text(input: &ModelInput) -> String {

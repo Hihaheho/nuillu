@@ -272,12 +272,6 @@ impl Module for AttentionSchemaModule {
         Some("Attention-schema forms a first-person model of what is currently held in attention.")
     }
 
-    fn allocation_hint() -> Option<&'static str> {
-        Some(
-            "Raise attention-schema when the current brain state suggests a meaningful shift in attention or a new first-person attention experience. Keep it low when attention has not meaningfully changed.",
-        )
-    }
-
     async fn next_batch(&mut self) -> Result<Self::Batch> {
         AttentionSchemaModule::next_batch(self).await
     }
@@ -406,7 +400,6 @@ mod tests {
 
     fn activate_cx(lutum: &Lutum, now: DateTime<Utc>) -> nuillu_module::ActivateCx<'static> {
         nuillu_module::ActivateCx::new(
-            &[],
             &[],
             &[],
             &[],
@@ -550,8 +543,6 @@ mod tests {
             "Instruction: Update the attention schema from only the new notes and cognition entries above."
         ));
         assert!(!first_user.contains("sensory"));
-        assert!(!first_user.contains("Current attention guidance"));
-        assert!(!first_user.contains("allocation guidance"));
         assert!(message_texts_with_role(&inputs[0], InputMessageRole::Developer).is_empty());
 
         let second_user_messages = message_texts_with_role(&inputs[1], InputMessageRole::User);
@@ -563,8 +554,6 @@ mod tests {
         assert!(!latest_user.contains("first fresh note about Koro"));
         assert!(!latest_user.contains("sensory"));
         assert!(!latest_user.contains("cognition-gate"));
-        assert!(!latest_user.contains("Current attention guidance"));
-        assert!(!latest_user.contains("allocation guidance"));
         assert!(message_texts_with_role(&inputs[1], InputMessageRole::Developer).is_empty());
     }
 }
