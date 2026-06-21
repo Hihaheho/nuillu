@@ -3,7 +3,7 @@ use std::collections::HashSet;
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use lutum::{ModelInput, Session, StagedTextStepOutcomeWithTools, TextStepOutcomeWithTools};
+use lutum::{ModelInput, Session, StagedTextStepOutcomeWithTools, StructuredTurnOutcome};
 use nuillu_module::{
     BlackboardReader, CognitionLogUpdatedInbox, LlmAccess, LlmContextWindow, Module,
     SessionAutoCompaction, SessionCompactionConfig, SessionCompactionProtectedPrefix, TypedMemo,
@@ -22,21 +22,18 @@ use crate::store::{
 const SYSTEM_PROMPT: &str = r#"You are the query-memory module.
 Retrieve memory evidence. Memory is not a fact table and retrieval must not decide current truth.
 Each activation has two possible LLM tool-call stages.
-First, plan retrieval by calling plan_memory_queries exactly once. Choose no_op only when the
-current state, previous session history, and recent cognition already contain enough context, or
-when memory evidence is clearly irrelevant. Do not use no_op to claim no relevant memory exists
-before searching when the current cognition asks for remembered facts, rules, procedures, people,
-places, objects, or past events. Memory inventory counts alone are not evidence that no relevant
-memory exists. Otherwise provide up to three concrete memory search queries.
+First, plan retrieval by calling plan_memory_queries exactly once with a concrete main_query and
+optional sub_queries. Query-memory exists to attempt recall; do not plan a no-op or explain that no
+memory is needed. The runtime will handle search misses, already-memoed evidence, and rejected
+evidence without writing a memo.
 Search for concrete requested facts, proper nouns, species/body/peer/world terms, route rules, and
-needed_fact phrases. Prefer limit 8 unless the request is obviously exact and narrow. Set
-include_linked when related context, procedures, rules, approach guidance, peer/body cues, or
-associations may be needed. Do not search for generic phrases such as "useful memory context" when
-a concrete question is available.
-The runtime executes searches and linked-memory fetches deterministically, then asks for evidence
-selection. In that second stage, call select_memory_evidence exactly once. Select only exact memory
-index strings from the provided tool result. Search hits are candidates, not automatic output.
-You may select flat hits and linked hits, or reject all evidence.
+needed_fact phrases. Do not search for generic phrases such as "useful memory context" when a
+concrete question is available.
+The runtime executes the planned searches, deduplicates already-memoed evidence, fetches linked
+memories deterministically for hits with linked neighbors, then asks for structured evidence
+selection. Select only exact memory index strings from the provided search results. Search hits are
+candidates; if the filter returns no valid selection, runtime may memo top fresh evidence as a
+deterministic fallback.
 Do not produce user-facing answers, decide final truth, explain results from outside tool output, or
 use plain assistant text as a data channel."#;
 
@@ -44,23 +41,20 @@ const COMPACTED_QUERY_MEMORY_SESSION_PREFIX: &str = "Compacted query-memory sess
 const MEMO_CONTEXT_WINDOW: LlmContextWindow = LlmContextWindow::new(8, 1_200, 4_800);
 const TOOL_TURN_MAX_OUTPUT_TOKENS: u32 = 768;
 const MAX_PLANNED_SEARCHES: usize = 3;
-const MAX_SEARCH_LIMIT: usize = 16;
+const MAX_SUB_QUERIES: usize = MAX_PLANNED_SEARCHES - 1;
+const PLANNED_SEARCH_LIMIT: usize = 8;
 const SESSION_COMPACTION_FOCUS: &str = r#"Preserve memo evidence, query requests, memory search
 arguments, useful memory hits, rejected broad searches, and allocation/cognition context that future
 retrieval should remember."#;
 const QUERY_PLAN_INSTRUCTION: &str = r#"Output instruction: call plan_memory_queries exactly once.
-Use disposition no_op when no memory retrieval is useful for this activation. Use disposition search
-with up to three concrete searches when memory evidence may help. If the current cognition asks
-about remembered facts, rules, procedures, people, places, objects, or past events and the memory
-inventory is nonempty, search before concluding there is no relevant memory. Memory inventory
-counts alone are not evidence that no relevant memory exists. Use limit 8 by default. Set
-include_linked=true for procedural/context questions where related memories may carry supporting
-evidence. Do not write plain assistant text."#;
-const EVIDENCE_SELECTION_INSTRUCTION: &str = r#"Output instruction: call select_memory_evidence
-exactly once. Select exact memory index strings from the fresh search result above, or reject all
-evidence. Include linked_hit_indexes when a linked hit adds supporting evidence or its link
-relationship is relevant to why the evidence belongs in memo, even if the same index is also
-present as a flat hit. Do not write plain assistant text."#;
+Use main_query for the best concrete memory search. Use sub_queries only for distinct alternate
+terms or facets, up to two strings. main_query must be nonblank. Do not write plain assistant text."#;
+const EVIDENCE_SELECTION_INSTRUCTION: &str = r#"Return structured evidence selection only.
+Select exact memory index strings from the fresh evidence candidates above in selected_indexes.
+Return an empty selected_indexes array only when no candidate is usable; runtime may apply
+deterministic top-evidence fallback when fresh candidates exist."#;
+const FALLBACK_FLAT_HIT_LIMIT: usize = 2;
+const FALLBACK_TOTAL_EVIDENCE_LIMIT: usize = 3;
 
 pub fn query_session_auto_compaction() -> SessionAutoCompaction {
     SessionAutoCompaction::new(
@@ -134,59 +128,39 @@ pub struct QueryMemoryLinkedHit {
     pub link: MemoryLink,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-#[serde(rename_all = "snake_case")]
-pub enum QueryMemoryPlanDisposition {
-    Search,
-    NoOp,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-pub struct PlannedMemorySearch {
-    pub query: String,
-    pub limit: usize,
-    #[serde(default)]
-    pub include_linked: bool,
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PlannedMemorySearch {
+    query: String,
+    limit: usize,
 }
 
 #[lutum::tool_input(name = "plan_memory_queries", output = PlanMemoryQueriesOutput)]
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct PlanMemoryQueriesArgs {
-    pub disposition: QueryMemoryPlanDisposition,
+    pub main_query: String,
     #[serde(default)]
-    pub searches: Vec<PlannedMemorySearch>,
-    #[serde(default)]
-    pub reason: String,
+    pub sub_queries: Vec<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct PlanMemoryExecutedSearch {
     pub query: String,
     pub limit: usize,
-    pub include_linked: bool,
     pub hit_indices: Vec<MemoryIndex>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct PlanMemoryQueriesOutput {
-    pub disposition: QueryMemoryPlanDisposition,
     pub searches: Vec<PlanMemoryExecutedSearch>,
     pub hits: Vec<QueryMemoryHit>,
     pub linked_hits: Vec<QueryMemoryLinkedHit>,
     pub message: String,
 }
 
-#[lutum::tool_input(name = "select_memory_evidence", output = SelectMemoryEvidenceOutput)]
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct SelectMemoryEvidenceArgs {
     #[serde(default)]
-    pub hit_indexes: Vec<MemoryIndex>,
-    #[serde(default)]
-    pub linked_hit_indexes: Vec<MemoryIndex>,
-    #[serde(default)]
-    pub reject_all: bool,
-    #[serde(default)]
-    pub reason: String,
+    pub selected_indexes: Vec<MemoryIndex>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -201,11 +175,6 @@ pub struct SelectMemoryEvidenceOutput {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema, lutum::Toolset)]
 pub enum QueryMemoryPlanTools {
     PlanMemoryQueries(PlanMemoryQueriesArgs),
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema, lutum::Toolset)]
-pub enum QueryMemoryFilterTools {
-    SelectMemoryEvidence(SelectMemoryEvidenceArgs),
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -468,35 +437,15 @@ impl QueryMemoryModule {
                     );
                 }
                 let QueryMemoryPlanToolsCall::PlanMemoryQueries(call) = round.tool_calls[0].clone();
-                let plan = normalize_plan(call.input.clone())?;
-
-                if matches!(plan.disposition, QueryMemoryPlanDisposition::NoOp) {
-                    let output = PlanMemoryQueriesOutput {
-                        disposition: QueryMemoryPlanDisposition::NoOp,
-                        searches: Vec::new(),
-                        hits: Vec::new(),
-                        linked_hits: Vec::new(),
-                        message: "planner chose no memory retrieval for this activation".to_owned(),
-                    };
-                    let result = call
-                        .complete(output)
-                        .context("complete plan_memory_queries no-op tool call")?;
-                    round
-                        .commit(&mut self.session, [result])
-                        .context("commit query-memory no-op planner round")?;
-                    cx.compact_and_save(&mut self.session, planner_usage)
-                        .await?;
-                    return Ok(());
-                }
+                let planned_searches = normalize_plan(call.input.clone())?;
 
                 let retrieval = self
-                    .execute_planned_searches(&plan.searches, cx.now())
+                    .execute_planned_searches(&planned_searches, cx.now())
                     .await
                     .context("execute planned memory searches")?;
                 let had_any_evidence = retrieval.has_evidence();
                 let retrieval = self.filter_recent_memo_evidence(retrieval).await;
                 let plan_output = PlanMemoryQueriesOutput {
-                    disposition: QueryMemoryPlanDisposition::Search,
                     searches: retrieval.executed_searches.clone(),
                     hits: retrieval.hits.clone(),
                     linked_hits: retrieval.linked_hits.clone(),
@@ -587,7 +536,7 @@ impl QueryMemoryModule {
                     continue;
                 }
                 search_hit_indices.push(hit.index.clone());
-                if search.include_linked && hit.linked_neighbor_count > 0 {
+                if hit.linked_neighbor_count > 0 {
                     linked_seed_indexes.push(hit.index.clone());
                 }
                 if seen_hits.insert(hit.index.clone()) {
@@ -603,7 +552,6 @@ impl QueryMemoryModule {
             retrieval.executed_searches.push(PlanMemoryExecutedSearch {
                 query: search.query.clone(),
                 limit: search.limit,
-                include_linked: search.include_linked,
                 hit_indices: search_hit_indices,
             });
 
@@ -635,7 +583,7 @@ impl QueryMemoryModule {
         requests: &[String],
         retrieval: &QueryMemoryRetrieval,
     ) -> Result<QueryMemoryFilterOutcome> {
-        let mut input = ModelInput::new()
+        let input = ModelInput::new()
             .system(nuillu_module::format_system_seed(
                 self.system_prompt(cx),
                 false,
@@ -645,44 +593,30 @@ impl QueryMemoryModule {
             .user(format_evidence_selection_request(requests, retrieval))
             .user(EVIDENCE_SELECTION_INSTRUCTION);
         let lutum = self.llm.lutum().await;
-        let outcome = lutum
-            .text_turn(input.clone())
-            .tools::<QueryMemoryFilterTools>()
-            .available_tools([QueryMemoryFilterToolsSelector::SelectMemoryEvidence])
-            .require_tool(QueryMemoryFilterToolsSelector::SelectMemoryEvidence)
+        let selection = match lutum
+            .structured_turn::<SelectMemoryEvidenceArgs>(input)
             .max_output_tokens(TOOL_TURN_MAX_OUTPUT_TOKENS)
-            .collect_controlled_with(nuillu_module::AbortOnAvailableToolNameInText::new())
+            .collect()
             .await
-            .context("query-memory filter text turn failed")?;
-
-        match outcome {
-            TextStepOutcomeWithTools::Finished(_) => {
-                bail!("query-memory filter finished without select_memory_evidence tool call")
-            }
-            TextStepOutcomeWithTools::FinishedNoOutput(_) => {
-                bail!("query-memory filter finished with no output")
-            }
-            TextStepOutcomeWithTools::NeedsTools(round) => {
-                nuillu_module::emit_trace_tool_calls(&round.tool_calls);
-                if round.tool_calls.len() != 1 {
-                    bail!(
-                        "query-memory filter must call select_memory_evidence exactly once, got {} calls",
-                        round.tool_calls.len()
-                    );
+        {
+            Ok(result) => match result.semantic {
+                StructuredTurnOutcome::Structured(args) if !args.selected_indexes.is_empty() => {
+                    args
                 }
-                let QueryMemoryFilterToolsCall::SelectMemoryEvidence(call) =
-                    round.tool_calls[0].clone();
-                let args = call.input.clone();
-                let outcome = self
-                    .build_filter_outcome(requests, retrieval, args.clone())
-                    .await?;
-                let result = call
-                    .complete(outcome.output.clone())
-                    .context("complete select_memory_evidence tool call")?;
-                round
-                    .commit_into(&mut input, [result])
-                    .context("commit query-memory filter tool round")?;
-                Ok(outcome)
+                StructuredTurnOutcome::Structured(_) => fallback_filter_selection(retrieval),
+                StructuredTurnOutcome::Refusal(_) => fallback_filter_selection(retrieval),
+            },
+            Err(_) => fallback_filter_selection(retrieval),
+        };
+
+        match self
+            .build_filter_outcome(requests, retrieval, selection.clone())
+            .await
+        {
+            Ok(outcome) => Ok(outcome),
+            Err(_) => {
+                self.build_filter_outcome(requests, retrieval, fallback_filter_selection(retrieval))
+                    .await
             }
         }
     }
@@ -731,10 +665,9 @@ impl QueryMemoryModule {
         retrieval: &QueryMemoryRetrieval,
         args: SelectMemoryEvidenceArgs,
     ) -> Result<QueryMemoryFilterOutcome> {
-        validate_filter_selection(retrieval, &args)?;
-
         let access_targets = usage_targets(&retrieval.hits, &retrieval.linked_hits);
-        if args.reject_all || (args.hit_indexes.is_empty() && args.linked_hit_indexes.is_empty()) {
+        let (selected_hits, selected_linked_hits) = resolve_filter_selection(retrieval, &args)?;
+        if selected_hits.is_empty() && selected_linked_hits.is_empty() {
             return Ok(QueryMemoryFilterOutcome {
                 args,
                 output: SelectMemoryEvidenceOutput {
@@ -750,9 +683,6 @@ impl QueryMemoryModule {
             });
         }
 
-        let selected_hits = select_hits(&retrieval.hits, &args.hit_indexes);
-        let selected_linked_hits =
-            select_linked_hits(&retrieval.linked_hits, &args.linked_hit_indexes);
         let hits = self.fresh_hits(&selected_hits).await;
         let linked_hits = self.fresh_linked_hits(&selected_linked_hits).await;
         let content = render_memo(requests, &retrieval.searches, &hits, &linked_hits);
@@ -924,109 +854,96 @@ impl QueryMemoryBatch {
     }
 }
 
-fn select_hits(hits: &[QueryMemoryHit], indexes: &[MemoryIndex]) -> Vec<QueryMemoryHit> {
-    let wanted = indexes.iter().cloned().collect::<HashSet<_>>();
-    let mut seen = HashSet::new();
-    hits.iter()
-        .filter(|hit| wanted.contains(&hit.index) && seen.insert(hit.index.clone()))
-        .cloned()
-        .collect()
-}
-
-fn select_linked_hits(
-    hits: &[QueryMemoryLinkedHit],
-    indexes: &[MemoryIndex],
-) -> Vec<QueryMemoryLinkedHit> {
-    let wanted = indexes.iter().cloned().collect::<HashSet<_>>();
-    let mut seen = HashSet::new();
-    hits.iter()
-        .filter(|hit| wanted.contains(&hit.index) && seen.insert(hit.index.clone()))
-        .cloned()
-        .collect()
-}
-
-fn normalize_plan(args: PlanMemoryQueriesArgs) -> Result<PlanMemoryQueriesArgs> {
-    match args.disposition {
-        QueryMemoryPlanDisposition::NoOp => {
-            if !args.searches.is_empty() {
-                bail!("query-memory planner used no_op disposition with planned searches");
-            }
-            Ok(PlanMemoryQueriesArgs {
-                disposition: QueryMemoryPlanDisposition::NoOp,
-                searches: Vec::new(),
-                reason: args.reason,
-            })
+fn normalize_plan(args: PlanMemoryQueriesArgs) -> Result<Vec<PlannedMemorySearch>> {
+    let main_query = args.main_query.trim().to_owned();
+    if main_query.is_empty() {
+        bail!("query-memory planner emitted a blank main_query");
+    }
+    let mut queries = vec![main_query];
+    for sub_query in args.sub_queries.into_iter().take(MAX_SUB_QUERIES) {
+        let sub_query = sub_query.trim().to_owned();
+        if sub_query.is_empty() {
+            bail!("query-memory planner emitted a blank sub_query");
         }
-        QueryMemoryPlanDisposition::Search => {
-            let searches = args
-                .searches
-                .into_iter()
-                .take(MAX_PLANNED_SEARCHES)
-                .map(|search| {
-                    let query = search.query.trim().to_owned();
-                    if query.is_empty() {
-                        bail!("query-memory planner emitted a blank search query");
-                    }
-                    Ok(PlannedMemorySearch {
-                        query,
-                        limit: search.limit.clamp(1, MAX_SEARCH_LIMIT),
-                        include_linked: search.include_linked,
-                    })
-                })
-                .collect::<Result<Vec<_>>>()?;
-            if searches.is_empty() {
-                bail!("query-memory planner used search disposition without searches");
-            }
-            Ok(PlanMemoryQueriesArgs {
-                disposition: QueryMemoryPlanDisposition::Search,
-                searches,
-                reason: args.reason,
-            })
+        if !queries.contains(&sub_query) {
+            queries.push(sub_query);
         }
     }
+
+    Ok(queries
+        .into_iter()
+        .map(|query| PlannedMemorySearch {
+            query,
+            limit: PLANNED_SEARCH_LIMIT,
+        })
+        .collect())
 }
 
-fn validate_filter_selection(
+fn fallback_filter_selection(retrieval: &QueryMemoryRetrieval) -> SelectMemoryEvidenceArgs {
+    let mut selected_indexes = Vec::new();
+    let mut seen = HashSet::new();
+
+    for hit in &retrieval.hits {
+        if selected_indexes.len() >= FALLBACK_FLAT_HIT_LIMIT {
+            break;
+        }
+        if seen.insert(hit.index.clone()) {
+            selected_indexes.push(hit.index.clone());
+        }
+    }
+
+    for hit in &retrieval.linked_hits {
+        if selected_indexes.len() >= FALLBACK_TOTAL_EVIDENCE_LIMIT {
+            break;
+        }
+        if seen.insert(hit.index.clone()) {
+            selected_indexes.push(hit.index.clone());
+        }
+    }
+
+    SelectMemoryEvidenceArgs { selected_indexes }
+}
+
+fn resolve_filter_selection(
     retrieval: &QueryMemoryRetrieval,
     args: &SelectMemoryEvidenceArgs,
-) -> Result<()> {
-    if args.reject_all && (!args.hit_indexes.is_empty() || !args.linked_hit_indexes.is_empty()) {
-        bail!("query-memory filter cannot reject_all and select evidence indexes");
+) -> Result<(Vec<QueryMemoryHit>, Vec<QueryMemoryLinkedHit>)> {
+    let mut unknown = Vec::new();
+    let mut seen = HashSet::new();
+    let mut selected_hits = Vec::new();
+    let mut selected_linked_hits = Vec::new();
+
+    for index in &args.selected_indexes {
+        if index.as_str().trim().is_empty() || !seen.insert(index.clone()) {
+            continue;
+        }
+        if let Some(hit) = retrieval
+            .linked_hits
+            .iter()
+            .find(|hit| hit.index == *index)
+            .cloned()
+        {
+            selected_linked_hits.push(hit);
+        } else if let Some(hit) = retrieval
+            .hits
+            .iter()
+            .find(|hit| hit.index == *index)
+            .cloned()
+        {
+            selected_hits.push(hit);
+        } else {
+            unknown.push(index.to_string());
+        }
     }
 
-    let flat_indexes = retrieval
-        .hits
-        .iter()
-        .map(|hit| hit.index.clone())
-        .collect::<HashSet<_>>();
-    let linked_indexes = retrieval
-        .linked_hits
-        .iter()
-        .map(|hit| hit.index.clone())
-        .collect::<HashSet<_>>();
-
-    let unknown_flat = args
-        .hit_indexes
-        .iter()
-        .filter(|index| !flat_indexes.contains(*index))
-        .map(ToString::to_string)
-        .collect::<Vec<_>>();
-    let unknown_linked = args
-        .linked_hit_indexes
-        .iter()
-        .filter(|index| !linked_indexes.contains(*index))
-        .map(ToString::to_string)
-        .collect::<Vec<_>>();
-
-    if !unknown_flat.is_empty() || !unknown_linked.is_empty() {
+    if !unknown.is_empty() {
         bail!(
-            "query-memory filter selected unknown evidence indexes; flat={}; linked={}",
-            unknown_flat.join(", "),
-            unknown_linked.join(", ")
+            "query-memory filter selected unknown evidence indexes: {}",
+            unknown.join(", ")
         );
     }
 
-    Ok(())
+    Ok((selected_hits, selected_linked_hits))
 }
 
 fn usage_targets(
@@ -1060,8 +977,9 @@ fn format_evidence_selection_request(
 ) -> String {
     let mut out = String::from("Select memo evidence from these deterministic memory results.");
     out.push_str(
-        " Use hit_indexes for directly retrieved flat evidence. Use linked_hit_indexes when the \
-         linked hit's content or relation adds evidence that should remain visible in memo.",
+        " Return selected_indexes as exact memory index strings from the fresh evidence candidates. \
+         Use an empty selected_indexes array only when no candidate is usable; runtime may apply \
+         deterministic top-evidence fallback when fresh candidates exist.",
     );
     out.push_str("\n\nMemory request(s):");
     for request in requests {
@@ -1082,12 +1000,12 @@ fn format_evidence_selection_request(
                 .join(", ")
         };
         out.push_str(&format!(
-            "\n- query: {}; limit: {}; include_linked: {}; hit indexes: {}",
-            search.query, search.limit, search.include_linked, hit_indices
+            "\n- query: {}; limit: {}; hit indexes: {}",
+            search.query, search.limit, hit_indices
         ));
     }
 
-    out.push_str("\n\nFlat hits available for hit_indexes:");
+    out.push_str("\n\nDirect search evidence candidates:");
     if retrieval.hits.is_empty() {
         out.push_str("\n- none");
     }
@@ -1102,7 +1020,7 @@ fn format_evidence_selection_request(
         ));
     }
 
-    out.push_str("\n\nLinked hits available for linked_hit_indexes:");
+    out.push_str("\n\nLinked evidence candidates:");
     if retrieval.linked_hits.is_empty() {
         out.push_str("\n- none");
     }
@@ -1128,14 +1046,8 @@ fn format_filter_decision_summary(
     output: &SelectMemoryEvidenceOutput,
 ) -> String {
     format!(
-        "Query-memory filter decision: reject_all={}; selected hit_indexes=[{}]; selected linked_hit_indexes=[{}]; memo_written={}; used_indexes=[{}]; reason={}",
-        args.reject_all,
-        args.hit_indexes
-            .iter()
-            .map(ToString::to_string)
-            .collect::<Vec<_>>()
-            .join(", "),
-        args.linked_hit_indexes
+        "Query-memory filter decision: selected_indexes=[{}]; memo_written={}; used_indexes=[{}]",
+        args.selected_indexes
             .iter()
             .map(ToString::to_string)
             .collect::<Vec<_>>()
@@ -1146,8 +1058,7 @@ fn format_filter_decision_summary(
             .iter()
             .map(ToString::to_string)
             .collect::<Vec<_>>()
-            .join(", "),
-        args.reason.trim()
+            .join(", ")
     )
 }
 
@@ -1303,9 +1214,9 @@ mod tests {
 
     use lutum::{
         AdapterStructuredTurn, AdapterTextTurn, AgentError, ErasedStructuredTurnEventStream,
-        ErasedTextTurnEventStream, FinishReason, Lutum, MockLlmAdapter, MockTextScenario,
-        ModelInputItem, RawTextTurnEvent, SharedPoolBudgetManager, SharedPoolBudgetOptions,
-        TurnAdapter, Usage,
+        ErasedTextTurnEventStream, FinishReason, Lutum, MockLlmAdapter, MockStructuredScenario,
+        MockTextScenario, ModelInput, ModelInputItem, RawStructuredTurnEvent, RawTextTurnEvent,
+        SharedPoolBudgetManager, SharedPoolBudgetOptions, TurnAdapter, Usage,
     };
     use nuillu_blackboard::{Blackboard, Bpm, ModulePolicy, TypedMemoLogRecord, linear_ratio_fn};
     use nuillu_module::ports::{NoopCognitionLogRepository, PortError, SystemClock};
@@ -1325,7 +1236,8 @@ mod tests {
     #[derive(Clone)]
     struct CapturingAdapter {
         inner: MockLlmAdapter,
-        text_inputs: Arc<Mutex<Vec<lutum::ModelInput>>>,
+        text_inputs: Arc<Mutex<Vec<ModelInput>>>,
+        structured_inputs: Arc<Mutex<Vec<ModelInput>>>,
     }
 
     impl CapturingAdapter {
@@ -1333,11 +1245,16 @@ mod tests {
             Self {
                 inner,
                 text_inputs: Arc::new(Mutex::new(Vec::new())),
+                structured_inputs: Arc::new(Mutex::new(Vec::new())),
             }
         }
 
-        fn text_inputs(&self) -> Vec<lutum::ModelInput> {
+        fn text_inputs(&self) -> Vec<ModelInput> {
             self.text_inputs.lock().unwrap().clone()
+        }
+
+        fn structured_inputs(&self) -> Vec<ModelInput> {
+            self.structured_inputs.lock().unwrap().clone()
         }
     }
 
@@ -1354,9 +1271,10 @@ mod tests {
 
         async fn structured_turn(
             &self,
-            input: lutum::ModelInput,
+            input: ModelInput,
             turn: AdapterStructuredTurn,
         ) -> Result<ErasedStructuredTurnEventStream, AgentError> {
+            self.structured_inputs.lock().unwrap().push(input.clone());
             self.inner.structured_turn(input, turn).await
         }
     }
@@ -1512,35 +1430,35 @@ mod tests {
         }
     }
 
-    fn plan_scenario(disposition: &str, searches: serde_json::Value) -> MockTextScenario {
+    fn plan_scenario(main_query: &str, sub_queries: serde_json::Value) -> MockTextScenario {
         tool_scenario(
             "query-memory-plan",
             "call-plan",
             "plan_memory_queries",
             serde_json::json!({
-                "disposition": disposition,
-                "searches": searches,
-                "reason": "test",
+                "main_query": main_query,
+                "sub_queries": sub_queries,
             }),
         )
     }
 
-    fn filter_scenario(
-        hit_indexes: Vec<&str>,
-        linked_hit_indexes: Vec<&str>,
-        reject_all: bool,
-    ) -> MockTextScenario {
-        tool_scenario(
-            "query-memory-filter",
-            "call-filter",
-            "select_memory_evidence",
-            serde_json::json!({
-                "hit_indexes": hit_indexes,
-                "linked_hit_indexes": linked_hit_indexes,
-                "reject_all": reject_all,
-                "reason": "test",
+    fn filter_scenario(selected_indexes: Vec<&str>) -> MockStructuredScenario {
+        let json = serde_json::json!({
+            "selected_indexes": selected_indexes,
+        })
+        .to_string();
+        MockStructuredScenario::events(vec![
+            Ok(RawStructuredTurnEvent::Started {
+                request_id: Some("query-memory-filter".into()),
+                model: "mock".into(),
             }),
-        )
+            Ok(RawStructuredTurnEvent::StructuredOutputChunk { json_delta: json }),
+            Ok(RawStructuredTurnEvent::Completed {
+                request_id: Some("query-memory-filter".into()),
+                finish_reason: FinishReason::Stop,
+                usage: usage(),
+            }),
+        ])
     }
 
     fn tool_scenario(
@@ -1562,21 +1480,6 @@ mod tests {
             Ok(RawTextTurnEvent::Completed {
                 request_id: Some(request_id.to_owned()),
                 finish_reason: FinishReason::ToolCall,
-                usage: usage(),
-            }),
-        ])
-    }
-
-    fn text_scenario(text: &str) -> MockTextScenario {
-        MockTextScenario::events(vec![
-            Ok(RawTextTurnEvent::Started {
-                request_id: Some("query-memory-text".into()),
-                model: "mock".into(),
-            }),
-            Ok(RawTextTurnEvent::TextDelta { delta: text.into() }),
-            Ok(RawTextTurnEvent::Completed {
-                request_id: Some("query-memory-text".into()),
-                finish_reason: FinishReason::Stop,
                 usage: usage(),
             }),
         ])
@@ -1739,23 +1642,24 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn planner_no_op_ends_after_one_llm_turn_with_no_memo() {
+    async fn blank_main_query_returns_activation_error() {
         tokio::task::LocalSet::new()
             .run_until(async {
                 let adapter = Arc::new(CapturingAdapter::new(
                     MockLlmAdapter::new()
-                        .with_text_scenario(plan_scenario("no_op", serde_json::json!([]))),
+                        .with_text_scenario(plan_scenario("", serde_json::json!([]))),
                 ));
                 let store = Rc::new(QueryMemoryTestStore::default());
                 let (blackboard, caps, memory_caps, lutum) =
                     test_caps_with_adapter(adapter.clone(), store);
                 let mut module = build_query_module(&caps, memory_caps).await;
 
-                run_query_memory_once(&blackboard, &caps, &mut module, &lutum)
+                let err = run_query_memory_once(&blackboard, &caps, &mut module, &lutum)
                     .await
-                    .expect("no-op activation should succeed");
+                    .expect_err("blank main query should fail activation");
 
                 assert_eq!(adapter.text_inputs().len(), 1);
+                assert!(err.to_string().contains("blank main_query"));
                 assert!(query_memory_memos(&blackboard).await.is_empty());
             })
             .await;
@@ -1767,10 +1671,8 @@ mod tests {
             .run_until(async {
                 let adapter = Arc::new(CapturingAdapter::new(
                     MockLlmAdapter::new().with_text_scenario(plan_scenario(
-                        "search",
-                        serde_json::json!([
-                            {"query": "Koro food approach", "limit": 99, "include_linked": true}
-                        ]),
+                        "Koro food approach",
+                        serde_json::json!([]),
                     )),
                 ));
                 let store = Rc::new(QueryMemoryTestStore::default());
@@ -1793,12 +1695,8 @@ mod tests {
         tokio::task::LocalSet::new()
             .run_until(async {
                 let adapter = Arc::new(CapturingAdapter::new(
-                    MockLlmAdapter::new().with_text_scenario(plan_scenario(
-                        "search",
-                        serde_json::json!([
-                            {"query": "Koro food approach", "limit": 8, "include_linked": false}
-                        ]),
-                    )),
+                    MockLlmAdapter::new()
+                        .with_text_scenario(plan_scenario("Koro food approach", serde_json::json!([]))),
                 ));
                 let store = Rc::new(QueryMemoryTestStore::default());
                 store.records.borrow_mut().push(record(
@@ -1854,12 +1752,10 @@ mod tests {
                 let adapter = Arc::new(CapturingAdapter::new(
                     MockLlmAdapter::new()
                         .with_text_scenario(plan_scenario(
-                            "search",
-                            serde_json::json!([
-                                {"query": "Koro food approach", "limit": 8, "include_linked": false}
-                            ]),
+                            "Koro food approach",
+                            serde_json::json!([]),
                         ))
-                        .with_text_scenario(filter_scenario(vec!["koro-rule"], Vec::new(), false)),
+                        .with_structured_scenario(filter_scenario(vec!["koro-rule"])),
                 ));
                 let store = Rc::new(QueryMemoryTestStore::default());
                 store.records.borrow_mut().push(record(
@@ -1884,16 +1780,17 @@ mod tests {
                 );
                 assert!(!memos[0].content.contains("How should Nui approach"));
 
-                let inputs = adapter.text_inputs();
-                assert_eq!(inputs.len(), 2);
+                let inputs = adapter.structured_inputs();
+                assert_eq!(adapter.text_inputs().len(), 1);
+                assert_eq!(inputs.len(), 1);
                 assert!(
-                    inputs[1]
+                    inputs[0]
                         .items()
                         .iter()
                         .all(|item| !matches!(item, ModelInputItem::Turn(_)))
                 );
                 assert!(
-                    inputs[1]
+                    inputs[0]
                         .items()
                         .iter()
                         .all(|item| !matches!(item, ModelInputItem::ToolResult(_)))
@@ -1909,16 +1806,13 @@ mod tests {
                 let adapter = Arc::new(CapturingAdapter::new(
                     MockLlmAdapter::new()
                         .with_text_scenario(plan_scenario(
-                            "search",
-                            serde_json::json!([
-                                {"query": "Koro food approach", "limit": 8, "include_linked": true}
-                            ]),
+                            "Koro food approach",
+                            serde_json::json!([]),
                         ))
-                        .with_text_scenario(filter_scenario(
-                            vec!["koro-primary"],
-                            vec!["koro-linked"],
-                            false,
-                        )),
+                        .with_structured_scenario(filter_scenario(vec![
+                            "koro-primary",
+                            "koro-linked",
+                        ])),
                 ));
                 let store = Rc::new(QueryMemoryTestStore::default());
                 let primary = record(
@@ -1963,18 +1857,16 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn filter_reject_all_persists_no_memo() {
+    async fn empty_filter_selection_falls_back_to_top_evidence() {
         tokio::task::LocalSet::new()
             .run_until(async {
                 let adapter = Arc::new(CapturingAdapter::new(
                     MockLlmAdapter::new()
                         .with_text_scenario(plan_scenario(
-                            "search",
-                            serde_json::json!([
-                                {"query": "Koro food approach", "limit": 8, "include_linked": false}
-                            ]),
+                            "Koro food approach",
+                            serde_json::json!([]),
                         ))
-                        .with_text_scenario(filter_scenario(Vec::new(), Vec::new(), true)),
+                        .with_structured_scenario(filter_scenario(Vec::new())),
                 ));
                 let store = Rc::new(QueryMemoryTestStore::default());
                 store.records.borrow_mut().push(record(
@@ -1987,27 +1879,26 @@ mod tests {
 
                 run_query_memory_once(&blackboard, &caps, &mut module, &lutum)
                     .await
-                    .expect("reject-all activation should succeed");
+                    .expect("empty filter selection should fallback");
 
-                assert_eq!(adapter.text_inputs().len(), 2);
-                assert!(query_memory_memos(&blackboard).await.is_empty());
+                assert_eq!(adapter.text_inputs().len(), 1);
+                assert_eq!(adapter.structured_inputs().len(), 1);
+                let memos = query_memory_memos(&blackboard).await;
+                assert_eq!(memos.len(), 1);
+                assert_eq!(memos[0].data().hits[0].index.as_str(), "koro-rule");
             })
             .await;
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn missing_filter_tool_call_returns_activation_error() {
+    async fn structured_filter_failure_falls_back_to_top_evidence() {
         tokio::task::LocalSet::new()
             .run_until(async {
                 let adapter = Arc::new(CapturingAdapter::new(
-                    MockLlmAdapter::new()
-                        .with_text_scenario(plan_scenario(
-                            "search",
-                            serde_json::json!([
-                                {"query": "Koro food approach", "limit": 8, "include_linked": false}
-                            ]),
-                        ))
-                        .with_text_scenario(text_scenario("plain answer")),
+                    MockLlmAdapter::new().with_text_scenario(plan_scenario(
+                        "Koro food approach",
+                        serde_json::json!([]),
+                    )),
                 ));
                 let store = Rc::new(QueryMemoryTestStore::default());
                 store.records.borrow_mut().push(record(
@@ -2018,11 +1909,13 @@ mod tests {
                     test_caps_with_adapter(adapter.clone(), store);
                 let mut module = build_query_module(&caps, memory_caps).await;
 
-                let err = run_query_memory_once(&blackboard, &caps, &mut module, &lutum)
+                run_query_memory_once(&blackboard, &caps, &mut module, &lutum)
                     .await
-                    .expect_err("missing filter tool should fail activation");
-                assert!(err.to_string().contains("select memory evidence"));
-                assert!(query_memory_memos(&blackboard).await.is_empty());
+                    .expect("structured filter failure should fallback");
+
+                let memos = query_memory_memos(&blackboard).await;
+                assert_eq!(memos.len(), 1);
+                assert_eq!(memos[0].data().hits[0].index.as_str(), "koro-rule");
             })
             .await;
     }
@@ -2041,8 +1934,8 @@ mod tests {
                             id: "call-plan-a".into(),
                             name: "plan_memory_queries".into(),
                             arguments_json_delta: serde_json::json!({
-                                "disposition": "search",
-                                "searches": [{"query": "Koro", "limit": 8, "include_linked": false}]
+                                "main_query": "Koro",
+                                "sub_queries": []
                             })
                             .to_string(),
                         }),
@@ -2050,8 +1943,8 @@ mod tests {
                             id: "call-plan-b".into(),
                             name: "plan_memory_queries".into(),
                             arguments_json_delta: serde_json::json!({
-                                "disposition": "search",
-                                "searches": [{"query": "food", "limit": 8, "include_linked": false}]
+                                "main_query": "food",
+                                "sub_queries": []
                             })
                             .to_string(),
                         }),
@@ -2076,22 +1969,16 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn unknown_filter_index_returns_activation_error() {
+    async fn unknown_filter_index_falls_back_to_top_evidence() {
         tokio::task::LocalSet::new()
             .run_until(async {
                 let adapter = Arc::new(CapturingAdapter::new(
                     MockLlmAdapter::new()
                         .with_text_scenario(plan_scenario(
-                            "search",
-                            serde_json::json!([
-                                {"query": "Koro food approach", "limit": 8, "include_linked": false}
-                            ]),
+                            "Koro food approach",
+                            serde_json::json!([]),
                         ))
-                        .with_text_scenario(filter_scenario(
-                            vec!["unknown-index"],
-                            Vec::new(),
-                            false,
-                        )),
+                        .with_structured_scenario(filter_scenario(vec!["unknown-index"])),
                 ));
                 let store = Rc::new(QueryMemoryTestStore::default());
                 store.records.borrow_mut().push(record(
@@ -2101,16 +1988,13 @@ mod tests {
                 let (blackboard, caps, memory_caps, lutum) = test_caps_with_adapter(adapter, store);
                 let mut module = build_query_module(&caps, memory_caps).await;
 
-                let err = run_query_memory_once(&blackboard, &caps, &mut module, &lutum)
+                run_query_memory_once(&blackboard, &caps, &mut module, &lutum)
                     .await
-                    .expect_err("unknown evidence index should fail activation");
-                let error_chain = err.chain().map(ToString::to_string).collect::<Vec<_>>();
-                assert!(
-                    error_chain
-                        .iter()
-                        .any(|error| error.contains("unknown evidence indexes"))
-                );
-                assert!(query_memory_memos(&blackboard).await.is_empty());
+                    .expect("unknown filter index should fallback");
+
+                let memos = query_memory_memos(&blackboard).await;
+                assert_eq!(memos.len(), 1);
+                assert_eq!(memos[0].data().hits[0].index.as_str(), "koro-rule");
             })
             .await;
     }

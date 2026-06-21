@@ -803,8 +803,8 @@ activation-table = [1.0, 0.5]
   id = "query-memory"
   replica-min = 1
   replica-max = 1
-  bpm-min = 6.0
-  bpm-max = 15.0
+  bpm-min = 12.0
+  bpm-max = 30.0
   initial-activation = 0.0
 }
 

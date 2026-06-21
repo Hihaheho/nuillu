@@ -18,7 +18,9 @@ pub use batch::NextBatch as CognitionGateBatch;
 const SYSTEM_PROMPT: &str = r#"Read the candidate facts and rank which should become part of this
 agent's current awareness. Candidate order and labels are not priority signals.
 In rank_awareness_candidates, lower-ranked labels outside the selected top entries
-are rejected from this agent's cognition and must not be used for later decisions.
+are not admitted into this agent's current awareness. The runtime may present the
+highest-ranked overflow candidates once more as previously deferred candidates.
+Do not rely on lower-ranked or omitted candidates unless they are shown again.
 
 Rank current, action-relevant facts highest: direct participant questions, requests,
 warnings, safety constraints, fresh sensory or world facts, body facts, and memory
@@ -40,8 +42,12 @@ needed for future ranking decisions."#;
 const NEW_CANDIDATE_HEADER: &str = "Candidate facts:";
 const CANDIDATE_DECISION_INSTRUCTION: &str =
     "Rank the bracket labels. Use the available ranking tool now.";
+const DEFERRED_CANDIDATE_PREFIX: &str =
+    "Previously deferred by the two-entry awareness limit last activation: ";
 
 const CANDIDATE_TEXT_CONTEXT_CHARS: usize = 1_200;
+const MAX_AWARENESS_ENTRIES: usize = 2;
+const MAX_DEFERRED_CANDIDATES: usize = 2;
 
 pub fn session_auto_compaction() -> SessionAutoCompaction {
     SessionAutoCompaction::new(
@@ -75,10 +81,23 @@ pub enum CognitionGateRankingTools {
     RankAwarenessCandidates(RankAwarenessCandidatesArgs),
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CognitionCandidateSource {
+    Deferred,
+    Fresh,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct CognitionCandidate {
     id: String,
     record: MemoLogRecord,
+    source: CognitionCandidateSource,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct RankedCandidateResolution {
+    selected: Vec<MemoLogRecord>,
+    deferred: Vec<MemoLogRecord>,
 }
 
 pub type CognitionGateSessionCompactionConfig = SessionCompactionConfig;
@@ -91,6 +110,7 @@ pub struct CognitionGateModule {
     session: Session,
     last_seen_cognition_index: Option<u64>,
     pending_unread_memos: Vec<MemoLogRecord>,
+    deferred_candidates: Vec<MemoLogRecord>,
 }
 
 impl CognitionGateModule {
@@ -109,6 +129,7 @@ impl CognitionGateModule {
             session,
             last_seen_cognition_index: None,
             pending_unread_memos: Vec::new(),
+            deferred_candidates: Vec::new(),
         }
     }
 
@@ -152,15 +173,16 @@ impl CognitionGateModule {
             }
         }
 
-        let candidates = clean_candidates(&self.pending_unread_memos);
+        let candidates = clean_candidates(&self.deferred_candidates, &self.pending_unread_memos);
         if candidates.is_empty() {
             if let Some(index) = latest_cognition_index {
                 self.last_seen_cognition_index = Some(index);
             }
             self.pending_unread_memos.clear();
+            self.deferred_candidates.clear();
             return Ok(());
         }
-        if candidates.len() <= 2 {
+        if candidates.len() <= MAX_AWARENESS_ENTRIES {
             let selected = candidates
                 .iter()
                 .map(|candidate| candidate.record.clone())
@@ -170,6 +192,7 @@ impl CognitionGateModule {
                 self.last_seen_cognition_index = Some(index);
             }
             self.pending_unread_memos.clear();
+            self.deferred_candidates.clear();
             return Ok(());
         }
 
@@ -187,19 +210,23 @@ impl CognitionGateModule {
 
         let lutum = self.llm.lutum().await;
         let result = self.run_selection_turn(&lutum, cx, &candidates).await;
-        if let Err(error) = result {
-            self.session
-                .input_mut()
-                .items_mut()
-                .truncate(session_len_before_activation);
-            cx.compact_and_save(&mut self.session, Usage::zero())
-                .await?;
-            return Err(error);
-        }
+        let next_deferred = match result {
+            Ok(next_deferred) => next_deferred,
+            Err(error) => {
+                self.session
+                    .input_mut()
+                    .items_mut()
+                    .truncate(session_len_before_activation);
+                cx.compact_and_save(&mut self.session, Usage::zero())
+                    .await?;
+                return Err(error);
+            }
+        };
         if let Some(index) = latest_cognition_index {
             self.last_seen_cognition_index = Some(index);
         }
         self.pending_unread_memos.clear();
+        self.deferred_candidates = next_deferred;
         Ok(())
     }
 
@@ -208,7 +235,7 @@ impl CognitionGateModule {
         lutum: &Lutum,
         cx: &nuillu_module::ActivateCx<'_>,
         candidates: &[CognitionCandidate],
-    ) -> Result<()> {
+    ) -> Result<Vec<MemoLogRecord>> {
         let outcome = self
             .session
             .text_turn()
@@ -256,7 +283,7 @@ impl CognitionGateModule {
                     .expect("exactly one tool call exists")
                     .clone();
                 let CognitionGateRankingToolsCall::RankAwarenessCandidates(call) = call;
-                let selected_records = self
+                let resolution = self
                     .resolve_ranked_candidates(&call.input, candidates)
                     .map_err(|error| {
                         cx.warn(format!("cognition-gate activation failed: {error}"));
@@ -272,9 +299,9 @@ impl CognitionGateModule {
                 round
                     .commit(&mut self.session, results)
                     .context("commit cognition-gate tool round")?;
-                self.append_ranked_records(&selected_records).await?;
+                self.append_ranked_records(&resolution.selected).await?;
                 cx.compact_and_save(&mut self.session, usage).await?;
-                Ok(())
+                Ok(resolution.deferred)
             }
         }
     }
@@ -283,7 +310,7 @@ impl CognitionGateModule {
         &self,
         args: &RankAwarenessCandidatesArgs,
         candidates: &[CognitionCandidate],
-    ) -> Result<Vec<MemoLogRecord>> {
+    ) -> Result<RankedCandidateResolution> {
         ranked_candidate_records(args, candidates)
     }
 
@@ -291,7 +318,7 @@ impl CognitionGateModule {
         if records.is_empty() {
             anyhow::bail!("no cognition record to append");
         }
-        if records.len() > 2 {
+        if records.len() > MAX_AWARENESS_ENTRIES {
             anyhow::bail!("too many cognition records");
         }
         for record in records {
@@ -334,7 +361,36 @@ where
         .join(", ")
 }
 
-fn clean_candidates(records: &[MemoLogRecord]) -> Vec<CognitionCandidate> {
+fn clean_candidates(
+    deferred_records: &[MemoLogRecord],
+    fresh_records: &[MemoLogRecord],
+) -> Vec<CognitionCandidate> {
+    let fresh_records = clean_memo_records(fresh_records);
+    let fresh_texts = fresh_records
+        .iter()
+        .map(|record| record.content.as_str())
+        .collect::<BTreeSet<_>>();
+
+    let mut seen = BTreeSet::new();
+    let mut candidates = Vec::new();
+    for record in clean_memo_records(deferred_records) {
+        if fresh_texts.contains(record.content.as_str()) {
+            continue;
+        }
+        if seen.insert(record.content.clone()) {
+            candidates.push((record, CognitionCandidateSource::Deferred));
+        }
+    }
+    for record in fresh_records {
+        if seen.insert(record.content.clone()) {
+            candidates.push((record, CognitionCandidateSource::Fresh));
+        }
+    }
+
+    records_to_letter_candidates(candidates)
+}
+
+fn clean_memo_records(records: &[MemoLogRecord]) -> Vec<MemoLogRecord> {
     let mut seen = BTreeSet::new();
     let mut deduped_records = Vec::new();
     for record in records {
@@ -350,7 +406,7 @@ fn clean_candidates(records: &[MemoLogRecord]) -> Vec<CognitionCandidate> {
         deduped_records.push(record);
     }
 
-    records_to_letter_candidates(deduped_records)
+    deduped_records
 }
 
 fn format_candidate_selection_prompt(candidates: &[CognitionCandidate]) -> String {
@@ -360,6 +416,9 @@ fn format_candidate_selection_prompt(candidates: &[CognitionCandidate]) -> Strin
         out.push('[');
         out.push_str(&candidate.id);
         out.push_str("] ");
+        if candidate.source == CognitionCandidateSource::Deferred {
+            out.push_str(DEFERRED_CANDIDATE_PREFIX);
+        }
         out.push_str(&compact_llm_context_text(
             &candidate.record.content,
             CANDIDATE_TEXT_CONTEXT_CHARS,
@@ -373,12 +432,13 @@ fn format_candidate_selection_prompt(candidates: &[CognitionCandidate]) -> Strin
 fn ranked_candidate_records(
     args: &RankAwarenessCandidatesArgs,
     candidates: &[CognitionCandidate],
-) -> Result<Vec<MemoLogRecord>> {
+) -> Result<RankedCandidateResolution> {
     if args.labels.is_empty() {
         anyhow::bail!("rank_awareness_candidates rejected empty labels");
     }
     let mut seen = BTreeSet::new();
     let mut selected = Vec::new();
+    let mut deferred = Vec::new();
     for (index, id) in args.labels.iter().enumerate() {
         let field = format!("labels[{index}]");
         let id = normalize_candidate_id(id);
@@ -388,26 +448,29 @@ fn ranked_candidate_records(
         if !seen.insert(id.clone()) {
             anyhow::bail!("rank_awareness_candidates rejected duplicate candidate IDs");
         }
-        let record = candidate_record_by_id(candidates, &id, &field)?;
-        if selected.len() < 2 {
-            selected.push(record.clone());
+        let candidate = candidate_by_id(candidates, &id, &field)?;
+        if selected.len() < MAX_AWARENESS_ENTRIES {
+            selected.push(candidate.record.clone());
+        } else if candidate.source == CognitionCandidateSource::Fresh
+            && deferred.len() < MAX_DEFERRED_CANDIDATES
+        {
+            deferred.push(candidate.record.clone());
         }
     }
-    Ok(selected)
+    Ok(RankedCandidateResolution { selected, deferred })
 }
 
-fn candidate_record_by_id<'a>(
+fn candidate_by_id<'a>(
     candidates: &'a [CognitionCandidate],
     id: &str,
     field: &str,
-) -> Result<&'a MemoLogRecord> {
+) -> Result<&'a CognitionCandidate> {
     if id.is_empty() {
         anyhow::bail!("rank_awareness_candidates rejected empty {field}");
     }
     candidates
         .iter()
         .find(|candidate| candidate.id == id)
-        .map(|candidate| &candidate.record)
         .ok_or_else(|| {
             let valid_ids = candidates
                 .iter()
@@ -421,16 +484,20 @@ fn candidate_record_by_id<'a>(
 }
 
 impl CognitionCandidate {
-    fn new(id: String, record: MemoLogRecord) -> Self {
-        Self { id, record }
+    fn new(id: String, record: MemoLogRecord, source: CognitionCandidateSource) -> Self {
+        Self { id, record, source }
     }
 }
 
-fn records_to_letter_candidates(records: Vec<MemoLogRecord>) -> Vec<CognitionCandidate> {
+fn records_to_letter_candidates(
+    records: Vec<(MemoLogRecord, CognitionCandidateSource)>,
+) -> Vec<CognitionCandidate> {
     records
         .into_iter()
         .enumerate()
-        .map(|(index, record)| CognitionCandidate::new(candidate_letter_id(index), record))
+        .map(|(index, (record, source))| {
+            CognitionCandidate::new(candidate_letter_id(index), record, source)
+        })
         .collect()
 }
 
@@ -836,7 +903,12 @@ mod tests {
                 cognitive: true,
             })
             .collect::<Vec<_>>();
-        records_to_letter_candidates(records)
+        records_to_letter_candidates(
+            records
+                .into_iter()
+                .map(|record| (record, CognitionCandidateSource::Fresh))
+                .collect(),
+        )
     }
 
     fn batch_from_candidates(candidates: &[CognitionCandidate]) -> CognitionGateBatch {
@@ -907,11 +979,62 @@ mod tests {
     }
 
     #[test]
+    fn clean_candidates_puts_deferred_first_but_prefers_duplicate_fresh_content() {
+        let deferred = test_candidates(&["same candidate", "old deferred"]);
+        let fresh = test_candidates(&["same candidate", "new fresh"]);
+        let deferred_records = deferred
+            .iter()
+            .map(|candidate| candidate.record.clone())
+            .collect::<Vec<_>>();
+        let fresh_records = fresh
+            .iter()
+            .map(|candidate| candidate.record.clone())
+            .collect::<Vec<_>>();
+
+        let candidates = clean_candidates(&deferred_records, &fresh_records);
+
+        assert_eq!(
+            candidates
+                .iter()
+                .map(|candidate| candidate.record.content.as_str())
+                .collect::<Vec<_>>(),
+            vec!["old deferred", "same candidate", "new fresh"]
+        );
+        assert_eq!(
+            candidates
+                .iter()
+                .map(|candidate| candidate.source)
+                .collect::<Vec<_>>(),
+            vec![
+                CognitionCandidateSource::Deferred,
+                CognitionCandidateSource::Fresh,
+                CognitionCandidateSource::Fresh
+            ]
+        );
+    }
+
+    #[test]
+    fn deferred_candidate_prompt_prefix_is_display_only() {
+        let mut candidates = test_candidates(&["old deferred", "new fresh"]);
+        candidates[0].source = CognitionCandidateSource::Deferred;
+
+        let prompt = format_candidate_selection_prompt(&candidates);
+
+        assert!(prompt.contains(&format!(
+            "[{}] {DEFERRED_CANDIDATE_PREFIX}old deferred",
+            candidates[0].id
+        )));
+        assert!(prompt.contains(&format!("[{}] new fresh", candidates[1].id)));
+        assert!(!prompt.contains("memo"));
+    }
+
+    #[test]
     fn system_prompt_is_rank_task_only() {
         assert!(SYSTEM_PROMPT.contains("agent's current awareness"));
         assert!(SYSTEM_PROMPT.contains("available ranking tool"));
+        assert!(SYSTEM_PROMPT.contains("previously deferred candidates"));
         assert!(SYSTEM_PROMPT.contains(
-            "rejected from this agent's cognition and must not be used for later decisions"
+            "Do not rely on lower-ranked or omitted candidates unless they are shown again"
         ));
         for forbidden in [
             "cognition-gate",
@@ -1403,7 +1526,7 @@ mod tests {
     #[test]
     fn ranked_candidates_maps_first_two_ids_to_candidate_records() {
         let candidates = test_candidates(&["first", "second", "third"]);
-        let selected = ranked_candidate_records(
+        let resolution = ranked_candidate_records(
             &RankAwarenessCandidatesArgs {
                 labels: vec![
                     candidates[1].id.clone(),
@@ -1415,12 +1538,79 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            selected
+            resolution
+                .selected
                 .iter()
                 .map(|record| record.content.as_str())
                 .collect::<Vec<_>>(),
             vec!["second", "first"]
         );
+        assert_eq!(resolution.deferred.len(), 1);
+        assert_eq!(resolution.deferred[0].content, "third");
+    }
+
+    #[test]
+    fn ranked_candidates_defers_next_two_fresh_candidates_only() {
+        let mut candidates = test_candidates(&[
+            "fresh selected A",
+            "fresh selected B",
+            "previous deferred skipped",
+            "fresh deferred C",
+            "fresh deferred D",
+            "fresh deferred E",
+        ]);
+        candidates[2].source = CognitionCandidateSource::Deferred;
+
+        let resolution = ranked_candidate_records(
+            &RankAwarenessCandidatesArgs {
+                labels: candidates
+                    .iter()
+                    .map(|candidate| candidate.id.clone())
+                    .collect(),
+            },
+            &candidates,
+        )
+        .unwrap();
+
+        assert_eq!(
+            resolution
+                .selected
+                .iter()
+                .map(|record| record.content.as_str())
+                .collect::<Vec<_>>(),
+            vec!["fresh selected A", "fresh selected B"]
+        );
+        assert_eq!(
+            resolution
+                .deferred
+                .iter()
+                .map(|record| record.content.as_str())
+                .collect::<Vec<_>>(),
+            vec!["fresh deferred C", "fresh deferred D"]
+        );
+    }
+
+    #[test]
+    fn ranked_candidates_do_not_defer_omitted_labels() {
+        let candidates = test_candidates(&["selected A", "selected B", "omitted C"]);
+
+        let resolution = ranked_candidate_records(
+            &RankAwarenessCandidatesArgs {
+                labels: vec![candidates[0].id.clone(), candidates[1].id.clone()],
+            },
+            &candidates,
+        )
+        .unwrap();
+
+        assert_eq!(
+            resolution
+                .selected
+                .iter()
+                .map(|record| record.content.as_str())
+                .collect::<Vec<_>>(),
+            vec!["selected A", "selected B"]
+        );
+        assert!(resolution.deferred.is_empty());
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -1530,6 +1720,138 @@ mod tests {
         assert_eq!(entries.len(), 2);
         assert_eq!(entries[0].text, "candidate B");
         assert_eq!(entries[1].text, "candidate A");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn skipped_fresh_candidates_are_deferred_into_next_selection_prompt() {
+        let first_candidates = test_candidates(&[
+            "first selected A",
+            "first selected B",
+            "carryover C",
+            "carryover D",
+        ]);
+        let second_candidates = test_candidates(&["fresh E"]);
+        let adapter = MockLlmAdapter::new()
+            .with_text_scenario(rank_awareness_candidates_scenario(
+                first_candidates
+                    .iter()
+                    .map(|candidate| candidate.id.clone())
+                    .collect::<Vec<_>>(),
+                1,
+            ))
+            .with_text_scenario(rank_awareness_candidates_scenario(["A"], 1));
+        let capture = CapturingAdapter::new(adapter);
+        let observed = capture.clone();
+        let mut fixture = gate_fixture_with_turn_adapter(Arc::new(capture)).await;
+
+        let lutum = fixture.gate.llm.lutum().await;
+        let identity_memories = Vec::new();
+        let cx = nuillu_module::ActivateCx::new(
+            &[],
+            &identity_memories,
+            &[],
+            compaction_runtime(&lutum),
+            SystemClock.now(),
+        );
+
+        fixture
+            .gate
+            .activate(&cx, &batch_from_candidates(&first_candidates))
+            .await
+            .unwrap();
+        assert_eq!(
+            fixture
+                .gate
+                .deferred_candidates
+                .iter()
+                .map(|record| record.content.as_str())
+                .collect::<Vec<_>>(),
+            vec!["carryover C", "carryover D"]
+        );
+
+        fixture
+            .gate
+            .activate(&cx, &batch_from_candidates(&second_candidates))
+            .await
+            .unwrap();
+
+        let inputs = observed.text_inputs();
+        assert_eq!(inputs.len(), 2);
+        let second_prompt = latest_candidate_user_message(inputs[1].items());
+        assert!(second_prompt.contains(&format!("[A] {DEFERRED_CANDIDATE_PREFIX}carryover C")));
+        assert!(second_prompt.contains(&format!("[B] {DEFERRED_CANDIDATE_PREFIX}carryover D")));
+        assert!(second_prompt.contains("[C] fresh E"));
+        assert_eq!(second_prompt.matches(DEFERRED_CANDIDATE_PREFIX).count(), 2);
+
+        let entries = fixture
+            .blackboard
+            .read(|bb| bb.cognition_log().entries().to_vec())
+            .await;
+        assert_eq!(entries.len(), 3);
+        assert_eq!(entries[0].text, "first selected A");
+        assert_eq!(entries[1].text, "first selected B");
+        assert_eq!(entries[2].text, "carryover C");
+        assert!(!entries[2].text.contains(DEFERRED_CANDIDATE_PREFIX));
+        assert!(fixture.gate.deferred_candidates.is_empty());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn deferred_plus_fresh_fast_path_promotes_without_second_llm_turn() {
+        let first_candidates =
+            test_candidates(&["first selected A", "first selected B", "carryover C"]);
+        let second_candidates = test_candidates(&["fresh D"]);
+        let adapter = MockLlmAdapter::new().with_text_scenario(rank_awareness_candidates_scenario(
+            first_candidates
+                .iter()
+                .map(|candidate| candidate.id.clone())
+                .collect::<Vec<_>>(),
+            1,
+        ));
+        let capture = CapturingAdapter::new(adapter);
+        let observed = capture.clone();
+        let mut fixture = gate_fixture_with_turn_adapter(Arc::new(capture)).await;
+
+        let lutum = fixture.gate.llm.lutum().await;
+        let identity_memories = Vec::new();
+        let cx = nuillu_module::ActivateCx::new(
+            &[],
+            &identity_memories,
+            &[],
+            compaction_runtime(&lutum),
+            SystemClock.now(),
+        );
+
+        fixture
+            .gate
+            .activate(&cx, &batch_from_candidates(&first_candidates))
+            .await
+            .unwrap();
+        assert_eq!(fixture.gate.deferred_candidates.len(), 1);
+
+        fixture
+            .gate
+            .activate(&cx, &batch_from_candidates(&second_candidates))
+            .await
+            .unwrap();
+
+        assert_eq!(observed.text_inputs().len(), 1);
+        let entries = fixture
+            .blackboard
+            .read(|bb| bb.cognition_log().entries().to_vec())
+            .await;
+        assert_eq!(
+            entries
+                .iter()
+                .map(|entry| entry.text.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "first selected A",
+                "first selected B",
+                "carryover C",
+                "fresh D"
+            ]
+        );
+        assert!(fixture.gate.deferred_candidates.is_empty());
     }
 
     #[tokio::test(flavor = "current_thread")]

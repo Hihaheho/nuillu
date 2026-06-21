@@ -5094,7 +5094,7 @@ fn register_eval_module(
         // and speak; needs a quick active pace.
         EvalModule::QueryMemory => registry
             .register_eval(
-                eval_policy(1..=1, Bpm::range(6.0, 15.0)),
+                eval_policy(1..=1, Bpm::range(12.0, 30.0)),
                 replica_hard_cap,
                 {
                     let memory_caps = memory_caps.clone();

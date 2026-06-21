@@ -1597,15 +1597,15 @@ mod tests {
     #[test]
     fn trace_tool_call_json_contains_matches_object_subset_unordered_arrays_and_extra_args() {
         let actual = serde_json::json!({
-            "hit_indexes": ["koro-approach-primary"],
-            "linked_hit_indexes": [
+            "selected_indexes": [
+                "koro-approach-primary",
                 "koro-signal-drill-linked",
                 "koro-food-fern-wait"
             ],
             "extra": true
         });
         let expected = serde_json::json!({
-            "linked_hit_indexes": [
+            "selected_indexes": [
                 "koro-food-fern-wait",
                 "koro-signal-drill-linked"
             ]
@@ -1617,10 +1617,10 @@ mod tests {
     #[test]
     fn trace_tool_call_json_contains_rejects_wrong_scalar_value() {
         let actual = serde_json::json!({
-            "linked_hit_indexes": ["koro-signal-drill-linked"]
+            "selected_indexes": ["koro-signal-drill-linked"]
         });
         let expected = serde_json::json!({
-            "linked_hit_indexes": ["wrong-index"]
+            "selected_indexes": ["wrong-index"]
         });
 
         assert!(!super::json_contains(&actual, &expected));
@@ -1710,7 +1710,7 @@ mod tests {
                             (
                                 "args_json".to_string(),
                                 FieldValue::Str(
-                                    r#"{"hit_indexes":["koro-approach-primary"],"linked_hit_indexes":["koro-signal-drill-linked"]}"#
+                                    r#"{"selected_indexes":["koro-approach-primary","koro-signal-drill-linked"]}"#
                                         .to_string(),
                                 ),
                             ),
@@ -1741,7 +1741,7 @@ mod tests {
             },
             tool_name: "write_retrieval_memo".to_string(),
             args_json_contains: Some(eure::value::Text::plaintext(
-                r#"{"linked_hit_indexes":["koro-signal-drill-linked"]}"#,
+                r#"{"selected_indexes":["koro-signal-drill-linked"]}"#,
             )),
         };
         let matching_args = evaluate_deterministic_check(
@@ -1775,7 +1775,7 @@ mod tests {
             },
             tool_name: "write_retrieval_memo".to_string(),
             args_json_contains: Some(eure::value::Text::plaintext(
-                r#"{"linked_hit_indexes":["wrong-index"]}"#,
+                r#"{"selected_indexes":["wrong-index"]}"#,
             )),
         };
         let wrong_arg = evaluate_deterministic_check(
