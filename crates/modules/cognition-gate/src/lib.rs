@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
@@ -16,11 +16,16 @@ mod batch;
 pub use batch::NextBatch as CognitionGateBatch;
 
 const SYSTEM_PROMPT: &str = r#"Read the candidate facts and rank which should become part of this
-agent's current awareness. Candidate order and labels are not priority signals.
-In rank_awareness_candidates, lower-ranked labels outside the selected top entries
-are not admitted into this agent's current awareness. The runtime may present the
-highest-ranked overflow candidates once more as previously deferred candidates.
-Do not rely on lower-ranked or omitted candidates unless they are shown again.
+agent's current awareness. Candidate order is occurrence order only. It never
+signals importance, urgency, relevance, confidence, or selection priority.
+Candidate labels are handles only.
+In rank_awareness_candidates, put candidates worth admitting now in
+important_labels, most important first. Put stale, redundant, process-like, or
+low-value candidates in noise_labels, closest to noise first. Use each bracket
+label exactly once across the two lists when possible.
+Only important_labels are admitted into this agent's current awareness. The runtime
+may present overflow important candidates once more as previously deferred candidates.
+Do not rely on noise or omitted candidates unless they are shown again.
 
 Rank current, action-relevant facts highest: direct participant questions, requests,
 warnings, safety constraints, fresh sensory or world facts, body facts, and memory
@@ -40,8 +45,7 @@ const SESSION_COMPACTION_FOCUS: &str = r#"Preserve candidate facts, prior rankin
 admitted events, rejected candidate events, recent awareness context, and relevant memory evidence
 needed for future ranking decisions."#;
 const NEW_CANDIDATE_HEADER: &str = "Candidate facts:";
-const CANDIDATE_DECISION_INSTRUCTION: &str =
-    "Rank the bracket labels. Use the available ranking tool now.";
+const CANDIDATE_DECISION_INSTRUCTION: &str = "Fill important_labels with candidates worth admitting now, most important first. Fill noise_labels with stale, redundant, process-like, or low-value candidates, closest to noise first. Use each bracket label exactly once across both lists. Use the available ranking tool now.";
 const DEFERRED_CANDIDATE_PREFIX: &str =
     "Previously deferred by the awareness limit last activation: ";
 
@@ -65,8 +69,12 @@ pub fn session_auto_compaction() -> SessionAutoCompaction {
 /// Rank candidate labels for the agent's current awareness.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct RankAwarenessCandidatesArgs {
-    /// Bracket labels ordered from most important to least important, such as A, B, C.
-    pub labels: Vec<String>,
+    /// Candidate labels worth admitting now, ordered most important first.
+    #[serde(default)]
+    pub important_labels: Vec<String>,
+    /// Stale, redundant, process-like, or low-value candidate labels, closest to noise first.
+    #[serde(default)]
+    pub noise_labels: Vec<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
@@ -387,7 +395,7 @@ fn clean_candidates(
         }
     }
 
-    records_to_letter_candidates(candidates)
+    records_to_source_candidates(candidates)
 }
 
 fn clean_memo_records(records: &[MemoLogRecord]) -> Vec<MemoLogRecord> {
@@ -433,22 +441,31 @@ fn ranked_candidate_records(
     args: &RankAwarenessCandidatesArgs,
     candidates: &[CognitionCandidate],
 ) -> Result<RankedCandidateResolution> {
-    if args.labels.is_empty() {
-        anyhow::bail!("rank_awareness_candidates rejected empty labels");
+    let important_error = match ranked_candidate_records_from_important(args, candidates) {
+        Ok(resolution) => return Ok(resolution),
+        Err(error) => error,
+    };
+
+    ranked_candidate_records_from_noise(args, candidates).map_err(|noise_error| {
+        anyhow!(
+            "rank_awareness_candidates rejected important_labels ({important_error}); \
+             noise_labels fallback failed ({noise_error})"
+        )
+    })
+}
+
+fn ranked_candidate_records_from_important(
+    args: &RankAwarenessCandidatesArgs,
+    candidates: &[CognitionCandidate],
+) -> Result<RankedCandidateResolution> {
+    let important = candidate_list_by_ids("important_labels", &args.important_labels, candidates)?;
+    if important.is_empty() {
+        anyhow::bail!("empty important_labels");
     }
-    let mut seen = BTreeSet::new();
+
     let mut selected = Vec::new();
     let mut deferred = Vec::new();
-    for (index, id) in args.labels.iter().enumerate() {
-        let field = format!("labels[{index}]");
-        let id = normalize_candidate_id(id);
-        if id.is_empty() {
-            anyhow::bail!("rank_awareness_candidates rejected empty {field}");
-        }
-        if !seen.insert(id.clone()) {
-            anyhow::bail!("rank_awareness_candidates rejected duplicate candidate IDs");
-        }
-        let candidate = candidate_by_id(candidates, &id, &field)?;
+    for candidate in important {
         if selected.len() < MAX_AWARENESS_ENTRIES {
             selected.push(candidate.record.clone());
         } else if candidate.source == CognitionCandidateSource::Fresh
@@ -458,6 +475,59 @@ fn ranked_candidate_records(
         }
     }
     Ok(RankedCandidateResolution { selected, deferred })
+}
+
+fn ranked_candidate_records_from_noise(
+    args: &RankAwarenessCandidatesArgs,
+    candidates: &[CognitionCandidate],
+) -> Result<RankedCandidateResolution> {
+    let noise = candidate_list_by_ids("noise_labels", &args.noise_labels, candidates)?;
+    let noise_ids = noise
+        .iter()
+        .map(|candidate| candidate.id.as_str())
+        .collect::<BTreeSet<_>>();
+    let selected = candidates
+        .iter()
+        .filter(|candidate| !noise_ids.contains(candidate.id.as_str()))
+        .map(|candidate| candidate.record.clone())
+        .collect::<Vec<_>>();
+
+    if selected.is_empty() {
+        anyhow::bail!("noise_labels fallback left no candidate to admit");
+    }
+    if selected.len() > MAX_AWARENESS_ENTRIES {
+        anyhow::bail!(
+            "noise_labels fallback left {} candidates, above awareness limit {}",
+            selected.len(),
+            MAX_AWARENESS_ENTRIES
+        );
+    }
+
+    Ok(RankedCandidateResolution {
+        selected,
+        deferred: Vec::new(),
+    })
+}
+
+fn candidate_list_by_ids<'a>(
+    field_prefix: &str,
+    ids: &[String],
+    candidates: &'a [CognitionCandidate],
+) -> Result<Vec<&'a CognitionCandidate>> {
+    let mut seen = BTreeSet::new();
+    let mut selected = Vec::new();
+    for (index, id) in ids.iter().enumerate() {
+        let field = format!("{field_prefix}[{index}]");
+        let id = normalize_candidate_id(id);
+        if id.is_empty() {
+            anyhow::bail!("rank_awareness_candidates rejected empty {field}");
+        }
+        if !seen.insert(id.clone()) {
+            anyhow::bail!("rank_awareness_candidates rejected duplicate {field_prefix}");
+        }
+        selected.push(candidate_by_id(candidates, &id, &field)?);
+    }
+    Ok(selected)
 }
 
 fn candidate_by_id<'a>(
@@ -489,30 +559,27 @@ impl CognitionCandidate {
     }
 }
 
-fn records_to_letter_candidates(
-    records: Vec<(MemoLogRecord, CognitionCandidateSource)>,
+fn records_to_source_candidates(
+    mut records: Vec<(MemoLogRecord, CognitionCandidateSource)>,
 ) -> Vec<CognitionCandidate> {
+    records.sort_by(|(left, _), (right, _)| {
+        left.written_at
+            .cmp(&right.written_at)
+            .then_with(|| left.owner.module.as_str().cmp(right.owner.module.as_str()))
+            .then_with(|| left.index.cmp(&right.index))
+            .then_with(|| left.owner.replica.cmp(&right.owner.replica))
+    });
+
+    let mut source_counts = BTreeMap::<String, usize>::new();
     records
         .into_iter()
-        .enumerate()
-        .map(|(index, (record, source))| {
-            CognitionCandidate::new(candidate_letter_id(index), record, source)
+        .map(|(record, source)| {
+            let source_id = record.owner.module.as_str().to_owned();
+            let count = source_counts.entry(source_id.clone()).or_default();
+            *count += 1;
+            CognitionCandidate::new(format!("{source_id}-{count}"), record, source)
         })
         .collect()
-}
-
-fn candidate_letter_id(index: usize) -> String {
-    let mut n = index;
-    let mut chars = Vec::new();
-    loop {
-        chars.push(char::from(b'A' + (n % 26) as u8));
-        n /= 26;
-        if n == 0 {
-            break;
-        }
-        n -= 1;
-    }
-    chars.iter().rev().collect()
 }
 
 fn normalize_candidate_id(value: &str) -> String {
@@ -521,7 +588,7 @@ fn normalize_candidate_id(value: &str) -> String {
         .trim_start_matches('[')
         .trim_end_matches(']')
         .trim()
-        .to_ascii_uppercase()
+        .to_ascii_lowercase()
 }
 
 #[async_trait(?Send)]
@@ -791,11 +858,41 @@ mod tests {
     }
 
     fn rank_awareness_candidates_scenario(
-        labels: impl IntoIterator<Item = impl Into<String>>,
+        important_labels: impl IntoIterator<Item = impl Into<String>>,
         input_tokens: u64,
     ) -> MockTextScenario {
-        let labels = labels.into_iter().map(Into::into).collect::<Vec<String>>();
-        let arguments = serde_json::json!({ "labels": labels });
+        let important_labels = important_labels
+            .into_iter()
+            .map(Into::into)
+            .collect::<Vec<String>>();
+        let arguments = serde_json::json!({
+            "important_labels": important_labels,
+            "noise_labels": [],
+        });
+        tool_scenario(
+            "rank_awareness_candidates",
+            arguments.to_string(),
+            input_tokens,
+        )
+    }
+
+    fn rank_awareness_candidates_with_noise_scenario(
+        important_labels: impl IntoIterator<Item = impl Into<String>>,
+        noise_labels: impl IntoIterator<Item = impl Into<String>>,
+        input_tokens: u64,
+    ) -> MockTextScenario {
+        let important_labels = important_labels
+            .into_iter()
+            .map(Into::into)
+            .collect::<Vec<String>>();
+        let noise_labels = noise_labels
+            .into_iter()
+            .map(Into::into)
+            .collect::<Vec<String>>();
+        let arguments = serde_json::json!({
+            "important_labels": important_labels,
+            "noise_labels": noise_labels,
+        });
         tool_scenario(
             "rank_awareness_candidates",
             arguments.to_string(),
@@ -897,13 +994,13 @@ mod tests {
             .enumerate()
             .map(|(index, content)| MemoLogRecord {
                 owner: owner.clone(),
-                index: contents.len().saturating_sub(index + 1) as u64,
+                index: index as u64,
                 written_at: now,
                 content: (*content).to_owned(),
                 cognitive: true,
             })
             .collect::<Vec<_>>();
-        records_to_letter_candidates(
+        records_to_source_candidates(
             records
                 .into_iter()
                 .map(|record| (record, CognitionCandidateSource::Fresh))
@@ -936,13 +1033,13 @@ mod tests {
     }
 
     #[test]
-    fn candidate_labels_are_letters_by_display_order() {
+    fn candidate_labels_use_module_source_counts_without_replica() {
         let candidates = test_candidates(&[
-            "candidate A",
-            "candidate B",
-            "candidate C",
-            "candidate D",
-            "candidate E",
+            "candidate one",
+            "candidate two",
+            "candidate three",
+            "candidate four",
+            "candidate five",
         ]);
 
         assert_eq!(
@@ -950,32 +1047,139 @@ mod tests {
                 .iter()
                 .map(|candidate| candidate.id.as_str())
                 .collect::<Vec<_>>(),
-            vec!["A", "B", "C", "D", "E"]
+            vec![
+                "sensory-1",
+                "sensory-2",
+                "sensory-3",
+                "sensory-4",
+                "sensory-5"
+            ]
         );
-        assert_eq!(candidate_letter_id(25), "Z");
-        assert_eq!(candidate_letter_id(26), "AA");
-        assert_eq!(candidate_letter_id(27), "AB");
+
+        let replica_owner = nuillu_types::ModuleInstanceId::new(
+            builtin::sensory(),
+            nuillu_types::ReplicaIndex::new(2),
+        );
+        let record = MemoLogRecord {
+            owner: replica_owner,
+            index: 0,
+            written_at: SystemClock.now(),
+            content: "replica-hidden candidate".to_owned(),
+            cognitive: true,
+        };
+        let candidates =
+            records_to_source_candidates(vec![(record, CognitionCandidateSource::Fresh)]);
+        assert_eq!(candidates[0].id, "sensory-1");
+        assert!(!candidates[0].id.contains("replica"));
+        assert!(!candidates[0].id.contains("[2]"));
     }
 
     #[test]
-    fn candidate_prompt_uses_letter_ids_not_numbers() {
-        let candidates = test_candidates(&["candidate A", "candidate B", "candidate C"]);
+    fn candidate_prompt_uses_source_ids_not_letters_or_numbers() {
+        let candidates = test_candidates(&["candidate one", "candidate two", "candidate three"]);
         let prompt = format_candidate_selection_prompt(&candidates);
 
         for candidate in &candidates {
             assert!(prompt.contains(&format!("[{}] {}", candidate.id, candidate.record.content)));
         }
-        assert!(!prompt.contains("1. candidate A"));
-        assert!(!prompt.contains("2. candidate B"));
-        assert!(!prompt.contains("3. candidate C"));
-        assert!(prompt.contains("[A] candidate A"));
-        assert!(prompt.contains("[B] candidate B"));
-        assert!(prompt.contains("[C] candidate C"));
+        assert!(!prompt.contains("1. candidate one"));
+        assert!(!prompt.contains("2. candidate two"));
+        assert!(!prompt.contains("3. candidate three"));
+        assert!(prompt.contains("[sensory-1] candidate one"));
+        assert!(prompt.contains("[sensory-2] candidate two"));
+        assert!(prompt.contains("[sensory-3] candidate three"));
+        assert!(!prompt.contains("[A]"));
+        assert!(!prompt.contains("[B]"));
+        assert!(!prompt.contains("[C]"));
         assert!(!prompt.contains("candidate number"));
         assert!(!prompt.contains("rank_awareness_candidates"));
         assert!(!prompt.contains("candidate_ids"));
         assert!(!prompt.contains("top_candidate_ids"));
         assert!(!prompt.contains("one or two"));
+    }
+
+    #[test]
+    fn candidate_labels_follow_written_at_order_and_do_not_expose_replica() {
+        let query_owner = nuillu_types::ModuleInstanceId::new(
+            builtin::query_memory(),
+            nuillu_types::ReplicaIndex::ZERO,
+        );
+        let sensory_replica_owner = nuillu_types::ModuleInstanceId::new(
+            builtin::sensory(),
+            nuillu_types::ReplicaIndex::new(2),
+        );
+        let first_at = SystemClock.now();
+        std::thread::sleep(Duration::from_millis(2));
+        let second_at = SystemClock.now();
+        std::thread::sleep(Duration::from_millis(2));
+        let third_at = SystemClock.now();
+
+        let earliest = MemoLogRecord {
+            owner: query_owner,
+            index: 7,
+            written_at: first_at,
+            content: "earliest query evidence".to_owned(),
+            cognitive: true,
+        };
+        let middle = MemoLogRecord {
+            owner: sensory_replica_owner.clone(),
+            index: 4,
+            written_at: second_at,
+            content: "middle sensory evidence".to_owned(),
+            cognitive: true,
+        };
+        let latest = MemoLogRecord {
+            owner: sensory_replica_owner,
+            index: 3,
+            written_at: third_at,
+            content: "latest sensory evidence".to_owned(),
+            cognitive: true,
+        };
+
+        let candidates = records_to_source_candidates(vec![
+            (latest, CognitionCandidateSource::Fresh),
+            (middle, CognitionCandidateSource::Fresh),
+            (earliest, CognitionCandidateSource::Fresh),
+        ]);
+
+        assert_eq!(
+            candidates
+                .iter()
+                .map(|candidate| candidate.record.content.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "earliest query evidence",
+                "middle sensory evidence",
+                "latest sensory evidence"
+            ]
+        );
+        assert_eq!(
+            candidates
+                .iter()
+                .map(|candidate| candidate.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["query-memory-1", "sensory-1", "sensory-2"]
+        );
+
+        let prompt = format_candidate_selection_prompt(&candidates);
+        assert!(prompt.contains("[query-memory-1] earliest query evidence"));
+        assert!(prompt.contains("[sensory-1] middle sensory evidence"));
+        assert!(prompt.contains("[sensory-2] latest sensory evidence"));
+        assert!(!prompt.contains("replica"));
+        assert!(!prompt.contains("[2]"));
+    }
+
+    #[test]
+    fn ranking_tool_schema_has_partitioned_fields_without_letter_examples() {
+        let schema = serde_json::to_string(&schemars::schema_for!(RankAwarenessCandidatesArgs))
+            .expect("rank awareness schema serializes");
+
+        assert!(schema.contains("important_labels"));
+        assert!(schema.contains("noise_labels"));
+        assert!(!schema.contains("A, B, C"));
+        assert!(!schema.contains("replica"));
+        assert!(!schema.contains("champion"));
+        assert!(!schema.contains("winner"));
     }
 
     #[test]
@@ -1032,10 +1236,17 @@ mod tests {
     fn system_prompt_is_rank_task_only() {
         assert!(SYSTEM_PROMPT.contains("agent's current awareness"));
         assert!(SYSTEM_PROMPT.contains("available ranking tool"));
-        assert!(SYSTEM_PROMPT.contains("previously deferred candidates"));
+        assert!(SYSTEM_PROMPT.contains("Candidate order is occurrence order only"));
         assert!(SYSTEM_PROMPT.contains(
-            "Do not rely on lower-ranked or omitted candidates unless they are shown again"
+            "It never\nsignals importance, urgency, relevance, confidence, or selection priority"
         ));
+        assert!(SYSTEM_PROMPT.contains("important_labels"));
+        assert!(SYSTEM_PROMPT.contains("noise_labels"));
+        assert!(SYSTEM_PROMPT.contains("previously deferred candidates"));
+        assert!(
+            SYSTEM_PROMPT
+                .contains("Do not rely on noise or omitted candidates unless they are shown again")
+        );
         for forbidden in [
             "cognition-gate",
             "cognition log",
@@ -1493,54 +1704,51 @@ mod tests {
     }
 
     #[test]
-    fn ranked_candidates_rejects_unknown_and_duplicate_ids() {
+    fn ranked_candidates_rejects_when_important_and_noise_paths_are_invalid() {
         let candidates = test_candidates(&["first", "second"]);
-        let empty = ranked_candidate_records(
-            &RankAwarenessCandidatesArgs { labels: Vec::new() },
-            &candidates,
-        )
-        .unwrap_err();
-        assert!(empty.to_string().contains("empty labels"));
-
         let unknown = ranked_candidate_records(
             &RankAwarenessCandidatesArgs {
-                labels: vec!["UNKNOWNX".to_owned()],
+                important_labels: vec!["UNKNOWNX".to_owned()],
+                noise_labels: vec!["UNKNOWNY".to_owned()],
             },
             &candidates,
         )
         .unwrap_err();
         assert!(unknown.to_string().contains("outside candidate IDs"));
 
-        let no_candidates = ranked_candidate_records(
-            &RankAwarenessCandidatesArgs {
-                labels: vec![candidates[0].id.clone()],
-            },
-            &[],
-        )
-        .unwrap_err();
-        assert!(no_candidates.to_string().contains("outside candidate IDs"));
-
         let duplicate = ranked_candidate_records(
             &RankAwarenessCandidatesArgs {
-                labels: vec![candidates[0].id.clone(), format!("[{}]", candidates[0].id)],
+                important_labels: vec![candidates[0].id.clone(), format!("[{}]", candidates[0].id)],
+                noise_labels: vec![candidates[1].id.clone(), format!("[{}]", candidates[1].id)],
             },
             &candidates,
         )
         .unwrap_err();
         assert!(duplicate.to_string().contains("duplicate"));
+
+        let no_candidates = ranked_candidate_records(
+            &RankAwarenessCandidatesArgs {
+                important_labels: vec![candidates[0].id.clone()],
+                noise_labels: Vec::new(),
+            },
+            &[],
+        )
+        .unwrap_err();
+        assert!(no_candidates.to_string().contains("outside candidate IDs"));
     }
 
     #[test]
-    fn ranked_candidates_maps_first_three_ids_to_candidate_records() {
+    fn ranked_candidates_maps_first_three_important_ids_to_candidate_records() {
         let candidates = test_candidates(&["first", "second", "third", "fourth"]);
         let resolution = ranked_candidate_records(
             &RankAwarenessCandidatesArgs {
-                labels: vec![
+                important_labels: vec![
                     candidates[1].id.clone(),
                     candidates[0].id.clone(),
                     candidates[2].id.clone(),
                     candidates[3].id.clone(),
                 ],
+                noise_labels: Vec::new(),
             },
             &candidates,
         )
@@ -1558,7 +1766,58 @@ mod tests {
     }
 
     #[test]
-    fn ranked_candidates_defers_next_three_fresh_candidates_only() {
+    fn ranked_candidates_falls_back_to_noise_complement_when_important_is_invalid() {
+        let candidates = test_candidates(&["noise one", "keep one", "keep two", "noise two"]);
+        let resolution = ranked_candidate_records(
+            &RankAwarenessCandidatesArgs {
+                important_labels: vec!["unknown-important".to_owned()],
+                noise_labels: vec![candidates[0].id.clone(), candidates[3].id.clone()],
+            },
+            &candidates,
+        )
+        .unwrap();
+
+        assert_eq!(
+            resolution
+                .selected
+                .iter()
+                .map(|record| record.content.as_str())
+                .collect::<Vec<_>>(),
+            vec!["keep one", "keep two"]
+        );
+        assert!(resolution.deferred.is_empty());
+    }
+
+    #[test]
+    fn ranked_candidates_rejects_empty_and_over_limit_noise_complements() {
+        let candidates = test_candidates(&["first", "second", "third", "fourth"]);
+        let empty = ranked_candidate_records(
+            &RankAwarenessCandidatesArgs {
+                important_labels: Vec::new(),
+                noise_labels: candidates
+                    .iter()
+                    .map(|candidate| candidate.id.clone())
+                    .collect(),
+            },
+            &candidates,
+        )
+        .unwrap_err();
+        assert!(empty.to_string().contains("left no candidate"));
+
+        let many_candidates = test_candidates(&["first", "second", "third", "fourth", "fifth"]);
+        let over_limit = ranked_candidate_records(
+            &RankAwarenessCandidatesArgs {
+                important_labels: vec!["unknown-important".to_owned()],
+                noise_labels: vec![many_candidates[0].id.clone()],
+            },
+            &many_candidates,
+        )
+        .unwrap_err();
+        assert!(over_limit.to_string().contains("above awareness limit"));
+    }
+
+    #[test]
+    fn ranked_candidates_defers_next_three_fresh_important_candidates_only() {
         let mut candidates = test_candidates(&[
             "fresh selected A",
             "fresh selected B",
@@ -1572,10 +1831,11 @@ mod tests {
 
         let resolution = ranked_candidate_records(
             &RankAwarenessCandidatesArgs {
-                labels: candidates
+                important_labels: candidates
                     .iter()
                     .map(|candidate| candidate.id.clone())
                     .collect(),
+                noise_labels: Vec::new(),
             },
             &candidates,
         )
@@ -1605,7 +1865,8 @@ mod tests {
 
         let resolution = ranked_candidate_records(
             &RankAwarenessCandidatesArgs {
-                labels: vec![candidates[0].id.clone(), candidates[1].id.clone()],
+                important_labels: vec![candidates[0].id.clone(), candidates[1].id.clone()],
+                noise_labels: Vec::new(),
             },
             &candidates,
         )
@@ -1658,7 +1919,58 @@ mod tests {
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].entry.text, "candidate B matters now");
         assert_eq!(records[0].entry.origin.owner.module, builtin::sensory());
-        assert_eq!(records[0].entry.origin.memo_index, Some(2));
+        assert_eq!(records[0].entry.origin.memo_index, Some(1));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn invalid_important_labels_can_fall_back_to_noise_complement() {
+        let candidates = test_candidates(&[
+            "stale greeting",
+            "current participant question",
+            "load-bearing memory evidence",
+            "process note",
+        ]);
+        let adapter = MockLlmAdapter::new().with_text_scenario(
+            rank_awareness_candidates_with_noise_scenario(
+                ["unknown-important"],
+                [candidates[0].id.clone(), candidates[3].id.clone()],
+                1,
+            ),
+        );
+        let capture = CapturingAdapter::new(adapter);
+        let observed = capture.clone();
+        let mut fixture = gate_fixture_with_turn_adapter(Arc::new(capture)).await;
+
+        let lutum = fixture.gate.llm.lutum().await;
+        let identity_memories = Vec::new();
+        let cx = nuillu_module::ActivateCx::new(
+            &[],
+            &identity_memories,
+            &[],
+            compaction_runtime(&lutum),
+            SystemClock.now(),
+        );
+        fixture
+            .gate
+            .activate(&cx, &batch_from_candidates(&candidates))
+            .await
+            .unwrap();
+
+        assert_eq!(observed.text_inputs().len(), 1);
+        let entries = fixture
+            .blackboard
+            .read(|bb| bb.cognition_log().entries().to_vec())
+            .await;
+        assert_eq!(
+            entries
+                .iter()
+                .map(|entry| entry.text.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "current participant question",
+                "load-bearing memory evidence"
+            ]
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -1756,7 +2068,7 @@ mod tests {
                     .collect::<Vec<_>>(),
                 1,
             ))
-            .with_text_scenario(rank_awareness_candidates_scenario(["A"], 1));
+            .with_text_scenario(rank_awareness_candidates_scenario(["sensory-1"], 1));
         let capture = CapturingAdapter::new(adapter);
         let observed = capture.clone();
         let mut fixture = gate_fixture_with_turn_adapter(Arc::new(capture)).await;
@@ -1795,10 +2107,20 @@ mod tests {
         let inputs = observed.text_inputs();
         assert_eq!(inputs.len(), 2);
         let second_prompt = latest_candidate_user_message(inputs[1].items());
-        assert!(second_prompt.contains(&format!("[A] {DEFERRED_CANDIDATE_PREFIX}carryover D")));
-        assert!(second_prompt.contains(&format!("[B] {DEFERRED_CANDIDATE_PREFIX}carryover E")));
-        assert!(second_prompt.contains(&format!("[C] {DEFERRED_CANDIDATE_PREFIX}carryover F")));
-        assert!(second_prompt.contains("[D] fresh G"));
+        assert!(second_prompt.contains(&format!(
+            "[sensory-1] {DEFERRED_CANDIDATE_PREFIX}carryover D"
+        )));
+        assert!(second_prompt.contains(&format!(
+            "[sensory-2] {DEFERRED_CANDIDATE_PREFIX}carryover E"
+        )));
+        assert!(second_prompt.contains(&format!(
+            "[sensory-3] {DEFERRED_CANDIDATE_PREFIX}carryover F"
+        )));
+        assert!(second_prompt.contains("[sensory-4] fresh G"));
+        assert!(!second_prompt.contains("[A]"));
+        assert!(!second_prompt.contains("[B]"));
+        assert!(!second_prompt.contains("[C]"));
+        assert!(!second_prompt.contains("[D]"));
         assert_eq!(second_prompt.matches(DEFERRED_CANDIDATE_PREFIX).count(), 3);
 
         let entries = fixture
