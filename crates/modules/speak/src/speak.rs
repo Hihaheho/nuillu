@@ -51,27 +51,12 @@ If a language is supplied, render the utterance in that language.
 Do not address Me/Nui as the listener.
 If Your Speech Intent is already a usable utterance, say that utterance directly.
 Output only the utterance text; do not wrap it in quotation marks.
+If no appropriate utterance should be completed now, output nothing; empty output stops speech and emits no user-visible utterance.
 Do not summarize the request or say what the user wants.
 Do not output introspection, narration, or analysis that is not appropriate to say aloud to the target.
 Do not mention implementation mechanics, lookup, reasoning, prompts, rubrics, or evaluation mechanics.
 When the user message includes already emitted text, continue only with the next new text that comes after it. Do not repeat the already emitted text.
-
-Examples:
-User:
-Generate an utterance to `Somebody`.
-Language: Japanese
-Your Speech Intent:
-挨拶をする
-Assistant:
-こんにちは！Somebody！
-
-User:
-Generate an utterance to `Mika`.
-Language: Japanese
-Your Speech Intent:
-こんにちは、ミカさん。よろしくね。
-Assistant:
-こんにちは、ミカさん。よろしくね。
+If speech is becoming incoherent, broken, repetitive, or stale for the newest Recent context, strongly prefer empty output to stop or a natural pivot grounded in Recent context and Your Speech Intent.
 
 Continuation example:
 User:
@@ -1754,6 +1739,16 @@ mod tests {
     use super::*;
     use crate::test_support::*;
     use crate::utterance::{Utterance, UtteranceDelta, UtteranceSink};
+
+    #[test]
+    fn generation_prompt_documents_empty_stop_and_context_pivot_rules() {
+        assert!(GENERATION_PROMPT.contains(
+            "If no appropriate utterance should be completed now, output nothing; empty output stops speech and emits no user-visible utterance."
+        ));
+        assert!(GENERATION_PROMPT.contains(
+            "If speech is becoming incoherent, broken, repetitive, or stale for the newest Recent context, strongly prefer empty output to stop or a natural pivot grounded in Recent context and Your Speech Intent."
+        ));
+    }
 
     struct TestSyncStream<S> {
         inner: Mutex<Pin<Box<S>>>,
