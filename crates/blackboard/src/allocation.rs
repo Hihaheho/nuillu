@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ops::RangeInclusive;
 use std::time::Duration;
 
-use nuillu_types::{ModelTier, ModuleId, ModuleInstanceId, ReplicaCapRange};
+use nuillu_types::{ModuleId, ModuleInstanceId, ReplicaCapRange};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 const ACTIVATION_RATIO_SCALE: u16 = 10_000;
@@ -348,8 +348,7 @@ impl Default for ZeroReplicaWindowPolicy {
 
 /// Per-module guidance the attention controller writes from each priority
 /// entry's `hint`. The activation knob is stored separately on
-/// [`ResourceAllocation`] (see `set_activation`); tier is host-fixed via
-/// [`ResourceAllocation::set_model_override`].
+/// [`ResourceAllocation`] (see `set_activation`).
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct ModuleConfig {
     #[serde(default)]
@@ -363,7 +362,6 @@ pub struct ModuleConfig {
 /// - `activation`: controller-derived `ActivationRatio` per module (mapped from
 ///   priority position via `activation_table`).
 /// - `activation_table`: host-set ratio table; index = priority position.
-/// - `model_override`: host-set tier per module; absent => `ModelTier::Default`.
 /// - `active_replicas` / `bpm`: derived state populated by `derived()`
 ///   when the blackboard knows the registered [`ModulePolicy`] per module.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -373,8 +371,6 @@ pub struct ResourceAllocation {
     activation: HashMap<ModuleId, ActivationRatio>,
     #[serde(default)]
     activation_table: Vec<ActivationRatio>,
-    #[serde(default)]
-    model_override: BTreeMap<ModuleId, ModelTier>,
     #[serde(skip)]
     active_replicas: HashMap<ModuleId, u8>,
     #[serde(skip)]
@@ -466,7 +462,6 @@ impl ResourceAllocation {
     pub fn retain_modules(&mut self, allowed: &std::collections::HashSet<ModuleId>) {
         self.per_module.retain(|id, _| allowed.contains(id));
         self.activation.retain(|id, _| allowed.contains(id));
-        self.model_override.retain(|id, _| allowed.contains(id));
         self.bpm.retain(|id, _| allowed.contains(id));
         self.active_replicas.retain(|id, _| allowed.contains(id));
     }
@@ -479,20 +474,6 @@ impl ResourceAllocation {
 
     pub fn set_activation_table(&mut self, table: Vec<ActivationRatio>) {
         self.activation_table = table;
-    }
-
-    /// Resolve a module's tier. Falls back to [`ModelTier::Default`] when the
-    /// host did not register an override for the module.
-    pub fn tier_for(&self, id: &ModuleId) -> ModelTier {
-        self.model_override.get(id).copied().unwrap_or_default()
-    }
-
-    pub fn set_model_override(&mut self, id: ModuleId, tier: ModelTier) {
-        self.model_override.insert(id, tier);
-    }
-
-    pub fn iter_model_override(&self) -> impl Iterator<Item = (&ModuleId, ModelTier)> {
-        self.model_override.iter().map(|(id, tier)| (id, *tier))
     }
 
     /// Derive `active_replicas` and `bpm` from the controller's activation
@@ -622,14 +603,6 @@ mod tests {
                 max_total_active_replicas: Some(10),
             }
         );
-    }
-
-    #[test]
-    fn tier_for_resolves_via_model_override_with_default_fallback() {
-        let mut allocation = ResourceAllocation::default();
-        allocation.set_model_override(id("speak"), ModelTier::Premium);
-        assert_eq!(allocation.tier_for(&id("speak")), ModelTier::Premium);
-        assert_eq!(allocation.tier_for(&id("missing")), ModelTier::Default);
     }
 
     #[test]

@@ -204,8 +204,11 @@ mod tests {
                                     vec![nuillu_types::builtin::allocation()],
                                     Vec::new(),
                                 ),
-                                caps.llm_access(),
+                                caps.llm("main")
+                                    .with_tier(nuillu_types::ModelTier::Default)
+                                    .into(),
                                 caps.session("main")
+                                    .with_tier(nuillu_types::ModelTier::Default)
                                     .with_auto_compaction(crate::session_auto_compaction())
                                     .await?,
                             )

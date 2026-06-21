@@ -25,7 +25,6 @@ pub fn ui(ui: &mut egui::Ui, snapshot: &BlackboardSnapshot) {
                                 "blackboard-ratio",
                                 &[("ratio", format!("{:.2}", item.activation_ratio).into())],
                             ));
-                            ui.label(&item.tier);
                         });
                         if !item.guidance.is_empty() {
                             ui.add_space(4.0);

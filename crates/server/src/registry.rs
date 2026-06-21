@@ -7,7 +7,7 @@ use nuillu_memory::MemoryCapabilities;
 use nuillu_module::ModuleRegistry;
 use nuillu_reward::PolicyCapabilities;
 use nuillu_speak::{UtteranceSink, UtteranceWriter};
-use nuillu_types::{ModelTier, ModuleId};
+use nuillu_types::ModuleId;
 
 use super::config::{RuntimeModule, ServerBootConfig, ServerModuleGroup, ServerModuleSpec};
 
@@ -61,34 +61,45 @@ fn register_server_module(
 ) -> ModuleRegistry {
     let module = spec.id;
     match module {
-        RuntimeModule::Sensory => registry.register_server(spec, |caps| async move {
-            Ok(nuillu_sensory::SensoryModule::new(
-                caps.sensory_input_inbox(),
-                caps.memo(),
-                caps.scene_reader(),
-                caps.clock(),
-                caps.llm_access(),
-                caps.session("one-shot")
-                    .with_auto_compaction(nuillu_sensory::one_shot_session_auto_compaction())
-                    .await?,
-                caps.session("ambient")
-                    .with_auto_compaction(nuillu_sensory::ambient_session_auto_compaction())
-                    .await?,
-            ))
-        }),
-        RuntimeModule::CognitionGate => registry.register_server(spec, |caps| async move {
-            Ok(nuillu_cognition_gate::CognitionGateModule::new(
-                caps.memo_updated_inbox(),
-                caps.blackboard_reader(),
-                caps.cognition_writer(),
-                caps.llm_access(),
-                caps.session("main")
-                    .with_auto_compaction(nuillu_cognition_gate::session_auto_compaction())
-                    .await?,
-            ))
-        }),
+        RuntimeModule::Sensory => {
+            let one_shot_tier = spec.session_tier("one-shot");
+            let ambient_tier = spec.session_tier("ambient");
+            registry.register_server(spec, move |caps| async move {
+                Ok(nuillu_sensory::SensoryModule::new(
+                    caps.sensory_input_inbox(),
+                    caps.memo(),
+                    caps.scene_reader(),
+                    caps.clock(),
+                    caps.llm("one-shot").with_tier(one_shot_tier).into(),
+                    caps.session("one-shot")
+                        .with_tier(one_shot_tier)
+                        .with_auto_compaction(nuillu_sensory::one_shot_session_auto_compaction())
+                        .await?,
+                    caps.session("ambient")
+                        .with_tier(ambient_tier)
+                        .with_auto_compaction(nuillu_sensory::ambient_session_auto_compaction())
+                        .await?,
+                ))
+            })
+        }
+        RuntimeModule::CognitionGate => {
+            let main_tier = spec.session_tier("main");
+            registry.register_server(spec, move |caps| async move {
+                Ok(nuillu_cognition_gate::CognitionGateModule::new(
+                    caps.memo_updated_inbox(),
+                    caps.blackboard_reader(),
+                    caps.cognition_writer(),
+                    caps.llm("main").with_tier(main_tier).into(),
+                    caps.session("main")
+                        .with_tier(main_tier)
+                        .with_auto_compaction(nuillu_cognition_gate::session_auto_compaction())
+                        .await?,
+                ))
+            })
+        }
         RuntimeModule::Allocation => {
             let voluntary = group_modules(boot_config, ServerModuleGroup::Voluntary);
+            let main_tier = spec.session_tier("main");
             registry.register_server(spec, move |caps| {
                 let voluntary = voluntary.clone();
                 async move {
@@ -100,53 +111,67 @@ fn register_server_module(
                         caps.allocation_reader(),
                         caps.interoception_reader(),
                         caps.allocation_writer(voluntary.clone(), Vec::new()),
-                        caps.llm_access(),
+                        caps.llm("main").with_tier(main_tier).into(),
                         caps.session("main")
+                            .with_tier(main_tier)
                             .with_auto_compaction(nuillu_allocation::session_auto_compaction())
                             .await?,
                     ))
                 }
             })
         }
-        RuntimeModule::AttentionSchema => registry.register_server(spec, |caps| async move {
-            Ok(nuillu_attention_schema::AttentionSchemaModule::new(
-                caps.memo_updated_inbox(),
-                caps.cognition_log_updated_inbox(),
-                caps.blackboard_reader(),
-                caps.cognition_log_reader(),
-                caps.memo(),
-                caps.llm_access(),
-                caps.session("main")
-                    .with_auto_compaction(nuillu_attention_schema::session_auto_compaction())
-                    .await?,
-            ))
-        }),
-        RuntimeModule::Interpreter => registry.register_server(spec, |caps| async move {
-            Ok(nuillu_interpreter::InterpreterModule::new(
-                caps.cognition_log_updated_inbox(),
-                caps.cognition_log_reader(),
-                caps.cognition_writer(),
-                caps.llm_access(),
-                caps.session("main")
-                    .with_auto_compaction(nuillu_interpreter::session_auto_compaction())
-                    .await?,
-            ))
-        }),
-        RuntimeModule::SelfModel => registry.register_server(spec, |caps| async move {
-            Ok(nuillu_self_model::SelfModelModule::new(
-                caps.cognition_log_updated_inbox(),
-                caps.allocation_reader(),
-                caps.blackboard_reader(),
-                caps.cognition_log_reader(),
-                caps.memo(),
-                caps.llm_access(),
-                caps.session("main")
-                    .with_auto_compaction(nuillu_self_model::session_auto_compaction())
-                    .await?,
-            ))
-        }),
+        RuntimeModule::AttentionSchema => {
+            let main_tier = spec.session_tier("main");
+            registry.register_server(spec, move |caps| async move {
+                Ok(nuillu_attention_schema::AttentionSchemaModule::new(
+                    caps.memo_updated_inbox(),
+                    caps.cognition_log_updated_inbox(),
+                    caps.blackboard_reader(),
+                    caps.cognition_log_reader(),
+                    caps.memo(),
+                    caps.llm("main").with_tier(main_tier).into(),
+                    caps.session("main")
+                        .with_tier(main_tier)
+                        .with_auto_compaction(nuillu_attention_schema::session_auto_compaction())
+                        .await?,
+                ))
+            })
+        }
+        RuntimeModule::Interpreter => {
+            let main_tier = spec.session_tier("main");
+            registry.register_server(spec, move |caps| async move {
+                Ok(nuillu_interpreter::InterpreterModule::new(
+                    caps.cognition_log_updated_inbox(),
+                    caps.cognition_log_reader(),
+                    caps.cognition_writer(),
+                    caps.llm("main").with_tier(main_tier).into(),
+                    caps.session("main")
+                        .with_tier(main_tier)
+                        .with_auto_compaction(nuillu_interpreter::session_auto_compaction())
+                        .await?,
+                ))
+            })
+        }
+        RuntimeModule::SelfModel => {
+            let main_tier = spec.session_tier("main");
+            registry.register_server(spec, move |caps| async move {
+                Ok(nuillu_self_model::SelfModelModule::new(
+                    caps.cognition_log_updated_inbox(),
+                    caps.allocation_reader(),
+                    caps.blackboard_reader(),
+                    caps.cognition_log_reader(),
+                    caps.memo(),
+                    caps.llm("main").with_tier(main_tier).into(),
+                    caps.session("main")
+                        .with_tier(main_tier)
+                        .with_auto_compaction(nuillu_self_model::session_auto_compaction())
+                        .await?,
+                ))
+            })
+        }
         RuntimeModule::QueryMemory => {
             let memory_caps = memory_caps.clone();
+            let main_tier = spec.session_tier("main");
             registry.register_server(spec, move |caps| {
                 let memory_caps = memory_caps.clone();
                 async move {
@@ -156,8 +181,9 @@ fn register_server_module(
                         memory_caps.retriever(),
                         memory_caps.content_reader(),
                         caps.typed_memo::<nuillu_memory::QueryMemoryMemo>(),
-                        caps.llm_access(),
+                        caps.llm("main").with_tier(main_tier).into(),
                         caps.session("main")
+                            .with_tier(main_tier)
                             .with_auto_compaction(nuillu_memory::query_session_auto_compaction())
                             .await?,
                     ))
@@ -166,6 +192,7 @@ fn register_server_module(
         }
         RuntimeModule::Memory => {
             let memory_caps = memory_caps.clone();
+            let main_tier = spec.session_tier("main");
             registry.register_server(spec, move |caps| {
                 let memory_caps = memory_caps.clone();
                 async move {
@@ -175,8 +202,9 @@ fn register_server_module(
                         caps.memory_metadata_reader(),
                         memory_caps.writer(),
                         memory_caps.retriever(),
-                        caps.llm_access(),
+                        caps.llm("main").with_tier(main_tier).into(),
                         caps.session("main")
+                            .with_tier(main_tier)
                             .with_auto_compaction(nuillu_memory::session_auto_compaction())
                             .await?,
                     ))
@@ -185,6 +213,8 @@ fn register_server_module(
         }
         RuntimeModule::MemoryCompaction => {
             let memory_caps = memory_caps.clone();
+            let main_tier = spec.session_tier("main");
+            let audit_tier = spec.session_tier("audit");
             registry.register_server(spec, move |caps| {
                 let memory_caps = memory_caps.clone();
                 async move {
@@ -192,14 +222,15 @@ fn register_server_module(
                         caps.interoception_updated_inbox(),
                         caps.blackboard_reader(),
                         memory_caps.compactor(),
-                        caps.llm_access(),
-                        caps.default_tier_llm_access(),
+                        caps.llm("main").with_tier(main_tier).into(),
+                        caps.llm("audit").with_tier(audit_tier).into(),
                     ))
                 }
             })
         }
         RuntimeModule::MemoryAssociation => {
             let memory_caps = memory_caps.clone();
+            let main_tier = spec.session_tier("main");
             registry.register_server(spec, move |caps| {
                 let memory_caps = memory_caps.clone();
                 async move {
@@ -209,13 +240,14 @@ fn register_server_module(
                         memory_caps.content_reader(),
                         memory_caps.writer(),
                         memory_caps.associator(),
-                        caps.llm_access(),
+                        caps.llm("main").with_tier(main_tier).into(),
                     ))
                 }
             })
         }
         RuntimeModule::MemoryRecombination => {
             let memory_caps = memory_caps.clone();
+            let main_tier = spec.session_tier("main");
             registry.register_server(spec, move |caps| {
                 let memory_caps = memory_caps.clone();
                 async move {
@@ -225,13 +257,14 @@ fn register_server_module(
                         caps.blackboard_reader(),
                         memory_caps.retriever(),
                         caps.cognition_writer(),
-                        caps.llm_access(),
+                        caps.llm("main").with_tier(main_tier).into(),
                     ))
                 }
             })
         }
         RuntimeModule::Interoception => {
             let suppressed = group_modules(boot_config, ServerModuleGroup::SleepSuppressed);
+            let main_tier = spec.session_tier("main");
             registry.register_server(spec, move |caps| {
                 let suppressed = suppressed.clone();
                 async move {
@@ -242,8 +275,9 @@ fn register_server_module(
                         caps.allocation_writer(Vec::new(), suppressed.clone()),
                         caps.interoception_policy(),
                         caps.interoception_writer(),
-                        caps.llm_access(),
+                        caps.llm("main").with_tier(main_tier).into(),
                         caps.session("main")
+                            .with_tier(main_tier)
                             .with_auto_compaction(nuillu_interoception::session_auto_compaction())
                             .await?,
                     ))
@@ -267,6 +301,7 @@ fn register_server_module(
         }
         RuntimeModule::Policy => {
             let policy_caps = policy_caps.clone();
+            let main_tier = spec.session_tier("main");
             registry.register_server(spec, move |caps| {
                 let policy_caps = policy_caps.clone();
                 async move {
@@ -282,8 +317,9 @@ fn register_server_module(
                         policy_caps.searcher(),
                         caps.memo(),
                         consideration_writer,
-                        caps.llm_access(),
+                        caps.llm("main").with_tier(main_tier).into(),
                         caps.session("main")
+                            .with_tier(main_tier)
                             .with_auto_compaction(nuillu_reward::policy_session_auto_compaction())
                             .await?,
                     ))
@@ -292,6 +328,7 @@ fn register_server_module(
         }
         RuntimeModule::PolicyCompaction => {
             let policy_caps = policy_caps.clone();
+            let main_tier = spec.session_tier("main");
             registry.register_server(spec, move |caps| {
                 let policy_caps = policy_caps.clone();
                 async move {
@@ -300,13 +337,14 @@ fn register_server_module(
                         caps.allocation_reader(),
                         caps.blackboard_reader(),
                         policy_caps.compactor(),
-                        caps.llm_access(),
+                        caps.llm("main").with_tier(main_tier).into(),
                     ))
                 }
             })
         }
         RuntimeModule::Reward => {
             let policy_caps = policy_caps.clone();
+            let main_tier = spec.session_tier("main");
             registry.register_server(spec, move |caps| {
                 let policy_caps = policy_caps.clone();
                 async move {
@@ -318,40 +356,51 @@ fn register_server_module(
                         policy_caps.searcher(),
                         policy_caps.upserter(),
                         caps.memo(),
-                        caps.llm_access(),
+                        caps.llm("main").with_tier(main_tier).into(),
                         caps.session("main")
+                            .with_tier(main_tier)
                             .with_auto_compaction(nuillu_reward::reward_session_auto_compaction())
                             .await?,
                     ))
                 }
             })
         }
-        RuntimeModule::Predict => registry.register_server(spec, |caps| async move {
-            Ok(nuillu_predict::PredictModule::new(
-                caps.cognition_log_updated_inbox(),
-                caps.cognition_log_reader(),
-                caps.memo(),
-                caps.llm_access(),
-                caps.session("main")
-                    .with_auto_compaction(nuillu_predict::session_auto_compaction())
-                    .await?,
-            ))
-        }),
-        RuntimeModule::Surprise => registry.register_server(spec, |caps| async move {
-            Ok(nuillu_surprise::SurpriseModule::new(
-                caps.cognition_log_updated_inbox(),
-                caps.cognition_log_reader(),
-                caps.blackboard_reader(),
-                caps.attention_control_mailbox(),
-                caps.memo(),
-                caps.llm_access(),
-                caps.session("main")
-                    .with_auto_compaction(nuillu_surprise::session_auto_compaction())
-                    .await?,
-            ))
-        }),
+        RuntimeModule::Predict => {
+            let main_tier = spec.session_tier("main");
+            registry.register_server(spec, move |caps| async move {
+                Ok(nuillu_predict::PredictModule::new(
+                    caps.cognition_log_updated_inbox(),
+                    caps.cognition_log_reader(),
+                    caps.memo(),
+                    caps.llm("main").with_tier(main_tier).into(),
+                    caps.session("main")
+                        .with_tier(main_tier)
+                        .with_auto_compaction(nuillu_predict::session_auto_compaction())
+                        .await?,
+                ))
+            })
+        }
+        RuntimeModule::Surprise => {
+            let main_tier = spec.session_tier("main");
+            registry.register_server(spec, move |caps| async move {
+                Ok(nuillu_surprise::SurpriseModule::new(
+                    caps.cognition_log_updated_inbox(),
+                    caps.cognition_log_reader(),
+                    caps.blackboard_reader(),
+                    caps.attention_control_mailbox(),
+                    caps.memo(),
+                    caps.llm("main").with_tier(main_tier).into(),
+                    caps.session("main")
+                        .with_tier(main_tier)
+                        .with_auto_compaction(nuillu_surprise::session_auto_compaction())
+                        .await?,
+                ))
+            })
+        }
         RuntimeModule::Speak => {
             let utterance_sink = utterance_sink.clone();
+            let planning_tier = spec.session_tier("planning");
+            let generation_tier = spec.session_tier("generation");
             registry.register_server(spec, move |caps| {
                 let utterance_sink = utterance_sink.clone();
                 async move {
@@ -367,18 +416,24 @@ fn register_server_module(
                                 utterance_sink.clone(),
                                 caps.clock(),
                             ),
-                            llm: caps.llm_access(),
+                            planning_llm: caps.llm("planning").with_tier(planning_tier).into(),
+                            generation_llm: caps
+                                .llm("generation")
+                                .with_tier(generation_tier)
+                                .into(),
                             scene: caps.scene_reader(),
                             clock: caps.clock(),
                             self_wake: caps.self_wake(),
                             planning_session: caps
                                 .session("planning")
+                                .with_tier(planning_tier)
                                 .with_auto_compaction(
                                     nuillu_speak::planning_session_auto_compaction(),
                                 )
                                 .await?,
                             generation_session: caps
                                 .session("generation")
+                                .with_tier(generation_tier)
                                 .with_auto_compaction(
                                     nuillu_speak::generation_session_auto_compaction(),
                                 )
@@ -406,7 +461,6 @@ pub(super) fn full_agent_allocation(boot_config: &ServerBootConfig) -> ResourceA
             &mut allocation,
             module.module_id(),
             module.initial_activation,
-            module.tier(),
         );
     }
     allocation
@@ -443,13 +497,7 @@ fn policy(module: &ServerModuleSpec) -> ModulePolicy {
     )
 }
 
-fn set_allocation_module(
-    allocation: &mut ResourceAllocation,
-    id: ModuleId,
-    activation_ratio: f64,
-    tier: ModelTier,
-) {
-    allocation.set_model_override(id.clone(), tier);
+fn set_allocation_module(allocation: &mut ResourceAllocation, id: ModuleId, activation_ratio: f64) {
     allocation.set(id.clone(), ModuleConfig::default());
     allocation.set_activation(id, ActivationRatio::from_f64(activation_ratio));
 }
@@ -528,10 +576,6 @@ mod tests {
         assert_eq!(
             allocation.activation_for(&builtin::speak()),
             ActivationRatio::from_f64(0.75)
-        );
-        assert_eq!(
-            allocation.tier_for(&builtin::speak()),
-            nuillu_types::ModelTier::Premium
         );
         assert_eq!(allocation.get(&builtin::policy()), None);
     }

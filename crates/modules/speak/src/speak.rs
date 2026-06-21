@@ -820,7 +820,8 @@ pub struct SpeakModule {
     attention_control: AttentionControlRequestMailbox,
     memo: Memo,
     utterance: UtteranceWriter,
-    llm: LlmAccess,
+    planning_llm: LlmAccess,
+    generation_llm: LlmAccess,
     scene: SceneReader,
     clock: Rc<dyn Clock>,
     planning_session: Session,
@@ -838,7 +839,8 @@ pub struct SpeakModuleParts {
     pub attention_control: AttentionControlRequestMailbox,
     pub memo: Memo,
     pub utterance: UtteranceWriter,
-    pub llm: LlmAccess,
+    pub planning_llm: LlmAccess,
+    pub generation_llm: LlmAccess,
     pub scene: SceneReader,
     pub clock: Rc<dyn Clock>,
     pub planning_session: Session,
@@ -854,7 +856,8 @@ impl SpeakModule {
             attention_control,
             memo,
             utterance,
-            llm,
+            planning_llm,
+            generation_llm,
             scene,
             clock,
             planning_session,
@@ -868,7 +871,8 @@ impl SpeakModule {
             attention_control,
             memo,
             utterance,
-            llm,
+            planning_llm,
+            generation_llm,
             scene,
             clock,
             planning_session,
@@ -1040,7 +1044,7 @@ impl SpeakModule {
         let mut turn_session = self.planning_session.clone();
         push_planning_context(&mut turn_session, cognition_context, None, &target_hints);
 
-        let lutum = self.llm.lutum().await;
+        let lutum = self.planning_llm.lutum().await;
         let target_schema = freeform_speech_target_schema();
         let outcome = SPEECH_TARGET_SCHEMA
             .scope(target_schema, async {
@@ -1145,7 +1149,7 @@ impl SpeakModule {
             &target_hints,
         );
 
-        let lutum = self.llm.lutum().await;
+        let lutum = self.planning_llm.lutum().await;
         let target_schema = freeform_speech_target_schema();
         let outcome = SPEECH_TARGET_SCHEMA
             .scope(target_schema, async {
@@ -1301,7 +1305,7 @@ impl SpeakModule {
         let buffered_deltas = Arc::new(Mutex::new(GenerationDeltaBuffer::default()));
         let (flushed_deltas, mut flushed_delta_batches) =
             tokio::sync::mpsc::unbounded_channel::<Vec<String>>();
-        let lutum = self.llm.lutum().await;
+        let lutum = self.generation_llm.lutum().await;
         let result = {
             let collect = turn_session
                 .text_turn()
@@ -2224,16 +2228,25 @@ mod tests {
                             utterance_sink_for_closure.clone(),
                             caps.clock(),
                         ),
-                        llm: caps.llm_access(),
+                        planning_llm: caps
+                            .llm("planning")
+                            .with_tier(nuillu_types::ModelTier::Premium)
+                            .into(),
+                        generation_llm: caps
+                            .llm("generation")
+                            .with_tier(nuillu_types::ModelTier::Default)
+                            .into(),
                         scene: caps.scene_reader(),
                         clock: caps.clock(),
                         self_wake: caps.self_wake(),
                         planning_session: caps
                             .session("planning")
+                            .with_tier(nuillu_types::ModelTier::Premium)
                             .with_auto_compaction(planning_session_auto_compaction())
                             .await?,
                         generation_session: caps
                             .session("generation")
+                            .with_tier(nuillu_types::ModelTier::Default)
                             .with_auto_compaction(generation_session_auto_compaction())
                             .await?,
                     }));
@@ -2279,7 +2292,7 @@ mod tests {
         module: &SpeakModule,
         now: chrono::DateTime<chrono::Utc>,
     ) -> nuillu_module::ActivateCx<'static> {
-        let compaction_lutum = module.llm.lutum().await;
+        let compaction_lutum = module.planning_llm.lutum().await;
         nuillu_module::ActivateCx::new(
             &[],
             &[],
@@ -2388,6 +2401,26 @@ mod tests {
             }
         }
         out
+    }
+
+    fn model_input_message_text(
+        item: &ModelInputItem,
+        expected_role: InputMessageRole,
+        label: &str,
+    ) -> String {
+        let ModelInputItem::Message { role, content } = item else {
+            panic!("expected {label}");
+        };
+        assert_eq!(role, &expected_role);
+        content
+            .as_slice()
+            .iter()
+            .filter_map(|content| match content {
+                MessageContent::Text(text) => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 
     fn session_message_texts(session: &Session, expected_role: InputMessageRole) -> Vec<String> {
@@ -2814,16 +2847,8 @@ mod tests {
         assert_eq!(draft.generation_id, 7);
         assert_eq!(draft.sequence, 0);
         assert_eq!(items.len(), 2);
-        let ModelInputItem::Message {
-            role: InputMessageRole::User,
-            content,
-        } = &items[0]
-        else {
-            panic!("expected user generation context");
-        };
-        let [MessageContent::Text(text)] = content.as_slice() else {
-            panic!("expected one text content item");
-        };
+        let text =
+            model_input_message_text(&items[0], InputMessageRole::User, "user generation context");
         assert_eq!(text, GENERATION_TURN_USER_PROMPT);
         let ModelInputItem::Assistant(AssistantInputItem::Text(text)) = &items[1] else {
             panic!("expected assistant thinking prefill");
@@ -2955,7 +2980,7 @@ mod tests {
             content: MemoryContent::new("Nui is a small blue frog."),
             occurred_at: None,
         }];
-        let compaction_lutum = module.llm.lutum().await;
+        let compaction_lutum = module.planning_llm.lutum().await;
         let clock = SystemClock;
         let cx = nuillu_module::ActivateCx::new(
             &catalog,
@@ -3581,19 +3606,11 @@ mod tests {
         let items = generation_input.items();
         assert!(items.len() >= 3);
         let tail = &items[items.len() - 3..];
-        let ModelInputItem::Message { role, content } = &tail[0] else {
-            panic!("expected continuation generation user context");
-        };
-        assert_eq!(role, &InputMessageRole::User);
-        let user_text = content
-            .as_slice()
-            .iter()
-            .filter_map(|content| match content {
-                MessageContent::Text(text) => Some(text.as_str()),
-                _ => None,
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
+        let user_text = model_input_message_text(
+            &tail[0],
+            InputMessageRole::User,
+            "continuation generation user context",
+        );
         assert_eq!(user_text, GENERATION_TURN_USER_PROMPT);
         assert!(!user_text.contains("Recent context:"));
         let ModelInputItem::Assistant(AssistantInputItem::Text(text)) = &tail[1] else {
@@ -3762,19 +3779,11 @@ mod tests {
         let items = generation_input.items();
         assert!(items.len() >= 3);
         let tail = &items[items.len() - 3..];
-        let ModelInputItem::Message { role, content } = &tail[0] else {
-            panic!("expected continuation generation user context");
-        };
-        assert_eq!(role, &InputMessageRole::User);
-        let user_text = content
-            .as_slice()
-            .iter()
-            .filter_map(|content| match content {
-                MessageContent::Text(text) => Some(text.as_str()),
-                _ => None,
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
+        let user_text = model_input_message_text(
+            &tail[0],
+            InputMessageRole::User,
+            "continuation generation user context",
+        );
         assert_eq!(user_text, GENERATION_TURN_USER_PROMPT);
         let ModelInputItem::Assistant(AssistantInputItem::Text(text)) = &tail[1] else {
             panic!("expected assistant thinking prefill");
@@ -3856,19 +3865,11 @@ mod tests {
         let items = generation_input.items();
         assert!(items.len() >= 3);
         let tail = &items[items.len() - 3..];
-        let ModelInputItem::Message { role, content } = &tail[0] else {
-            panic!("expected continuation generation user plan");
-        };
-        assert_eq!(role, &InputMessageRole::User);
-        let user_text = content
-            .as_slice()
-            .iter()
-            .filter_map(|content| match content {
-                MessageContent::Text(text) => Some(text.as_str()),
-                _ => None,
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
+        let user_text = model_input_message_text(
+            &tail[0],
+            InputMessageRole::User,
+            "continuation generation user plan",
+        );
         assert_eq!(user_text, GENERATION_TURN_USER_PROMPT);
         let ModelInputItem::Assistant(AssistantInputItem::Text(text)) = &tail[1] else {
             panic!("expected assistant thinking prefill");
@@ -4241,13 +4242,9 @@ mod tests {
         assert_eq!(draft.sequence, 2);
         assert_eq!(draft.accumulated, "hello world");
         assert_eq!(items.len(), 3);
-        assert!(matches!(
-            &items[0],
-            ModelInputItem::Message {
-                role: InputMessageRole::User,
-                ..
-            }
-        ));
+        let text =
+            model_input_message_text(&items[0], InputMessageRole::User, "user generation context");
+        assert_eq!(text, GENERATION_TURN_USER_PROMPT);
         let ModelInputItem::Assistant(AssistantInputItem::Text(text)) = &items[1] else {
             panic!("expected assistant thinking prefill");
         };

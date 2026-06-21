@@ -534,8 +534,11 @@ mod tests {
                         caps.blackboard_reader(),
                         caps.attention_control_mailbox(),
                         caps.memo(),
-                        caps.llm_access(),
+                        caps.llm("main")
+                            .with_tier(nuillu_types::ModelTier::Default)
+                            .into(),
                         caps.session("main")
+                            .with_tier(nuillu_types::ModelTier::Default)
                             .with_auto_compaction(session_auto_compaction())
                             .await?,
                     ));

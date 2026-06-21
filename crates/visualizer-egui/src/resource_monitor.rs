@@ -980,7 +980,6 @@ mod tests {
                 active_replicas,
                 bpm: Some(bpm),
                 period_ms: Some(period_ms),
-                tier: "default".to_string(),
                 guidance: String::new(),
             }],
             module_policies: vec![ModulePolicyView {

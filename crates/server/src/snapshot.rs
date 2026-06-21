@@ -5,7 +5,7 @@ use nuillu_blackboard::{
     ZeroReplicaWindowPolicy,
 };
 use nuillu_memory::{LinkedMemoryRecord, MemoryRecord};
-use nuillu_types::{MemoryRank, ModelTier};
+use nuillu_types::MemoryRank;
 use nuillu_visualizer_protocol::{
     AllocationView, BlackboardSnapshot, CognitionEntryView, CognitionLogView, InteroceptionView,
     LinkedMemoryRecordView, MemoView, MemoryConceptView, MemoryLinkView, MemoryMetadataView,
@@ -177,7 +177,6 @@ fn allocation_views(allocation: &ResourceAllocation) -> Vec<AllocationView> {
                 module: module.as_str().to_owned(),
                 activation_ratio: allocation.activation_for(module).as_f64(),
                 active_replicas: allocation.active_replicas(module),
-                tier: model_tier_name(allocation.tier_for(module)).to_owned(),
                 guidance: config.guidance.clone(),
             }
         })
@@ -240,14 +239,6 @@ pub fn memory_rank_name(rank: MemoryRank) -> &'static str {
         MemoryRank::LongTerm => "long-term",
         MemoryRank::MidTerm => "mid-term",
         MemoryRank::ShortTerm => "short-term",
-    }
-}
-
-pub fn model_tier_name(tier: ModelTier) -> &'static str {
-    match tier {
-        ModelTier::Cheap => "cheap",
-        ModelTier::Default => "default",
-        ModelTier::Premium => "premium",
     }
 }
 

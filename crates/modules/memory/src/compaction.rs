@@ -7,9 +7,7 @@ use lutum::{
     TextStepOutcomeWithTools, ToolResult,
 };
 use nuillu_blackboard::MemoryMetadata;
-use nuillu_module::{
-    BlackboardReader, FixedTierLlmAccess, InteroceptiveUpdatedInbox, LlmAccess, Module,
-};
+use nuillu_module::{BlackboardReader, InteroceptiveUpdatedInbox, LlmAccess, Module};
 use nuillu_types::{MemoryIndex, MemoryRank};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -107,7 +105,7 @@ pub struct MemoryCompactionModule {
     blackboard: BlackboardReader,
     compactor: MemoryCompactor,
     llm: LlmAccess,
-    audit_llm: FixedTierLlmAccess,
+    audit_llm: LlmAccess,
     system_prompt: std::sync::OnceLock<String>,
 }
 
@@ -117,7 +115,7 @@ impl MemoryCompactionModule {
         blackboard: BlackboardReader,
         compactor: MemoryCompactor,
         llm: LlmAccess,
-        audit_llm: FixedTierLlmAccess,
+        audit_llm: LlmAccess,
     ) -> Self {
         Self {
             owner: nuillu_types::ModuleId::new(<Self as Module>::id())
@@ -861,8 +859,12 @@ mod tests {
                         caps.interoception_updated_inbox(),
                         caps.blackboard_reader(),
                         memory_caps.compactor(),
-                        caps.llm_access(),
-                        caps.default_tier_llm_access(),
+                        caps.llm("main")
+                            .with_tier(nuillu_types::ModelTier::Cheap)
+                            .into(),
+                        caps.llm("audit")
+                            .with_tier(nuillu_types::ModelTier::Default)
+                            .into(),
                     ))
                 }
             })

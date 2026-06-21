@@ -577,12 +577,6 @@ impl AgentRuntimeControl {
         self.session_compaction_policy
     }
 
-    pub async fn tier_for(&self, owner: &ModuleInstanceId) -> ModelTier {
-        self.blackboard
-            .read(|bb| bb.allocation().tier_for(&owner.module))
-            .await
-    }
-
     /// Snapshot of the registered-module peer-context catalog. Cheap
     /// synchronous read; the scheduler turns this into an [`ActivateCx`] for
     /// each `activate` call.
@@ -964,22 +958,13 @@ impl ModuleCapabilityFactory {
         )
     }
 
-    pub fn llm_access(&self) -> LlmAccess {
-        LlmAccess::new(
-            self.owner.clone(),
-            self.root.inner.tiers.clone(),
-            self.root.inner.blackboard.clone(),
-            self.root.inner.runtime_events.clone(),
-        )
-    }
-
-    pub fn default_tier_llm_access(&self) -> crate::FixedTierLlmAccess {
-        crate::FixedTierLlmAccess::new(
-            self.owner.clone(),
-            ModelTier::Default,
-            self.root.inner.tiers.clone(),
-            self.root.inner.runtime_events.clone(),
-        )
+    pub fn llm(&self, key: impl Into<String>) -> LlmCapabilityRequest {
+        LlmCapabilityRequest {
+            owner: self.owner.clone(),
+            root: self.root.clone(),
+            key: key.into(),
+            tier: ModelTier::Default,
+        }
     }
 
     pub fn session(&self, key: impl Into<String>) -> SessionCapabilityRequest {
@@ -987,6 +972,7 @@ impl ModuleCapabilityFactory {
             owner: self.owner.clone(),
             root: self.root.clone(),
             key: key.into(),
+            tier: ModelTier::Default,
             auto_compaction: None,
         }
     }
@@ -1082,14 +1068,46 @@ impl ModuleCapabilityFactory {
     }
 }
 
+pub struct LlmCapabilityRequest {
+    owner: ModuleInstanceId,
+    root: CapabilityProviders,
+    key: String,
+    tier: ModelTier,
+}
+
+impl LlmCapabilityRequest {
+    pub fn with_tier(mut self, tier: ModelTier) -> Self {
+        self.tier = tier;
+        self
+    }
+}
+
+impl From<LlmCapabilityRequest> for LlmAccess {
+    fn from(request: LlmCapabilityRequest) -> Self {
+        LlmAccess::new(
+            request.owner,
+            request.key,
+            request.tier,
+            request.root.inner.tiers.clone(),
+            request.root.inner.runtime_events.clone(),
+        )
+    }
+}
+
 pub struct SessionCapabilityRequest {
     owner: ModuleInstanceId,
     root: CapabilityProviders,
     key: String,
+    tier: ModelTier,
     auto_compaction: Option<SessionAutoCompaction>,
 }
 
 impl SessionCapabilityRequest {
+    pub fn with_tier(mut self, tier: ModelTier) -> Self {
+        self.tier = tier;
+        self
+    }
+
     pub fn with_auto_compaction(mut self, auto_compaction: SessionAutoCompaction) -> Self {
         self.auto_compaction = Some(auto_compaction);
         self
@@ -1123,13 +1141,7 @@ impl IntoFuture for SessionCapabilityRequest {
             let mut session = snapshot
                 .map(crate::PersistedSessionSnapshot::into_session)
                 .unwrap_or_else(Session::new);
-            let tier = self
-                .root
-                .inner
-                .blackboard
-                .read(|bb| bb.allocation().tier_for(&self.owner.module))
-                .await;
-            let reasoning = self.root.inner.tiers.pick_handle(tier).reasoning;
+            let reasoning = self.root.inner.tiers.pick_handle(self.tier).reasoning;
             attach_persistent_session_metadata(
                 &mut session,
                 self.owner,

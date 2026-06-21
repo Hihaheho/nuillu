@@ -5,7 +5,6 @@ use std::ops::Deref;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use lutum::Lutum;
-use nuillu_blackboard::Blackboard;
 use nuillu_types::{ModelTier, ModuleActivationId, ModuleInstanceId};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, TryAcquireError};
@@ -295,28 +294,20 @@ impl Drop for LlmLease {
 
 /// LLM-access capability.
 ///
-/// Owner-stamped: `lutum()` reads the current
-/// [`ResourceAllocation`](nuillu_blackboard::ResourceAllocation) for the
-/// owning module and returns a leased [`Lutum`] handle bound to the
-/// allocation's tier.
+/// Owner-stamped and key-stamped: `lutum()` returns a leased [`Lutum`] handle
+/// bound to the tier chosen for this named session/LLM key at module
+/// construction.
 ///
-/// Modules consume the returned `Lutum` directly — typically by passing
-/// it to `lutum::Session`'s turn builder collect step
-/// (e.g. `session.text_turn().collect(&lutum)`) for a single-turn or
-/// agent-loop activation. The capability deliberately stops at the `Lutum`
-/// boundary; everything past it (Session shape, prompts, tools) is the
-/// module's own concern.
+/// Modules consume the returned `Lutum` directly — typically by passing it to
+/// `lutum::Session`'s turn builder collect step
+/// (e.g. `session.text_turn().collect(&lutum)`) for a single-turn or agent-loop
+/// activation. The capability deliberately stops at the `Lutum` boundary;
+/// everything past it (Session shape, prompts, tools) is the module's own
+/// concern.
 #[derive(Clone)]
 pub struct LlmAccess {
     owner: ModuleInstanceId,
-    tiers: LutumTiers,
-    blackboard: Blackboard,
-    events: RuntimeEventEmitter,
-}
-
-#[derive(Clone)]
-pub struct FixedTierLlmAccess {
-    owner: ModuleInstanceId,
+    key: String,
     tier: ModelTier,
     tiers: LutumTiers,
     events: RuntimeEventEmitter,
@@ -325,36 +316,35 @@ pub struct FixedTierLlmAccess {
 impl LlmAccess {
     pub(crate) fn new(
         owner: ModuleInstanceId,
+        key: impl Into<String>,
+        tier: ModelTier,
         tiers: LutumTiers,
-        blackboard: Blackboard,
         events: RuntimeEventEmitter,
     ) -> Self {
         Self {
             owner,
+            key: key.into(),
+            tier,
             tiers,
-            blackboard,
             events,
         }
     }
 
-    /// A leased [`Lutum`] for the owner module's currently allocated tier.
-    /// Tier resolution is per-call so allocation changes between
-    /// activations take effect on the next call without re-issuing the
-    /// capability.
+    /// A leased [`Lutum`] for this handle's configured tier.
     pub async fn lutum(&self) -> LlmLease {
-        self.lutum_with_metadata(LlmRequestSource::ModuleTurn, None)
-            .await
+        self.lutum_with_metadata(LlmRequestSource::ModuleTurn).await
     }
 
-    async fn lutum_with_metadata(
-        &self,
-        source: LlmRequestSource,
-        session_key: Option<String>,
-    ) -> LlmLease {
-        let tier = self
-            .blackboard
-            .read(|bb| bb.allocation().tier_for(&self.owner.module))
-            .await;
+    pub fn tier(&self) -> ModelTier {
+        self.tier
+    }
+
+    pub fn key(&self) -> &str {
+        &self.key
+    }
+
+    async fn lutum_with_metadata(&self, source: LlmRequestSource) -> LlmLease {
+        let tier = self.tier;
         let handle = self.tiers.pick_handle(tier);
         let events = self.events.clone();
         let owner = self.owner.clone();
@@ -372,7 +362,7 @@ impl LlmAccess {
                 owner: self.owner.clone(),
                 tier,
                 source,
-                session_key,
+                session_key: Some(self.key.clone()),
                 activation_id,
                 activation_attempt,
                 batch,
@@ -387,61 +377,6 @@ impl LlmAccess {
                 events: self.events.clone(),
                 owner: self.owner.clone(),
                 tier,
-                call,
-            },
-        )
-    }
-}
-
-impl FixedTierLlmAccess {
-    pub(crate) fn new(
-        owner: ModuleInstanceId,
-        tier: ModelTier,
-        tiers: LutumTiers,
-        events: RuntimeEventEmitter,
-    ) -> Self {
-        Self {
-            owner,
-            tier,
-            tiers,
-            events,
-        }
-    }
-
-    pub async fn lutum(&self) -> LlmLease {
-        let handle = self.tiers.pick_handle(self.tier);
-        let events = self.events.clone();
-        let owner = self.owner.clone();
-        let tier = self.tier;
-        let permit = handle
-            .concurrency
-            .acquire_with_wait_observer(|| {
-                events.llm_semaphore_wait_started(owner, tier);
-            })
-            .await;
-        let call = self.events.llm_accessed(self.owner.clone(), self.tier);
-        let lutum = if let Some((activation_id, activation_attempt, batch)) =
-            current_activation_llm_request_metadata()
-        {
-            handle.lutum.clone().with_extension(LlmRequestMetadata {
-                owner: self.owner.clone(),
-                tier: self.tier,
-                source: LlmRequestSource::ModuleTurn,
-                session_key: None,
-                activation_id,
-                activation_attempt,
-                batch,
-            })
-        } else {
-            handle.lutum.clone()
-        };
-        LlmLease::new(
-            lutum,
-            permit,
-            LlmLeaseCompletion {
-                events: self.events.clone(),
-                owner: self.owner.clone(),
-                tier: self.tier,
                 call,
             },
         )
@@ -471,7 +406,6 @@ mod tests {
         ModelInputHookContext, OnModelInput, RawTextTurnEvent, SharedPoolBudgetManager,
         SharedPoolBudgetOptions, Usage,
     };
-    use nuillu_blackboard::{Blackboard, ResourceAllocation};
     use nuillu_types::{ModelTier, ModuleActivationId, ModuleInstanceId, ReplicaIndex, builtin};
 
     use crate::ports::PortError;
@@ -479,8 +413,8 @@ mod tests {
     use crate::{LlmTierHandle, LutumTiers};
 
     use super::{
-        FixedTierLlmAccess, LlmAccess, LlmBatchDebug, LlmConcurrencyLimiter, LlmRequestMetadata,
-        LlmRequestSource, with_activation_llm_request_metadata,
+        LlmAccess, LlmBatchDebug, LlmConcurrencyLimiter, LlmRequestMetadata, LlmRequestSource,
+        with_activation_llm_request_metadata,
     };
 
     #[derive(Debug, Default)]
@@ -511,9 +445,6 @@ mod tests {
 
     #[tokio::test]
     async fn lutum_emits_one_runtime_event_per_acquisition() {
-        let mut allocation = ResourceAllocation::default();
-        allocation.set_model_override(builtin::cognition_gate(), ModelTier::Premium);
-        let blackboard = Blackboard::with_allocation(allocation);
         let owner = ModuleInstanceId::new(builtin::cognition_gate(), ReplicaIndex::ZERO);
         let adapter = Arc::new(MockLlmAdapter::new());
         let budget = SharedPoolBudgetManager::new(SharedPoolBudgetOptions::default());
@@ -521,7 +452,7 @@ mod tests {
         let tiers = crate::LutumTiers::from_shared_lutum(lutum);
         let sink = Rc::new(RecordingSink::default());
         let events = RuntimeEventEmitter::new(sink.clone());
-        let access = LlmAccess::new(owner.clone(), tiers, blackboard, events);
+        let access = LlmAccess::new(owner.clone(), "main", ModelTier::Premium, tiers, events);
 
         let _ = access.lutum().await;
         let _ = access.lutum().await;
@@ -563,7 +494,6 @@ mod tests {
         let local = tokio::task::LocalSet::new();
         local
             .run_until(async {
-                let blackboard = Blackboard::default();
                 let owner = ModuleInstanceId::new(builtin::cognition_gate(), ReplicaIndex::ZERO);
                 let adapter = Arc::new(MockLlmAdapter::new());
                 let budget = SharedPoolBudgetManager::new(SharedPoolBudgetOptions::default());
@@ -577,7 +507,8 @@ mod tests {
                 };
                 let sink = Rc::new(RecordingSink::default());
                 let events = RuntimeEventEmitter::new(sink.clone());
-                let access = LlmAccess::new(owner.clone(), tiers, blackboard, events);
+                let access =
+                    LlmAccess::new(owner.clone(), "main", ModelTier::Default, tiers, events);
 
                 let first = access.lutum().await;
                 assert_eq!(
@@ -657,9 +588,6 @@ mod tests {
 
     #[tokio::test]
     async fn lutum_attaches_owner_metadata_to_request_extensions() {
-        let mut allocation = ResourceAllocation::default();
-        allocation.set_model_override(builtin::cognition_gate(), ModelTier::Premium);
-        let blackboard = Blackboard::with_allocation(allocation);
         let owner = ModuleInstanceId::new(builtin::cognition_gate(), ReplicaIndex::ZERO);
         let seen = Arc::new(Mutex::new(Vec::new()));
         let adapter = Arc::new(
@@ -689,7 +617,7 @@ mod tests {
         let tiers = crate::LutumTiers::from_shared_lutum(lutum);
         let sink = Rc::new(RecordingSink::default());
         let events = RuntimeEventEmitter::new(sink);
-        let access = LlmAccess::new(owner.clone(), tiers, blackboard, events);
+        let access = LlmAccess::new(owner.clone(), "main", ModelTier::Premium, tiers, events);
 
         let batch = crate::ModuleBatch::new("metadata-batch");
         let expected_batch = LlmBatchDebug::from_batch(&batch);
@@ -712,7 +640,7 @@ mod tests {
                 owner,
                 tier: ModelTier::Premium,
                 source: LlmRequestSource::ModuleTurn,
-                session_key: None,
+                session_key: Some("main".to_owned()),
                 activation_id: ModuleActivationId::new(7),
                 activation_attempt: 1,
                 batch: expected_batch,
@@ -721,10 +649,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fixed_tier_lutum_uses_configured_tier_independent_of_allocation() {
-        let mut allocation = ResourceAllocation::default();
-        allocation.set_model_override(builtin::memory_compaction(), ModelTier::Premium);
-        let _blackboard = Blackboard::with_allocation(allocation);
+    async fn lutum_uses_configured_tier_and_key() {
         let owner = ModuleInstanceId::new(builtin::memory_compaction(), ReplicaIndex::ZERO);
         let seen = Arc::new(Mutex::new(Vec::new()));
         let adapter = Arc::new(
@@ -754,7 +679,7 @@ mod tests {
         let tiers = crate::LutumTiers::from_shared_lutum(lutum);
         let sink = Rc::new(RecordingSink::default());
         let events = RuntimeEventEmitter::new(sink.clone());
-        let access = FixedTierLlmAccess::new(owner.clone(), ModelTier::Default, tiers, events);
+        let access = LlmAccess::new(owner.clone(), "audit", ModelTier::Default, tiers, events);
 
         let batch = crate::ModuleBatch::new("fixed-tier-batch");
         let expected_batch = LlmBatchDebug::from_batch(&batch);
@@ -795,7 +720,7 @@ mod tests {
                 owner,
                 tier: ModelTier::Default,
                 source: LlmRequestSource::ModuleTurn,
-                session_key: None,
+                session_key: Some("audit".to_owned()),
                 activation_id: ModuleActivationId::new(8),
                 activation_attempt: 1,
                 batch: expected_batch,

@@ -994,8 +994,11 @@ mod tests {
                             vec![builtin::allocation(), builtin::sensory()],
                             Vec::new(),
                         ),
-                        caps.llm_access(),
+                        caps.llm("main")
+                            .with_tier(nuillu_types::ModelTier::Default)
+                            .into(),
                         caps.session("main")
+                            .with_tier(nuillu_types::ModelTier::Default)
                             .with_auto_compaction(session_auto_compaction())
                             .await?,
                     ));
@@ -1066,8 +1069,11 @@ mod tests {
                             ],
                             Vec::new(),
                         ),
-                        caps.llm_access(),
+                        caps.llm("main")
+                            .with_tier(nuillu_types::ModelTier::Default)
+                            .into(),
                         caps.session("main")
+                            .with_tier(nuillu_types::ModelTier::Default)
                             .with_auto_compaction(session_auto_compaction())
                             .await?,
                     ));

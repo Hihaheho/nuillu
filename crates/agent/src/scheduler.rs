@@ -2499,7 +2499,6 @@ async fn activate_with_retries(
     max_activation_attempts: u8,
 ) -> (AllocatedModule, Result<(), String>) {
     let module_owner = module.owner().clone();
-    let module_tier = runtime.tier_for(&module_owner).await;
     let max_attempts = u32::from(max_activation_attempts.max(1));
     let mut activation_attempt = 1_u32;
     loop {
@@ -2519,7 +2518,7 @@ async fn activate_with_retries(
                         .clone()
                         .with_extension(LlmRequestMetadata {
                             owner: module_owner.clone(),
-                            tier: ModelTier::Cheap,
+                            tier: ModelTier::Default,
                             source: LlmRequestSource::SessionCompaction,
                             session_key: None,
                             activation_id,
@@ -2527,7 +2526,7 @@ async fn activate_with_retries(
                             batch: LlmBatchDebug::from_batch(batch),
                         }),
                     runtime.session_compaction_handle().concurrency.clone(),
-                    module_tier,
+                    ModelTier::Default,
                     runtime.session_compaction_policy(),
                 ),
                 runtime.clock().now(),
@@ -4587,7 +4586,6 @@ mod tests {
             .run_until(async {
                 let mut alloc = ResourceAllocation::default();
                 alloc.set(compaction_observer_id(), ModuleConfig::default());
-                alloc.set_model_override(compaction_observer_id(), ModelTier::Premium);
                 alloc.set_activation(compaction_observer_id(), ActivationRatio::ONE);
 
                 let blackboard = Blackboard::with_allocation(alloc);
@@ -4630,7 +4628,7 @@ mod tests {
                                 compaction_observer_id(),
                                 ReplicaIndex::ZERO,
                             ),
-                            tier: ModelTier::Cheap,
+                            tier: ModelTier::Default,
                             source: LlmRequestSource::SessionCompaction,
                             session_key: None,
                             activation_id: ModuleActivationId::new(0),
@@ -4642,8 +4640,8 @@ mod tests {
                             },
                         })
                     );
-                    assert_eq!(observation.module_tier, ModelTier::Premium);
-                    assert_eq!(observation.threshold, 33);
+                    assert_eq!(observation.module_tier, ModelTier::Default);
+                    assert_eq!(observation.threshold, 22);
                     for _ in 0..4 {
                         tokio::task::yield_now().await;
                     }
@@ -4661,7 +4659,6 @@ mod tests {
             .run_until(async {
                 let mut alloc = ResourceAllocation::default();
                 alloc.set(llm_metadata_observer_id(), ModuleConfig::default());
-                alloc.set_model_override(llm_metadata_observer_id(), ModelTier::Premium);
                 alloc.set_activation(llm_metadata_observer_id(), ActivationRatio::ONE);
 
                 let blackboard = Blackboard::with_allocation(alloc);
@@ -4685,7 +4682,7 @@ mod tests {
                             let done_tx = Rc::clone(&done_tx);
                             move |caps| LlmMetadataRetryObserver {
                                 attention_control_inbox: caps.attention_control_inbox(),
-                                llm: caps.llm_access(),
+                                llm: caps.llm("probe").with_tier(ModelTier::Premium).into(),
                                 observations: Rc::clone(&observations),
                                 attempts: Rc::clone(&attempts),
                                 on_done: done_tx.borrow_mut().take(),
@@ -4727,7 +4724,7 @@ mod tests {
                             owner: owner.clone(),
                             tier: ModelTier::Premium,
                             source: LlmRequestSource::ModuleTurn,
-                            session_key: None,
+                            session_key: Some("probe".to_owned()),
                             activation_id,
                             activation_attempt: attempt,
                             batch: expected_batch.clone(),
@@ -4737,7 +4734,7 @@ mod tests {
                         observation.session_compaction,
                         Some(LlmRequestMetadata {
                             owner: owner.clone(),
-                            tier: ModelTier::Cheap,
+                            tier: ModelTier::Default,
                             source: LlmRequestSource::SessionCompaction,
                             session_key: None,
                             activation_id,

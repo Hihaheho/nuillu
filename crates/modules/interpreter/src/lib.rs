@@ -347,8 +347,11 @@ mod tests {
                     caps.cognition_log_updated_inbox(),
                     caps.cognition_log_reader(),
                     caps.cognition_writer(),
-                    caps.llm_access(),
+                    caps.llm("main")
+                        .with_tier(nuillu_types::ModelTier::Default)
+                        .into(),
                     caps.session("main")
+                        .with_tier(nuillu_types::ModelTier::Default)
                         .with_auto_compaction(session_auto_compaction())
                         .await?,
                 ))

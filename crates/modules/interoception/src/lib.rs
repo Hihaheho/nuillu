@@ -952,8 +952,11 @@ mod tests {
                     caps.allocation_writer(Vec::new(), Vec::new()),
                     caps.interoception_policy(),
                     caps.interoception_writer(),
-                    caps.llm_access(),
+                    caps.llm("main")
+                        .with_tier(nuillu_types::ModelTier::Cheap)
+                        .into(),
                     caps.session("main")
+                        .with_tier(nuillu_types::ModelTier::Cheap)
                         .with_auto_compaction(session_auto_compaction())
                         .await?,
                 ))

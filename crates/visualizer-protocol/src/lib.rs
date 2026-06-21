@@ -662,7 +662,6 @@ pub struct AllocationView {
     pub bpm: Option<f64>,
     #[serde(default)]
     pub period_ms: Option<u64>,
-    pub tier: String,
     pub guidance: String,
 }
 

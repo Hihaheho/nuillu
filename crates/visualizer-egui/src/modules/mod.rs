@@ -2277,7 +2277,6 @@ fn apply_allocation_to_row(row: &mut ModuleOverviewRow, allocation: &AllocationV
     row.active_replicas = Some(allocation.active_replicas);
     row.bpm = allocation.bpm;
     row.period_ms = allocation.period_ms;
-    row.tier = Some(allocation.tier.clone());
     row.guidance = (!allocation.guidance.is_empty()).then(|| allocation.guidance.clone());
 }
 
@@ -4257,7 +4256,6 @@ mod tests {
                 active_replicas: 1,
                 bpm: Some(9.0),
                 period_ms: Some(6667),
-                tier: "Default".to_string(),
                 guidance: String::new(),
             }],
             ..BlackboardSnapshot::default()
@@ -4304,7 +4302,6 @@ mod tests {
                 active_replicas: 1,
                 bpm: Some(18.0),
                 period_ms: Some(3333),
-                tier: "Cheap".to_string(),
                 guidance: String::new(),
             }],
             module_policies: vec![ModulePolicyView {
@@ -4741,7 +4738,6 @@ mod tests {
                 active_replicas: 1,
                 bpm: None,
                 period_ms: None,
-                tier: "Default".to_string(),
                 guidance: String::new(),
             }],
             ..BlackboardSnapshot::default()
@@ -5264,7 +5260,6 @@ mod tests {
                 active_replicas: 1,
                 bpm: Some(20.0),
                 period_ms: Some(3000),
-                tier: "Default".to_string(),
                 guidance: String::new(),
             }],
             ..BlackboardSnapshot::default()
@@ -5316,7 +5311,6 @@ mod tests {
                 active_replicas: 1,
                 bpm: Some(20.0),
                 period_ms: Some(3000),
-                tier: "Default".to_string(),
                 guidance: String::new(),
             }],
             ..BlackboardSnapshot::default()
@@ -5450,7 +5444,6 @@ mod tests {
                 active_replicas: 1,
                 bpm: Some(12.5),
                 period_ms: Some(3000),
-                tier: "Premium".to_string(),
                 guidance: "inspect recent input".to_string(),
             }],
             ..BlackboardSnapshot::default()

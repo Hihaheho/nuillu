@@ -119,7 +119,7 @@ pub struct ServerModuleSpec {
     pub bpm_max: f64,
     pub initial_activation: f64,
     #[eure(default)]
-    pub tier: ServerModelTier,
+    pub sessions: Vec<ServerModuleSessionSpec>,
     #[eure(default)]
     pub groups: Vec<ServerModuleGroup>,
     #[eure(default)]
@@ -128,21 +128,28 @@ pub struct ServerModuleSpec {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, FromEure)]
 #[eure(crate = ::eure::document, rename_all = "kebab-case")]
-pub enum ServerModelTier {
+pub enum ServerSessionTier {
     Cheap,
     #[default]
     Default,
     Premium,
 }
 
-impl From<ServerModelTier> for ModelTier {
-    fn from(value: ServerModelTier) -> Self {
+impl From<ServerSessionTier> for ModelTier {
+    fn from(value: ServerSessionTier) -> Self {
         match value {
-            ServerModelTier::Cheap => Self::Cheap,
-            ServerModelTier::Default => Self::Default,
-            ServerModelTier::Premium => Self::Premium,
+            ServerSessionTier::Cheap => Self::Cheap,
+            ServerSessionTier::Default => Self::Default,
+            ServerSessionTier::Premium => Self::Premium,
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, FromEure)]
+#[eure(crate = ::eure::document, rename_all = "kebab-case")]
+pub struct ServerModuleSessionSpec {
+    pub key: String,
+    pub tier: ServerSessionTier,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, FromEure)]
@@ -232,6 +239,36 @@ impl RuntimeModule {
             Self::Speak => builtin::speak(),
         }
     }
+
+    pub fn session_defaults(self) -> &'static [(&'static str, ModelTier)] {
+        match self {
+            Self::Sensory => &[
+                ("one-shot", ModelTier::Cheap),
+                ("ambient", ModelTier::Cheap),
+            ],
+            Self::CognitionGate => &[("main", ModelTier::Default)],
+            Self::Allocation => &[("main", ModelTier::Default)],
+            Self::AttentionSchema => &[("main", ModelTier::Default)],
+            Self::Interpreter => &[("main", ModelTier::Default)],
+            Self::SelfModel => &[("main", ModelTier::Default)],
+            Self::QueryMemory => &[("main", ModelTier::Cheap)],
+            Self::Memory => &[("main", ModelTier::Cheap)],
+            Self::MemoryCompaction => &[("main", ModelTier::Cheap), ("audit", ModelTier::Default)],
+            Self::MemoryAssociation => &[("main", ModelTier::Cheap)],
+            Self::MemoryRecombination => &[("main", ModelTier::Cheap)],
+            Self::Interoception => &[("main", ModelTier::Cheap)],
+            Self::Homeostasis => &[],
+            Self::Policy => &[("main", ModelTier::Default)],
+            Self::PolicyCompaction => &[("main", ModelTier::Cheap)],
+            Self::Reward => &[("main", ModelTier::Default)],
+            Self::Predict => &[("main", ModelTier::Cheap)],
+            Self::Surprise => &[("main", ModelTier::Default)],
+            Self::Speak => &[
+                ("planning", ModelTier::Premium),
+                ("generation", ModelTier::Default),
+            ],
+        }
+    }
 }
 
 impl ServerConfig {
@@ -281,8 +318,24 @@ impl ServerModuleSpec {
         self.id.module_id()
     }
 
-    pub fn tier(&self) -> ModelTier {
-        self.tier.into()
+    pub fn session_tier(&self, key: &str) -> ModelTier {
+        self.sessions
+            .iter()
+            .find(|session| session.key == key)
+            .map(|session| session.tier.into())
+            .or_else(|| {
+                self.id
+                    .session_defaults()
+                    .iter()
+                    .find(|(candidate, _)| *candidate == key)
+                    .map(|(_, tier)| *tier)
+            })
+            .unwrap_or_else(|| {
+                panic!(
+                    "unknown session key {key:?} for module {}; config validation should reject this",
+                    self.id.as_str()
+                )
+            })
     }
 
     pub fn replica_range(&self) -> ReplicaCapRange {
@@ -332,6 +385,39 @@ impl ServerModuleSpec {
                 path.display(),
                 self.id.as_str()
             );
+        }
+        let defaults = self.id.session_defaults();
+        let mut seen_sessions = HashSet::new();
+        for session in &self.sessions {
+            if !seen_sessions.insert(session.key.as_str()) {
+                anyhow::bail!(
+                    "server config {} declares session {} for module {} more than once",
+                    path.display(),
+                    session.key,
+                    self.id.as_str()
+                );
+            }
+            if defaults
+                .iter()
+                .all(|(default_key, _)| *default_key != session.key.as_str())
+            {
+                let expected = defaults
+                    .iter()
+                    .map(|(key, _)| *key)
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                anyhow::bail!(
+                    "server config {} declares unknown session {} for module {}; expected one of: {}",
+                    path.display(),
+                    session.key,
+                    self.id.as_str(),
+                    if expected.is_empty() {
+                        "(none)"
+                    } else {
+                        &expected
+                    }
+                );
+            }
         }
         Ok(())
     }
@@ -403,11 +489,10 @@ fn default_replica_capacity() -> u8 {
 
 fn default_server_modules() -> Vec<ServerModuleSpec> {
     use RuntimeModule as M;
-    use ServerModelTier as T;
     use ServerModuleGroup as G;
 
     vec![
-        module_spec(M::Sensory, 1, 1, 3.0, 8.0, 1.0, T::Cheap, [], []),
+        module_spec(M::Sensory, 1, 1, 3.0, 8.0, 1.0, [], []),
         module_spec(
             M::CognitionGate,
             1,
@@ -415,7 +500,6 @@ fn default_server_modules() -> Vec<ServerModuleSpec> {
             6.0,
             12.0,
             1.0,
-            T::Default,
             [G::Voluntary, G::SleepSuppressed],
             [
                 M::Sensory,
@@ -425,7 +509,7 @@ fn default_server_modules() -> Vec<ServerModuleSpec> {
                 M::Surprise,
             ],
         ),
-        module_spec(M::Allocation, 1, 1, 6.0, 6.0, 1.0, T::Default, [], []),
+        module_spec(M::Allocation, 1, 1, 6.0, 6.0, 1.0, [], []),
         module_spec(
             M::AttentionSchema,
             0,
@@ -433,7 +517,6 @@ fn default_server_modules() -> Vec<ServerModuleSpec> {
             3.0,
             6.0,
             0.0,
-            T::Default,
             [G::Voluntary, G::SleepSuppressed],
             [],
         ),
@@ -444,7 +527,6 @@ fn default_server_modules() -> Vec<ServerModuleSpec> {
             3.0,
             6.0,
             0.0,
-            T::Default,
             [G::Voluntary, G::SleepSuppressed],
             [],
         ),
@@ -455,7 +537,6 @@ fn default_server_modules() -> Vec<ServerModuleSpec> {
             3.0,
             6.0,
             0.0,
-            T::Default,
             [G::Voluntary, G::SleepSuppressed],
             [M::QueryMemory],
         ),
@@ -466,7 +547,6 @@ fn default_server_modules() -> Vec<ServerModuleSpec> {
             6.0,
             15.0,
             0.0,
-            T::Cheap,
             [G::Voluntary, G::SleepSuppressed],
             [],
         ),
@@ -477,7 +557,6 @@ fn default_server_modules() -> Vec<ServerModuleSpec> {
             6.0,
             18.0,
             0.0,
-            T::Cheap,
             [G::Voluntary, G::SleepSuppressed],
             [],
         ),
@@ -488,7 +567,6 @@ fn default_server_modules() -> Vec<ServerModuleSpec> {
             2.0,
             6.0,
             0.0,
-            T::Cheap,
             [G::HomeostaticDrive],
             [M::MemoryAssociation, M::Homeostasis],
         ),
@@ -499,7 +577,6 @@ fn default_server_modules() -> Vec<ServerModuleSpec> {
             2.0,
             6.0,
             0.0,
-            T::Cheap,
             [G::HomeostaticDrive],
             [M::Homeostasis],
         ),
@@ -510,12 +587,11 @@ fn default_server_modules() -> Vec<ServerModuleSpec> {
             2.0,
             6.0,
             0.0,
-            T::Cheap,
             [G::HomeostaticDrive],
             [M::MemoryCompaction, M::Homeostasis],
         ),
-        module_spec(M::Interoception, 1, 1, 1.0, 3.0, 1.0, T::Cheap, [], []),
-        module_spec(M::Homeostasis, 1, 1, 6.0, 20.0, 1.0, T::Cheap, [], []),
+        module_spec(M::Interoception, 1, 1, 1.0, 3.0, 1.0, [], []),
+        module_spec(M::Homeostasis, 1, 1, 6.0, 20.0, 1.0, [], []),
         module_spec(
             M::Policy,
             1,
@@ -523,7 +599,6 @@ fn default_server_modules() -> Vec<ServerModuleSpec> {
             2.0,
             6.0,
             0.0,
-            T::Default,
             [G::Voluntary, G::SleepSuppressed],
             [],
         ),
@@ -534,7 +609,6 @@ fn default_server_modules() -> Vec<ServerModuleSpec> {
             2.0,
             6.0,
             0.0,
-            T::Cheap,
             [G::HomeostaticDrive],
             [M::Reward, M::Homeostasis],
         ),
@@ -545,7 +619,6 @@ fn default_server_modules() -> Vec<ServerModuleSpec> {
             1.0,
             2.0,
             0.0,
-            T::Default,
             [G::Voluntary, G::SleepSuppressed],
             [M::Policy],
         ),
@@ -556,7 +629,6 @@ fn default_server_modules() -> Vec<ServerModuleSpec> {
             1.0,
             6.0,
             0.0,
-            T::Cheap,
             [G::Voluntary, G::SleepSuppressed],
             [],
         ),
@@ -567,7 +639,6 @@ fn default_server_modules() -> Vec<ServerModuleSpec> {
             1.0,
             3.0,
             0.0,
-            T::Default,
             [G::Voluntary, G::SleepSuppressed],
             [M::Predict],
         ),
@@ -578,7 +649,6 @@ fn default_server_modules() -> Vec<ServerModuleSpec> {
             6.0,
             18.0,
             0.0,
-            T::Premium,
             [G::Voluntary, G::SleepSuppressed],
             [
                 M::QueryMemory,
@@ -598,7 +668,6 @@ fn module_spec<const G: usize, const D: usize>(
     bpm_min: f64,
     bpm_max: f64,
     initial_activation: f64,
-    tier: ServerModelTier,
     groups: [ServerModuleGroup; G],
     depends_on: [RuntimeModule; D],
 ) -> ServerModuleSpec {
@@ -610,7 +679,7 @@ fn module_spec<const G: usize, const D: usize>(
         bpm_min,
         bpm_max,
         initial_activation,
-        tier,
+        sessions: Vec::new(),
         groups: groups.to_vec(),
         depends_on: depends_on.to_vec(),
     }
@@ -654,6 +723,8 @@ mod tests {
             .expect("default config includes speak");
         assert_eq!(speak.bpm_min, 6.0);
         assert_eq!(speak.bpm_max, 18.0);
+        assert_eq!(speak.session_tier("planning"), ModelTier::Premium);
+        assert_eq!(speak.session_tier("generation"), ModelTier::Default);
     }
 
     #[test]
@@ -670,7 +741,6 @@ activation-table = [1.0, 0.5]
   bpm-min = 3.0
   bpm-max = 8.0
   initial-activation = 1.0
-  tier = "cheap"
 }
 
 @ modules[] {
@@ -681,9 +751,18 @@ activation-table = [1.0, 0.5]
   bpm-min = 3.0
   bpm-max = 6.0
   initial-activation = 0.0
-  tier = "premium"
   groups = ["voluntary", "sleep-suppressed"]
   depends-on = ["cognition-gate"]
+
+  @ sessions[] {
+    key = "planning"
+    tier = "premium"
+  }
+
+  @ sessions[] {
+    key = "generation"
+    tier = "default"
+  }
 }
 "#,
             Path::new(".tmp/server/config.eure"),
@@ -695,7 +774,14 @@ activation-table = [1.0, 0.5]
             config.active_modules(),
             vec![RuntimeModule::Sensory, RuntimeModule::Speak]
         );
-        assert_eq!(config.modules[1].tier(), ModelTier::Premium);
+        assert_eq!(
+            config.modules[1].session_tier("planning"),
+            ModelTier::Premium
+        );
+        assert_eq!(
+            config.modules[1].session_tier("generation"),
+            ModelTier::Default
+        );
         assert_eq!(
             config.modules[1].groups,
             vec![
@@ -720,7 +806,6 @@ activation-table = [1.0, 0.5]
   bpm-min = 6.0
   bpm-max = 15.0
   initial-activation = 0.0
-  tier = "cheap"
 }
 
 @ modules[] {
@@ -730,7 +815,6 @@ activation-table = [1.0, 0.5]
   bpm-min = 2.0
   bpm-max = 6.0
   initial-activation = 0.0
-  tier = "cheap"
 }
 "#,
             Path::new(".tmp/server/config.eure"),
@@ -771,6 +855,69 @@ activation-table = [1.0, 0.5]
         .to_string();
 
         assert!(error.contains("sensory more than once"), "{error}");
+    }
+
+    #[test]
+    fn parse_server_boot_config_rejects_unknown_session_key() {
+        let error = parse_server_boot_config_content(
+            r#"
+@ modules[] {
+  id = "speak"
+  replica-min = 0
+  replica-max = 1
+  bpm-min = 3.0
+  bpm-max = 6.0
+  initial-activation = 0.0
+
+  @ sessions[] {
+    key = "draft"
+    tier = "premium"
+  }
+}
+"#,
+            Path::new(".tmp/server/config.eure"),
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(
+            error.contains("unknown session draft for module speak"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn parse_server_boot_config_rejects_duplicate_session_keys() {
+        let error = parse_server_boot_config_content(
+            r#"
+@ modules[] {
+  id = "speak"
+  replica-min = 0
+  replica-max = 1
+  bpm-min = 3.0
+  bpm-max = 6.0
+  initial-activation = 0.0
+
+  @ sessions[] {
+    key = "planning"
+    tier = "premium"
+  }
+
+  @ sessions[] {
+    key = "planning"
+    tier = "default"
+  }
+}
+"#,
+            Path::new(".tmp/server/config.eure"),
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(
+            error.contains("session planning for module speak more than once"),
+            "{error}"
+        );
     }
 
     #[test]

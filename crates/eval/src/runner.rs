@@ -281,7 +281,7 @@ impl VisualizerHook {
 use nuillu_server::{
     LlmLogContext, VisualizerEventSink, VisualizerLlmObserver, build_embedder, build_model_handle,
     build_tiers, duration_millis_u64, linked_memory_record_view, memory_rank_name,
-    memory_record_view, model_tier_name, module_policy_views,
+    memory_record_view, module_policy_views,
 };
 
 #[derive(Debug, Clone)]
@@ -4988,23 +4988,27 @@ fn register_eval_module(
         // Input-driven and bursty: bursts of inputs need a fast active pace
         // so observations are normalized within the same tick window.
         EvalModule::Sensory => {
+            let one_shot_tier = eval_session_tier(module, "one-shot");
+            let ambient_tier = eval_session_tier(module, "ambient");
             registry
                 .register_eval(
                     eval_policy(0..=1, Bpm::range(6.0, 18.0)),
                     replica_hard_cap,
-                    |caps| async move {
+                    move |caps| async move {
                         Ok(nuillu_sensory::SensoryModule::new(
                             caps.sensory_input_inbox(),
                             caps.memo(),
                             caps.scene_reader(),
                             caps.clock(),
-                            caps.llm_access(),
+                            caps.llm("one-shot").with_tier(one_shot_tier).into(),
                             caps.session("one-shot")
+                                .with_tier(one_shot_tier)
                                 .with_auto_compaction(
                                     nuillu_sensory::one_shot_session_auto_compaction(),
                                 )
                                 .await?,
                             caps.session("ambient")
+                                .with_tier(ambient_tier)
                                 .with_auto_compaction(
                                     nuillu_sensory::ambient_session_auto_compaction(),
                                 )
@@ -5016,23 +5020,29 @@ fn register_eval_module(
         }
         // Must re-fire fast as memos accumulate so the cognition log is
         // current by the time speak considers it.
-        EvalModule::CognitionGate => registry
-            .register_eval(
-                eval_policy(0..=1, Bpm::range(6.0, 18.0)),
-                replica_hard_cap,
-                |caps| async move {
-                    Ok(nuillu_cognition_gate::CognitionGateModule::new(
-                        caps.memo_updated_inbox(),
-                        caps.blackboard_reader(),
-                        caps.cognition_writer(),
-                        caps.llm_access(),
-                        caps.session("main")
-                            .with_auto_compaction(nuillu_cognition_gate::session_auto_compaction())
-                            .await?,
-                    ))
-                },
-            )
-            .expect("eval module registration should be unique"),
+        EvalModule::CognitionGate => {
+            let main_tier = eval_session_tier(module, "main");
+            registry
+                .register_eval(
+                    eval_policy(0..=1, Bpm::range(6.0, 18.0)),
+                    replica_hard_cap,
+                    move |caps| async move {
+                        Ok(nuillu_cognition_gate::CognitionGateModule::new(
+                            caps.memo_updated_inbox(),
+                            caps.blackboard_reader(),
+                            caps.cognition_writer(),
+                            caps.llm("main").with_tier(main_tier).into(),
+                            caps.session("main")
+                                .with_tier(main_tier)
+                                .with_auto_compaction(
+                                    nuillu_cognition_gate::session_auto_compaction(),
+                                )
+                                .await?,
+                        ))
+                    },
+                )
+                .expect("eval module registration should be unique")
+        }
         // Expensive (premium tier in default model-set), heavy reasoning.
         // Should only fire on meaningful state shifts — slow base pace so
         // it doesn't burn budget reacting to every memo update.
@@ -5042,6 +5052,7 @@ fn register_eval_module(
                 replica_hard_cap,
                 {
                     let voluntary = voluntary_modules(all_modules);
+                    let main_tier = eval_session_tier(module, "main");
                     move |caps| {
                         let voluntary = voluntary.clone();
                         async move {
@@ -5053,8 +5064,9 @@ fn register_eval_module(
                                 caps.allocation_reader(),
                                 caps.interoception_reader(),
                                 caps.allocation_writer(voluntary.clone(), Vec::new()),
-                                caps.llm_access(),
+                                caps.llm("main").with_tier(main_tier).into(),
                                 caps.session("main")
+                                    .with_tier(main_tier)
                                     .with_auto_compaction(
                                         nuillu_allocation::session_auto_compaction(),
                                     )
@@ -5068,19 +5080,21 @@ fn register_eval_module(
         // Periodic first-person attention narration; not on the critical
         // path for the speak loop.
         EvalModule::AttentionSchema => {
+            let main_tier = eval_session_tier(module, "main");
             registry
                 .register_eval(
                     eval_policy(0..=1, Bpm::range(3.0, 6.0)),
                     replica_hard_cap,
-                    |caps| async move {
+                    move |caps| async move {
                         Ok(nuillu_attention_schema::AttentionSchemaModule::new(
                             caps.memo_updated_inbox(),
                             caps.cognition_log_updated_inbox(),
                             caps.blackboard_reader(),
                             caps.cognition_log_reader(),
                             caps.memo(),
-                            caps.llm_access(),
+                            caps.llm("main").with_tier(main_tier).into(),
                             caps.session("main")
+                                .with_tier(main_tier)
                                 .with_auto_compaction(
                                     nuillu_attention_schema::session_auto_compaction(),
                                 )
@@ -5090,43 +5104,51 @@ fn register_eval_module(
                 )
                 .expect("eval module registration should be unique")
         }
-        EvalModule::Interpreter => registry
-            .register_eval(
-                eval_policy(0..=1, Bpm::range(3.0, 6.0)),
-                replica_hard_cap,
-                |caps| async move {
-                    Ok(nuillu_interpreter::InterpreterModule::new(
-                        caps.cognition_log_updated_inbox(),
-                        caps.cognition_log_reader(),
-                        caps.cognition_writer(),
-                        caps.llm_access(),
-                        caps.session("main")
-                            .with_auto_compaction(nuillu_interpreter::session_auto_compaction())
-                            .await?,
-                    ))
-                },
-            )
-            .expect("eval module registration should be unique"),
+        EvalModule::Interpreter => {
+            let main_tier = eval_session_tier(module, "main");
+            registry
+                .register_eval(
+                    eval_policy(0..=1, Bpm::range(3.0, 6.0)),
+                    replica_hard_cap,
+                    move |caps| async move {
+                        Ok(nuillu_interpreter::InterpreterModule::new(
+                            caps.cognition_log_updated_inbox(),
+                            caps.cognition_log_reader(),
+                            caps.cognition_writer(),
+                            caps.llm("main").with_tier(main_tier).into(),
+                            caps.session("main")
+                                .with_tier(main_tier)
+                                .with_auto_compaction(nuillu_interpreter::session_auto_compaction())
+                                .await?,
+                        ))
+                    },
+                )
+                .expect("eval module registration should be unique")
+        }
         // On-demand: fires on cognition-log updates and reads controller guidance as context.
-        EvalModule::SelfModel => registry
-            .register_eval(
-                eval_policy(0..=1, Bpm::range(3.0, 6.0)),
-                replica_hard_cap,
-                |caps| async move {
-                    Ok(nuillu_self_model::SelfModelModule::new(
-                        caps.cognition_log_updated_inbox(),
-                        caps.allocation_reader(),
-                        caps.blackboard_reader(),
-                        caps.cognition_log_reader(),
-                        caps.memo(),
-                        caps.llm_access(),
-                        caps.session("main")
-                            .with_auto_compaction(nuillu_self_model::session_auto_compaction())
-                            .await?,
-                    ))
-                },
-            )
-            .expect("eval module registration should be unique"),
+        EvalModule::SelfModel => {
+            let main_tier = eval_session_tier(module, "main");
+            registry
+                .register_eval(
+                    eval_policy(0..=1, Bpm::range(3.0, 6.0)),
+                    replica_hard_cap,
+                    move |caps| async move {
+                        Ok(nuillu_self_model::SelfModelModule::new(
+                            caps.cognition_log_updated_inbox(),
+                            caps.allocation_reader(),
+                            caps.blackboard_reader(),
+                            caps.cognition_log_reader(),
+                            caps.memo(),
+                            caps.llm("main").with_tier(main_tier).into(),
+                            caps.session("main")
+                                .with_tier(main_tier)
+                                .with_auto_compaction(nuillu_self_model::session_auto_compaction())
+                                .await?,
+                        ))
+                    },
+                )
+                .expect("eval module registration should be unique")
+        }
         // Memory retrieval is on the critical path between cognition-gate
         // and speak; needs a quick active pace.
         EvalModule::QueryMemory => registry
@@ -5135,6 +5157,7 @@ fn register_eval_module(
                 replica_hard_cap,
                 {
                     let memory_caps = memory_caps.clone();
+                    let main_tier = eval_session_tier(module, "main");
                     move |caps| {
                         let memory_caps = memory_caps.clone();
                         async move {
@@ -5144,8 +5167,9 @@ fn register_eval_module(
                                 memory_caps.retriever(),
                                 memory_caps.content_reader(),
                                 caps.typed_memo::<nuillu_memory::QueryMemoryMemo>(),
-                                caps.llm_access(),
+                                caps.llm("main").with_tier(main_tier).into(),
                                 caps.session("main")
+                                    .with_tier(main_tier)
                                     .with_auto_compaction(
                                         nuillu_memory::query_session_auto_compaction(),
                                     )
@@ -5163,6 +5187,7 @@ fn register_eval_module(
                 replica_hard_cap,
                 {
                     let memory_caps = memory_caps.clone();
+                    let main_tier = eval_session_tier(module, "main");
                     move |caps| {
                         let memory_caps = memory_caps.clone();
                         async move {
@@ -5172,8 +5197,9 @@ fn register_eval_module(
                                 caps.memory_metadata_reader(),
                                 memory_caps.writer(),
                                 memory_caps.retriever(),
-                                caps.llm_access(),
+                                caps.llm("main").with_tier(main_tier).into(),
                                 caps.session("main")
+                                    .with_tier(main_tier)
                                     .with_auto_compaction(nuillu_memory::session_auto_compaction())
                                     .await?,
                             ))
@@ -5189,6 +5215,8 @@ fn register_eval_module(
                 replica_hard_cap,
                 {
                     let memory_caps = memory_caps.clone();
+                    let main_tier = eval_session_tier(module, "main");
+                    let audit_tier = eval_session_tier(module, "audit");
                     move |caps| {
                         let memory_caps = memory_caps.clone();
                         async move {
@@ -5196,8 +5224,8 @@ fn register_eval_module(
                                 caps.interoception_updated_inbox(),
                                 caps.blackboard_reader(),
                                 memory_caps.compactor(),
-                                caps.llm_access(),
-                                caps.default_tier_llm_access(),
+                                caps.llm("main").with_tier(main_tier).into(),
+                                caps.llm("audit").with_tier(audit_tier).into(),
                             ))
                         }
                     }
@@ -5210,6 +5238,7 @@ fn register_eval_module(
                 replica_hard_cap,
                 {
                     let memory_caps = memory_caps.clone();
+                    let main_tier = eval_session_tier(module, "main");
                     move |caps| {
                         let memory_caps = memory_caps.clone();
                         async move {
@@ -5219,7 +5248,7 @@ fn register_eval_module(
                                 memory_caps.content_reader(),
                                 memory_caps.writer(),
                                 memory_caps.associator(),
-                                caps.llm_access(),
+                                caps.llm("main").with_tier(main_tier).into(),
                             ))
                         }
                     }
@@ -5232,6 +5261,7 @@ fn register_eval_module(
                 replica_hard_cap,
                 {
                     let memory_caps = memory_caps.clone();
+                    let main_tier = eval_session_tier(module, "main");
                     move |caps| {
                         let memory_caps = memory_caps.clone();
                         async move {
@@ -5241,7 +5271,7 @@ fn register_eval_module(
                                 caps.blackboard_reader(),
                                 memory_caps.retriever(),
                                 caps.cognition_writer(),
-                                caps.llm_access(),
+                                caps.llm("main").with_tier(main_tier).into(),
                             ))
                         }
                     }
@@ -5254,6 +5284,7 @@ fn register_eval_module(
                 replica_hard_cap,
                 {
                     let suppressed = sleep_suppressed_modules();
+                    let main_tier = eval_session_tier(module, "main");
                     move |caps| {
                         let suppressed = suppressed.clone();
                         async move {
@@ -5264,8 +5295,9 @@ fn register_eval_module(
                                 caps.allocation_writer(Vec::new(), suppressed.clone()),
                                 caps.interoception_policy(),
                                 caps.interoception_writer(),
-                                caps.llm_access(),
+                                caps.llm("main").with_tier(main_tier).into(),
                                 caps.session("main")
+                                    .with_tier(main_tier)
                                     .with_auto_compaction(
                                         nuillu_interoception::session_auto_compaction(),
                                     )
@@ -5298,6 +5330,7 @@ fn register_eval_module(
                 replica_hard_cap,
                 {
                     let policy_caps = policy_caps.clone();
+                    let main_tier = eval_session_tier(module, "main");
                     move |caps| {
                         let policy_caps = policy_caps.clone();
                         async move {
@@ -5313,8 +5346,9 @@ fn register_eval_module(
                                 policy_caps.searcher(),
                                 caps.memo(),
                                 consideration_writer,
-                                caps.llm_access(),
+                                caps.llm("main").with_tier(main_tier).into(),
                                 caps.session("main")
+                                    .with_tier(main_tier)
                                     .with_auto_compaction(
                                         nuillu_reward::policy_session_auto_compaction(),
                                     )
@@ -5331,6 +5365,7 @@ fn register_eval_module(
                 replica_hard_cap,
                 {
                     let policy_caps = policy_caps.clone();
+                    let main_tier = eval_session_tier(module, "main");
                     move |caps| {
                         let policy_caps = policy_caps.clone();
                         async move {
@@ -5339,7 +5374,7 @@ fn register_eval_module(
                                 caps.allocation_reader(),
                                 caps.blackboard_reader(),
                                 policy_caps.compactor(),
-                                caps.llm_access(),
+                                caps.llm("main").with_tier(main_tier).into(),
                             ))
                         }
                     }
@@ -5352,6 +5387,7 @@ fn register_eval_module(
                 replica_hard_cap,
                 {
                     let policy_caps = policy_caps.clone();
+                    let main_tier = eval_session_tier(module, "main");
                     move |caps| {
                         let policy_caps = policy_caps.clone();
                         async move {
@@ -5363,8 +5399,9 @@ fn register_eval_module(
                                 policy_caps.searcher(),
                                 policy_caps.upserter(),
                                 caps.memo(),
-                                caps.llm_access(),
+                                caps.llm("main").with_tier(main_tier).into(),
                                 caps.session("main")
+                                    .with_tier(main_tier)
                                     .with_auto_compaction(
                                         nuillu_reward::reward_session_auto_compaction(),
                                     )
@@ -5376,44 +5413,52 @@ fn register_eval_module(
             )
             .expect("eval module registration should be unique"),
         // Cognition-log triggered; not on speak critical path.
-        EvalModule::Predict => registry
-            .register_eval(
-                eval_policy(1..=1, Bpm::range(6.0, 18.0)),
-                replica_hard_cap,
-                |caps| async move {
-                    Ok(nuillu_predict::PredictModule::new(
-                        caps.cognition_log_updated_inbox(),
-                        caps.cognition_log_reader(),
-                        caps.memo(),
-                        caps.llm_access(),
-                        caps.session("main")
-                            .with_auto_compaction(nuillu_predict::session_auto_compaction())
-                            .await?,
-                    ))
-                },
-            )
-            .expect("eval module registration should be unique"),
+        EvalModule::Predict => {
+            let main_tier = eval_session_tier(module, "main");
+            registry
+                .register_eval(
+                    eval_policy(1..=1, Bpm::range(6.0, 18.0)),
+                    replica_hard_cap,
+                    move |caps| async move {
+                        Ok(nuillu_predict::PredictModule::new(
+                            caps.cognition_log_updated_inbox(),
+                            caps.cognition_log_reader(),
+                            caps.memo(),
+                            caps.llm("main").with_tier(main_tier).into(),
+                            caps.session("main")
+                                .with_tier(main_tier)
+                                .with_auto_compaction(nuillu_predict::session_auto_compaction())
+                                .await?,
+                        ))
+                    },
+                )
+                .expect("eval module registration should be unique")
+        }
         // Cognition-log triggered; should be quick enough to flag
         // unexpected events while they're still relevant.
-        EvalModule::Surprise => registry
-            .register_eval(
-                eval_policy(1..=1, Bpm::range(6.0, 18.0)),
-                replica_hard_cap,
-                |caps| async move {
-                    Ok(nuillu_surprise::SurpriseModule::new(
-                        caps.cognition_log_updated_inbox(),
-                        caps.cognition_log_reader(),
-                        caps.blackboard_reader(),
-                        caps.attention_control_mailbox(),
-                        caps.memo(),
-                        caps.llm_access(),
-                        caps.session("main")
-                            .with_auto_compaction(nuillu_surprise::session_auto_compaction())
-                            .await?,
-                    ))
-                },
-            )
-            .expect("eval module registration should be unique"),
+        EvalModule::Surprise => {
+            let main_tier = eval_session_tier(module, "main");
+            registry
+                .register_eval(
+                    eval_policy(1..=1, Bpm::range(6.0, 18.0)),
+                    replica_hard_cap,
+                    move |caps| async move {
+                        Ok(nuillu_surprise::SurpriseModule::new(
+                            caps.cognition_log_updated_inbox(),
+                            caps.cognition_log_reader(),
+                            caps.blackboard_reader(),
+                            caps.attention_control_mailbox(),
+                            caps.memo(),
+                            caps.llm("main").with_tier(main_tier).into(),
+                            caps.session("main")
+                                .with_tier(main_tier)
+                                .with_auto_compaction(nuillu_surprise::session_auto_compaction())
+                                .await?,
+                        ))
+                    },
+                )
+                .expect("eval module registration should be unique")
+        }
         // Reactive on cognition-log updates. The target-selection tool
         // decides whether this activation emits speech or stays silent.
         EvalModule::Speak => registry
@@ -5422,6 +5467,8 @@ fn register_eval_module(
                 replica_hard_cap,
                 {
                     let utterance_sink = utterance_sink.clone();
+                    let planning_tier = eval_session_tier(module, "planning");
+                    let generation_tier = eval_session_tier(module, "generation");
                     move |caps| {
                         let utterance_sink = utterance_sink.clone();
                         async move {
@@ -5437,18 +5484,27 @@ fn register_eval_module(
                                         utterance_sink.clone(),
                                         caps.clock(),
                                     ),
-                                    llm: caps.llm_access(),
+                                    planning_llm: caps
+                                        .llm("planning")
+                                        .with_tier(planning_tier)
+                                        .into(),
+                                    generation_llm: caps
+                                        .llm("generation")
+                                        .with_tier(generation_tier)
+                                        .into(),
                                     scene: caps.scene_reader(),
                                     clock: caps.clock(),
                                     self_wake: caps.self_wake(),
                                     planning_session: caps
                                         .session("planning")
+                                        .with_tier(planning_tier)
                                         .with_auto_compaction(
                                             nuillu_speak::planning_session_auto_compaction(),
                                         )
                                         .await?,
                                     generation_session: caps
                                         .session("generation")
+                                        .with_tier(generation_tier)
                                         .with_auto_compaction(
                                             nuillu_speak::generation_session_auto_compaction(),
                                         )
@@ -5471,28 +5527,28 @@ pub(crate) fn full_agent_allocation(
     allocation.set_activation_table(eval_activation_table());
 
     for module in modules {
-        let (activation, tier) = match module {
-            EvalModule::Sensory => (1.0, ModelTier::Cheap),
-            EvalModule::CognitionGate => (0.0, ModelTier::Cheap),
-            EvalModule::Allocation => (1.0, ModelTier::Default),
-            EvalModule::AttentionSchema => (0.0, ModelTier::Default),
-            EvalModule::Interpreter => (0.0, ModelTier::Default),
-            EvalModule::SelfModel => (0.0, ModelTier::Default),
-            EvalModule::QueryMemory => (0.0, ModelTier::Cheap),
-            EvalModule::Memory => (0.0, ModelTier::Cheap),
-            EvalModule::MemoryCompaction => (0.0, ModelTier::Cheap),
-            EvalModule::MemoryAssociation => (0.0, ModelTier::Cheap),
-            EvalModule::MemoryRecombination => (0.0, ModelTier::Cheap),
-            EvalModule::Interoception => (1.0, ModelTier::Cheap),
-            EvalModule::Homeostasis => (1.0, ModelTier::Cheap),
-            EvalModule::Policy => (0.0, ModelTier::Default),
-            EvalModule::PolicyCompaction => (0.0, ModelTier::Cheap),
-            EvalModule::Reward => (0.0, ModelTier::Default),
-            EvalModule::Predict => (0.0, ModelTier::Cheap),
-            EvalModule::Surprise => (0.0, ModelTier::Default),
-            EvalModule::Speak => (0.0, ModelTier::Premium),
+        let activation = match module {
+            EvalModule::Sensory => 1.0,
+            EvalModule::Allocation => 1.0,
+            EvalModule::Interoception => 1.0,
+            EvalModule::Homeostasis => 1.0,
+            EvalModule::CognitionGate
+            | EvalModule::AttentionSchema
+            | EvalModule::Interpreter
+            | EvalModule::SelfModel
+            | EvalModule::QueryMemory
+            | EvalModule::Memory
+            | EvalModule::MemoryCompaction
+            | EvalModule::MemoryAssociation
+            | EvalModule::MemoryRecombination
+            | EvalModule::Policy
+            | EvalModule::PolicyCompaction
+            | EvalModule::Reward
+            | EvalModule::Predict
+            | EvalModule::Surprise
+            | EvalModule::Speak => 0.0,
         };
-        set_allocation_module(&mut allocation, module.module_id(), activation, tier);
+        set_allocation_module(&mut allocation, module.module_id(), activation);
     }
     allocation
 }
@@ -5519,7 +5575,6 @@ fn module_allocation(
     for module in modules {
         let is_target = *module == target_module;
         let id = module.module_id();
-        allocation.set_model_override(id.clone(), eval_module_tier(*module));
         allocation.set(id.clone(), ModuleConfig::default());
         allocation.set_activation(
             id,
@@ -5533,13 +5588,7 @@ fn module_allocation(
     allocation
 }
 
-fn set_allocation_module(
-    allocation: &mut ResourceAllocation,
-    id: ModuleId,
-    activation_ratio: f64,
-    tier: ModelTier,
-) {
-    allocation.set_model_override(id.clone(), tier);
+fn set_allocation_module(allocation: &mut ResourceAllocation, id: ModuleId, activation_ratio: f64) {
     allocation.set(id.clone(), ModuleConfig::default());
     allocation.set_activation(id, ActivationRatio::from_f64(activation_ratio));
 }
@@ -5576,6 +5625,21 @@ fn eval_module_tier(module: EvalModule) -> ModelTier {
         | EvalModule::Policy
         | EvalModule::Reward
         | EvalModule::Surprise => ModelTier::Default,
+    }
+}
+
+fn eval_session_tier(module: EvalModule, key: &str) -> ModelTier {
+    match (module, key) {
+        (EvalModule::Sensory, "one-shot" | "ambient") => ModelTier::Cheap,
+        (EvalModule::Speak, "planning") => ModelTier::Premium,
+        (EvalModule::Speak, "generation") => ModelTier::Default,
+        (EvalModule::MemoryCompaction, "main") => ModelTier::Cheap,
+        (EvalModule::MemoryCompaction, "audit") => ModelTier::Default,
+        (_, "main") => eval_module_tier(module),
+        _ => panic!(
+            "unknown eval session key {key:?} for module {}",
+            module.as_str()
+        ),
     }
 }
 
@@ -5724,7 +5788,6 @@ fn visualizer_blackboard_snapshot(bb: &BlackboardInner) -> BlackboardSnapshot {
                     module: module.module,
                     activation_ratio: module.activation_ratio,
                     active_replicas: module.active_replicas,
-                    tier: module.tier,
                     guidance: module.guidance.as_str().to_owned(),
                 }
             })
@@ -5822,7 +5885,6 @@ fn allocation_module_dumps(allocation: &ResourceAllocation) -> Vec<AllocationMod
             period_ms: allocation
                 .bpm_for(module)
                 .map(|bpm| duration_millis_u64(bpm.period())),
-            tier: model_tier_name(allocation.tier_for(module)).to_owned(),
             guidance: DumpText::new(config.guidance.clone()),
         })
         .collect::<Vec<_>>();
@@ -5987,7 +6049,6 @@ struct AllocationModuleObservation {
     active_replicas: u8,
     period_ms: Option<u64>,
     guidance: String,
-    tier: ModelTier,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -6016,7 +6077,6 @@ struct ActiveModuleObservation {
     module: String,
     active_replicas: u8,
     activation_ratio: ActivationRatio,
-    tier: ModelTier,
 }
 
 fn memo_log_observations(bb: &BlackboardInner) -> BTreeMap<String, Vec<MemoLogObservation>> {
@@ -6083,7 +6143,6 @@ fn allocation_observation(
                         .bpm_for(module)
                         .map(|bpm| duration_millis_u64(bpm.period())),
                     guidance: config.guidance.clone(),
-                    tier: allocation.tier_for(module),
                 },
             )
         })
@@ -6126,7 +6185,6 @@ fn active_module_observations(bb: &BlackboardInner) -> Vec<ActiveModuleObservati
                 module: module.as_str().to_owned(),
                 active_replicas,
                 activation_ratio: bb.allocation().activation_for(&module),
-                tier: bb.allocation().tier_for(&module),
             })
         })
         .collect()
@@ -6202,14 +6260,7 @@ fn allocation_live_summary(allocation: &BTreeMap<String, AllocationModuleObserva
     let active = allocation
         .iter()
         .filter(|(_, obs)| obs.activation_ratio > ActivationRatio::ZERO)
-        .map(|(module, obs)| {
-            format!(
-                "{}:{:.2}/{:?}",
-                module,
-                obs.activation_ratio.as_f64(),
-                obs.tier
-            )
-        })
+        .map(|(module, obs)| format!("{}:{:.2}", module, obs.activation_ratio.as_f64()))
         .collect::<Vec<_>>();
     let inactive = allocation
         .values()
@@ -6226,11 +6277,10 @@ fn active_modules_live_summary(active_modules: &[ActiveModuleObservation]) -> St
         .iter()
         .map(|module| {
             format!(
-                "{}:{}:{:.2}/{:?}",
+                "{}:{}:{:.2}",
                 module.module,
                 module.active_replicas,
-                module.activation_ratio.as_f64(),
-                module.tier
+                module.activation_ratio.as_f64()
             )
         })
         .collect::<Vec<_>>()
@@ -9522,7 +9572,6 @@ limits {
     async fn agent_observation_serializes_string_keyed_blackboard_maps() {
         let now = Utc.with_ymd_and_hms(2026, 5, 7, 0, 0, 0).unwrap();
         let mut allocation = ResourceAllocation::default();
-        allocation.set_model_override(builtin::query_memory(), ModelTier::Default);
         allocation.set(
             builtin::query_memory(),
             ModuleConfig {
@@ -9625,7 +9674,6 @@ limits {
                     "active_replicas": 0,
                     "period_ms": 1000,
                     "guidance": "test guidance",
-                    "tier": "Default",
                 },
             },
             "allocation_proposals": {
@@ -9635,7 +9683,6 @@ limits {
                         "active_replicas": 0,
                         "period_ms": null,
                         "guidance": "test guidance",
-                        "tier": "Default",
                     },
                 },
             },
@@ -9844,8 +9891,9 @@ prompt = "What am I attending to?"
                                 caps.blackboard_reader(),
                                 caps.cognition_log_reader(),
                                 caps.memo(),
-                                caps.llm_access(),
+                                caps.llm("main").with_tier(ModelTier::Default).into(),
                                 caps.session("main")
+                                    .with_tier(ModelTier::Default)
                                     .with_auto_compaction(
                                         nuillu_attention_schema::session_auto_compaction(),
                                     )
@@ -10085,24 +10133,15 @@ prompt = "What am I attending to?"
             allocation.activation_for(&builtin::sensory()),
             ActivationRatio::ONE
         );
-        assert_eq!(allocation.tier_for(&builtin::sensory()), ModelTier::Cheap);
 
         assert_eq!(
             allocation.activation_for(&builtin::cognition_gate()),
             ActivationRatio::ZERO
         );
-        assert_eq!(
-            allocation.tier_for(&builtin::cognition_gate()),
-            ModelTier::Cheap
-        );
 
         assert_eq!(
             allocation.activation_for(&builtin::allocation()),
             ActivationRatio::ONE
-        );
-        assert_eq!(
-            allocation.tier_for(&builtin::allocation()),
-            ModelTier::Default
         );
 
         assert_eq!(
@@ -10110,23 +10149,14 @@ prompt = "What am I attending to?"
             ActivationRatio::ONE
         );
         assert_eq!(
-            allocation.tier_for(&builtin::interoception()),
-            ModelTier::Cheap
-        );
-        assert_eq!(
             allocation.activation_for(&builtin::homeostasis()),
             ActivationRatio::ONE
-        );
-        assert_eq!(
-            allocation.tier_for(&builtin::homeostasis()),
-            ModelTier::Cheap
         );
 
         assert_eq!(
             allocation.activation_for(&builtin::speak()),
             ActivationRatio::ZERO
         );
-        assert_eq!(allocation.tier_for(&builtin::speak()), ModelTier::Premium);
 
         for module in [
             builtin::attention_schema(),

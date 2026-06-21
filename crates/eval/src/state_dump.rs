@@ -124,7 +124,6 @@ pub struct AllocationModuleDump {
     pub activation_ratio: f64,
     pub active_replicas: u8,
     pub period_ms: Option<u64>,
-    pub tier: String,
     pub guidance: DumpText,
 }
 

@@ -662,8 +662,11 @@ mod tests {
                         caps.memo_updated_inbox(),
                         caps.blackboard_reader(),
                         caps.cognition_writer(),
-                        caps.llm_access(),
+                        caps.llm("main")
+                            .with_tier(nuillu_types::ModelTier::Default)
+                            .into(),
                         caps.session("main")
+                            .with_tier(nuillu_types::ModelTier::Default)
                             .with_auto_compaction(session_auto_compaction())
                             .await?,
                     ));

@@ -16,8 +16,8 @@ pub const SERVER_TAB_ID: &str = "server";
 
 pub use config::{
     DEFAULT_MODULES, EmbeddingBackendConfig, LlmBackendConfig, LlmGenerationConfig, RuntimeModule,
-    ServerBootConfig, ServerConfig, ServerModelTier, ServerModuleGroup, ServerModuleSpec,
-    default_run_id, default_server_session_id, install_lutum_trace_subscriber,
+    ServerBootConfig, ServerConfig, ServerModuleGroup, ServerModuleSessionSpec, ServerModuleSpec,
+    ServerSessionTier, default_run_id, default_server_session_id, install_lutum_trace_subscriber,
     load_server_boot_config,
 };
 pub use environment::{
@@ -37,5 +37,5 @@ pub use nuillu_llm_trace_file::{FileLlmTraceSink, LlmLogContext};
 pub use runtime::run_server_with_visualizer;
 pub use snapshot::{
     duration_millis_u64, linked_memory_record_view, memory_metadata_views, memory_rank_name,
-    memory_record_view, model_tier_name, module_policy_views, zero_replica_window_view,
+    memory_record_view, module_policy_views, zero_replica_window_view,
 };

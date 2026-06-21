@@ -13,8 +13,8 @@
 //!   Memo is single-issued per module construction so a module owner has one
 //!   payload type.
 //! - Typed mailbox sends are owner-stamped; identities cannot be forged.
-//! - LLM tier is read from allocation per-call inside [`LlmAccess`];
-//!   modules don't pick tiers themselves.
+//! - LLM tier is fixed on named session/LLM handles at module construction;
+//!   modules do not choose tiers during activation.
 
 pub use nuillu_blackboard::{
     AgenticDeadlockMarker, AllocationCommand, AllocationEffectKind, AllocationEffectLevel,
@@ -62,8 +62,8 @@ pub use allocation_writer::AllocationWriter;
 pub use capabilities::{
     AgentRuntimeControl, AllocatedModule, AllocatedModules, CapabilityProviderConfig,
     CapabilityProviderPorts, CapabilityProviderRuntime, CapabilityProviders, HostIo,
-    InternalHarnessIo, ModuleCapabilityFactory, ModuleDependencies, ModuleRegisterer,
-    ModuleRegistry, ModuleRegistryError, SelfWake, SelfWakePermitClaim,
+    InternalHarnessIo, LlmCapabilityRequest, ModuleCapabilityFactory, ModuleDependencies,
+    ModuleRegisterer, ModuleRegistry, ModuleRegistryError, SelfWake, SelfWakePermitClaim,
 };
 pub use channels::{
     AmbientSensoryEntry, AttentionControlRequest, AttentionControlRequestInbox,
@@ -78,8 +78,8 @@ pub use cognition::CognitionWriter;
 pub use dependencies::{apply_standard_dependencies, standard_dependency_edges};
 pub use interoception::InteroceptiveWriter;
 pub use llm::{
-    FixedTierLlmAccess, LlmAccess, LlmBatchDebug, LlmConcurrencyLimiter, LlmLease,
-    LlmRequestMetadata, LlmRequestSource, current_activation_llm_request_metadata,
+    LlmAccess, LlmBatchDebug, LlmConcurrencyLimiter, LlmLease, LlmRequestMetadata,
+    LlmRequestSource, current_activation_llm_request_metadata,
     with_activation_llm_request_metadata,
 };
 pub use memo::{Memo, TypedMemo};

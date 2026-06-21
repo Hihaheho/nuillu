@@ -51,9 +51,13 @@ replica-capacity.$optional = true
 bpm-min = `float`
 bpm-max = `float`
 initial-activation = `float`
-tier = `$types.model-tier`
-tier.$optional = true
 groups = [`$types.module-group`]
 groups.$optional = true
 depends-on = [`$types.runtime-module`]
 depends-on.$optional = true
+sessions = [`$types.server-module-session`]
+sessions.$optional = true
+
+@ $types.server-module-session
+key = `text`
+tier = `$types.model-tier`

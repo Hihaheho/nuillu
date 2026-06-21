@@ -1479,11 +1479,15 @@ mod tests {
                         caps.memo(),
                         caps.scene_reader(),
                         caps.clock(),
-                        caps.llm_access(),
+                        caps.llm("one-shot")
+                            .with_tier(nuillu_types::ModelTier::Cheap)
+                            .into(),
                         caps.session("one-shot")
+                            .with_tier(nuillu_types::ModelTier::Cheap)
                             .with_auto_compaction(one_shot_session_auto_compaction())
                             .await?,
                         caps.session("ambient")
+                            .with_tier(nuillu_types::ModelTier::Cheap)
                             .with_auto_compaction(ambient_session_auto_compaction())
                             .await?,
                     )

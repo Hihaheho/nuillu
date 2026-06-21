@@ -129,10 +129,10 @@ impl<'a> ActivateCx<'a> {
             .cloned()
             .ok_or(SessionCheckpointError::MissingMetadata)?;
         strip_reasoning_blocks_from_session(session);
+        let threshold = self.session_compaction.input_token_threshold();
         if let Some(profile) = metadata.auto_compaction
-            && usage.input_tokens > self.session_compaction.input_token_threshold()
+            && usage.input_tokens > threshold
         {
-            let threshold = self.session_compaction.input_token_threshold();
             let tier = self.session_compaction.module_tier();
             let before_items = session.input().items().len();
             self.runtime_events.session_compaction_started(

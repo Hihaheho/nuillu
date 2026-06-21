@@ -1135,11 +1135,8 @@ impl BlackboardInner {
             .collect();
 
         let mut effective = ResourceAllocation::default();
-        // Carry host-set tier and activation-table state through unchanged.
+        // Carry host-set activation-table state through unchanged.
         effective.set_activation_table(self.base_allocation.activation_table().to_vec());
-        for (id, tier) in self.base_allocation.iter_model_override() {
-            effective.set_model_override(id.clone(), tier);
-        }
         for id in module_ids {
             let module_proposals = active_proposals
                 .iter()
@@ -1261,7 +1258,7 @@ mod tests {
 
     use chrono::TimeZone;
     use nuillu_types::{
-        MemoryContent, MemoryIndex, ModelTier, ModuleId, ReplicaCapRange, ReplicaIndex, builtin,
+        MemoryContent, MemoryIndex, ModuleId, ReplicaCapRange, ReplicaIndex, builtin,
     };
 
     fn memo_time(seconds: i64) -> DateTime<Utc> {
@@ -1641,10 +1638,6 @@ mod tests {
         let query_activation = effective.activation_for(&builtin::query_memory());
         assert_eq!(effective.active_replicas(&builtin::query_memory()), 2);
         assert!((query_activation.as_f64() - 0.6667).abs() < 0.001);
-        assert_eq!(
-            effective.tier_for(&builtin::query_memory()),
-            ModelTier::Default
-        );
         assert_eq!(
             query.guidance,
             "allocation: query cheaply\nallocation[1]: query deeply"

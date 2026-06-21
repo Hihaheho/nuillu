@@ -664,8 +664,11 @@ mod tests {
                                 caps.memory_metadata_reader(),
                                 memory_caps.writer(),
                                 memory_caps.retriever(),
-                                caps.llm_access(),
+                                caps.llm("main")
+                                    .with_tier(nuillu_types::ModelTier::Cheap)
+                                    .into(),
                                 caps.session("main")
+                                    .with_tier(nuillu_types::ModelTier::Cheap)
                                     .with_auto_compaction(session_auto_compaction())
                                     .await?,
                             )
