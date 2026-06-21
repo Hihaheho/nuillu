@@ -3756,7 +3756,7 @@ mod tests {
             LlmObservationEvent::ToolCallChunk {
                 turn_id: "turn-tool".to_string(),
                 id: "call-1".to_string(),
-                name: "leave_allocation_unchanged".to_string(),
+                name: "reprioritize_modules".to_string(),
                 arguments_json_delta: "{\"memo\":".to_string(),
             },
         );
@@ -3765,7 +3765,7 @@ mod tests {
             LlmObservationEvent::ToolCallChunk {
                 turn_id: "turn-tool".to_string(),
                 id: "call-1".to_string(),
-                name: "leave_allocation_unchanged".to_string(),
+                name: "reprioritize_modules".to_string(),
                 arguments_json_delta: "\"The current".to_string(),
             },
         );
@@ -3777,7 +3777,7 @@ mod tests {
                 kind: "tool_call".to_string(),
                 content: "{\"memo\":\"The current".to_string(),
                 streaming: true,
-                source: Some("leave_allocation_unchanged(call-1)".to_string()),
+                source: Some("reprioritize_modules(call-1)".to_string()),
             }]
         );
     }
@@ -3817,7 +3817,7 @@ mod tests {
             LlmObservationEvent::ToolCallChunk {
                 turn_id: "turn-tools".to_string(),
                 id: "call-2".to_string(),
-                name: "leave_allocation_unchanged".to_string(),
+                name: "reprioritize_modules".to_string(),
                 arguments_json_delta: "{}".to_string(),
             },
         );
@@ -3839,7 +3839,7 @@ mod tests {
                     kind: "tool_call".to_string(),
                     content: "{}".to_string(),
                     streaming: true,
-                    source: Some("leave_allocation_unchanged(call-2)".to_string()),
+                    source: Some("reprioritize_modules(call-2)".to_string()),
                 },
                 LlmOutputItemState {
                     kind: "tool_call".to_string(),
@@ -3877,7 +3877,7 @@ mod tests {
             LlmObservationEvent::ToolCallChunk {
                 turn_id: "turn-ready".to_string(),
                 id: "call-1".to_string(),
-                name: "leave_allocation_unchanged".to_string(),
+                name: "reprioritize_modules".to_string(),
                 arguments_json_delta: "{\"memo\":".to_string(),
             },
         );
@@ -3886,7 +3886,7 @@ mod tests {
             LlmObservationEvent::ToolCallReady {
                 turn_id: "turn-ready".to_string(),
                 id: "call-1".to_string(),
-                name: "leave_allocation_unchanged".to_string(),
+                name: "reprioritize_modules".to_string(),
                 arguments_json: "{\"memo\":\"stable\"}".to_string(),
             },
         );
@@ -3898,7 +3898,7 @@ mod tests {
                 kind: "tool_call_ready".to_string(),
                 content: "{\"memo\":\"stable\"}".to_string(),
                 streaming: false,
-                source: Some("leave_allocation_unchanged(call-1)".to_string()),
+                source: Some("reprioritize_modules(call-1)".to_string()),
             }]
         );
     }

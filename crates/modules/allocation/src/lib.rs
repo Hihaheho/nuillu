@@ -27,19 +27,21 @@ allocation posture is best for the mind and which modules deserve extra activati
 
 On each activation, choose the best current allocation posture for the mind. Use current memos,
 current cognition entries, current attention-control requests, interoception, memory inventory,
-stuckness, and current allocation state. If the current allocation already fits that posture, call
-leave_allocation_unchanged; otherwise call reprioritize_modules for modules that need extra
-activation now.
+stuckness, and current allocation state. Always call reprioritize_modules with the complete current
+ideal target opinion for this allocation turn.
 
 Use exactly one tool per activation:
-- leave_allocation_unchanged when the current allocation already fits the best current posture.
-- reprioritize_modules when one or more modules need extra activation now. `priority_module_ids`
+- reprioritize_modules is always required, including when the desired posture is unchanged.
+  `priority_module_ids`
   lists registered module ids in descending priority order. `hints_by_module` may map module ids to
-  concise module-specific guidance. Omitted modules fall back to the host/base allocation: the
-  priority list adds salience drive, it is not a complete allow-list and not an inhibition list.
-  Separate suppression caps, when granted by the host, are the inhibition path. Position in
-  `priority_module_ids` maps to the host-configured activation table; positions beyond the table
-  fall to zero, so prioritise tightly. Do not invent module ids and do not duplicate ids.
+  concise module-specific guidance. Re-emit module ids and guidance that should remain prioritized.
+  Omitted modules fall back to the host/base allocation because this is your complete target
+  opinion, not a delta. Use an empty `priority_module_ids` list only when no module should receive
+  extra allocation-module target effects now. The priority list adds salience drive, it is not a
+  complete allow-list and not an inhibition list. Separate suppression caps, when granted by the
+  host, are the inhibition path. Position in `priority_module_ids` maps to the host-configured
+  activation table; positions beyond the table fall to zero, so prioritise tightly. Do not invent
+  module ids and do not duplicate ids.
 
 Attention-control requests are not target-module work queues. They are current attention bids that
 you may admit, defer, or reject. If you admit a request, activate the relevant module and put the
@@ -207,7 +209,7 @@ pub fn controller_schema_json(allowed_modules: &[ModuleId]) -> serde_json::Value
             },
             "priority_module_ids": {
                 "type": "array",
-                "description": "Modules to add salience/drive for, in descending priority order. Omitted modules keep boot/base allocation unless suppressed elsewhere. Position maps to the host-configured activation_table; positions beyond the table fall to zero.",
+                "description": "Complete current ideal target module list, in descending priority order. Re-emit modules that should remain prioritized. Omitted modules return to host/base allocation; an empty list means no extra allocation-module target effects now. Position maps to the host-configured activation_table; positions beyond the table fall to zero.",
                 "items": priority_module_items,
             },
             "hints_by_module": {
@@ -261,19 +263,7 @@ impl JsonSchema for ModuleTargetId {
     }
 }
 
-/// Record that no allocation change is needed.
-#[lutum::tool_input(name = "leave_allocation_unchanged", output = LeaveAllocationUnchangedOutput)]
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-pub struct LeaveAllocationUnchangedArgs {
-    pub memo: String,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
-pub struct LeaveAllocationUnchangedOutput {
-    pub unchanged: bool,
-}
-
-/// Raise activation for modules that should act on the current evidence now.
+/// Emit the complete current ideal target allocation opinion.
 #[lutum::tool_input(name = "reprioritize_modules", output = ReprioritizeModulesOutput)]
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct ReprioritizeModulesArgs {
@@ -290,7 +280,6 @@ pub struct ReprioritizeModulesOutput {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema, lutum::Toolset)]
 pub enum AllocationTools {
-    LeaveAllocationUnchanged(LeaveAllocationUnchangedArgs),
     ReprioritizeModules(ReprioritizeModulesArgs),
 }
 
@@ -431,10 +420,7 @@ impl AllocationModule {
                 self.session
                     .text_turn()
                     .tools::<AllocationTools>()
-                    .available_tools([
-                        AllocationToolsSelector::LeaveAllocationUnchanged,
-                        AllocationToolsSelector::ReprioritizeModules,
-                    ])
+                    .available_tools([AllocationToolsSelector::ReprioritizeModules])
                     .require_any_tool()
                     .max_output_tokens(TOOL_TURN_MAX_OUTPUT_TOKENS)
                     .collect_controlled_with(
@@ -472,22 +458,13 @@ impl AllocationModule {
                 if round.tool_calls.is_empty() {
                     let detail = format!(
                         "model returned NeedsTools outcome with empty tool_calls; {expected}",
-                        expected = "expected leave_allocation_unchanged or reprioritize_modules"
+                        expected = "expected reprioritize_modules"
                     );
                     cx.warn(format!("allocation activation failed: {detail}"));
                 }
                 // The LLM may return multiple tool calls; adopt the first decision only.
                 for call in round.tool_calls.iter().cloned() {
                     match call {
-                        AllocationToolsCall::LeaveAllocationUnchanged(call) => {
-                            if applied.is_none() {
-                                applied = Some(apply_no_change(call.input.memo.clone()));
-                            }
-                            results.push(
-                                call.complete(LeaveAllocationUnchangedOutput { unchanged: true })
-                                    .context("complete leave_allocation_unchanged tool call")?,
-                            );
-                        }
                         AllocationToolsCall::ReprioritizeModules(call) => {
                             if applied.is_none() {
                                 applied = Some(apply_reprioritize(&registered, call.input.clone()));
@@ -514,12 +491,10 @@ impl AllocationModule {
                 round
                     .commit(&mut self.session, results)
                     .context("commit allocation tool round")?;
-                if let Some(AppliedDecision::Reprioritize { commands, .. }) = applied.as_ref() {
-                    self.allocation_writer
-                        .submit(commands.clone())
-                        .await
-                        .context("persist allocation decision")?;
-                }
+                self.allocation_writer
+                    .submit(applied_decision.commands.clone())
+                    .await
+                    .context("persist allocation decision")?;
                 cx.compact_and_save(&mut self.session, usage).await?;
             }
         };
@@ -533,26 +508,15 @@ impl AllocationModule {
     }
 }
 
-enum AppliedDecision {
-    Unchanged {
-        memo: String,
-    },
-    Reprioritize {
-        memo: String,
-        commands: Vec<AllocationCommand>,
-    },
+struct AppliedDecision {
+    memo: String,
+    commands: Vec<AllocationCommand>,
 }
 
 impl AppliedDecision {
     fn memo(&self) -> &str {
-        match self {
-            Self::Unchanged { memo } | Self::Reprioritize { memo, .. } => memo,
-        }
+        &self.memo
     }
-}
-
-fn apply_no_change(memo: String) -> AppliedDecision {
-    AppliedDecision::Unchanged { memo }
 }
 
 fn apply_reprioritize(
@@ -588,7 +552,7 @@ fn apply_reprioritize(
         ));
     }
 
-    AppliedDecision::Reprioritize { memo, commands }
+    AppliedDecision { memo, commands }
 }
 
 fn priority_level(rank: usize) -> AllocationEffectLevel {
@@ -688,8 +652,7 @@ where
 
 fn no_decision_failure_detail(tool_names: &str) -> String {
     format!(
-        "tool turn produced no decision: tool_calls=[{tool_names}]; expected exactly one of \
-         leave_allocation_unchanged, reprioritize_modules"
+        "tool turn produced no decision: tool_calls=[{tool_names}]; expected reprioritize_modules"
     )
 }
 
@@ -752,8 +715,7 @@ mod tests {
     fn no_decision_failure_detail_includes_tool_names() {
         assert_eq!(
             no_decision_failure_detail("foo, bar"),
-            "tool turn produced no decision: tool_calls=[foo, bar]; expected exactly one of \
-             leave_allocation_unchanged, reprioritize_modules"
+            "tool turn produced no decision: tool_calls=[foo, bar]; expected reprioritize_modules"
         );
     }
 
@@ -784,7 +746,7 @@ mod tests {
                     },
                     "priority_module_ids": {
                         "type": "array",
-                        "description": "Modules to add salience/drive for, in descending priority order. Omitted modules keep boot/base allocation unless suppressed elsewhere. Position maps to the host-configured activation_table; positions beyond the table fall to zero.",
+                        "description": "Complete current ideal target module list, in descending priority order. Re-emit modules that should remain prioritized. Omitted modules return to host/base allocation; an empty list means no extra allocation-module target effects now. Position maps to the host-configured activation_table; positions beyond the table fall to zero.",
                         "items": {
                             "enum": ["query-memory"],
                         },
@@ -1145,10 +1107,20 @@ mod tests {
         ])
     }
 
-    fn leave_unchanged_scenario(input_tokens: u64, memo: &str) -> MockTextScenario {
+    fn reprioritize_scenario(
+        input_tokens: u64,
+        memo: &str,
+        priority_module_ids: &[&str],
+        hints_by_module: serde_json::Value,
+    ) -> MockTextScenario {
         tool_scenario(
-            "leave_allocation_unchanged",
-            serde_json::json!({ "memo": memo }).to_string(),
+            "reprioritize_modules",
+            serde_json::json!({
+                "memo": memo,
+                "priority_module_ids": priority_module_ids,
+                "hints_by_module": hints_by_module,
+            })
+            .to_string(),
             input_tokens,
         )
     }
@@ -1181,10 +1153,7 @@ mod tests {
     }
 
     fn expect_reprioritize(applied: AppliedDecision) -> (String, Vec<AllocationCommand>) {
-        let AppliedDecision::Reprioritize { memo, commands } = applied else {
-            panic!("expected reprioritize decision");
-        };
-        (memo, commands)
+        (applied.memo, applied.commands)
     }
 
     #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1408,11 +1377,7 @@ mod tests {
     fn allocation_tools_have_generic_descriptions() {
         assert!(
             <ReprioritizeModulesArgs as lutum::ToolInput>::DESCRIPTION
-                .contains("Raise activation for modules")
-        );
-        assert!(
-            <LeaveAllocationUnchangedArgs as lutum::ToolInput>::DESCRIPTION
-                .contains("no allocation change is needed")
+                .contains("complete current ideal target allocation opinion")
         );
     }
 
@@ -1475,35 +1440,31 @@ mod tests {
         assert!(!input.contains("Current memos at"));
         assert!(!input.contains("These are durable notes from other faculties"));
         assert!(!input.contains("batch"));
-        assert!(!input.contains("Never call leave_allocation_unchanged"));
         assert_eq!(allocation_observation_input(None, None, &[]), None);
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn leave_allocation_unchanged_preserves_previous_reprioritize_effects() {
+    async fn reprioritize_reemits_current_ideal_target_effects() {
         let adapter = MockLlmAdapter::new()
-            .with_text_scenario(tool_scenario(
-                "reprioritize_modules",
+            .with_text_scenario(reprioritize_scenario(
+                1,
+                "Admit retrieval, memory, self-model framing, and speech.",
+                &["query-memory", "memory", "self-model", "speak"],
                 serde_json::json!({
-                    "memo": "Admit retrieval, memory, self-model framing, and speech.",
-                    "priority_module_ids": [
-                        "query-memory",
-                        "memory",
-                        "self-model",
-                        "speak"
-                    ],
-                    "hints_by_module": {
-                        "memory": "retrieve the developer identity fact",
-                        "self-model": "frame the answer correctly",
-                        "speak": "answer when grounded"
-                    }
-                })
-                .to_string(),
-                1,
+                    "memory": "retrieve the developer identity fact",
+                    "self-model": "frame the answer correctly",
+                    "speak": "answer when grounded"
+                }),
             ))
-            .with_text_scenario(leave_unchanged_scenario(
+            .with_text_scenario(reprioritize_scenario(
                 1,
-                "No allocation change is needed; keep the prior target effects.",
+                "Re-emit the same ideal target posture.",
+                &["query-memory", "memory", "self-model", "speak"],
+                serde_json::json!({
+                    "memory": "retrieve the developer identity fact",
+                    "self-model": "frame the answer correctly",
+                    "speak": "answer when grounded"
+                }),
             ));
         let AllocationNoChangeFixture {
             mut controller,
@@ -1544,6 +1505,62 @@ mod tests {
         controller.activate_with(&cx, &[]).await.unwrap();
         let second = speak_allocation_snapshot(&controller).await;
         assert_eq!(second, first);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn empty_reprioritize_clears_previous_target_effects() {
+        let adapter = MockLlmAdapter::new()
+            .with_text_scenario(reprioritize_scenario(
+                1,
+                "Speech should answer now.",
+                &["speak"],
+                serde_json::json!({
+                    "speak": "answer when grounded"
+                }),
+            ))
+            .with_text_scenario(reprioritize_scenario(
+                1,
+                "No module needs extra target effects now.",
+                &[],
+                serde_json::json!({}),
+            ));
+        let AllocationNoChangeFixture {
+            mut controller,
+            source_memo,
+            peer_contexts,
+            allocation_hints,
+        } = allocation_no_change_fixture_with_turn_adapter(Arc::new(adapter)).await;
+
+        let lutum = controller.llm.lutum().await;
+        let identity_memories = Vec::new();
+        let compaction = nuillu_module::SessionCompactionRuntime::new(
+            lutum.lutum().clone(),
+            nuillu_module::LlmConcurrencyLimiter::new(None),
+            nuillu_types::ModelTier::Cheap,
+            nuillu_module::SessionCompactionPolicy::default(),
+        );
+        let cx = nuillu_module::ActivateCx::new(
+            &peer_contexts,
+            &allocation_hints,
+            &identity_memories,
+            &[],
+            compaction,
+            SystemClock.now(),
+        );
+
+        source_memo.write("Speech needs a response.").await;
+        controller.activate_with(&cx, &[]).await.unwrap();
+        let first = speak_allocation_snapshot(&controller).await;
+        assert_eq!(first.activation, ActivationRatio::ONE);
+        assert_eq!(first.active_replicas, 1);
+        assert_eq!(first.guidance, "answer when grounded");
+
+        source_memo.write("Speech no longer needs focus.").await;
+        controller.activate_with(&cx, &[]).await.unwrap();
+        let second = speak_allocation_snapshot(&controller).await;
+        assert_eq!(second.activation, ActivationRatio::ZERO);
+        assert_eq!(second.active_replicas, 0);
+        assert_eq!(second.guidance, "");
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -1650,8 +1667,22 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn second_activation_sends_prior_session_history_to_lutum() {
         let adapter = MockLlmAdapter::new()
-            .with_text_scenario(leave_unchanged_scenario(1, "first controller note"))
-            .with_text_scenario(leave_unchanged_scenario(1, "second controller note"));
+            .with_text_scenario(reprioritize_scenario(
+                1,
+                "first controller note",
+                &["sensory"],
+                serde_json::json!({
+                    "sensory": "inspect current input"
+                }),
+            ))
+            .with_text_scenario(reprioritize_scenario(
+                1,
+                "second controller note",
+                &["sensory"],
+                serde_json::json!({
+                    "sensory": "inspect current input"
+                }),
+            ));
         let capture = CapturingAdapter::new(adapter);
         let observed = capture.clone();
         let mut fixture = controller_fixture_with_turn_adapter(Arc::new(capture)).await;
@@ -1802,7 +1833,7 @@ mod tests {
                 turn.item_at(index)
                     .and_then(|item| item.as_tool_call())
                     .is_some_and(|call| {
-                        call.name.as_str() == "leave_allocation_unchanged"
+                        call.name.as_str() == "reprioritize_modules"
                             && call.arguments.get().contains("first controller note")
                     })
             })
@@ -1869,7 +1900,7 @@ mod tests {
                 turn.item_at(index)
                     .and_then(|item| item.as_tool_call())
                     .is_some_and(|call| {
-                        call.name.as_str() == "leave_allocation_unchanged"
+                        call.name.as_str() == "reprioritize_modules"
                             && call.arguments.get().contains("first controller note")
                     })
             })
