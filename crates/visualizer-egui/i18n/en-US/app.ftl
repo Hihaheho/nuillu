@@ -24,6 +24,7 @@ modules-count = modules: { $count }
 module-name-sensory = sensory
 module-name-cognition-gate = cognition-gate
 module-name-allocation = allocation
+module-name-action = action
 module-name-attention-schema = attention-schema
 module-name-interpreter = interpreter
 module-name-self-model = self-model
@@ -40,6 +41,8 @@ module-name-reward = reward
 module-name-predict = predict
 module-name-surprise = surprise
 module-name-speak = speak
+module-name-sleep = sleep
+module-name-poet = poet
 module-name-speak-gate = speak-gate
 
 section-cognition-log = Cognition Log

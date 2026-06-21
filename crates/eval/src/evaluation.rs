@@ -1189,7 +1189,7 @@ fn scoped_agent_allocation(
     value: Option<&serde_json::Value>,
     module: EvalModule,
 ) -> Option<serde_json::Value> {
-    if module == EvalModule::Allocation {
+    if matches!(module, EvalModule::Allocation | EvalModule::Action) {
         return value.cloned();
     }
     filter_object_entry(value, module.as_str())
@@ -1202,7 +1202,7 @@ fn scoped_agent_allocation_proposals(
     let proposals = value?.as_object()?;
     let mut scoped = serde_json::Map::new();
     for (owner, proposal) in proposals {
-        if module == EvalModule::Allocation {
+        if matches!(module, EvalModule::Allocation | EvalModule::Action) {
             if owner_matches_module(owner, module) {
                 scoped.insert(owner.clone(), proposal.clone());
             }
@@ -1220,7 +1220,7 @@ fn scoped_allocation_array(
     value: Option<&serde_json::Value>,
     module: EvalModule,
 ) -> Option<serde_json::Value> {
-    if module == EvalModule::Allocation {
+    if matches!(module, EvalModule::Allocation | EvalModule::Action) {
         return value.cloned();
     }
     filter_array_by_field(value, "module", module.as_str())
@@ -1233,7 +1233,7 @@ fn scoped_last_state_allocation_proposals(
     let proposals = value?.as_array()?;
     let mut scoped = Vec::new();
     for proposal in proposals {
-        if module == EvalModule::Allocation {
+        if matches!(module, EvalModule::Allocation | EvalModule::Action) {
             if nested_value_text(proposal, &["controller", "module"]).as_deref()
                 == Some(module.as_str())
             {

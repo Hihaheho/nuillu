@@ -252,6 +252,7 @@ pub enum EvalModule {
     Sensory,
     CognitionGate,
     Allocation,
+    Action,
     AttentionSchema,
     Interpreter,
     SelfModel,
@@ -268,12 +269,15 @@ pub enum EvalModule {
     Predict,
     Surprise,
     Speak,
+    Sleep,
+    Poet,
 }
 
 pub const DEFAULT_FULL_AGENT_MODULES: &[EvalModule] = &[
     EvalModule::Sensory,
     EvalModule::CognitionGate,
     EvalModule::Allocation,
+    EvalModule::Action,
     EvalModule::AttentionSchema,
     EvalModule::Interpreter,
     EvalModule::SelfModel,
@@ -290,6 +294,8 @@ pub const DEFAULT_FULL_AGENT_MODULES: &[EvalModule] = &[
     EvalModule::Predict,
     EvalModule::Surprise,
     EvalModule::Speak,
+    EvalModule::Sleep,
+    EvalModule::Poet,
 ];
 
 impl EvalModule {
@@ -298,6 +304,7 @@ impl EvalModule {
             Self::Sensory => "sensory",
             Self::CognitionGate => "cognition-gate",
             Self::Allocation => "allocation",
+            Self::Action => "action",
             Self::AttentionSchema => "attention-schema",
             Self::Interpreter => "interpreter",
             Self::SelfModel => "self-model",
@@ -314,6 +321,8 @@ impl EvalModule {
             Self::Predict => "predict",
             Self::Surprise => "surprise",
             Self::Speak => "speak",
+            Self::Sleep => "sleep",
+            Self::Poet => "poet",
         }
     }
 
@@ -322,6 +331,7 @@ impl EvalModule {
             Self::Sensory => builtin::sensory(),
             Self::CognitionGate => builtin::cognition_gate(),
             Self::Allocation => builtin::allocation(),
+            Self::Action => builtin::action(),
             Self::AttentionSchema => builtin::attention_schema(),
             Self::Interpreter => builtin::interpreter(),
             Self::SelfModel => builtin::self_model(),
@@ -338,11 +348,17 @@ impl EvalModule {
             Self::Predict => builtin::predict(),
             Self::Surprise => builtin::surprise(),
             Self::Speak => builtin::speak(),
+            Self::Sleep => builtin::sleep(),
+            Self::Poet => builtin::poet(),
         }
     }
 
     pub fn is_action_module(self) -> bool {
         matches!(self, Self::Speak)
+    }
+
+    pub fn is_action_target(self) -> bool {
+        matches!(self, Self::Speak | Self::Sleep | Self::Poet)
     }
 }
 
@@ -372,6 +388,7 @@ impl FullAgentCase {
 pub enum ModuleEvalTarget {
     Sensory,
     CognitionGate,
+    Action,
     QueryMemory,
     AttentionSchema,
     Interpreter,
@@ -386,6 +403,8 @@ pub enum ModuleEvalTarget {
     Predict,
     Surprise,
     Speak,
+    Sleep,
+    Poet,
 }
 
 impl ModuleEvalTarget {
@@ -393,6 +412,7 @@ impl ModuleEvalTarget {
         match self {
             Self::Sensory => "sensory",
             Self::CognitionGate => "cognition-gate",
+            Self::Action => "action",
             Self::QueryMemory => "query-memory",
             Self::AttentionSchema => "attention-schema",
             Self::Interpreter => "interpreter",
@@ -407,6 +427,8 @@ impl ModuleEvalTarget {
             Self::Predict => "predict",
             Self::Surprise => "surprise",
             Self::Speak => "speak",
+            Self::Sleep => "sleep",
+            Self::Poet => "poet",
         }
     }
 
@@ -414,6 +436,7 @@ impl ModuleEvalTarget {
         match self {
             Self::Sensory => EvalModule::Sensory,
             Self::CognitionGate => EvalModule::CognitionGate,
+            Self::Action => EvalModule::Action,
             Self::QueryMemory => EvalModule::QueryMemory,
             Self::AttentionSchema => EvalModule::AttentionSchema,
             Self::Interpreter => EvalModule::Interpreter,
@@ -428,6 +451,8 @@ impl ModuleEvalTarget {
             Self::Predict => EvalModule::Predict,
             Self::Surprise => EvalModule::Surprise,
             Self::Speak => EvalModule::Speak,
+            Self::Sleep => EvalModule::Sleep,
+            Self::Poet => EvalModule::Poet,
         }
     }
 
@@ -437,6 +462,7 @@ impl ModuleEvalTarget {
             .find_map(|part| match part {
                 "sensory" => Some(Self::Sensory),
                 "cognition-gate" => Some(Self::CognitionGate),
+                "action" => Some(Self::Action),
                 "query-memory" => Some(Self::QueryMemory),
                 "attention-schema" => Some(Self::AttentionSchema),
                 "interpreter" => Some(Self::Interpreter),
@@ -451,6 +477,8 @@ impl ModuleEvalTarget {
                 "predict" => Some(Self::Predict),
                 "surprise" => Some(Self::Surprise),
                 "speak" => Some(Self::Speak),
+                "sleep" => Some(Self::Sleep),
+                "poet" => Some(Self::Poet),
                 _ => None,
             })
     }

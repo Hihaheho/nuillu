@@ -78,6 +78,7 @@ pub enum RuntimeModule {
     Sensory,
     CognitionGate,
     Allocation,
+    Action,
     AttentionSchema,
     Interpreter,
     SelfModel,
@@ -94,6 +95,8 @@ pub enum RuntimeModule {
     Predict,
     Surprise,
     Speak,
+    Sleep,
+    Poet,
 }
 
 const SERVER_BOOT_CONFIG_FILE: &str = "config.eure";
@@ -158,12 +161,14 @@ pub enum ServerModuleGroup {
     Voluntary,
     SleepSuppressed,
     HomeostaticDrive,
+    ActionTarget,
 }
 
 pub const DEFAULT_MODULES: &[RuntimeModule] = &[
     RuntimeModule::Sensory,
     RuntimeModule::CognitionGate,
     RuntimeModule::Allocation,
+    RuntimeModule::Action,
     RuntimeModule::AttentionSchema,
     RuntimeModule::Interpreter,
     RuntimeModule::SelfModel,
@@ -180,6 +185,8 @@ pub const DEFAULT_MODULES: &[RuntimeModule] = &[
     RuntimeModule::Predict,
     RuntimeModule::Surprise,
     RuntimeModule::Speak,
+    RuntimeModule::Sleep,
+    RuntimeModule::Poet,
 ];
 
 impl Default for ServerBootConfig {
@@ -197,6 +204,7 @@ impl RuntimeModule {
             Self::Sensory => "sensory",
             Self::CognitionGate => "cognition-gate",
             Self::Allocation => "allocation",
+            Self::Action => "action",
             Self::AttentionSchema => "attention-schema",
             Self::Interpreter => "interpreter",
             Self::SelfModel => "self-model",
@@ -213,6 +221,8 @@ impl RuntimeModule {
             Self::Predict => "predict",
             Self::Surprise => "surprise",
             Self::Speak => "speak",
+            Self::Sleep => "sleep",
+            Self::Poet => "poet",
         }
     }
 
@@ -221,6 +231,7 @@ impl RuntimeModule {
             Self::Sensory => builtin::sensory(),
             Self::CognitionGate => builtin::cognition_gate(),
             Self::Allocation => builtin::allocation(),
+            Self::Action => builtin::action(),
             Self::AttentionSchema => builtin::attention_schema(),
             Self::Interpreter => builtin::interpreter(),
             Self::SelfModel => builtin::self_model(),
@@ -237,6 +248,8 @@ impl RuntimeModule {
             Self::Predict => builtin::predict(),
             Self::Surprise => builtin::surprise(),
             Self::Speak => builtin::speak(),
+            Self::Sleep => builtin::sleep(),
+            Self::Poet => builtin::poet(),
         }
     }
 
@@ -248,6 +261,7 @@ impl RuntimeModule {
             ],
             Self::CognitionGate => &[("main", ModelTier::Default)],
             Self::Allocation => &[("main", ModelTier::Default)],
+            Self::Action => &[("main", ModelTier::Default)],
             Self::AttentionSchema => &[("main", ModelTier::Default)],
             Self::Interpreter => &[("main", ModelTier::Default)],
             Self::SelfModel => &[("main", ModelTier::Default)],
@@ -267,6 +281,8 @@ impl RuntimeModule {
                 ("planning", ModelTier::Premium),
                 ("generation", ModelTier::Default),
             ],
+            Self::Sleep => &[("main", ModelTier::Cheap)],
+            Self::Poet => &[("main", ModelTier::Cheap)],
         }
     }
 }
@@ -511,6 +527,22 @@ fn default_server_modules() -> Vec<ServerModuleSpec> {
         ),
         module_spec(M::Allocation, 1, 1, 6.0, 6.0, 1.0, [], []),
         module_spec(
+            M::Action,
+            1,
+            1,
+            3.0,
+            9.0,
+            0.0,
+            [G::Voluntary, G::SleepSuppressed],
+            [
+                M::QueryMemory,
+                M::Interpreter,
+                M::SelfModel,
+                M::Surprise,
+                M::CognitionGate,
+            ],
+        ),
+        module_spec(
             M::AttentionSchema,
             0,
             1,
@@ -649,7 +681,7 @@ fn default_server_modules() -> Vec<ServerModuleSpec> {
             6.0,
             18.0,
             0.0,
-            [G::Voluntary, G::SleepSuppressed],
+            [G::SleepSuppressed, G::ActionTarget],
             [
                 M::QueryMemory,
                 M::Interpreter,
@@ -657,6 +689,26 @@ fn default_server_modules() -> Vec<ServerModuleSpec> {
                 M::Surprise,
                 M::CognitionGate,
             ],
+        ),
+        module_spec(
+            M::Sleep,
+            0,
+            1,
+            1.0,
+            3.0,
+            0.0,
+            [G::SleepSuppressed, G::ActionTarget],
+            [],
+        ),
+        module_spec(
+            M::Poet,
+            0,
+            1,
+            1.0,
+            3.0,
+            0.0,
+            [G::SleepSuppressed, G::ActionTarget],
+            [],
         ),
     ]
 }

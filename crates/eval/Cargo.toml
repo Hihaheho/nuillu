@@ -26,6 +26,7 @@ lutum-openai = { workspace = true }
 lutum-trace = { workspace = true }
 nuillu-agent = { workspace = true }
 nuillu-allocation = { workspace = true }
+nuillu-action = { workspace = true }
 nuillu-attention-schema = { workspace = true }
 nuillu-blackboard = { workspace = true }
 nuillu-memory = { workspace = true }
@@ -39,6 +40,8 @@ nuillu-reward = { workspace = true }
 nuillu-sensory = { workspace = true }
 nuillu-self-model = { workspace = true }
 nuillu-speak = { workspace = true }
+nuillu-sleep = { workspace = true }
+nuillu-poet = { workspace = true }
 nuillu-cognition-gate = { workspace = true }
 nuillu-surprise = { workspace = true }
 nuillu-server = { workspace = true }

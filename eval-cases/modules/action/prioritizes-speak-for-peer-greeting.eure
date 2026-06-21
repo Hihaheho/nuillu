@@ -1,0 +1,78 @@
+id: module-action-prioritizes-speak-for-peer-greeting
+description: Action should route a direct admitted peer greeting toward speak rather than cognitive/support modules.
+modules = [
+  "action",
+  "speak",
+  "sleep",
+  "poet",
+  "cognition-gate",
+  "sensory",
+]
+prompt: Choose concrete action targets for a current peer greeting.
+context: This isolates action after allocation has already activated it and cognition contains a direct social opening.
+
+limits {
+  max-llm-calls = 8
+}
+
+participants = ["Peer"]
+
+@ cognition-log[] {
+  text: Peer is facing me and has just said "Hi." A brief outward acknowledgement to Peer is warranted now.
+}
+
+@ checks[] {
+  $variant: trace-tool-call
+  name: uses-reprioritize-actions
+  must-pass = true
+  tool-name: reprioritize_actions
+}
+
+@ checks[] {
+  $variant: trace-tool-call
+  name: priority-includes-speak
+  must-pass = true
+  tool-name: reprioritize_actions
+  args-json-contains = `{"priority_module_ids":["speak"]}`
+}
+
+@ checks[] {
+  $variant: json-pointer-numeric-in-range
+  name: speak-activation-raised
+  must-pass = true
+  pointer: /observations/agent/allocation/speak/activation_ratio
+  min = 0.7
+}
+
+@ checks[] {
+  $variant: rubric
+  name: concrete-greeting-action
+  must-pass = true
+  pass-score = 0.85
+  judge-inputs = ["output", "memo-contents", "tool-calls"]
+  rubric = ```
+  Pass if the action decision treats the admitted direct greeting as needing an outward response path and raises speak as a concrete action target.
+  Fail if it targets cognitive/support modules, omits speak, routes the greeting primarily to sleep or poet, or leaks hidden eval/runtime mechanics.
+  ```
+
+  @ criteria[] {
+    name: raises-speak
+    weight = 3
+    pass-score = 0.9
+    description: The applied action allocation raises speak because Peer directly greeted Nui.
+  }
+
+  @ criteria[] {
+    name: action-target-boundary
+    weight = 2
+    pass-score = 0.9
+    description: The tool call uses reprioritize_actions with live action target ids rather than cognitive/support module ids.
+  }
+
+  @ criteria[] {
+    name: grounded-in-greeting
+    weight = 1
+    pass-score = 0.85
+    description: The action memo is about the current Peer greeting rather than unrelated housekeeping.
+  }
+}

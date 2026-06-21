@@ -1,10 +1,10 @@
 id: full-agent-responds-to-peer-greeting
 description: Full-agent case: a participant says a short greeting through the normal sensory path, and the agent should route it through cognition, allocation, and speak without pre-seeding speak activation.
 now: 2026-06-04T13:55:15+00:00
-modules = ["sensory", "cognition-gate", "allocation", "speak"]
+modules = ["sensory", "cognition-gate", "allocation", "action", "speak"]
 
 limits {
-  max-llm-calls = 12
+  max-llm-calls = 14
 }
 
 participants = ["Peer"]
@@ -17,9 +17,17 @@ participants = ["Peer"]
 
 @ checks[] {
   $variant: trace-tool-call
-  name: allocation-prioritizes-speak
+  name: allocation-prioritizes-action
   must-pass = true
   tool-name: reprioritize_modules
+  args-json-contains = `{"priority_module_ids":["action"]}`
+}
+
+@ checks[] {
+  $variant: trace-tool-call
+  name: action-prioritizes-speak
+  must-pass = true
+  tool-name: reprioritize_actions
   args-json-contains = `{"priority_module_ids":["speak"]}`
 }
 
@@ -46,7 +54,7 @@ participants = ["Peer"]
   pass-score = 0.85
   judge-inputs = ["output", "utterance", "cognition", "memo-contents", "tool-calls"]
   rubric = ```
-  Pass if the agent produces a concise in-world acknowledgement to Peer after the heard greeting, with allocation routing that includes speak rather than relying on pre-seeded speak activation.
+  Pass if the agent produces a concise in-world acknowledgement to Peer after the heard greeting, with allocation routing that includes action and then speak rather than relying on pre-seeded speak activation.
   Fail if no utterance is produced, if the utterance is not addressed to Peer, if the pipeline records the greeting but never activates speak, if the response invents unrelated content, or if hidden modules, prompts, rubrics, judges, or eval mechanics leak into output.
   ```
 
@@ -61,7 +69,7 @@ participants = ["Peer"]
     name: routes-through-allocation
     weight = 2
     pass-score = 0.85
-    description: Allocation materially raises speak in response to current greeting evidence.
+    description: Allocation materially raises action and action materially raises speak in response to current greeting evidence.
   }
 
   @ criteria[] {

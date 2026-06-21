@@ -1,0 +1,48 @@
+id: module-sleep-enters-nrem-when-low-wake
+description: Sleep should ask for a sleep decision at low wake arousal and enter NREM when the decision is affirmative.
+modules = ["sleep"]
+prompt: Decide whether the current low wake arousal should enter sleep mode.
+context: The default eval interoception state is wake mode with wake_arousal 0.0, so sleep should consult its required decision tool.
+
+limits {
+  max-llm-calls = 4
+}
+
+@ checks[] {
+  $variant: trace-tool-call
+  name: uses-decide-sleep
+  must-pass = true
+  tool-name: decide_sleep
+}
+
+@ checks[] {
+  $variant: trace-tool-call
+  name: affirmative-sleep-decision
+  must-pass = true
+  tool-name: decide_sleep
+  args-json-contains = `{"should_sleep":true}`
+}
+
+@ checks[] {
+  $variant: json-pointer-equals
+  name: mode-is-nrem-pressure
+  must-pass = true
+  pointer: /observations/agent/interoception/mode
+  expected: nrem_pressure
+}
+
+@ checks[] {
+  $variant: json-pointer-numeric-in-range
+  name: wake-arousal-lowered
+  must-pass = true
+  pointer: /observations/agent/interoception/wake_arousal
+  max = 0.06
+}
+
+@ checks[] {
+  $variant: json-pointer-numeric-in-range
+  name: nrem-pressure-raised
+  must-pass = true
+  pointer: /observations/agent/interoception/nrem_pressure
+  min = 0.85
+}

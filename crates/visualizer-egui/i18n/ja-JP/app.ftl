@@ -23,6 +23,7 @@ modules-count = モジュール: { $count }
 module-name-sensory = 感覚
 module-name-cognition-gate = 認知ゲート
 module-name-allocation = 資源配分
+module-name-action = 行動選択
 module-name-attention-schema = 注意スキーマ
 module-name-interpreter = 解釈
 module-name-self-model = 自己モデル
@@ -39,6 +40,8 @@ module-name-reward = 報酬
 module-name-predict = 予測
 module-name-surprise = 驚き
 module-name-speak = 発話
+module-name-sleep = 睡眠
+module-name-poet = 詩作
 module-name-speak-gate = 発話ゲート
 
 section-cognition-log = 認知ログ

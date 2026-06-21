@@ -16,6 +16,7 @@ const MODULE_NAME_KEYS: &[(&str, &str)] = &[
     ("sensory", "module-name-sensory"),
     ("cognition-gate", "module-name-cognition-gate"),
     ("allocation", "module-name-allocation"),
+    ("action", "module-name-action"),
     ("attention-schema", "module-name-attention-schema"),
     ("interpreter", "module-name-interpreter"),
     ("self-model", "module-name-self-model"),
@@ -32,6 +33,8 @@ const MODULE_NAME_KEYS: &[(&str, &str)] = &[
     ("predict", "module-name-predict"),
     ("surprise", "module-name-surprise"),
     ("speak", "module-name-speak"),
+    ("sleep", "module-name-sleep"),
+    ("poet", "module-name-poet"),
     ("speak-gate", "module-name-speak-gate"),
 ];
 
@@ -339,7 +342,13 @@ mod tests {
             ja.localized_module_name_with_id("sensory"),
             "感覚 (sensory)"
         );
+        assert_eq!(ja.localized_module_name("action"), "行動選択");
+        assert_eq!(ja.localized_module_name("sleep"), "睡眠");
+        assert_eq!(ja.localized_module_name("poet"), "詩作");
         assert_eq!(en.localized_module_name("sensory"), "sensory");
+        assert_eq!(en.localized_module_name("action"), "action");
+        assert_eq!(en.localized_module_name("sleep"), "sleep");
+        assert_eq!(en.localized_module_name("poet"), "poet");
         assert_eq!(en.localized_module_name_with_id("sensory"), "sensory");
         assert_eq!(ja.localized_module_name("custom-module"), "custom-module");
         assert_eq!(

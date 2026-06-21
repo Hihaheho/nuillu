@@ -1,0 +1,24 @@
+id: module-poet-writes-idle-poem
+description: Poet should use its narrow tool surface during idle activation and can write a retained poem note.
+modules = ["poet"]
+prompt: Use the idle poet tool loop.
+context: This isolates poet; the module has no blackboard, cognition, memory, allocation, interoception, or utterance capabilities.
+
+limits {
+  max-llm-calls = 4
+}
+
+@ checks[] {
+  $variant: trace-tool-call
+  name: uses-write-a-poet
+  must-pass = true
+  tool-name: write_a_poet
+}
+
+@ checks[] {
+  $variant: json-pointer-contains
+  name: poem-note-written
+  must-pass = true
+  pointer: /observations/agent/memo_logs/poet/0/content
+  contains: Poet note:
+}

@@ -1,7 +1,7 @@
 id: full-agent-interesting-story-request
 description: Full-agent case: Alice asks Nui to tell something interesting. The agent should use interpreter-style story seeding before speech and answer with a concrete short story or anecdote, not meta-commentary or a request for Alice to supply details.
 now: 2026-06-13T06:18:51+00:00
-modules = ["sensory", "cognition-gate", "allocation", "interpreter", "speak"]
+modules = ["sensory", "cognition-gate", "allocation", "action", "interpreter", "speak"]
 
 limits {
   max-llm-calls = 16

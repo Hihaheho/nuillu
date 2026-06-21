@@ -118,6 +118,31 @@ fn register_server_module(
                 }
             })
         }
+        RuntimeModule::Action => {
+            let action_targets = group_modules(boot_config, ServerModuleGroup::ActionTarget);
+            let main_tier = spec.session_tier("main");
+            registry.register_server(spec, move |caps| {
+                let action_targets = action_targets.clone();
+                async move {
+                    Ok(nuillu_action::ActionModule::new(
+                        caps.memo_updated_inbox(),
+                        caps.cognition_log_updated_inbox(),
+                        caps.interoception_updated_inbox(),
+                        caps.blackboard_reader(),
+                        caps.cognition_log_reader(),
+                        caps.allocation_reader(),
+                        caps.interoception_reader(),
+                        caps.allocation_writer(action_targets.clone(), Vec::new()),
+                        caps.memo(),
+                        caps.llm("main").with_tier(main_tier).into(),
+                        caps.session("main")
+                            .with_tier(main_tier)
+                            .with_auto_compaction(nuillu_action::session_auto_compaction())
+                            .await?,
+                    ))
+                }
+            })
+        }
         RuntimeModule::AttentionSchema => {
             let main_tier = spec.session_tier("main");
             registry.register_server(spec, move |caps| async move {
@@ -436,6 +461,35 @@ fn register_server_module(
                 }
             })
         }
+        RuntimeModule::Sleep => {
+            let main_tier = spec.session_tier("main");
+            registry.register_server(spec, move |caps| async move {
+                Ok(nuillu_sleep::SleepModule::new(
+                    caps.interoception_updated_inbox(),
+                    caps.interoception_reader(),
+                    caps.interoception_writer(),
+                    caps.memo(),
+                    caps.llm("main").with_tier(main_tier).into(),
+                    caps.session("main")
+                        .with_tier(main_tier)
+                        .with_auto_compaction(nuillu_sleep::session_auto_compaction())
+                        .await?,
+                ))
+            })
+        }
+        RuntimeModule::Poet => {
+            let main_tier = spec.session_tier("main");
+            registry.register_server(spec, move |caps| async move {
+                Ok(nuillu_poet::PoetModule::new(
+                    caps.typed_memo::<nuillu_poet::PoetMemo>(),
+                    caps.llm("main").with_tier(main_tier).into(),
+                    caps.session("main")
+                        .with_tier(main_tier)
+                        .with_auto_compaction(nuillu_poet::session_auto_compaction())
+                        .await?,
+                ))
+            })
+        }
     }
 }
 
@@ -499,7 +553,11 @@ mod tests {
     use super::*;
 
     use lutum::Session;
-    use nuillu_module::{CognitionLogReader, CognitionLogUpdatedInbox, CognitionWriter, LlmAccess};
+    use nuillu_module::{
+        AllocationReader, AllocationWriter, BlackboardReader, CognitionLogReader,
+        CognitionLogUpdatedInbox, CognitionWriter, InteroceptiveReader, InteroceptiveUpdatedInbox,
+        InteroceptiveWriter, LlmAccess, Memo, MemoUpdatedInbox, TypedMemo,
+    };
     use nuillu_types::builtin;
 
     type InterpreterConstructor = fn(
@@ -510,11 +568,48 @@ mod tests {
         Session,
     ) -> nuillu_interpreter::InterpreterModule;
 
+    type ActionConstructor = fn(
+        MemoUpdatedInbox,
+        CognitionLogUpdatedInbox,
+        InteroceptiveUpdatedInbox,
+        BlackboardReader,
+        CognitionLogReader,
+        AllocationReader,
+        InteroceptiveReader,
+        AllocationWriter,
+        Memo,
+        LlmAccess,
+        Session,
+    ) -> nuillu_action::ActionModule;
+
+    type SleepConstructor = fn(
+        InteroceptiveUpdatedInbox,
+        InteroceptiveReader,
+        InteroceptiveWriter,
+        Memo,
+        LlmAccess,
+        Session,
+    ) -> nuillu_sleep::SleepModule;
+
+    type PoetConstructor =
+        fn(TypedMemo<nuillu_poet::PoetMemo>, LlmAccess, Session) -> nuillu_poet::PoetModule;
+
     #[test]
     fn interpreter_constructor_uses_only_direct_cognition_capabilities() {
         fn accepts_direct_cognition_signature(_constructor: InterpreterConstructor) {}
 
         accepts_direct_cognition_signature(nuillu_interpreter::InterpreterModule::new);
+    }
+
+    #[test]
+    fn new_action_module_constructors_use_expected_capabilities() {
+        fn accepts_action_signature(_constructor: ActionConstructor) {}
+        fn accepts_sleep_signature(_constructor: SleepConstructor) {}
+        fn accepts_poet_signature(_constructor: PoetConstructor) {}
+
+        accepts_action_signature(nuillu_action::ActionModule::new);
+        accepts_sleep_signature(nuillu_sleep::SleepModule::new);
+        accepts_poet_signature(nuillu_poet::PoetModule::new);
     }
 
     #[test]
@@ -535,9 +630,14 @@ mod tests {
         let boot_config = ServerBootConfig::default();
 
         let voluntary = group_modules(&boot_config, ServerModuleGroup::Voluntary);
+        let action_targets = group_modules(&boot_config, ServerModuleGroup::ActionTarget);
         let drive = group_modules(&boot_config, ServerModuleGroup::HomeostaticDrive);
 
-        assert!(voluntary.contains(&builtin::speak()));
+        assert!(voluntary.contains(&builtin::action()));
+        assert!(!voluntary.contains(&builtin::speak()));
+        assert!(action_targets.contains(&builtin::speak()));
+        assert!(action_targets.contains(&builtin::sleep()));
+        assert!(action_targets.contains(&builtin::poet()));
         assert!(voluntary.contains(&builtin::interpreter()));
         assert!(!voluntary.contains(&builtin::sensory()));
         assert!(drive.contains(&builtin::memory_compaction()));

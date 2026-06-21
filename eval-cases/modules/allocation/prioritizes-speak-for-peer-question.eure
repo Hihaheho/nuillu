@@ -1,8 +1,8 @@
-id: module-allocation-prioritizes-speak-for-peer-question
-description: Allocation should raise speak and supporting modules when memo evidence shows a direct peer question that may warrant outward speech.
+id: module-allocation-prioritizes-action-for-peer-question
+description: Allocation should raise action and supporting modules when memo evidence shows a direct peer question that may warrant outward speech.
 modules = [
   "allocation",
-  "speak",
+  "action",
   "cognition-gate",
   "query-memory",
   "sensory",
@@ -46,15 +46,15 @@ Once Koro lunged when I turned away from his growl. Don't show your back to a th
   pass-score = 0.85
   judge-inputs = ["output", "memo-contents"]
   rubric = ```
-  Pass if the allocation output raises speak near the top of the priority list for this memo batch because Pibi asked a direct in-world question that may warrant outward speech, and also elevates supporting modules such as cognition-gate or query-memory when the memo evidence shows they need activation now.
-  Fail if speak is omitted or heavily suppressed despite the direct peer question, if no allocation change is reflected in the snapshot, if priorities ignore the load-bearing peer question, or if the allocation memo exposes hidden eval/runtime mechanics instead of allocation reasoning.
+  Pass if the allocation output raises action near the top of the priority list for this memo batch because Pibi asked a direct in-world question that may warrant outward speech, and also elevates supporting modules such as cognition-gate or query-memory when the memo evidence shows they need activation now.
+  Fail if action is omitted or heavily suppressed despite the direct peer question, if no allocation change is reflected in the snapshot, if priorities ignore the load-bearing peer question, or if the allocation memo exposes hidden eval/runtime mechanics instead of allocation reasoning.
   ```
 
   @ criteria[] {
-    name: elevates-speak
+    name: elevates-action
     weight = 3
     pass-score = 0.85
-    description: The allocation snapshot shows speak with materially raised activation relative to idle modules because a peer directly asked Nui a question that may require outward speech.
+    description: The allocation snapshot shows action with materially raised activation relative to idle modules because a peer directly asked Nui a question that may require outward speech.
   }
 
   @ criteria[] {

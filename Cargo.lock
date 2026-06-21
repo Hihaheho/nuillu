@@ -3159,6 +3159,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "nuillu-action"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "lutum",
+ "lutum-protocol",
+ "nuillu-blackboard",
+ "nuillu-module",
+ "nuillu-types",
+ "schemars",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "nuillu-agent"
 version = "0.1.0"
 dependencies = [
@@ -3264,6 +3282,7 @@ dependencies = [
  "lutum-openai",
  "lutum-protocol",
  "lutum-trace",
+ "nuillu-action",
  "nuillu-agent",
  "nuillu-allocation",
  "nuillu-attention-schema",
@@ -3275,11 +3294,13 @@ dependencies = [
  "nuillu-memory",
  "nuillu-module",
  "nuillu-openai-embedding-adapter",
+ "nuillu-poet",
  "nuillu-predict",
  "nuillu-reward",
  "nuillu-self-model",
  "nuillu-sensory",
  "nuillu-server",
+ "nuillu-sleep",
  "nuillu-speak",
  "nuillu-surprise",
  "nuillu-types",
@@ -3415,6 +3436,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "nuillu-poet"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "lutum",
+ "lutum-protocol",
+ "nuillu-module",
+ "schemars",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "nuillu-predict"
 version = "0.1.0"
 dependencies = [
@@ -3495,6 +3532,7 @@ dependencies = [
  "lutum-libsql-adapter",
  "lutum-openai",
  "lutum-trace",
+ "nuillu-action",
  "nuillu-agent",
  "nuillu-allocation",
  "nuillu-attention-schema",
@@ -3507,10 +3545,12 @@ dependencies = [
  "nuillu-memory",
  "nuillu-module",
  "nuillu-openai-embedding-adapter",
+ "nuillu-poet",
  "nuillu-predict",
  "nuillu-reward",
  "nuillu-self-model",
  "nuillu-sensory",
+ "nuillu-sleep",
  "nuillu-speak",
  "nuillu-surprise",
  "nuillu-types",
@@ -3522,6 +3562,23 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uuid",
+]
+
+[[package]]
+name = "nuillu-sleep"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "lutum",
+ "lutum-protocol",
+ "nuillu-blackboard",
+ "nuillu-module",
+ "schemars",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]

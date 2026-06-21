@@ -121,10 +121,11 @@ pub struct RunnerConfig {
 }
 
 /// Modules that may never be disabled via `RunnerConfig::disabled_modules` —
-/// removing them breaks the basic observe → cognize → speak pipeline that the
+/// removing them breaks the basic observe → cognize → act/speak pipeline that the
 /// full-agent eval cases assume.
 pub const REQUIRED_FULL_AGENT_MODULES: &[EvalModule] = &[
     EvalModule::Allocation,
+    EvalModule::Action,
     EvalModule::Sensory,
     EvalModule::Speak,
 ];
@@ -2596,10 +2597,28 @@ async fn execute_module_case(
                                 )
                                 .await
                         }
-                        ModuleEvalTarget::Allocation => {
+                        ModuleEvalTarget::Allocation | ModuleEvalTarget::Action => {
                             last_memo_log_content_for_module(&blackboard, &shutdown_target_module)
                                 .await
                                 .is_some()
+                                || module_activation_finished(
+                                    &blackboard,
+                                    events.as_ref(),
+                                    &shutdown_target_module,
+                                )
+                                .await
+                        }
+                        ModuleEvalTarget::Sleep => {
+                            let sleeping = blackboard
+                                .read(|bb| {
+                                    matches!(
+                                        bb.interoception().mode,
+                                        nuillu_blackboard::InteroceptiveMode::NremPressure
+                                            | nuillu_blackboard::InteroceptiveMode::RemPressure
+                                    )
+                                })
+                                .await;
+                            sleeping
                                 || module_activation_finished(
                                     &blackboard,
                                     events.as_ref(),
@@ -2663,7 +2682,9 @@ async fn execute_module_case(
             .last_complete()
             .map(|utterance| utterance.text)
             .unwrap_or_default(),
-        ModuleEvalTarget::Allocation => allocation_artifact(&env.blackboard, &target_module).await,
+        ModuleEvalTarget::Allocation | ModuleEvalTarget::Action => {
+            allocation_artifact(&env.blackboard, &target_module).await
+        }
         _ => last_memo_log_content_for_module(&env.blackboard, &target_module)
             .await
             .unwrap_or_default(),
@@ -2887,6 +2908,43 @@ async fn activate_module_case_target(
                     .expect("module eval failed to publish CognitionLogUpdated");
             }
         }
+        ModuleEvalTarget::Action => {
+            for record in memo_seed_records {
+                harness
+                    .memo_updated_mailbox()
+                    .publish(nuillu_module::MemoUpdated {
+                        owner: record.owner.clone(),
+                        index: record.index,
+                    })
+                    .await
+                    .expect("module eval failed to publish MemoUpdated");
+            }
+            if has_cognition_log_seed {
+                harness
+                    .cognition_log_updated_mailbox()
+                    .publish(CognitionLogUpdated::EntryAppended {
+                        source: ModuleInstanceId::new(
+                            builtin::cognition_gate(),
+                            ReplicaIndex::ZERO,
+                        ),
+                    })
+                    .await
+                    .expect("module eval failed to publish CognitionLogUpdated");
+            }
+            harness
+                .interoception_updated_mailbox()
+                .publish(nuillu_module::InteroceptiveUpdated)
+                .await
+                .expect("module eval failed to publish InteroceptiveUpdated");
+        }
+        ModuleEvalTarget::Sleep => {
+            harness
+                .interoception_updated_mailbox()
+                .publish(nuillu_module::InteroceptiveUpdated)
+                .await
+                .expect("module eval failed to publish InteroceptiveUpdated");
+        }
+        ModuleEvalTarget::Poet => {}
         ModuleEvalTarget::Predict => {
             if has_cognition_log_seed {
                 harness
@@ -4870,6 +4928,15 @@ fn hidden_from_attention_modules() -> Vec<ModuleId> {
     ]
 }
 
+fn action_target_modules(modules: &[EvalModule]) -> Vec<ModuleId> {
+    modules
+        .iter()
+        .copied()
+        .filter(|module| module.is_action_target())
+        .map(EvalModule::module_id)
+        .collect()
+}
+
 fn homeostatic_drive_modules() -> Vec<ModuleId> {
     vec![
         nuillu_types::builtin::memory_compaction(),
@@ -4881,6 +4948,7 @@ fn homeostatic_drive_modules() -> Vec<ModuleId> {
 
 fn sleep_suppressed_modules() -> Vec<ModuleId> {
     vec![
+        nuillu_types::builtin::action(),
         nuillu_types::builtin::cognition_gate(),
         nuillu_types::builtin::attention_schema(),
         nuillu_types::builtin::interpreter(),
@@ -4892,6 +4960,8 @@ fn sleep_suppressed_modules() -> Vec<ModuleId> {
         nuillu_types::builtin::predict(),
         nuillu_types::builtin::surprise(),
         nuillu_types::builtin::speak(),
+        nuillu_types::builtin::sleep(),
+        nuillu_types::builtin::poet(),
     ]
 }
 
@@ -4899,10 +4969,15 @@ fn voluntary_modules(modules: &[EvalModule]) -> Vec<ModuleId> {
     let hidden = hidden_from_attention_modules()
         .into_iter()
         .collect::<std::collections::HashSet<_>>();
+    let action_targets = action_target_modules(modules)
+        .into_iter()
+        .collect::<std::collections::HashSet<_>>();
     modules
         .iter()
         .map(|module| module.module_id())
-        .filter(|id| *id != builtin::sensory() && !hidden.contains(id))
+        .filter(|id| {
+            *id != builtin::sensory() && !hidden.contains(id) && !action_targets.contains(id)
+        })
         .collect()
 }
 
@@ -5012,6 +5087,37 @@ fn register_eval_module(
                                     .with_auto_compaction(
                                         nuillu_allocation::session_auto_compaction(),
                                     )
+                                    .await?,
+                            ))
+                        }
+                    }
+                },
+            )
+            .expect("eval module registration should be unique"),
+        EvalModule::Action => registry
+            .register_eval(
+                eval_policy(0..=1, Bpm::range(3.0, 9.0)),
+                replica_hard_cap,
+                {
+                    let action_targets = action_target_modules(all_modules);
+                    let main_tier = eval_session_tier(module, "main");
+                    move |caps| {
+                        let action_targets = action_targets.clone();
+                        async move {
+                            Ok(nuillu_action::ActionModule::new(
+                                caps.memo_updated_inbox(),
+                                caps.cognition_log_updated_inbox(),
+                                caps.interoception_updated_inbox(),
+                                caps.blackboard_reader(),
+                                caps.cognition_log_reader(),
+                                caps.allocation_reader(),
+                                caps.interoception_reader(),
+                                caps.allocation_writer(action_targets.clone(), Vec::new()),
+                                caps.memo(),
+                                caps.llm("main").with_tier(main_tier).into(),
+                                caps.session("main")
+                                    .with_tier(main_tier)
+                                    .with_auto_compaction(nuillu_action::session_auto_compaction())
                                     .await?,
                             ))
                         }
@@ -5453,6 +5559,47 @@ fn register_eval_module(
                 },
             )
             .expect("eval module registration should be unique"),
+        EvalModule::Sleep => registry
+            .register_eval(
+                eval_policy(0..=1, Bpm::range(1.0, 3.0)),
+                replica_hard_cap,
+                {
+                    let main_tier = eval_session_tier(module, "main");
+                    move |caps| async move {
+                        Ok(nuillu_sleep::SleepModule::new(
+                            caps.interoception_updated_inbox(),
+                            caps.interoception_reader(),
+                            caps.interoception_writer(),
+                            caps.memo(),
+                            caps.llm("main").with_tier(main_tier).into(),
+                            caps.session("main")
+                                .with_tier(main_tier)
+                                .with_auto_compaction(nuillu_sleep::session_auto_compaction())
+                                .await?,
+                        ))
+                    }
+                },
+            )
+            .expect("eval module registration should be unique"),
+        EvalModule::Poet => registry
+            .register_eval(
+                eval_policy(0..=1, Bpm::range(1.0, 3.0)),
+                replica_hard_cap,
+                {
+                    let main_tier = eval_session_tier(module, "main");
+                    move |caps| async move {
+                        Ok(nuillu_poet::PoetModule::new(
+                            caps.typed_memo::<nuillu_poet::PoetMemo>(),
+                            caps.llm("main").with_tier(main_tier).into(),
+                            caps.session("main")
+                                .with_tier(main_tier)
+                                .with_auto_compaction(nuillu_poet::session_auto_compaction())
+                                .await?,
+                        ))
+                    }
+                },
+            )
+            .expect("eval module registration should be unique"),
     }
 }
 
@@ -5469,7 +5616,8 @@ pub(crate) fn full_agent_allocation(
             EvalModule::Allocation => 1.0,
             EvalModule::Interoception => 1.0,
             EvalModule::Homeostasis => 1.0,
-            EvalModule::CognitionGate
+            EvalModule::Action
+            | EvalModule::CognitionGate
             | EvalModule::AttentionSchema
             | EvalModule::Interpreter
             | EvalModule::SelfModel
@@ -5483,7 +5631,9 @@ pub(crate) fn full_agent_allocation(
             | EvalModule::Reward
             | EvalModule::Predict
             | EvalModule::Surprise
-            | EvalModule::Speak => 0.0,
+            | EvalModule::Speak
+            | EvalModule::Sleep
+            | EvalModule::Poet => 0.0,
         };
         set_allocation_module(&mut allocation, module.module_id(), activation);
     }
@@ -5542,6 +5692,8 @@ fn module_id_for_target(target: ModuleEvalTarget) -> ModuleId {
 fn eval_module_tier(module: EvalModule) -> ModelTier {
     match module {
         EvalModule::Sensory
+        | EvalModule::Sleep
+        | EvalModule::Poet
         | EvalModule::CognitionGate
         | EvalModule::QueryMemory
         | EvalModule::Memory
@@ -5553,7 +5705,7 @@ fn eval_module_tier(module: EvalModule) -> ModelTier {
         | EvalModule::PolicyCompaction
         | EvalModule::Predict => ModelTier::Cheap,
         EvalModule::Speak => ModelTier::Premium,
-        EvalModule::Allocation => ModelTier::Default,
+        EvalModule::Allocation | EvalModule::Action => ModelTier::Default,
         EvalModule::AttentionSchema
         | EvalModule::Interpreter
         | EvalModule::SelfModel

@@ -195,6 +195,7 @@ pub mod builtin {
         sensory               => "sensory",
         cognition_gate        => "cognition-gate",
         allocation => "allocation",
+        action => "action",
         attention_schema      => "attention-schema",
         interpreter           => "interpreter",
         self_model            => "self-model",
@@ -212,6 +213,8 @@ pub mod builtin {
         surprise              => "surprise",
         speak_gate            => "speak-gate",
         speak                 => "speak",
+        sleep                 => "sleep",
+        poet                  => "poet",
     );
 }
 

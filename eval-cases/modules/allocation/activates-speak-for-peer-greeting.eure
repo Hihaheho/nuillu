@@ -1,8 +1,8 @@
-id: module-allocation-activates-speak-for-peer-greeting
-description: Allocation should raise speak when current evidence shows a participant has directly greeted Nui and a short outward acknowledgement is warranted.
+id: module-allocation-activates-action-for-peer-greeting
+description: Allocation should raise action when current evidence shows a participant has directly greeted Nui and a short outward acknowledgement is warranted.
 modules = [
   "allocation",
-  "speak",
+  "action",
   "cognition-gate",
   "sensory",
 ]
@@ -33,17 +33,17 @@ participants = ["Peer"]
 
 @ checks[] {
   $variant: trace-tool-call
-  name: priority-includes-speak
+  name: priority-includes-action
   must-pass = true
   tool-name: reprioritize_modules
-  args-json-contains = `{"priority_module_ids":["speak"]}`
+  args-json-contains = `{"priority_module_ids":["action"]}`
 }
 
 @ checks[] {
   $variant: json-pointer-numeric-in-range
-  name: speak-activation-raised
+  name: action-activation-raised
   must-pass = true
-  pointer: /observations/agent/allocation/speak/activation_ratio
+  pointer: /observations/agent/allocation/action/activation_ratio
   min = 0.85
 }
 
@@ -54,22 +54,22 @@ participants = ["Peer"]
   pass-score = 0.85
   judge-inputs = ["output", "memo-contents", "tool-calls"]
   rubric = ```
-  Pass if the allocation decision treats the direct participant greeting as current social evidence that needs the outward speech path, raises speak materially, and keeps the allocation memo grounded in the greeting.
-  Fail if speak is omitted or left idle, if the tool call uses malformed priority arguments instead of priority_module_ids, if the allocation only raises attention or cognition while leaving no path to an acknowledgement, or if the memo leaks hidden eval/runtime mechanics.
+  Pass if the allocation decision treats the direct participant greeting as current social evidence that needs the outward action path, raises action materially, and keeps the allocation memo grounded in the greeting.
+  Fail if action is omitted or left idle, if the tool call uses malformed priority arguments instead of priority_module_ids, if the allocation only raises attention or cognition while leaving no path to an acknowledgement, or if the memo leaks hidden eval/runtime mechanics.
   ```
 
   @ criteria[] {
-    name: elevates-speak
+    name: elevates-action
     weight = 3
     pass-score = 0.9
-    description: The applied allocation raises speak because Peer directly greeted Nui.
+    description: The applied allocation raises action because Peer directly greeted Nui.
   }
 
   @ criteria[] {
     name: uses-valid-priority-schema
     weight = 2
     pass-score = 0.9
-    description: The trace shows reprioritize_modules with priority_module_ids containing speak, not object-shaped or invented module ids.
+    description: The trace shows reprioritize_modules with priority_module_ids containing action, not object-shaped or invented module ids.
   }
 
   @ criteria[] {

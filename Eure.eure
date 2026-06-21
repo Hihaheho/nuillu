@@ -62,6 +62,18 @@ schema = "schemas/eval-predict-case.schema.eure"
 globs = ["eval-cases/modules/allocation/**/*.eure"]
 schema = "schemas/eval-allocation-case.schema.eure"
 
+@ targets.eval-action-cases
+globs = ["eval-cases/modules/action/**/*.eure"]
+schema = "schemas/eval-action-case.schema.eure"
+
+@ targets.eval-sleep-cases
+globs = ["eval-cases/modules/sleep/**/*.eure"]
+schema = "schemas/eval-sleep-case.schema.eure"
+
+@ targets.eval-poet-cases
+globs = ["eval-cases/modules/poet/**/*.eure"]
+schema = "schemas/eval-poet-case.schema.eure"
+
 @ targets.eval-policy-cases
 globs = ["eval-cases/modules/policy/**/*.eure"]
 schema = "schemas/eval-policy-case.schema.eure"
@@ -98,6 +110,9 @@ default-targets = [
   "eval-surprise-cases",
   "eval-predict-cases",
   "eval-allocation-cases",
+  "eval-action-cases",
+  "eval-sleep-cases",
+  "eval-poet-cases",
   "eval-policy-cases",
   "eval-policy-compaction-cases",
   "eval-modelsets",
