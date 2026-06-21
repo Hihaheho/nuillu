@@ -19,6 +19,10 @@ impl InteroceptionRuntimePolicy {
     pub fn affect_increase_for(&self, level: AllocationEffectLevel) -> f32 {
         level_unit(level) * 0.25 * self.affect_arousal_change_multiplier
     }
+
+    pub fn valence_change_for(&self, level: AllocationEffectLevel) -> f32 {
+        level_unit(level) * 0.25 * self.affect_arousal_change_multiplier
+    }
 }
 
 impl Default for InteroceptionRuntimePolicy {

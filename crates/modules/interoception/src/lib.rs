@@ -21,9 +21,9 @@ use serde::{Deserialize, Serialize};
 const SYSTEM_PROMPT: &str = r#"You are the interoception module.
 Maintain the agent's internal state from the recent cognitive workspace. Estimate affect as
 current internal condition, not a moral judgment and not a memory fact.
-For arousal, return structured salience levels rather than numeric deltas. Use higher wake and
-affect salience only when the unread sensory/cognitive evidence is enough to wake or emotionally
-activate the agent. Return valence in [-1, 1] and one short untyped emotion phrase.
+For arousal and valence, return structured semantic labels rather than numeric deltas. Use higher
+wake and affect salience only when the unread sensory/cognitive evidence is enough to wake or
+emotionally activate the agent. Return valence polarity/salience and one short untyped emotion phrase.
 Use neutral values when evidence is weak. Do not mention implementation details."#;
 
 const PERIODIC_WAKEUP: Duration = Duration::from_secs(1);
@@ -82,12 +82,45 @@ impl From<ArousalEffectLevel> for AllocationEffectLevel {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ValencePolarity {
+    Negative,
+    Neutral,
+    Positive,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ValenceEffectLevel {
+    Off,
+    Minimal,
+    Low,
+    Normal,
+    High,
+    Max,
+}
+
+impl From<ValenceEffectLevel> for AllocationEffectLevel {
+    fn from(level: ValenceEffectLevel) -> Self {
+        match level {
+            ValenceEffectLevel::Off => Self::Off,
+            ValenceEffectLevel::Minimal => Self::Minimal,
+            ValenceEffectLevel::Low => Self::Low,
+            ValenceEffectLevel::Normal => Self::Normal,
+            ValenceEffectLevel::High => Self::High,
+            ValenceEffectLevel::Max => Self::Max,
+        }
+    }
+}
+
 #[lutum::tool_input(name = "report_affect", output = ReportAffectOutput)]
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct AffectAssessment {
     pub wake_salience: ArousalEffectLevel,
     pub affect_salience: ArousalEffectLevel,
-    pub valence: f32,
+    pub valence_polarity: ValencePolarity,
+    pub valence_salience: ValenceEffectLevel,
     pub emotion: String,
 }
 
@@ -95,8 +128,14 @@ pub struct AffectAssessment {
 struct AffectAppraisal {
     wake_salience: ArousalEffectLevel,
     affect_salience: ArousalEffectLevel,
-    valence: Option<f32>,
+    valence: Option<ValenceAppraisal>,
     emotion: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ValenceAppraisal {
+    polarity: ValencePolarity,
+    salience: ValenceEffectLevel,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -381,7 +420,7 @@ fn format_affect_assessment_input(
     now: DateTime<Utc>,
 ) -> String {
     format!(
-        "Interoception affect appraisal request\n\nCurrent interoceptive state:\n{}\n\nUnread memo evidence:\n{}\n\nUnread cognition evidence:\n{}\n\nInstruction:\nCall report_affect once. Use structured salience levels, not numeric arousal deltas. Use off/no-change salience and preserve current valence/emotion when evidence is weak.",
+        "Interoception affect appraisal request\n\nCurrent interoceptive state:\n{}\n\nUnread memo evidence:\n{}\n\nUnread cognition evidence:\n{}\n\nInstruction:\nCall report_affect once. Use structured salience levels and valence polarity, not numeric arousal or valence deltas. Use off/no-change salience, neutral polarity, and preserve current emotion when evidence is weak.",
         format_interoceptive_state(current),
         format_bounded_memo_log_batch(unread_memos, now, MEMO_CONTEXT_WINDOW)
             .unwrap_or_else(|| "none".to_owned()),
@@ -417,7 +456,10 @@ impl From<AffectAssessment> for AffectAppraisal {
         Self {
             wake_salience: assessment.wake_salience,
             affect_salience: assessment.affect_salience,
-            valence: Some(assessment.valence),
+            valence: Some(ValenceAppraisal {
+                polarity: assessment.valence_polarity,
+                salience: assessment.valence_salience,
+            }),
             emotion: Some(assessment.emotion),
         }
     }
@@ -478,7 +520,8 @@ fn normalize_affect_assessment(assessment: AffectAssessment) -> AffectAssessment
     AffectAssessment {
         wake_salience: assessment.wake_salience,
         affect_salience: assessment.affect_salience,
-        valence: clamp_signed_unit(assessment.valence),
+        valence_polarity: assessment.valence_polarity,
+        valence_salience: assessment.valence_salience,
         emotion: assessment.emotion.trim().to_owned(),
     }
 }
@@ -501,10 +544,22 @@ fn merge_affect_patch(
         patch.mode = Some(InteroceptiveMode::Wake);
     }
     if let Some(valence) = appraisal.valence {
-        patch.valence = Some(valence);
+        let base_valence = patch.valence.unwrap_or(current.valence);
+        patch.valence = Some(clamp_signed_unit(
+            base_valence + signed_valence_delta(valence, policy),
+        ));
     }
     if let Some(emotion) = appraisal.emotion {
         patch.emotion = Some(emotion);
+    }
+}
+
+fn signed_valence_delta(appraisal: ValenceAppraisal, policy: &InteroceptionRuntimePolicy) -> f32 {
+    let magnitude = policy.valence_change_for(appraisal.salience.into());
+    match appraisal.polarity {
+        ValencePolarity::Negative => -magnitude,
+        ValencePolarity::Neutral => 0.0,
+        ValencePolarity::Positive => magnitude,
     }
 }
 
@@ -758,12 +813,14 @@ mod tests {
         let normalized = normalize_affect_assessment(AffectAssessment {
             wake_salience: ArousalEffectLevel::High,
             affect_salience: ArousalEffectLevel::Low,
-            valence: -1.5,
+            valence_polarity: ValencePolarity::Negative,
+            valence_salience: ValenceEffectLevel::High,
             emotion: "  startled relief  ".to_owned(),
         });
 
         assert!(matches!(normalized.wake_salience, ArousalEffectLevel::High));
-        assert_eq!(normalized.valence, -1.0);
+        assert_eq!(normalized.valence_polarity, ValencePolarity::Negative);
+        assert_eq!(normalized.valence_salience, ValenceEffectLevel::High);
         assert_eq!(normalized.emotion, "startled relief");
     }
 
@@ -772,7 +829,10 @@ mod tests {
         let mut appraisal = AffectAppraisal {
             wake_salience: ArousalEffectLevel::Off,
             affect_salience: ArousalEffectLevel::Off,
-            valence: Some(-0.3),
+            valence: Some(ValenceAppraisal {
+                polarity: ValencePolarity::Negative,
+                salience: ValenceEffectLevel::Normal,
+            }),
             emotion: Some("uneasy".to_owned()),
         };
 
@@ -786,7 +846,13 @@ mod tests {
 
         assert_eq!(appraisal.wake_salience, ArousalEffectLevel::Low);
         assert_eq!(appraisal.affect_salience, ArousalEffectLevel::Minimal);
-        assert_eq!(appraisal.valence, Some(-0.3));
+        assert_eq!(
+            appraisal.valence,
+            Some(ValenceAppraisal {
+                polarity: ValencePolarity::Negative,
+                salience: ValenceEffectLevel::Normal,
+            })
+        );
         assert_eq!(appraisal.emotion.as_deref(), Some("uneasy"));
     }
 
@@ -837,16 +903,19 @@ mod tests {
     fn salient_affect_assessment_raises_arousal_from_levels() {
         let policy = InteroceptionRuntimePolicy {
             wake_arousal_change_multiplier: 2.0,
+            affect_arousal_change_multiplier: 2.0,
             ..InteroceptionRuntimePolicy::default()
         };
         let current = InteroceptiveState {
             wake_arousal: 0.2,
             affect_arousal: 0.1,
+            valence: -0.2,
             ..InteroceptiveState::default()
         };
         let mut patch = InteroceptivePatch {
             wake_arousal: Some(0.2),
             affect_arousal: Some(0.1),
+            valence: Some(-0.1),
             ..InteroceptivePatch::default()
         };
 
@@ -856,7 +925,10 @@ mod tests {
             AffectAppraisal {
                 wake_salience: ArousalEffectLevel::Max,
                 affect_salience: ArousalEffectLevel::High,
-                valence: Some(0.4),
+                valence: Some(ValenceAppraisal {
+                    polarity: ValencePolarity::Positive,
+                    salience: ValenceEffectLevel::Normal,
+                }),
                 emotion: Some("alert".to_owned()),
             },
             &policy,
@@ -865,7 +937,7 @@ mod tests {
         assert!(patch.wake_arousal.unwrap() > 0.7);
         assert!(patch.affect_arousal.unwrap() > 0.2);
         assert_eq!(patch.mode, Some(InteroceptiveMode::Wake));
-        assert_eq!(patch.valence, Some(0.4));
+        assert!(patch.valence.unwrap() > 0.0);
         assert_eq!(patch.emotion.as_deref(), Some("alert"));
     }
 
@@ -875,7 +947,8 @@ mod tests {
             serde_json::json!({
                 "wake_salience": "high",
                 "affect_salience": "normal",
-                "valence": 0.4,
+                "valence_polarity": "positive",
+                "valence_salience": "normal",
                 "emotion": "alert curiosity",
                 "ignored_extra": "ok"
             })
@@ -892,7 +965,7 @@ mod tests {
         module.activate(&cx, &batch).await.unwrap();
 
         let state = blackboard.read(|bb| bb.interoception().clone()).await;
-        assert_eq!(state.valence, 0.4);
+        assert!(state.valence > 0.0);
         assert_eq!(state.emotion, "alert curiosity");
         assert!(state.affect_arousal > 0.0);
     }
@@ -904,7 +977,8 @@ mod tests {
                 serde_json::json!({
                     "wake_salience": "low",
                     "affect_salience": "low",
-                    "valence": 0.2,
+                    "valence_polarity": "positive",
+                    "valence_salience": "low",
                     "emotion": "curious"
                 })
                 .to_string(),
@@ -913,7 +987,8 @@ mod tests {
                 serde_json::json!({
                     "wake_salience": "minimal",
                     "affect_salience": "minimal",
-                    "valence": 0.1,
+                    "valence_polarity": "positive",
+                    "valence_salience": "minimal",
                     "emotion": "settled"
                 })
                 .to_string(),
@@ -968,7 +1043,8 @@ mod tests {
                 serde_json::json!({
                     "wake_salience": 0.2,
                     "affect_salience": "normal",
-                    "valence": 0.4,
+                    "valence_polarity": "positive",
+                    "valence_salience": "normal",
                     "emotion": "alert curiosity"
                 })
                 .to_string(),
@@ -1000,7 +1076,8 @@ mod tests {
                 serde_json::json!({
                     "wake_salience": 0.2,
                     "affect_salience": "normal",
-                    "valence": 0.4,
+                    "valence_polarity": "positive",
+                    "valence_salience": "normal",
                     "emotion": "alert curiosity"
                 })
                 .to_string(),
@@ -1009,7 +1086,8 @@ mod tests {
                 serde_json::json!({
                     "wake_salience": "minimal",
                     "affect_salience": "minimal",
-                    "valence": 0.1,
+                    "valence_polarity": "positive",
+                    "valence_salience": "minimal",
                     "emotion": "settled"
                 })
                 .to_string(),
