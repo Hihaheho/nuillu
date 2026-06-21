@@ -43,11 +43,11 @@ const NEW_CANDIDATE_HEADER: &str = "Candidate facts:";
 const CANDIDATE_DECISION_INSTRUCTION: &str =
     "Rank the bracket labels. Use the available ranking tool now.";
 const DEFERRED_CANDIDATE_PREFIX: &str =
-    "Previously deferred by the two-entry awareness limit last activation: ";
+    "Previously deferred by the awareness limit last activation: ";
 
 const CANDIDATE_TEXT_CONTEXT_CHARS: usize = 1_200;
-const MAX_AWARENESS_ENTRIES: usize = 2;
-const MAX_DEFERRED_CANDIDATES: usize = 2;
+const MAX_AWARENESS_ENTRIES: usize = 3;
+const MAX_DEFERRED_CANDIDATES: usize = 3;
 
 pub fn session_auto_compaction() -> SessionAutoCompaction {
     SessionAutoCompaction::new(
@@ -1174,9 +1174,13 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn activation_sends_three_or_more_candidates_as_persistent_user() {
-        let candidates =
-            test_candidates(&["sensory detail A", "sensory detail B", "sensory detail C"]);
+    async fn activation_sends_over_limit_candidates_as_persistent_user() {
+        let candidates = test_candidates(&[
+            "sensory detail A",
+            "sensory detail B",
+            "sensory detail C",
+            "sensory detail D",
+        ]);
         let adapter = MockLlmAdapter::new().with_text_scenario(rank_awareness_candidates_scenario(
             [candidates[1].id.clone()],
             1,
@@ -1218,6 +1222,8 @@ mod tests {
         assert!(candidate_input.contains("sensory detail B"));
         assert!(candidate_input.contains(&format!("[{}] sensory detail C", candidates[2].id)));
         assert!(candidate_input.contains("sensory detail C"));
+        assert!(candidate_input.contains(&format!("[{}] sensory detail D", candidates[3].id)));
+        assert!(candidate_input.contains("sensory detail D"));
         assert!(!candidate_input.contains("1. sensory detail A"));
         assert!(!candidate_input.contains("2. sensory detail B"));
         assert!(!candidate_input.contains("3. sensory detail C"));
@@ -1273,6 +1279,7 @@ mod tests {
                         && text.contains("sensory detail A")
                         && text.contains("sensory detail B")
                         && text.contains("sensory detail C")
+                        && text.contains("sensory detail D")
                         && !text.contains("memo")
                         && !text.contains("held-in-mind notes")
                         && !text.contains("working notes")
@@ -1524,14 +1531,15 @@ mod tests {
     }
 
     #[test]
-    fn ranked_candidates_maps_first_two_ids_to_candidate_records() {
-        let candidates = test_candidates(&["first", "second", "third"]);
+    fn ranked_candidates_maps_first_three_ids_to_candidate_records() {
+        let candidates = test_candidates(&["first", "second", "third", "fourth"]);
         let resolution = ranked_candidate_records(
             &RankAwarenessCandidatesArgs {
                 labels: vec![
                     candidates[1].id.clone(),
                     candidates[0].id.clone(),
                     candidates[2].id.clone(),
+                    candidates[3].id.clone(),
                 ],
             },
             &candidates,
@@ -1543,23 +1551,24 @@ mod tests {
                 .iter()
                 .map(|record| record.content.as_str())
                 .collect::<Vec<_>>(),
-            vec!["second", "first"]
+            vec!["second", "first", "third"]
         );
         assert_eq!(resolution.deferred.len(), 1);
-        assert_eq!(resolution.deferred[0].content, "third");
+        assert_eq!(resolution.deferred[0].content, "fourth");
     }
 
     #[test]
-    fn ranked_candidates_defers_next_two_fresh_candidates_only() {
+    fn ranked_candidates_defers_next_three_fresh_candidates_only() {
         let mut candidates = test_candidates(&[
             "fresh selected A",
             "fresh selected B",
+            "fresh selected C",
             "previous deferred skipped",
-            "fresh deferred C",
             "fresh deferred D",
             "fresh deferred E",
+            "fresh deferred F",
         ]);
-        candidates[2].source = CognitionCandidateSource::Deferred;
+        candidates[3].source = CognitionCandidateSource::Deferred;
 
         let resolution = ranked_candidate_records(
             &RankAwarenessCandidatesArgs {
@@ -1578,7 +1587,7 @@ mod tests {
                 .iter()
                 .map(|record| record.content.as_str())
                 .collect::<Vec<_>>(),
-            vec!["fresh selected A", "fresh selected B"]
+            vec!["fresh selected A", "fresh selected B", "fresh selected C"]
         );
         assert_eq!(
             resolution
@@ -1586,7 +1595,7 @@ mod tests {
                 .iter()
                 .map(|record| record.content.as_str())
                 .collect::<Vec<_>>(),
-            vec!["fresh deferred C", "fresh deferred D"]
+            vec!["fresh deferred D", "fresh deferred E", "fresh deferred F"]
         );
     }
 
@@ -1615,8 +1624,12 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn ranked_top_appends_matching_memo_after_single_selection_turn() {
-        let candidates =
-            test_candidates(&["candidate A", "candidate B matters now", "candidate C"]);
+        let candidates = test_candidates(&[
+            "candidate A",
+            "candidate B matters now",
+            "candidate C",
+            "candidate D",
+        ]);
         let adapter = MockLlmAdapter::new().with_text_scenario(rank_awareness_candidates_scenario(
             [candidates[1].id.clone()],
             1,
@@ -1645,7 +1658,7 @@ mod tests {
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].entry.text, "candidate B matters now");
         assert_eq!(records[0].entry.origin.owner.module, builtin::sensory());
-        assert_eq!(records[0].entry.origin.memo_index, Some(1));
+        assert_eq!(records[0].entry.origin.memo_index, Some(2));
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -1654,6 +1667,7 @@ mod tests {
             "Ryo said, \"Nui, hello.\"",
             "Ryo asked Nui to say what Nui is thinking.",
             "background wind shifted.",
+            "background birds called.",
         ]);
         let adapter = MockLlmAdapter::new().with_text_scenario(rank_awareness_candidates_scenario(
             [candidates[1].id.clone()],
@@ -1690,7 +1704,8 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn ranked_top_appends_second_selected_memo() {
-        let candidates = test_candidates(&["candidate A", "candidate B", "candidate C"]);
+        let candidates =
+            test_candidates(&["candidate A", "candidate B", "candidate C", "candidate D"]);
         let adapter = MockLlmAdapter::new().with_text_scenario(rank_awareness_candidates_scenario(
             [candidates[1].id.clone(), candidates[0].id.clone()],
             1,
@@ -1727,10 +1742,12 @@ mod tests {
         let first_candidates = test_candidates(&[
             "first selected A",
             "first selected B",
-            "carryover C",
+            "first selected C",
             "carryover D",
+            "carryover E",
+            "carryover F",
         ]);
-        let second_candidates = test_candidates(&["fresh E"]);
+        let second_candidates = test_candidates(&["fresh G"]);
         let adapter = MockLlmAdapter::new()
             .with_text_scenario(rank_awareness_candidates_scenario(
                 first_candidates
@@ -1766,7 +1783,7 @@ mod tests {
                 .iter()
                 .map(|record| record.content.as_str())
                 .collect::<Vec<_>>(),
-            vec!["carryover C", "carryover D"]
+            vec!["carryover D", "carryover E", "carryover F"]
         );
 
         fixture
@@ -1778,28 +1795,34 @@ mod tests {
         let inputs = observed.text_inputs();
         assert_eq!(inputs.len(), 2);
         let second_prompt = latest_candidate_user_message(inputs[1].items());
-        assert!(second_prompt.contains(&format!("[A] {DEFERRED_CANDIDATE_PREFIX}carryover C")));
-        assert!(second_prompt.contains(&format!("[B] {DEFERRED_CANDIDATE_PREFIX}carryover D")));
-        assert!(second_prompt.contains("[C] fresh E"));
-        assert_eq!(second_prompt.matches(DEFERRED_CANDIDATE_PREFIX).count(), 2);
+        assert!(second_prompt.contains(&format!("[A] {DEFERRED_CANDIDATE_PREFIX}carryover D")));
+        assert!(second_prompt.contains(&format!("[B] {DEFERRED_CANDIDATE_PREFIX}carryover E")));
+        assert!(second_prompt.contains(&format!("[C] {DEFERRED_CANDIDATE_PREFIX}carryover F")));
+        assert!(second_prompt.contains("[D] fresh G"));
+        assert_eq!(second_prompt.matches(DEFERRED_CANDIDATE_PREFIX).count(), 3);
 
         let entries = fixture
             .blackboard
             .read(|bb| bb.cognition_log().entries().to_vec())
             .await;
-        assert_eq!(entries.len(), 3);
+        assert_eq!(entries.len(), 4);
         assert_eq!(entries[0].text, "first selected A");
         assert_eq!(entries[1].text, "first selected B");
-        assert_eq!(entries[2].text, "carryover C");
-        assert!(!entries[2].text.contains(DEFERRED_CANDIDATE_PREFIX));
+        assert_eq!(entries[2].text, "first selected C");
+        assert_eq!(entries[3].text, "carryover D");
+        assert!(!entries[3].text.contains(DEFERRED_CANDIDATE_PREFIX));
         assert!(fixture.gate.deferred_candidates.is_empty());
     }
 
     #[tokio::test(flavor = "current_thread")]
     async fn deferred_plus_fresh_fast_path_promotes_without_second_llm_turn() {
-        let first_candidates =
-            test_candidates(&["first selected A", "first selected B", "carryover C"]);
-        let second_candidates = test_candidates(&["fresh D"]);
+        let first_candidates = test_candidates(&[
+            "first selected A",
+            "first selected B",
+            "first selected C",
+            "carryover D",
+        ]);
+        let second_candidates = test_candidates(&["fresh E"]);
         let adapter = MockLlmAdapter::new().with_text_scenario(rank_awareness_candidates_scenario(
             first_candidates
                 .iter()
@@ -1847,8 +1870,9 @@ mod tests {
             vec![
                 "first selected A",
                 "first selected B",
-                "carryover C",
-                "fresh D"
+                "first selected C",
+                "carryover D",
+                "fresh E"
             ]
         );
         assert!(fixture.gate.deferred_candidates.is_empty());
@@ -1869,6 +1893,7 @@ mod tests {
                 "stale greeting already handled",
                 memory_text,
                 "I am speaking to Ryo about prior context.",
+                "redundant restatement of the greeting",
             ],
         );
         let adapter = MockLlmAdapter::new().with_text_scenario(rank_awareness_candidates_scenario(
@@ -1903,8 +1928,12 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn activation_rolls_back_failed_candidate_turn_and_retries_pending_candidates() {
-        let candidates =
-            test_candidates(&["sensory detail A", "sensory detail B", "sensory detail C"]);
+        let candidates = test_candidates(&[
+            "sensory detail A",
+            "sensory detail B",
+            "sensory detail C",
+            "sensory detail D",
+        ]);
         let adapter = MockLlmAdapter::new()
             .with_text_scenario(MockTextScenario::start_error(MockError::Synthetic {
                 message: "synthetic failure".into(),
@@ -1934,7 +1963,7 @@ mod tests {
             err.to_string().contains("decision turn failed")
                 || err.to_string().contains("synthetic")
         );
-        assert_eq!(fixture.gate.pending_unread_memos.len(), 3);
+        assert_eq!(fixture.gate.pending_unread_memos.len(), 4);
 
         let items = fixture.gate.session.input().items().to_vec();
         assert!(!has_message_with_role_containing(
@@ -1962,6 +1991,11 @@ mod tests {
             InputMessageRole::User,
             "sensory detail C"
         ));
+        assert!(!has_message_with_role_containing(
+            &items,
+            InputMessageRole::User,
+            "sensory detail D"
+        ));
 
         fixture.gate.activate(&cx, &batch).await.unwrap();
         assert!(fixture.gate.pending_unread_memos.is_empty());
@@ -1974,6 +2008,7 @@ mod tests {
         assert!(retried_candidates.contains("sensory detail A"));
         assert!(retried_candidates.contains("sensory detail B"));
         assert!(retried_candidates.contains("sensory detail C"));
+        assert!(retried_candidates.contains("sensory detail D"));
         assert!(!retried_candidates.contains("memo"));
         assert!(!retried_candidates.contains("held-in-mind notes"));
     }
@@ -1985,6 +2020,7 @@ mod tests {
             "sensory detail B",
             "sensory detail C",
             "sensory detail D",
+            "sensory detail E",
         ]);
         let adapter = MockLlmAdapter::new()
             .with_text_scenario(MockTextScenario::start_error(MockError::Synthetic {
@@ -2012,13 +2048,13 @@ mod tests {
             SystemClock.now(),
         );
 
-        let first_batch = batch_from_candidates(&candidates[..3]);
+        let first_batch = batch_from_candidates(&candidates[..4]);
         fixture.gate.activate(&cx, &first_batch).await.unwrap_err();
-        assert_eq!(fixture.gate.pending_unread_memos.len(), 3);
-
-        let second_batch = batch_from_candidates(&candidates[3..4]);
-        fixture.gate.activate(&cx, &second_batch).await.unwrap_err();
         assert_eq!(fixture.gate.pending_unread_memos.len(), 4);
+
+        let second_batch = batch_from_candidates(&candidates[4..5]);
+        fixture.gate.activate(&cx, &second_batch).await.unwrap_err();
+        assert_eq!(fixture.gate.pending_unread_memos.len(), 5);
 
         fixture.gate.activate(&cx, &second_batch).await.unwrap();
         assert!(fixture.gate.pending_unread_memos.is_empty());
@@ -2031,8 +2067,9 @@ mod tests {
         assert!(accumulated_candidates.contains("sensory detail B"));
         assert!(accumulated_candidates.contains("sensory detail C"));
         assert!(accumulated_candidates.contains("sensory detail D"));
+        assert!(accumulated_candidates.contains("sensory detail E"));
 
-        let fresh = test_candidates(&["sensory detail E", "sensory detail F"]);
+        let fresh = test_candidates(&["sensory detail F", "sensory detail G"]);
         let third_batch = batch_from_candidates(&fresh);
         fixture.gate.activate(&cx, &third_batch).await.unwrap();
 
@@ -2043,8 +2080,8 @@ mod tests {
             .read(|bb| bb.cognition_log().entries().to_vec())
             .await;
         assert_eq!(entries.len(), 3);
-        assert_eq!(entries[1].text, "sensory detail E");
-        assert_eq!(entries[2].text, "sensory detail F");
+        assert_eq!(entries[1].text, "sensory detail F");
+        assert_eq!(entries[2].text, "sensory detail G");
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -2053,9 +2090,14 @@ mod tests {
             "The agent noticed the north door is blocked.",
             "sensory detail A2",
             "sensory detail A3",
+            "sensory detail A4",
         ]);
-        let second_candidates =
-            test_candidates(&["sensory detail B", "sensory detail B2", "sensory detail B3"]);
+        let second_candidates = test_candidates(&[
+            "sensory detail B",
+            "sensory detail B2",
+            "sensory detail B3",
+            "sensory detail B4",
+        ]);
         let adapter = MockLlmAdapter::new()
             .with_text_scenario(rank_awareness_candidates_scenario(
                 [first_candidates[0].id.clone()],
@@ -2254,6 +2296,7 @@ mod tests {
             "identity seed candidate A",
             "identity seed candidate B",
             "identity seed candidate C",
+            "identity seed candidate D",
         ]);
         let adapter = MockLlmAdapter::new().with_text_scenario(rank_awareness_candidates_scenario(
             [candidates[1].id.clone()],
