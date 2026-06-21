@@ -50,11 +50,12 @@ const QUERY_PLAN_INSTRUCTION: &str = r#"Output instruction: call plan_memory_que
 Use main_query for the best concrete memory search. Use sub_queries only for distinct alternate
 terms or facets, up to two strings. main_query must be nonblank. Do not write plain assistant text."#;
 const EVIDENCE_SELECTION_INSTRUCTION: &str = r#"Return structured evidence selection only.
-Select exact memory index strings from the fresh evidence candidates above in selected_indexes.
+Select up to three exact memory index strings from the fresh evidence candidates above in selected_indexes.
 Return an empty selected_indexes array only when no candidate is usable; runtime may apply
 deterministic top-evidence fallback when fresh candidates exist."#;
 const FALLBACK_FLAT_HIT_LIMIT: usize = 2;
 const FALLBACK_TOTAL_EVIDENCE_LIMIT: usize = 3;
+const FILTER_SELECTION_LIMIT: usize = FALLBACK_TOTAL_EVIDENCE_LIMIT;
 
 pub fn query_session_auto_compaction() -> SessionAutoCompaction {
     SessionAutoCompaction::new(
@@ -149,11 +150,22 @@ pub struct PlanMemoryExecutedSearch {
     pub hit_indices: Vec<MemoryIndex>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct PlanMemorySearchSummary {
+    pub query: String,
+    pub limit: usize,
+    pub fresh_direct_hits: usize,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct PlanMemoryQueriesOutput {
-    pub searches: Vec<PlanMemoryExecutedSearch>,
-    pub hits: Vec<QueryMemoryHit>,
-    pub linked_hits: Vec<QueryMemoryLinkedHit>,
+    pub searches: Vec<PlanMemorySearchSummary>,
+    pub fresh_direct_hits: usize,
+    pub fresh_linked_hits: usize,
+    pub selected_hits: usize,
+    pub selected_linked_hits: usize,
+    pub used_indexes: Vec<MemoryIndex>,
+    pub memo_written: bool,
     pub message: String,
 }
 
@@ -229,6 +241,19 @@ impl QueryMemoryRetrieval {
     fn has_evidence(&self) -> bool {
         !self.hits.is_empty() || !self.linked_hits.is_empty()
     }
+}
+
+fn summarize_executed_searches(
+    searches: &[PlanMemoryExecutedSearch],
+) -> Vec<PlanMemorySearchSummary> {
+    searches
+        .iter()
+        .map(|search| PlanMemorySearchSummary {
+            query: search.query.clone(),
+            limit: search.limit,
+            fresh_direct_hits: search.hit_indices.len(),
+        })
+        .collect()
 }
 
 #[derive(Clone, Debug)]
@@ -445,27 +470,31 @@ impl QueryMemoryModule {
                     .context("execute planned memory searches")?;
                 let had_any_evidence = retrieval.has_evidence();
                 let retrieval = self.filter_recent_memo_evidence(retrieval).await;
-                let plan_output = PlanMemoryQueriesOutput {
-                    searches: retrieval.executed_searches.clone(),
-                    hits: retrieval.hits.clone(),
-                    linked_hits: retrieval.linked_hits.clone(),
-                    message: if !had_any_evidence {
-                        "planned searches returned no memory hits".to_owned()
-                    } else if !retrieval.has_evidence() {
-                        "planned searches returned only evidence already present in query-memory memo"
-                            .to_owned()
-                    } else {
-                        "planned searches executed; filter stage will select evidence".to_owned()
-                    },
-                };
-                let result = call
-                    .complete(plan_output)
-                    .context("complete plan_memory_queries search tool call")?;
-                round
-                    .commit(&mut self.session, [result])
-                    .context("commit query-memory planner round")?;
+                let fresh_direct_hits = retrieval.hits.len();
+                let fresh_linked_hits = retrieval.linked_hits.len();
 
                 if !retrieval.has_evidence() {
+                    let plan_output = PlanMemoryQueriesOutput {
+                        searches: summarize_executed_searches(&retrieval.executed_searches),
+                        fresh_direct_hits,
+                        fresh_linked_hits,
+                        selected_hits: 0,
+                        selected_linked_hits: 0,
+                        used_indexes: Vec::new(),
+                        memo_written: false,
+                        message: if !had_any_evidence {
+                            "planned searches returned no memory hits".to_owned()
+                        } else {
+                            "planned searches returned only evidence already present in query-memory memo"
+                                .to_owned()
+                        },
+                    };
+                    let result = call
+                        .complete(plan_output)
+                        .context("complete plan_memory_queries search tool call")?;
+                    round
+                        .commit(&mut self.session, [result])
+                        .context("commit query-memory planner round")?;
                     cx.compact_and_save(&mut self.session, planner_usage)
                         .await?;
                     return Ok(());
@@ -475,6 +504,22 @@ impl QueryMemoryModule {
                     .select_memory_evidence(cx, &requests, &retrieval)
                     .await
                     .context("select memory evidence")?;
+                let plan_output = PlanMemoryQueriesOutput {
+                    searches: summarize_executed_searches(&retrieval.executed_searches),
+                    fresh_direct_hits,
+                    fresh_linked_hits,
+                    selected_hits: filter.output.selected_hits,
+                    selected_linked_hits: filter.output.selected_linked_hits,
+                    used_indexes: filter.output.used_indexes.clone(),
+                    memo_written: filter.output.memo_written,
+                    message: filter.output.message.clone(),
+                };
+                let result = call
+                    .complete(plan_output)
+                    .context("complete plan_memory_queries search tool call")?;
+                round
+                    .commit(&mut self.session, [result])
+                    .context("commit query-memory planner round")?;
                 self.session
                     .push_user(format_filter_decision_summary(&filter.args, &filter.output));
                 cx.compact_and_save(&mut self.session, planner_usage)
@@ -914,6 +959,9 @@ fn resolve_filter_selection(
     let mut selected_linked_hits = Vec::new();
 
     for index in &args.selected_indexes {
+        if selected_hits.len() + selected_linked_hits.len() >= FILTER_SELECTION_LIMIT {
+            break;
+        }
         if index.as_str().trim().is_empty() || !seen.insert(index.clone()) {
             continue;
         }
@@ -977,7 +1025,7 @@ fn format_evidence_selection_request(
 ) -> String {
     let mut out = String::from("Select memo evidence from these deterministic memory results.");
     out.push_str(
-        " Return selected_indexes as exact memory index strings from the fresh evidence candidates. \
+        " Return selected_indexes as up to three exact memory index strings from the fresh evidence candidates. \
          Use an empty selected_indexes array only when no candidate is usable; runtime may apply \
          deterministic top-evidence fallback when fresh candidates exist.",
     );
@@ -1212,6 +1260,7 @@ mod tests {
     use std::rc::Rc;
     use std::sync::{Arc, Mutex};
 
+    use lutum::MessageContent;
     use lutum::{
         AdapterStructuredTurn, AdapterTextTurn, AgentError, ErasedStructuredTurnEventStream,
         ErasedTextTurnEventStream, FinishReason, Lutum, MockLlmAdapter, MockStructuredScenario,
@@ -1610,6 +1659,49 @@ mod tests {
         blackboard.typed_memo_logs::<QueryMemoryMemo>(&owner).await
     }
 
+    fn model_input_text(input: &ModelInput) -> String {
+        let mut out = String::new();
+        for item in input.items() {
+            match item {
+                ModelInputItem::Message { content, .. } => {
+                    for content in content.as_slice() {
+                        if let MessageContent::Text(text) = content {
+                            out.push_str(text);
+                            out.push('\n');
+                        }
+                    }
+                }
+                ModelInputItem::Assistant(item) => {
+                    out.push_str(&format!("{item:?}\n"));
+                }
+                ModelInputItem::ToolResult(result) => {
+                    out.push_str(result.result.get());
+                    out.push('\n');
+                }
+                ModelInputItem::Turn(turn) => {
+                    for index in 0..turn.item_count() {
+                        let Some(item) = turn.item_at(index) else {
+                            continue;
+                        };
+                        if let Some(text) = item.as_text() {
+                            out.push_str(text);
+                            out.push('\n');
+                        }
+                        if let Some(tool) = item.as_tool_call() {
+                            out.push_str(tool.arguments.get());
+                            out.push('\n');
+                        }
+                        if let Some(tool) = item.as_tool_result() {
+                            out.push_str(tool.result.get());
+                            out.push('\n');
+                        }
+                    }
+                }
+            }
+        }
+        out
+    }
+
     #[test]
     fn memo_plaintext_contains_only_retrieved_evidence() {
         let memo = render_memo(
@@ -1795,6 +1887,103 @@ mod tests {
                         .iter()
                         .all(|item| !matches!(item, ModelInputItem::ToolResult(_)))
                 );
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn planner_tool_result_omits_unselected_candidate_content_from_session() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let adapter = Arc::new(CapturingAdapter::new(
+                    MockLlmAdapter::new()
+                        .with_text_scenario(plan_scenario(
+                            "Koro food approach",
+                            serde_json::json!([]),
+                        ))
+                        .with_structured_scenario(filter_scenario(vec!["selected-rule"]))
+                        .with_text_scenario(plan_scenario(
+                            "Koro food approach",
+                            serde_json::json!([]),
+                        ))
+                        .with_structured_scenario(filter_scenario(vec!["unselected-rule"])),
+                ));
+                let store = Rc::new(QueryMemoryTestStore::default());
+                store.records.borrow_mut().push(record(
+                    "selected-rule",
+                    "Selected memory evidence should stay available through memo.",
+                ));
+                store.records.borrow_mut().push(record(
+                    "unselected-rule",
+                    "Unselected candidate content must not persist in the planner tool result.",
+                ));
+                let (blackboard, caps, memory_caps, lutum) =
+                    test_caps_with_adapter(adapter.clone(), store);
+                let mut module = build_query_module(&caps, memory_caps).await;
+
+                run_query_memory_once(&blackboard, &caps, &mut module, &lutum)
+                    .await
+                    .expect("first activation should succeed");
+                run_query_memory_once(&blackboard, &caps, &mut module, &lutum)
+                    .await
+                    .expect("second activation should succeed");
+
+                let inputs = adapter.text_inputs();
+                assert_eq!(inputs.len(), 2);
+                let second_input = model_input_text(&inputs[1]);
+                assert!(second_input.contains("Selected memory evidence"));
+                assert!(!second_input.contains("Unselected candidate content"));
+                assert!(second_input.contains("fresh_direct_hits"));
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn filter_selection_is_capped_to_three_evidence_items() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let adapter = Arc::new(CapturingAdapter::new(
+                    MockLlmAdapter::new()
+                        .with_text_scenario(plan_scenario(
+                            "Koro food approach",
+                            serde_json::json!([]),
+                        ))
+                        .with_structured_scenario(filter_scenario(vec![
+                            "rule-1", "rule-2", "rule-3", "rule-4", "rule-5",
+                        ])),
+                ));
+                let store = Rc::new(QueryMemoryTestStore::default());
+                for index in 1..=5 {
+                    store.records.borrow_mut().push(record(
+                        &format!("rule-{index}"),
+                        &format!("memory evidence {index}"),
+                    ));
+                }
+                let (blackboard, caps, memory_caps, lutum) =
+                    test_caps_with_adapter(adapter.clone(), store);
+                let mut module = build_query_module(&caps, memory_caps).await;
+
+                run_query_memory_once(&blackboard, &caps, &mut module, &lutum)
+                    .await
+                    .expect("activation should succeed");
+
+                let memos = query_memory_memos(&blackboard).await;
+                assert_eq!(memos.len(), 1);
+                assert_eq!(
+                    memos[0]
+                        .data()
+                        .hits
+                        .iter()
+                        .map(|hit| hit.index.to_string())
+                        .collect::<Vec<_>>(),
+                    vec![
+                        "rule-1".to_owned(),
+                        "rule-2".to_owned(),
+                        "rule-3".to_owned()
+                    ]
+                );
+                assert!(memos[0].content.contains("memory evidence 3"));
+                assert!(!memos[0].content.contains("memory evidence 4"));
             })
             .await;
     }
