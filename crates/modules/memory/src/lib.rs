@@ -41,16 +41,19 @@ pub use compaction::{
     GetMemoriesArgs, MemoryCompactionModule, MergeMemoriesArgs, MergeMemoriesOutput,
 };
 pub use memory::{
-    InsertMemoryArgs, InsertMemoryOutput, MemoryBatch, MemoryConceptInput, MemoryModule,
-    MemoryTagInput, MemoryTools, MemoryToolsCall, MemoryToolsSelector, ReinforceMemoryArgs,
-    ReinforceMemoryOutput, session_auto_compaction,
+    DeleteRedundantMemoryArgs, DeleteRedundantMemoryOutput, InsertMemoryArgs, InsertMemoryOutput,
+    KeepNewMemoryArgs, KeepNewMemoryOutput, MemoryBatch, MemoryConceptInput, MemoryModule,
+    MemoryNoveltyTools, MemoryNoveltyToolsCall, MemoryNoveltyToolsSelector, MemoryTagInput,
+    MemoryTools, MemoryToolsCall, MemoryToolsSelector, SkipMemoryArgs, SkipMemoryOutput,
+    session_auto_compaction,
 };
 pub use query::{
-    BroadcastSearchResultsArgs, BroadcastSearchResultsOutput, DisposeSearchResultsArgs,
-    DisposeSearchResultsOutput, FetchLinkedMemoriesArgs, FetchLinkedMemoriesOutput,
-    QueryMemoryBatch, QueryMemoryHit, QueryMemoryLinkedHit, QueryMemoryMemo, QueryMemoryMemoHit,
-    QueryMemoryMemoLinkedHit, QueryMemoryMemoSearch, QueryMemoryModule, QueryMemoryTools,
-    QueryMemoryToolsCall, QueryMemoryToolsSelector, SearchMemoryArgs, SearchMemoryOutput,
+    PlanMemoryExecutedSearch, PlanMemoryQueriesArgs, PlanMemoryQueriesOutput, PlannedMemorySearch,
+    QueryMemoryBatch, QueryMemoryFilterTools, QueryMemoryFilterToolsCall,
+    QueryMemoryFilterToolsSelector, QueryMemoryHit, QueryMemoryLinkedHit, QueryMemoryMemo,
+    QueryMemoryMemoHit, QueryMemoryMemoLinkedHit, QueryMemoryMemoSearch, QueryMemoryModule,
+    QueryMemoryPlanDisposition, QueryMemoryPlanTools, QueryMemoryPlanToolsCall,
+    QueryMemoryPlanToolsSelector, SelectMemoryEvidenceArgs, SelectMemoryEvidenceOutput,
     query_session_auto_compaction,
 };
 pub use recombination::{

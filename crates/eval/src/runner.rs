@@ -2333,8 +2333,7 @@ async fn execute_module_case(
         module_target_forces_cognitive_memo_seeds(target),
     )
     .await?;
-    let cognition_seed_records =
-        seed_cognition_log(&env.blackboard, env.clock.as_ref(), &case.cognition_log).await;
+    let _ = seed_cognition_log(&env.blackboard, env.clock.as_ref(), &case.cognition_log).await;
     if let Some(visualizer) = hooks.visualizer.as_mut() {
         emit_visualizer_blackboard_snapshot(case_id, &env.blackboard, Some(visualizer)).await;
         emit_visualizer_memory_records(
@@ -2426,7 +2425,6 @@ async fn execute_module_case(
                         &harness,
                         &prompt,
                         &memo_seed_records,
-                        &cognition_seed_records,
                         has_cognition_log_seed,
                         &case_id_for_activation,
                         &case_inputs,
@@ -2478,7 +2476,6 @@ async fn execute_module_case(
                                 &harness,
                                 &prompt,
                                 &memo_seed_records,
-                                &cognition_seed_records,
                                 has_cognition_log_seed,
                                 &case_id_for_activation,
                                 &case_inputs,
@@ -2716,7 +2713,6 @@ async fn activate_module_case_target(
     harness: &InternalHarnessIo,
     prompt: &str,
     memo_seed_records: &[MemoLogRecord],
-    cognition_seed_records: &[CognitionLogEntryRecord],
     has_cognition_log_seed: bool,
     case_id: &str,
     inputs: &[FullAgentInput],
@@ -2751,11 +2747,20 @@ async fn activate_module_case_target(
                 .expect("module eval failed to publish MemoUpdated");
         }
         ModuleEvalTarget::QueryMemory => {
+            let source = ModuleInstanceId::new(builtin::cognition_gate(), ReplicaIndex::ZERO);
+            blackboard
+                .append_cognition_log(
+                    source.clone(),
+                    CognitionLogEntry {
+                        at: clock.now(),
+                        text: prompt.to_string(),
+                        origin: CognitionLogOrigin::direct(source.clone()),
+                    },
+                )
+                .await;
             harness
                 .cognition_log_updated_mailbox()
-                .publish(CognitionLogUpdated::EntryAppended {
-                    source: ModuleInstanceId::new(builtin::cognition_gate(), ReplicaIndex::ZERO),
-                })
+                .publish(CognitionLogUpdated::EntryAppended { source })
                 .await
                 .expect("module eval failed to publish CognitionLogUpdated");
         }
@@ -2807,14 +2812,27 @@ async fn activate_module_case_target(
                 .expect("module eval failed to publish CognitionLogUpdated");
         }
         ModuleEvalTarget::Memory => {
+            for record in memo_seed_records {
+                harness
+                    .memo_updated_mailbox()
+                    .publish(nuillu_module::MemoUpdated {
+                        owner: record.owner.clone(),
+                        index: record.index,
+                    })
+                    .await
+                    .expect("module eval failed to publish MemoUpdated");
+            }
             if has_cognition_log_seed {
-                for record in cognition_seed_records {
-                    harness
-                        .cognition_log_evicted_mailbox()
-                        .publish(record.clone())
-                        .await
-                        .expect("module eval failed to publish CognitionLogEvicted");
-                }
+                harness
+                    .cognition_log_updated_mailbox()
+                    .publish(CognitionLogUpdated::EntryAppended {
+                        source: ModuleInstanceId::new(
+                            builtin::cognition_gate(),
+                            ReplicaIndex::ZERO,
+                        ),
+                    })
+                    .await
+                    .expect("module eval failed to publish CognitionLogUpdated");
             }
         }
         ModuleEvalTarget::MemoryCompaction
@@ -2942,14 +2960,13 @@ async fn activate_module_case_step(
     )
     .await
     .expect("module eval step memo seeds should be valid");
-    let cognition_seed_records = seed_cognition_log(blackboard, clock, &step.cognition_log).await;
+    let _ = seed_cognition_log(blackboard, clock, &step.cognition_log).await;
     activate_module_case_target(
         target,
         blackboard,
         harness,
         prompt,
         &memo_seed_records,
-        &cognition_seed_records,
         !step.cognition_log.is_empty(),
         case_id,
         &step.inputs,
@@ -5116,9 +5133,13 @@ fn register_eval_module(
                         let memory_caps = memory_caps.clone();
                         async move {
                             Ok(nuillu_memory::MemoryModule::new(
-                                caps.cognition_log_evicted_inbox(),
+                                caps.memo_updated_inbox(),
+                                caps.cognition_log_updated_inbox(),
+                                caps.blackboard_reader(),
+                                caps.cognition_log_reader(),
                                 caps.memory_metadata_reader(),
                                 memory_caps.writer(),
+                                memory_caps.deleter(),
                                 memory_caps.retriever(),
                                 caps.llm("main").with_tier(main_tier).into(),
                                 caps.session("main")

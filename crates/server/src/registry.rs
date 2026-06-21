@@ -194,9 +194,13 @@ fn register_server_module(
                 let memory_caps = memory_caps.clone();
                 async move {
                     Ok(nuillu_memory::MemoryModule::new(
-                        caps.cognition_log_evicted_inbox(),
+                        caps.memo_updated_inbox(),
+                        caps.cognition_log_updated_inbox(),
+                        caps.blackboard_reader(),
+                        caps.cognition_log_reader(),
                         caps.memory_metadata_reader(),
                         memory_caps.writer(),
+                        memory_caps.deleter(),
                         memory_caps.retriever(),
                         caps.llm("main").with_tier(main_tier).into(),
                         caps.session("main")

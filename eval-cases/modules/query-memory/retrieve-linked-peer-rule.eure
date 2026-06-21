@@ -1,8 +1,8 @@
 id: module-query-memory-retrieve-linked-peer-rule
-description: Query-memory should expand a flat search hit through linked memories and broadcast linked evidence.
+description: Query-memory should expand a flat search hit through linked memories and write linked evidence to memo.
 modules = ["query-memory"]
 prompt: How should Nui approach Koro near food?
-context: Flat search should hit koro-approach-primary among the Koro-food memories; koro-signal-drill-linked is reachable only through fetch_linked_memories on that primary hit.
+context: Flat search should hit koro-approach-primary among the Koro-food memories; koro-signal-drill-linked is reachable through deterministic linked expansion before select_memory_evidence.
 
 limits {
   max-llm-calls = 12
@@ -66,16 +66,19 @@ limits {
 
 @ checks[] {
   $variant: trace-tool-call
-  name: calls-fetch-linked-memories
+  name: planner-requests-linked-expansion
   must-pass = true
-  tool-name: fetch_linked_memories
+  tool-name: plan_memory_queries
+  args-json-contains = ```
+  {"searches": [{"include_linked": true}]}
+  ```
 }
 
 @ checks[] {
   $variant: trace-tool-call
-  name: broadcasts-linked-signal-index
+  name: selects-linked-signal-index
   must-pass = true
-  tool-name: broadcast_search_results
+  tool-name: select_memory_evidence
   args-json-contains = ```
   {"linked_hit_indexes": ["koro-signal-drill-linked"]}
   ```
