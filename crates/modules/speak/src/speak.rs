@@ -36,9 +36,9 @@ When no speech is in progress, call prepare_speech only when new cognition suppo
 For direct speech heard from a named speaker, target that speaker. Use everyone only when the cognition explicitly calls for group or broadcast speech.
 When no speech is in progress, call decline_speech_now when no new outward utterance is appropriate now. If speak should not be prioritized again until new cognition arrives, include inhibit_reason.
 When speech is already in progress, continue ordinary speech, redirect only for urgent invalidating cognition, or abort when the partial utterance should stop.
+Abort in-progress speech when the already emitted partial is not appropriate to say aloud to the target, including introspection, narration, request analysis, repeated broken text, or implementation/process talk.
 Predictions, expected dialogue flow, and my own previous speech are not new outward speech motivation by themselves.
-facts must be short quotes or summaries from identity memory or the cognition log only.
-my_speech_intent is what I should convey outwardly. Nui is my own name; do not treat my name as the listener. Do not write the target's future reply, expression, feeling, action, or narration there.
+my_speech_intent is what I should convey outwardly, grounded in identity memory or the cognition log. Nui is my own name; do not treat my name as the listener. Do not write the target's future reply, expression, feeling, action, or narration there.
 If the cognition log contains an explicit language request, set language and shape my_speech_intent for that language.
 Do not invent policy, actions, identity, memory, visible evidence, unknown-state evidence, or other facts not supported by the provided context."#;
 
@@ -46,16 +46,54 @@ const FRESH_PLANNING_TURN_DEVELOPER_INSTRUCTION: &str = "Use exactly one tool: p
 const ACTIVE_PLANNING_TURN_DEVELOPER_INSTRUCTION: &str = "Use exactly one tool: continue_speech for ordinary continuation of the current partial utterance, interrupt_and_redirect_speech only for urgent or safety-priority interruption, or abort_speech only when the partial should stop without completion.";
 
 const GENERATION_PROMPT: &str = r#"Write one concise in-world utterance.
-Use only Recent context, Facts, and my_speech_intent as content. Do not add a new plan or unsupported facts.
+Use only Recent context and Your Speech Intent as content. Do not add a new plan or unsupported facts.
 If a language is supplied, render the utterance in that language.
-The utterance starts after Me:, so do not address Me/Nui as the listener.
+Do not address Me/Nui as the listener.
+If Your Speech Intent is already a usable utterance, say that utterance directly.
 Output only the utterance text; do not wrap it in quotation marks.
-Do not mention implementation mechanics, lookup, reasoning, prompts, rubrics, or evaluation mechanics."#;
-const GENERATION_TURN_USER_PROMPT: &str = "Generate an utterance to a target.";
+Do not summarize the request or say what the user wants.
+Do not output introspection, narration, or analysis that is not appropriate to say aloud to the target.
+Do not mention implementation mechanics, lookup, reasoning, prompts, rubrics, or evaluation mechanics.
+When the user message includes already emitted text, continue only with the next new text that comes after it. Do not repeat the already emitted text.
+
+Examples:
+User:
+Generate an utterance to `Somebody`.
+Language: Japanese
+Your Speech Intent:
+挨拶をする
+Assistant:
+こんにちは！Somebody！
+
+User:
+Generate an utterance to `Mika`.
+Language: Japanese
+Your Speech Intent:
+こんにちは、ミカさん。よろしくね。
+Assistant:
+こんにちは、ミカさん。よろしくね。
+
+Continuation example:
+User:
+Generate an utterance to `Ryo`.
+Language: Japanese
+Your Speech Intent:
+こんにちは！Ryoさんは、何か楽しいことを準備していますか？
+Continue the utterance after the already emitted text below. Emit only the next new text that comes after it. Do not repeat, restate, or include any already emitted text.
+
+Already emitted:
+こんにちは！Ryoさんは、何か楽しい
+Assistant:
+ことを準備していますか？"#;
+const GENERATION_TURN_USER_PROMPT_PREFIX: &str = "Generate an utterance to";
+const GENERATION_CONTINUATION_INSTRUCTION: &str = "Continue the utterance after the already emitted text below. Emit only the next new text that comes after it. Do not repeat, restate, or include any already emitted text.";
 
 const COGNITION_CONTEXT_WINDOW: LlmContextWindow = LlmContextWindow::new(12, 600, 4_800);
 const SPEECH_PLANNING_TURN_MAX_OUTPUT_TOKENS: u32 = 1024;
 const SPEECH_GENERATION_TEXT_DELTA_SLICE_LIMIT: usize = 8;
+const SPEECH_GENERATION_TEXT_DELTA_CHAR_LIMIT: usize = 20;
+const SPEECH_GENERATION_SLICES_PER_PLAN: u8 = 3;
+const ACTIVE_SPEECH_PLANNING_ALREADY_EMITTED_CHARS: usize = 600;
 const THINK_OPEN_TAG: &str = "<think>";
 const THINK_CLOSE_TAG: &str = "</think>";
 const COMPACTED_SPEAK_PLANNING_SESSION_PREFIX: &str = "Compacted speak planning session history:";
@@ -65,7 +103,7 @@ const PLANNING_SESSION_COMPACTION_FOCUS: &str = r#"Preserve prior speech target 
 selected targets, rejected/no-speech decisions, completed outward utterances, in-progress
 speech continuations, and cognition-log context needed for future speak planning."#;
 const GENERATION_SESSION_COMPACTION_FOCUS: &str = r#"Preserve completed outward utterances,
-their addressees, and any Facts/my_speech_intent context needed to understand those utterances."#;
+their addressees, and any Your Speech Intent context needed to understand those utterances."#;
 
 pub fn planning_session_auto_compaction() -> SessionAutoCompaction {
     SessionAutoCompaction::new(
@@ -147,8 +185,6 @@ struct PrepareSpeechArgs {
     /// language request.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     language: Option<String>,
-    /// Short facts quoted or summarized from identity memory or cognition log.
-    facts: Vec<String>,
     /// What I should convey outwardly. Do not describe the target's future
     /// reply, expression, feeling, action, or narration here.
     my_speech_intent: String,
@@ -181,9 +217,6 @@ struct DeclineSpeechNowOutput {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 /// Call when an in-progress utterance should continue to the same target.
 struct ContinueSpeechArgs {
-    /// Short facts quoted or summarized from identity memory or cognition log.
-    #[serde(default)]
-    facts: Vec<String>,
     /// What the current speaker should convey as a continuation of the already
     /// emitted partial utterance.
     my_speech_intent: String,
@@ -209,9 +242,6 @@ struct InterruptAndRedirectSpeechArgs {
     /// apply an explicit language request.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     language: Option<String>,
-    /// Short facts quoted or summarized from identity memory or cognition log.
-    #[serde(default)]
-    facts: Vec<String>,
     /// What I should convey outwardly to `target`.
     my_speech_intent: String,
     /// Why the in-progress utterance must be interrupted now.
@@ -312,52 +342,92 @@ impl GenerationDraft {
 struct ActiveSpeech {
     args: PrepareSpeechArgs,
     draft: GenerationDraft,
+    generation_slices_since_plan: u8,
 }
 
 #[derive(Default)]
 struct GenerationDeltaBuffer {
     deltas: Vec<String>,
-    non_empty_text_delta_count: usize,
+    visible_text_delta_count: usize,
+    visible_text_char_count: usize,
+    limit_reached: bool,
     think_filter: ThinkTagFilter,
 }
 
 impl GenerationDeltaBuffer {
     fn push(&mut self, delta: String) -> Option<Vec<String>> {
+        if self.limit_reached {
+            return None;
+        }
         let Some(delta) = self.think_filter.push(&delta) else {
-            return self.drain_ready_batch();
+            return None;
         };
         self.push_visible(delta);
         self.drain_ready_batch()
     }
 
     fn finish(&mut self) -> Option<Vec<String>> {
+        if self.limit_reached {
+            return None;
+        }
         if let Some(delta) = self.think_filter.finish() {
             self.push_visible(delta);
         }
         self.drain_pending_batch()
     }
 
+    fn limit_reached(&self) -> bool {
+        self.limit_reached
+    }
+
     fn push_visible(&mut self, delta: String) {
-        if !delta.is_empty() {
-            self.non_empty_text_delta_count += 1;
+        if delta.is_empty() {
+            self.deltas.push(delta);
+            return;
         }
+        if self.visible_text_delta_count >= SPEECH_GENERATION_TEXT_DELTA_SLICE_LIMIT {
+            self.limit_reached = true;
+            return;
+        }
+        let remaining_chars =
+            SPEECH_GENERATION_TEXT_DELTA_CHAR_LIMIT.saturating_sub(self.visible_text_char_count);
+        let (delta, char_count, truncated) = truncate_generation_text_delta(delta, remaining_chars);
+        self.visible_text_delta_count += 1;
+        self.visible_text_char_count += char_count;
         self.deltas.push(delta);
+        if truncated || self.visible_text_char_count >= SPEECH_GENERATION_TEXT_DELTA_CHAR_LIMIT {
+            self.limit_reached = true;
+        }
     }
 
     fn drain_ready_batch(&mut self) -> Option<Vec<String>> {
-        if self.non_empty_text_delta_count >= SPEECH_GENERATION_TEXT_DELTA_SLICE_LIMIT {
+        if self.limit_reached
+            || self.visible_text_delta_count >= SPEECH_GENERATION_TEXT_DELTA_SLICE_LIMIT
+            || self.visible_text_char_count >= SPEECH_GENERATION_TEXT_DELTA_CHAR_LIMIT
+        {
+            self.limit_reached = true;
             return self.drain_pending_batch();
         }
         None
     }
 
     fn drain_pending_batch(&mut self) -> Option<Vec<String>> {
-        self.non_empty_text_delta_count = 0;
         if self.deltas.is_empty() {
             return None;
         }
         Some(std::mem::take(&mut self.deltas))
     }
+}
+
+fn truncate_generation_text_delta(delta: String, max_chars: usize) -> (String, usize, bool) {
+    if max_chars == 0 {
+        return (String::new(), 0, !delta.is_empty());
+    };
+    let Some((split_at, _)) = delta.char_indices().nth(max_chars) else {
+        let char_count = delta.chars().count();
+        return (delta, char_count, false);
+    };
+    (delta[..split_at].to_owned(), max_chars, true)
 }
 
 #[derive(Default)]
@@ -520,31 +590,29 @@ fn render_aborted_utterance_planning_record(draft: &GenerationDraft, reason: &st
     )
 }
 
-fn format_generation_thinking_prefill(args: &PrepareSpeechArgs, draft: &GenerationDraft) -> String {
+fn format_generation_turn_user_prompt(args: &PrepareSpeechArgs, draft: &GenerationDraft) -> String {
     let mut out = format!(
-        "{THINK_OPEN_TAG}\nPreparing speech to `{}`.",
+        "{GENERATION_TURN_USER_PROMPT_PREFIX} `{}`.",
         draft.target.trim()
     );
     if let Some(language) = trimmed_optional(args.language.as_deref()) {
         out.push_str(&format!("\nLanguage: {language}"));
     }
-    out.push_str("\nFacts:");
-    let mut wrote_fact = false;
-    for fact in args.facts.iter().map(String::as_str).filter_map(|fact| {
-        let fact = fact.trim();
-        (!fact.is_empty()).then_some(fact)
-    }) {
-        wrote_fact = true;
-        out.push_str("\n- ");
-        out.push_str(fact);
-    }
-    if !wrote_fact {
-        out.push_str("\n- (none supplied)");
-    }
     out.push_str(&format!(
-        "\nmy_speech_intent:\n{}\n{THINK_CLOSE_TAG}\nMe:\n",
+        "\nYour Speech Intent:\n{}",
         args.my_speech_intent.trim(),
     ));
+    out
+}
+
+fn format_generation_llm_user_prompt(args: &PrepareSpeechArgs, draft: &GenerationDraft) -> String {
+    let mut out = format_generation_turn_user_prompt(args, draft);
+    if !draft.accumulated.is_empty() {
+        out.push_str("\n\n");
+        out.push_str(GENERATION_CONTINUATION_INSTRUCTION);
+        out.push_str("\n\nAlready emitted:\n");
+        out.push_str(&draft.accumulated);
+    }
     out
 }
 
@@ -565,22 +633,6 @@ fn format_planning_input(
         if let Some(language) = trimmed_optional(active.args.language.as_deref()) {
             out.push_str(&format!("\n- Language: {language}"));
         }
-        out.push_str("\n- Planned facts:");
-        let facts = active
-            .args
-            .facts
-            .iter()
-            .map(String::as_str)
-            .filter_map(|fact| trimmed_optional(Some(fact)))
-            .collect::<Vec<_>>();
-        if facts.is_empty() {
-            out.push_str(" (none supplied)");
-        } else {
-            for fact in facts {
-                out.push_str("\n  - ");
-                out.push_str(fact);
-            }
-        }
         out.push_str(&format!(
             "\n- Planned my_speech_intent: {}",
             active.args.my_speech_intent.trim()
@@ -588,9 +640,12 @@ fn format_planning_input(
         out.push_str(&format!(
             "\n- Already emitted: {}",
             if active.draft.accumulated.trim().is_empty() {
-                "(none)"
+                Cow::Borrowed("(none)")
             } else {
-                active.draft.accumulated.trim()
+                Cow::Owned(compact_llm_context_text(
+                    active.draft.accumulated.trim(),
+                    ACTIVE_SPEECH_PLANNING_ALREADY_EMITTED_CHARS,
+                ))
             }
         ));
     }
@@ -626,7 +681,7 @@ fn is_non_empty_target(target: &str) -> bool {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct GenerationTurnContext {
-    thinking_prefill: String,
+    base_user_prompt: String,
 }
 
 fn push_generation_context(
@@ -634,13 +689,10 @@ fn push_generation_context(
     args: &PrepareSpeechArgs,
     draft: &GenerationDraft,
 ) -> GenerationTurnContext {
-    let thinking_prefill = format_generation_thinking_prefill(args, draft);
-    session.push_ephemeral_user(GENERATION_TURN_USER_PROMPT);
-    session.push_ephemeral_assistant_text(thinking_prefill.clone());
-    if !draft.accumulated.is_empty() {
-        session.push_ephemeral_assistant_text(draft.accumulated.clone());
-    }
-    GenerationTurnContext { thinking_prefill }
+    let base_user_prompt = format_generation_turn_user_prompt(args, draft);
+    let llm_user_prompt = format_generation_llm_user_prompt(args, draft);
+    session.push_ephemeral_user(llm_user_prompt);
+    GenerationTurnContext { base_user_prompt }
 }
 
 fn push_completed_generation_turn(
@@ -648,8 +700,7 @@ fn push_completed_generation_turn(
     context: &GenerationTurnContext,
     text: &str,
 ) {
-    session.push_user(GENERATION_TURN_USER_PROMPT);
-    session.push_assistant_text(context.thinking_prefill.clone());
+    session.push_user(context.base_user_prompt.clone());
     session.input_mut().push(ModelInputItem::turn(Arc::new(
         AssistantTurnView::from_items(&[AssistantTurnItem::Text(text.to_owned())]),
     )));
@@ -929,30 +980,37 @@ impl SpeakModule {
         let now = self.clock.now();
         self.append_generation_cognition_context(cx, &batch.cognition_entries)
             .await?;
-        let (plan, mut draft) = if let Some(active) = self.active_speech.take() {
+        let (plan, mut draft, generation_slices_since_plan) = if let Some(active) =
+            self.active_speech.take()
+        {
             let planning_context =
                 active_speech_cognition_context_from_entries(&batch.cognition_entries, now);
             let should_continue_without_planning = batch.continue_active_speech
                 && batch.updates.is_empty()
-                && batch.cognition_entries.is_empty();
+                && batch.cognition_entries.is_empty()
+                && active.generation_slices_since_plan < SPEECH_GENERATION_SLICES_PER_PLAN;
             if should_continue_without_planning {
+                let generation_slices_since_plan = active.generation_slices_since_plan;
                 let plan = PlannedSpeech {
                     args: active.args,
                     target: active.draft.target.clone(),
                 };
-                (plan, active.draft)
+                (plan, active.draft, generation_slices_since_plan)
             } else {
                 let Some(active_plan) = self
                     .plan_active_speech(cx, &planning_context, &active)
                     .await?
                 else {
                     self.mark_generation_cognition_entries_reflected(&batch.cognition_entries);
-                    self.active_speech = Some(active);
+                    self.active_speech = Some(ActiveSpeech {
+                        generation_slices_since_plan: 0,
+                        ..active
+                    });
                     self.self_wake.wake();
                     return Ok(());
                 };
                 match active_plan {
-                    ActiveSpeechPlan::Continue(plan) => (plan, active.draft),
+                    ActiveSpeechPlan::Continue(plan) => (plan, active.draft, 0),
                     ActiveSpeechPlan::Redirect {
                         plan,
                         interrupt_reason,
@@ -961,7 +1019,7 @@ impl SpeakModule {
                             .await?;
                         let draft =
                             GenerationDraft::new(self.utterance.next_generation_id(), &plan.target);
-                        (plan, draft)
+                        (plan, draft, 0)
                     }
                     ActiveSpeechPlan::Abort { interrupt_reason } => {
                         self.record_aborted_generation(cx, &active.draft, &interrupt_reason)
@@ -994,7 +1052,7 @@ impl SpeakModule {
                 }
             };
             let draft = GenerationDraft::new(self.utterance.next_generation_id(), &plan.target);
-            (plan, draft)
+            (plan, draft, 0)
         };
 
         match self
@@ -1010,6 +1068,7 @@ impl SpeakModule {
                 self.active_speech = Some(ActiveSpeech {
                     args: plan.args.clone(),
                     draft,
+                    generation_slices_since_plan: generation_slices_since_plan.saturating_add(1),
                 });
                 self.self_wake.wake();
             }
@@ -1216,11 +1275,6 @@ impl SpeakModule {
                                             .language
                                             .clone()
                                             .or_else(|| active.args.language.clone()),
-                                        facts: if call.input.facts.is_empty() {
-                                            active.args.facts.clone()
-                                        } else {
-                                            call.input.facts.clone()
-                                        },
                                         my_speech_intent: call.input.my_speech_intent.clone(),
                                     },
                                     target,
@@ -1240,7 +1294,6 @@ impl SpeakModule {
                                         args: PrepareSpeechArgs {
                                             target: call.input.target.clone(),
                                             language: call.input.language.clone(),
-                                            facts: call.input.facts.clone(),
                                             my_speech_intent: call.input.my_speech_intent.clone(),
                                         },
                                         target,
@@ -1328,19 +1381,20 @@ impl SpeakModule {
             }
         };
 
-        self.emit_remaining_generation_deltas(
-            draft,
-            buffered_deltas,
-            flushed_deltas,
-            &mut flushed_delta_batches,
-        )
-        .await;
+        let slice_limit_reached = self
+            .emit_remaining_generation_deltas(
+                draft,
+                buffered_deltas,
+                flushed_deltas,
+                &mut flushed_delta_batches,
+            )
+            .await;
 
         match result {
             Ok(staged) => {
                 let usage = staged.usage;
                 let finish_reason = staged.finish_reason.clone();
-                if finish_reason == FinishReason::Length {
+                if slice_limit_reached || finish_reason == FinishReason::Length {
                     staged.turn.discard();
                     cx.compact_and_save(&mut self.generation_session, usage)
                         .await?;
@@ -1385,6 +1439,15 @@ impl SpeakModule {
             }
             Err(CollectError::UnexpectedEof { partial }) => {
                 let usage = partial.usage.unwrap_or_else(Usage::zero);
+                if slice_limit_reached {
+                    cx.compact_and_save(&mut self.generation_session, usage)
+                        .await?;
+                    return Ok(if draft.accumulated.trim().is_empty() {
+                        GenerationStreamOutcome::NoVisibleOutput
+                    } else {
+                        GenerationStreamOutcome::LengthLimited
+                    });
+                }
                 self.finish_completed_generation_slice(
                     cx,
                     turn_session,
@@ -1564,12 +1627,13 @@ impl SpeakModule {
         buffered_deltas: Arc<Mutex<GenerationDeltaBuffer>>,
         flushed_deltas: tokio::sync::mpsc::UnboundedSender<Vec<String>>,
         flushed_delta_batches: &mut tokio::sync::mpsc::UnboundedReceiver<Vec<String>>,
-    ) {
-        let remaining = {
+    ) -> bool {
+        let (remaining, limit_reached) = {
             let mut buffered = buffered_deltas
                 .lock()
                 .expect("generation delta buffer mutex poisoned");
-            buffered.finish()
+            let remaining = buffered.finish();
+            (remaining, buffered.limit_reached())
         };
         if let Some(deltas) = remaining {
             let _ = flushed_deltas.send(deltas);
@@ -1578,6 +1642,7 @@ impl SpeakModule {
         while let Some(deltas) = flushed_delta_batches.recv().await {
             self.emit_generation_delta_batch(draft, deltas).await;
         }
+        limit_reached
     }
 
     async fn emit_generation_delta_batch(&self, draft: &mut GenerationDraft, deltas: Vec<String>) {
@@ -1870,19 +1935,9 @@ mod tests {
         language: Option<&str>,
         my_speech_intent: &str,
     ) -> MockTextScenario {
-        prepare_speech_scenario_with_facts(target, language, &[], my_speech_intent)
-    }
-
-    fn prepare_speech_scenario_with_facts(
-        target: &str,
-        language: Option<&str>,
-        facts: &[&str],
-        my_speech_intent: &str,
-    ) -> MockTextScenario {
         let arguments_json = serde_json::json!({
             "target": target,
             "language": language,
-            "facts": facts,
             "my_speech_intent": my_speech_intent
         })
         .to_string();
@@ -1937,7 +1992,6 @@ mod tests {
 
     fn continue_speech_scenario(my_speech_intent: &str) -> MockTextScenario {
         let arguments_json = serde_json::json!({
-            "facts": [],
             "my_speech_intent": my_speech_intent
         })
         .to_string();
@@ -1966,7 +2020,6 @@ mod tests {
     ) -> MockTextScenario {
         let arguments_json = serde_json::json!({
             "target": target,
-            "facts": [],
             "my_speech_intent": my_speech_intent,
             "interrupt_reason": interrupt_reason
         })
@@ -2099,7 +2152,6 @@ mod tests {
         PrepareSpeechArgs {
             target: SpeechTarget::from(target),
             language: None,
-            facts: vec!["Koro asks for help.".into()],
             my_speech_intent: "Tell Koro to stay close because Koro asks for help.".into(),
         }
     }
@@ -2769,15 +2821,14 @@ mod tests {
         let inputs = observed.text_inputs();
         assert_eq!(inputs.len(), 2);
         let generation_text = model_input_text(&inputs[1]);
-        assert!(generation_text.contains(GENERATION_TURN_USER_PROMPT));
-        assert!(generation_text.contains("<think>\nPreparing speech to `Ryo`."));
+        assert!(generation_text.contains("Generate an utterance to `Ryo`."));
         assert!(generation_text.contains("Language: Japanese"));
         assert!(generation_text.contains("Recent context:\n- Ryo says, \"日本語でお願い\"."));
         assert!(generation_text.contains("Ryo says, \"日本語でお願い\""));
-        assert!(generation_text.contains("Facts:\n- (none supplied)"));
-        assert!(
-            generation_text.contains("my_speech_intent:\n日本語で短く返事する。\n</think>\nMe:\n")
-        );
+        assert!(!generation_text.contains("Facts for speech:"));
+        assert!(generation_text.contains("Your Speech Intent:\n日本語で短く返事する。"));
+        assert!(!generation_text.contains("<think>"));
+        assert!(!generation_text.contains("</think>"));
         assert!(!generation_text.contains("Context cue:"));
         assert!(!generation_text.contains("Speak to:"));
         assert!(!generation_text.contains("Substance to express:"));
@@ -2785,12 +2836,10 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn facts_and_my_speech_intent_flow_to_generation_input() {
+    async fn my_speech_intent_flows_to_generation_input_without_facts() {
         let adapter = MockLlmAdapter::new()
-            .with_text_scenario(prepare_speech_scenario_with_facts(
+            .with_text_scenario(prepare_speech_scenario(
                 "Ryo",
-                None,
-                &["Ryo greeted Nui in Japanese."],
                 "Return the greeting warmly and acknowledge Ryo.",
             ))
             .with_text_scenario(generation_text_scenario("こんにちは、Ryo。"));
@@ -2826,17 +2875,20 @@ mod tests {
         let generation_text = model_input_text(&inputs[1]);
         assert!(generation_text.contains("Recent context:\n- Ryo says, \"こんにちは Nui\"."));
         assert!(generation_text.contains("Ryo says, \"こんにちは Nui\""));
-        assert!(generation_text.contains("Facts:\n- Ryo greeted Nui in Japanese."));
-        assert!(generation_text.contains(
-            "my_speech_intent:\nReturn the greeting warmly and acknowledge Ryo.\n</think>\nMe:\n"
-        ));
+        assert!(!generation_text.contains("Facts for speech:"));
+        assert!(
+            generation_text
+                .contains("Your Speech Intent:\nReturn the greeting warmly and acknowledge Ryo.")
+        );
+        assert!(!generation_text.contains("<think>"));
+        assert!(!generation_text.contains("</think>"));
         assert!(!generation_text.contains("Context cue:"));
         assert!(!generation_text.contains("Ryo replies"));
         assert!(!generation_text.contains("Ryo smiles"));
     }
 
     #[test]
-    fn fresh_generation_uses_thinking_plan_prefill() {
+    fn fresh_generation_uses_single_user_prompt() {
         let draft = GenerationDraft::new(7, "Koro");
         let args = test_prepare_speech_args("Koro");
         let mut session = Session::new();
@@ -2846,22 +2898,19 @@ mod tests {
 
         assert_eq!(draft.generation_id, 7);
         assert_eq!(draft.sequence, 0);
-        assert_eq!(items.len(), 2);
+        assert_eq!(items.len(), 1);
         let text =
             model_input_message_text(&items[0], InputMessageRole::User, "user generation context");
-        assert_eq!(text, GENERATION_TURN_USER_PROMPT);
-        let ModelInputItem::Assistant(AssistantInputItem::Text(text)) = &items[1] else {
-            panic!("expected assistant thinking prefill");
-        };
         assert!(!text.contains("Recent context:"));
         assert!(!text.contains("What you are currently thinking at"));
         assert!(!text.contains("New thoughts available to you at"));
-        assert!(text.contains("<think>\nPreparing speech to `Koro`."));
-        assert!(text.contains("Facts:\n- Koro asks for help."));
-        assert!(text.contains("my_speech_intent:"));
-        assert!(text.ends_with("Me:\n"));
-        assert!(text.contains("</think>"));
+        assert!(text.contains("Generate an utterance to `Koro`."));
+        assert!(!text.contains("Facts for speech:"));
+        assert!(text.contains("Your Speech Intent:"));
         assert!(text.contains("Tell Koro to stay close because Koro asks for help."));
+        assert!(!text.contains("<think>"));
+        assert!(!text.contains("</think>"));
+        assert!(!text.contains("Me:"));
         assert!(!text.contains("Context cue:"));
         assert!(!text.contains("Speak to:"));
         assert!(!text.contains("Substance to express:"));
@@ -2880,17 +2929,19 @@ mod tests {
         let args = PrepareSpeechArgs {
             target: SpeechTarget::from("Ryo"),
             language: Some("Japanese".into()),
-            facts: vec!["Ryo requested Japanese.".into()],
             my_speech_intent: "日本語で短く返事する。".into(),
         };
 
-        let text = format_generation_thinking_prefill(&args, &draft);
+        let text = format_generation_turn_user_prompt(&args, &draft);
 
         assert!(!text.contains("Recent context:"));
-        assert!(text.contains("<think>\nPreparing speech to `Ryo`."));
+        assert!(text.contains("Generate an utterance to `Ryo`."));
         assert!(text.contains("Language: Japanese"));
-        assert!(text.contains("Facts:\n- Ryo requested Japanese."));
-        assert!(text.contains("my_speech_intent:\n日本語で短く返事する。\n</think>\nMe:\n"));
+        assert!(!text.contains("Facts for speech:"));
+        assert!(text.contains("Your Speech Intent:\n日本語で短く返事する。"));
+        assert!(!text.contains("<think>"));
+        assert!(!text.contains("</think>"));
+        assert!(!text.contains("Me:"));
         assert!(!text.contains("Speak to:"));
         assert!(!text.contains("Substance to express:"));
         assert!(!text.contains("New thoughts available to you at"));
@@ -2902,17 +2953,13 @@ mod tests {
         let args = PrepareSpeechArgs {
             target: SpeechTarget::from("Pibi"),
             language: None,
-            facts: vec![
-                "Pibi asks whether dinner is ready or where it is.".into(),
-                "I see no food or person nearby.".into(),
-            ],
             my_speech_intent: "Tell Pibi I do not know whether dinner is ready or where it is, because I see no food or person nearby.".into(),
         };
 
-        let text = format_generation_thinking_prefill(&args, &draft);
+        let text = format_generation_turn_user_prompt(&args, &draft);
 
         assert!(!text.contains("Recent context:"));
-        assert!(text.contains("Facts:\n- Pibi asks whether dinner is ready or where it is."));
+        assert!(!text.contains("Facts for speech:"));
         assert!(text.contains("I do not know whether dinner is ready"));
         assert!(text.contains("I see no food or person nearby."));
     }
@@ -2921,7 +2968,23 @@ mod tests {
     fn speech_prompts_are_slim_and_avoid_peer_catalog() {
         let prompt = nuillu_module::format_policy_system_prompt(GENERATION_PROMPT, &[]);
 
-        assert!(prompt.len() < 1100);
+        assert!(prompt.len() < 1800);
+        assert!(prompt.contains("Do not summarize the request or say what the user wants."));
+        assert!(prompt.contains("not appropriate to say aloud to the target"));
+        assert!(prompt.contains("introspection, narration, or analysis"));
+        assert!(prompt.contains("If Your Speech Intent is already a usable utterance"));
+        assert!(prompt.contains("already emitted text below"));
+        assert!(prompt.contains("Emit only the next new text"));
+        assert!(prompt.contains("Do not repeat, restate, or include any already emitted text."));
+        assert!(prompt.contains("Generate an utterance to `Ryo`."));
+        assert!(prompt.contains(
+            "Your Speech Intent:\nこんにちは！Ryoさんは、何か楽しいことを準備していますか？"
+        ));
+        assert!(prompt.contains(
+            "Already emitted:\nこんにちは！Ryoさんは、何か楽しい\nAssistant:\nことを準備していますか？"
+        ));
+        assert!(!prompt.contains("Assistant prefill:"));
+        assert!(!prompt.contains("Assistant continuation:"));
         assert!(!prompt.contains("Identity memory loaded at agent startup"));
         assert!(!prompt.contains("prepare_speech"));
         assert!(!prompt.contains("tool call"));
@@ -2929,11 +2992,39 @@ mod tests {
         assert!(!prompt.contains("You are part of a cognitive system"));
         assert!(!prompt.contains("- cognition-gate:"));
         assert!(!prompt.contains("- query-memory:"));
+        assert!(SPEECH_PLANNING_PROMPT.contains("Abort in-progress speech"));
+        assert!(SPEECH_PLANNING_PROMPT.contains("not appropriate to say aloud to the target"));
+        assert!(SPEECH_PLANNING_PROMPT.contains("repeated broken text"));
         assert!(!SPEECH_PLANNING_PROMPT.contains("\"self\""));
         assert!(!SPEECH_PLANNING_PROMPT.contains("greet"));
         assert!(!SPEECH_PLANNING_PROMPT.contains("Hi"));
         assert!(!SPEECH_PLANNING_PROMPT.contains("allocation"));
         assert!(!SPEECH_PLANNING_PROMPT.contains("allocated"));
+    }
+
+    #[test]
+    fn active_planning_input_truncates_long_partial_utterance() {
+        let long_partial =
+            "The user wants me to generate a Japanese utterance for Ryo. ".repeat(80);
+        let active = ActiveSpeech {
+            args: test_prepare_speech_args("Ryo"),
+            draft: GenerationDraft {
+                generation_id: 3,
+                sequence: 9,
+                accumulated: long_partial.clone(),
+                target: "Ryo".into(),
+            },
+            generation_slices_since_plan: SPEECH_GENERATION_SLICES_PER_PLAN,
+        };
+
+        let input = format_planning_input("New thoughts available:\n- none", Some(&active), &[]);
+
+        assert!(input.contains("Already emitted: The user wants me"));
+        assert!(!input.contains(&long_partial));
+        assert!(
+            input.len() < 1_200,
+            "active planning input should not carry the full runaway partial"
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -3023,10 +3114,11 @@ mod tests {
         assert!(
             generation_text.contains("Recent context:\n- Koro asks Nuillu to help them stay safe.")
         );
-        assert!(generation_text.contains(GENERATION_TURN_USER_PROMPT));
-        assert!(generation_text.contains("<think>\nPreparing speech to `Koro`."));
+        assert!(generation_text.contains("Generate an utterance to `Koro`."));
         assert!(generation_text.contains("Koro asks Nuillu to help them stay safe."));
-        assert!(generation_text.contains("my_speech_intent:\nTell Koro to stay close."));
+        assert!(generation_text.contains("Your Speech Intent:\nTell Koro to stay close."));
+        assert!(!generation_text.contains("<think>"));
+        assert!(!generation_text.contains("</think>"));
         let inputs = observed.text_inputs();
         assert_eq!(inputs.len(), 2);
         let generation_input = model_input_text(&inputs[1]);
@@ -3036,8 +3128,9 @@ mod tests {
         );
         assert!(!generation_input.contains("New thoughts available to you at "));
         assert!(!generation_input.contains("What you are currently thinking at "));
-        assert!(generation_input.contains(GENERATION_TURN_USER_PROMPT));
-        assert!(generation_input.contains("<think>\nPreparing speech to `Koro`."));
+        assert!(generation_input.contains("Generate an utterance to `Koro`."));
+        assert!(!generation_input.contains("<think>"));
+        assert!(!generation_input.contains("</think>"));
         assert_eq!(
             session_turn_texts(&module.generation_session),
             vec!["Koro, stay close.".to_string()]
@@ -3087,6 +3180,58 @@ mod tests {
             turns[1].config.generation.max_output_tokens, None,
             "speak generation is sliced by visible text deltas so reasoning tokens do not consume the slice budget"
         );
+    }
+
+    #[test]
+    fn generation_delta_buffer_seals_after_slice_limit() {
+        let mut buffer = GenerationDeltaBuffer::default();
+        let first_seven = ["K", "o", "r", "o", ",", " ", "s"];
+
+        for delta in first_seven {
+            assert_eq!(buffer.push(delta.to_string()), None);
+            assert!(!buffer.limit_reached());
+        }
+
+        assert_eq!(
+            buffer.push("t".to_string()),
+            Some(
+                ["K", "o", "r", "o", ",", " ", "s", "t"]
+                    .into_iter()
+                    .map(str::to_string)
+                    .collect()
+            )
+        );
+        assert!(buffer.limit_reached());
+        assert_eq!(buffer.push(" ignored".to_string()), None);
+        assert_eq!(buffer.finish(), None);
+    }
+
+    #[test]
+    fn generation_delta_buffer_truncates_long_visible_delta() {
+        let mut buffer = GenerationDeltaBuffer::default();
+
+        assert_eq!(
+            buffer.push("あいうえおかきくけこさしすせそたちつてと追加".to_string()),
+            Some(vec!["あいうえおかきくけこさしすせそたちつてと".to_string()])
+        );
+        assert!(buffer.limit_reached());
+        assert_eq!(buffer.push(" ignored".to_string()), None);
+        assert_eq!(buffer.finish(), None);
+    }
+
+    #[test]
+    fn generation_delta_buffer_seals_on_accumulated_char_limit() {
+        let mut buffer = GenerationDeltaBuffer::default();
+
+        assert_eq!(buffer.push("123456789".to_string()), None);
+        assert!(!buffer.limit_reached());
+        assert_eq!(
+            buffer.push("abcdefghijklmno".to_string()),
+            Some(vec!["123456789".to_string(), "abcdefghijk".to_string()])
+        );
+        assert!(buffer.limit_reached());
+        assert_eq!(buffer.push(" ignored".to_string()), None);
+        assert_eq!(buffer.finish(), None);
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -3184,6 +3329,137 @@ mod tests {
         };
         assert!(matches!(outcome, GenerationStreamOutcome::LengthLimited));
         assert_eq!(draft.accumulated, "Koro, st");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn generation_slice_limit_ignores_text_deltas_after_cap() {
+        let adapter = MockLlmAdapter::new().with_text_scenario(
+            generation_text_deltas_scenario_with_finish_reason(
+                &["K", "o", "r", "o", ",", " ", "s", "t", "a", "y"],
+                FinishReason::Stop,
+            ),
+        );
+        let mut allocation = ResourceAllocation::default();
+        allocation.set(builtin::speak(), ModuleConfig::default());
+        allocation.set_activation(builtin::speak(), ActivationRatio::ONE);
+        let blackboard = Blackboard::with_allocation(allocation);
+        let deltas = Rc::new(RefCell::new(Vec::new()));
+        let sink: Rc<dyn UtteranceSink> = Rc::new(CapturingDeltaSink {
+            deltas: Rc::clone(&deltas),
+            first_delta: RefCell::new(None),
+        });
+        let (mut module, _caps) =
+            speak_module_with_turn_adapter(blackboard, Arc::new(adapter), sink).await;
+        let now = SystemClock.now();
+        let cx = test_activate_cx(&module, now).await;
+        let mut draft = GenerationDraft::new(0, "Koro");
+        let args = test_prepare_speech_args("Koro");
+
+        let outcome = module
+            .collect_generation_slice(&cx, &args, &mut draft)
+            .await
+            .unwrap();
+
+        assert!(matches!(outcome, GenerationStreamOutcome::LengthLimited));
+        assert_eq!(
+            deltas.borrow().as_slice(),
+            &[
+                ("Koro".to_string(), 0, 0, "K".to_string()),
+                ("Koro".to_string(), 0, 1, "o".to_string()),
+                ("Koro".to_string(), 0, 2, "r".to_string()),
+                ("Koro".to_string(), 0, 3, "o".to_string()),
+                ("Koro".to_string(), 0, 4, ",".to_string()),
+                ("Koro".to_string(), 0, 5, " ".to_string()),
+                ("Koro".to_string(), 0, 6, "s".to_string()),
+                ("Koro".to_string(), 0, 7, "t".to_string()),
+            ]
+        );
+        assert_eq!(draft.accumulated, "Koro, st");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn generation_long_text_delta_is_truncated_and_kept_active() {
+        let adapter = MockLlmAdapter::new().with_text_scenario(
+            generation_text_deltas_scenario_with_finish_reason(
+                &["あいうえおかきくけこさしすせそたちつてと追加", "ignored"],
+                FinishReason::Stop,
+            ),
+        );
+        let mut allocation = ResourceAllocation::default();
+        allocation.set(builtin::speak(), ModuleConfig::default());
+        allocation.set_activation(builtin::speak(), ActivationRatio::ONE);
+        let blackboard = Blackboard::with_allocation(allocation);
+        let deltas = Rc::new(RefCell::new(Vec::new()));
+        let sink: Rc<dyn UtteranceSink> = Rc::new(CapturingDeltaSink {
+            deltas: Rc::clone(&deltas),
+            first_delta: RefCell::new(None),
+        });
+        let (mut module, _caps) =
+            speak_module_with_turn_adapter(blackboard, Arc::new(adapter), sink).await;
+        let now = SystemClock.now();
+        let cx = test_activate_cx(&module, now).await;
+        let mut draft = GenerationDraft::new(0, "Ryo");
+        let args = test_prepare_speech_args("Ryo");
+
+        let outcome = module
+            .collect_generation_slice(&cx, &args, &mut draft)
+            .await
+            .unwrap();
+
+        assert!(matches!(outcome, GenerationStreamOutcome::LengthLimited));
+        assert_eq!(
+            deltas.borrow().as_slice(),
+            &[(
+                "Ryo".to_string(),
+                0,
+                0,
+                "あいうえおかきくけこさしすせそたちつてと".to_string(),
+            )]
+        );
+        assert_eq!(
+            draft.accumulated,
+            "あいうえおかきくけこさしすせそたちつてと"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn generation_accumulated_char_limit_stops_before_eight_deltas() {
+        let adapter = MockLlmAdapter::new().with_text_scenario(
+            generation_text_deltas_scenario_with_finish_reason(
+                &["1234567890", "abcdefghijklmno", "ignored"],
+                FinishReason::Stop,
+            ),
+        );
+        let mut allocation = ResourceAllocation::default();
+        allocation.set(builtin::speak(), ModuleConfig::default());
+        allocation.set_activation(builtin::speak(), ActivationRatio::ONE);
+        let blackboard = Blackboard::with_allocation(allocation);
+        let deltas = Rc::new(RefCell::new(Vec::new()));
+        let sink: Rc<dyn UtteranceSink> = Rc::new(CapturingDeltaSink {
+            deltas: Rc::clone(&deltas),
+            first_delta: RefCell::new(None),
+        });
+        let (mut module, _caps) =
+            speak_module_with_turn_adapter(blackboard, Arc::new(adapter), sink).await;
+        let now = SystemClock.now();
+        let cx = test_activate_cx(&module, now).await;
+        let mut draft = GenerationDraft::new(0, "Ryo");
+        let args = test_prepare_speech_args("Ryo");
+
+        let outcome = module
+            .collect_generation_slice(&cx, &args, &mut draft)
+            .await
+            .unwrap();
+
+        assert!(matches!(outcome, GenerationStreamOutcome::LengthLimited));
+        assert_eq!(
+            deltas.borrow().as_slice(),
+            &[
+                ("Ryo".to_string(), 0, 0, "1234567890".to_string()),
+                ("Ryo".to_string(), 0, 1, "abcdefghij".to_string()),
+            ]
+        );
+        assert_eq!(draft.accumulated, "1234567890abcdefghij");
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -3312,8 +3588,10 @@ mod tests {
             vec!["Koro, stay close.".to_string()]
         );
         let generation_text = session_input_text(&module.generation_session);
-        assert!(generation_text.contains("<think>\nPreparing speech to `Koro`."));
+        assert!(generation_text.contains("Generate an utterance to `Koro`."));
         assert!(!generation_text.contains("hidden reasoning"));
+        assert!(!generation_text.contains("<think>"));
+        assert!(!generation_text.contains("</think>"));
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -3440,6 +3718,7 @@ mod tests {
             .as_ref()
             .expect("partial output should remain active for continuation");
         assert_eq!(active.draft.accumulated, "Koro, st");
+        assert_eq!(active.generation_slices_since_plan, 1);
         assert_eq!(
             session_turn_texts(&module.generation_session),
             Vec::<String>::new()
@@ -3506,7 +3785,11 @@ mod tests {
         assert!(memos[0].contains("my_speech_intent:\nTell Koro to stay close."));
         assert!(memos[0].contains("Already said:\nKoro, st"));
         assert!(!memos[0].contains("I said to Koro"));
-        assert!(module.active_speech.is_some());
+        let active = module
+            .active_speech
+            .as_ref()
+            .expect("sliced output should remain active for continuation");
+        assert_eq!(active.generation_slices_since_plan, 1);
         let speak_owner = ModuleInstanceId::new(builtin::speak(), ReplicaIndex::ZERO);
         let progress = blackboard
             .read(|bb| bb.utterance_progress_for_instance(&speak_owner).cloned())
@@ -3604,26 +3887,27 @@ mod tests {
         assert!(!full_input_text.contains("none since the previous speech slice"));
         assert!(!full_input_text.contains("New thoughts available to you at "));
         let items = generation_input.items();
-        assert!(items.len() >= 3);
-        let tail = &items[items.len() - 3..];
+        assert!(!items.is_empty());
+        let last = items
+            .last()
+            .expect("generation input should have a user prompt");
         let user_text = model_input_message_text(
-            &tail[0],
+            last,
             InputMessageRole::User,
             "continuation generation user context",
         );
-        assert_eq!(user_text, GENERATION_TURN_USER_PROMPT);
+        assert!(user_text.contains("Generate an utterance to `Koro`."));
         assert!(!user_text.contains("Recent context:"));
-        let ModelInputItem::Assistant(AssistantInputItem::Text(text)) = &tail[1] else {
-            panic!("expected assistant thinking prefill");
-        };
-        assert!(text.contains("<think>\nPreparing speech to `Koro`."));
-        assert!(text.contains("my_speech_intent:\nTell Koro to stay close.\n</think>\nMe:\n"));
-        assert!(!text.contains("Speak to:"));
-        assert!(!text.contains("Substance to express:"));
-        let ModelInputItem::Assistant(AssistantInputItem::Text(text)) = &tail[2] else {
-            panic!("expected assistant partial utterance prefill");
-        };
-        assert_eq!(text, "Koro, st");
+        assert!(user_text.contains("Your Speech Intent:\nTell Koro to stay close."));
+        assert!(user_text.contains("Continue the utterance after the already emitted text below."));
+        assert!(user_text.contains("Emit only the next new text"));
+        assert!(user_text.contains("Do not repeat, restate, or include any already emitted text."));
+        assert!(user_text.ends_with("Already emitted:\nKoro, st"));
+        assert!(!user_text.contains("Already said:"));
+        assert!(!user_text.contains("Speak to:"));
+        assert!(!user_text.contains("Substance to express:"));
+        assert!(!user_text.contains("<think>"));
+        assert!(!user_text.contains("</think>"));
         assert_eq!(
             items
                 .iter()
@@ -3631,8 +3915,8 @@ mod tests {
                     matches!(item, ModelInputItem::Assistant(AssistantInputItem::Text(text)) if text == "Koro, st")
                 })
                 .count(),
-            1,
-            "partial utterance should appear only as the continuation prefill"
+            0,
+            "partial utterance should not appear as an assistant prefill"
         );
     }
 
@@ -3691,6 +3975,7 @@ mod tests {
             .expect("generation should still be active after the second slice");
         assert_eq!(active.draft.accumulated, "Koro, stay close");
         assert_eq!(active.draft.sequence, 16);
+        assert_eq!(active.generation_slices_since_plan, 2);
         let speak_owner = ModuleInstanceId::new(builtin::speak(), ReplicaIndex::ZERO);
         let progress = blackboard
             .read(|bb| bb.utterance_progress_for_instance(&speak_owner).cloned())
@@ -3707,6 +3992,107 @@ mod tests {
         assert!(!planning_text.contains("Outward speech currently in progress to Koro"));
         assert!(!planning_text.contains("Already emitted:\nKoro, st"));
         assert!(!planning_text.contains("Already emitted:\nKoro, stay close"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn generation_only_continuation_replans_after_three_slices() {
+        let adapter = MockLlmAdapter::new()
+            .with_text_scenario(prepare_speech_scenario("Koro", "Tell Koro to stay close."))
+            .with_text_scenario(generation_text_sliced_scenario(&[
+                "K", "o", "r", "o", ",", " ", "s", "t",
+            ]))
+            .with_text_scenario(generation_text_sliced_scenario(&[
+                "a", "y", " ", "c", "l", "o", "s", "e",
+            ]))
+            .with_text_scenario(generation_text_sliced_scenario(&[
+                " ", "n", "o", "w", " ", "p", "l", "e",
+            ]))
+            .with_text_scenario(continue_speech_scenario(
+                "Tell Koro to stay close now please.",
+            ))
+            .with_text_scenario(generation_text_scenario("ase."));
+        let mut allocation = ResourceAllocation::default();
+        allocation.set(builtin::speak(), ModuleConfig::default());
+        allocation.set_activation(builtin::speak(), ActivationRatio::ONE);
+        let blackboard = Blackboard::with_allocation(allocation);
+        let completed = Rc::new(RefCell::new(Vec::new()));
+        let sink: Rc<dyn crate::utterance::UtteranceSink> = Rc::new(CapturingUtteranceSink {
+            completed: Rc::clone(&completed),
+            done: RefCell::new(None),
+        });
+        let (mut module, caps) =
+            speak_module_with_turn_adapter(blackboard.clone(), Arc::new(adapter), sink).await;
+        caps.scene().set([Participant::new("Koro")]);
+        let now = SystemClock.now();
+        publish_cognition_update(
+            &blackboard,
+            &caps,
+            now,
+            "Koro asks Nuillu to help them stay safe.",
+        )
+        .await;
+
+        let first_batch = module.next_batch().await.unwrap();
+        let cx = test_activate_cx(&module, now).await;
+        SpeakModule::activate(&mut module, &cx, &first_batch)
+            .await
+            .unwrap();
+
+        let second_batch = tokio::time::timeout(Duration::from_millis(100), module.next_batch())
+            .await
+            .expect("first continuation should not wait for cognition")
+            .unwrap();
+        assert!(second_batch.continue_active_speech);
+        assert!(second_batch.updates.is_empty());
+        assert!(second_batch.cognition_entries.is_empty());
+        let cx = test_activate_cx(&module, now + chrono::Duration::seconds(1)).await;
+        SpeakModule::activate(&mut module, &cx, &second_batch)
+            .await
+            .unwrap();
+        assert_eq!(module.planning_session.list_turns().count(), 1);
+
+        let third_batch = tokio::time::timeout(Duration::from_millis(100), module.next_batch())
+            .await
+            .expect("second continuation should not wait for cognition")
+            .unwrap();
+        assert!(third_batch.continue_active_speech);
+        assert!(third_batch.updates.is_empty());
+        assert!(third_batch.cognition_entries.is_empty());
+        let cx = test_activate_cx(&module, now + chrono::Duration::seconds(2)).await;
+        SpeakModule::activate(&mut module, &cx, &third_batch)
+            .await
+            .unwrap();
+
+        let active = module
+            .active_speech
+            .as_ref()
+            .expect("third sliced output should remain active");
+        assert_eq!(active.generation_slices_since_plan, 3);
+        assert_eq!(module.planning_session.list_turns().count(), 1);
+
+        let fourth_batch = tokio::time::timeout(Duration::from_millis(100), module.next_batch())
+            .await
+            .expect("third continuation should still self-wake")
+            .unwrap();
+        assert!(fourth_batch.continue_active_speech);
+        assert!(fourth_batch.updates.is_empty());
+        assert!(fourth_batch.cognition_entries.is_empty());
+        let cx = test_activate_cx(&module, now + chrono::Duration::seconds(3)).await;
+        SpeakModule::activate(&mut module, &cx, &fourth_batch)
+            .await
+            .unwrap();
+
+        assert_eq!(module.planning_session.list_turns().count(), 2);
+        assert_eq!(
+            completed.borrow().as_slice(),
+            &[(
+                "Koro".to_string(),
+                "Koro, stay close now please.".to_string(),
+            )]
+        );
+        assert!(module.active_speech.is_none());
+        let planning_text = session_input_text(&module.planning_session);
+        assert!(planning_text.contains("Already emitted: Koro, stay close now ple"));
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -3777,28 +4163,37 @@ mod tests {
         assert_eq!(inputs.len(), 4);
         let generation_input = &inputs[3];
         let items = generation_input.items();
-        assert!(items.len() >= 3);
-        let tail = &items[items.len() - 3..];
+        assert!(!items.is_empty());
+        let last = items
+            .last()
+            .expect("generation input should have a user prompt");
         let user_text = model_input_message_text(
-            &tail[0],
+            last,
             InputMessageRole::User,
             "continuation generation user context",
         );
-        assert_eq!(user_text, GENERATION_TURN_USER_PROMPT);
-        let ModelInputItem::Assistant(AssistantInputItem::Text(text)) = &tail[1] else {
-            panic!("expected assistant thinking prefill");
-        };
-        assert!(text.contains("<think>\nPreparing speech to `everyone`."));
-        assert!(!text.contains("Alice is still present and waiting for the greeting reply."));
-        assert!(text.contains(
-            "my_speech_intent:\nAliceの挨拶に親しみを込めて短く応える。\n</think>\nMe:\n"
-        ));
-        assert!(!text.contains("Speak to:"));
-        assert!(!text.contains("Substance to express:"));
-        let ModelInputItem::Assistant(AssistantInputItem::Text(text)) = &tail[2] else {
-            panic!("expected assistant partial utterance prefill");
-        };
-        assert_eq!(text, partial);
+        assert!(user_text.contains("Generate an utterance to `everyone`."));
+        assert!(!user_text.contains("Alice is still present and waiting for the greeting reply."));
+        assert!(user_text.contains("Your Speech Intent:\nAliceの挨拶に親しみを込めて短く応える。"));
+        assert!(user_text.contains("Continue the utterance after the already emitted text below."));
+        assert!(user_text.contains("Emit only the next new text"));
+        assert!(user_text.contains("Do not repeat, restate, or include any already emitted text."));
+        assert!(user_text.ends_with(&format!("Already emitted:\n{partial}")));
+        assert!(!user_text.contains("Already said:"));
+        assert!(!user_text.contains("Speak to:"));
+        assert!(!user_text.contains("Substance to express:"));
+        assert!(!user_text.contains("<think>"));
+        assert!(!user_text.contains("</think>"));
+        assert_eq!(
+            items
+                .iter()
+                .filter(|item| {
+                    matches!(item, ModelInputItem::Assistant(AssistantInputItem::Text(text)) if text == partial)
+                })
+                .count(),
+            0,
+            "partial utterance should not appear as an assistant prefill"
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -3863,26 +4258,37 @@ mod tests {
         assert_eq!(inputs.len(), 4);
         let generation_input = &inputs[3];
         let items = generation_input.items();
-        assert!(items.len() >= 3);
-        let tail = &items[items.len() - 3..];
+        assert!(!items.is_empty());
+        let last = items
+            .last()
+            .expect("generation input should have a user prompt");
         let user_text = model_input_message_text(
-            &tail[0],
+            last,
             InputMessageRole::User,
             "continuation generation user plan",
         );
-        assert_eq!(user_text, GENERATION_TURN_USER_PROMPT);
-        let ModelInputItem::Assistant(AssistantInputItem::Text(text)) = &tail[1] else {
-            panic!("expected assistant thinking prefill");
-        };
-        assert!(text.contains("<think>\nPreparing speech to `Koro`."));
-        assert!(!text.contains("Koro sees a falling rock and now needs to duck."));
-        assert!(text.contains("my_speech_intent:\nTell Koro to duck now.\n</think>\nMe:\n"));
-        assert!(!text.contains("Speak to:"));
-        assert!(!text.contains("Substance to express:"));
-        let ModelInputItem::Assistant(AssistantInputItem::Text(text)) = &tail[2] else {
-            panic!("expected assistant partial utterance prefill");
-        };
-        assert_eq!(text, "Koro, du");
+        assert!(user_text.contains("Generate an utterance to `Koro`."));
+        assert!(!user_text.contains("Koro sees a falling rock and now needs to duck."));
+        assert!(user_text.contains("Your Speech Intent:\nTell Koro to duck now."));
+        assert!(user_text.contains("Continue the utterance after the already emitted text below."));
+        assert!(user_text.contains("Emit only the next new text"));
+        assert!(user_text.contains("Do not repeat, restate, or include any already emitted text."));
+        assert!(user_text.ends_with("Already emitted:\nKoro, du"));
+        assert!(!user_text.contains("Already said:"));
+        assert!(!user_text.contains("Speak to:"));
+        assert!(!user_text.contains("Substance to express:"));
+        assert!(!user_text.contains("<think>"));
+        assert!(!user_text.contains("</think>"));
+        assert_eq!(
+            items
+                .iter()
+                .filter(|item| {
+                    matches!(item, ModelInputItem::Assistant(AssistantInputItem::Text(text)) if text == "Koro, du")
+                })
+                .count(),
+            0,
+            "partial utterance should not appear as an assistant prefill"
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -3897,8 +4303,9 @@ mod tests {
                 "Tell the offstage voice to stop causing trouble.",
                 "The offstage voice is causing immediate trouble.",
             ))
-            .with_text_scenario(generation_text_scenario(
-                "Offstage voice, stop causing trouble.",
+            .with_text_scenario(generation_text_deltas_scenario_with_finish_reason(
+                &["Stop that, please."],
+                FinishReason::Stop,
             ));
         let capture = CapturingAdapter::new(adapter);
         let observed = capture.clone();
@@ -3946,7 +4353,7 @@ mod tests {
             completed.borrow().as_slice(),
             &[(
                 "OffstageVoice".to_string(),
-                "Offstage voice, stop causing trouble.".to_string(),
+                "Stop that, please.".to_string()
             )]
         );
         assert!(module.active_speech.is_none());
@@ -3960,10 +4367,7 @@ mod tests {
             nuillu_blackboard::UtteranceProgressState::Completed
         );
         assert_eq!(progress.target, "OffstageVoice");
-        assert_eq!(
-            progress.partial_utterance,
-            "Offstage voice, stop causing trouble."
-        );
+        assert_eq!(progress.partial_utterance, "Stop that, please.");
         assert_eq!(observed.text_turns().len(), 4);
         let planning_text = session_input_text(&module.planning_session);
         assert!(!planning_text.contains("Completed outward utterance to Koro:\nKoro, st"));
@@ -4197,8 +4601,9 @@ mod tests {
                 "OffstageVoice",
                 "Tell the offstage voice to stop causing trouble.",
             ))
-            .with_text_scenario(generation_text_scenario(
-                "Offstage voice, stop causing trouble.",
+            .with_text_scenario(generation_text_deltas_scenario_with_finish_reason(
+                &["Stop that, please."],
+                FinishReason::Stop,
             ));
 
         let (blackboard, completed) = activate_once_with_adapter(
@@ -4212,7 +4617,7 @@ mod tests {
             completed.borrow().as_slice(),
             &[(
                 "OffstageVoice".to_string(),
-                "Offstage voice, stop causing trouble.".to_string(),
+                "Stop that, please.".to_string()
             )]
         );
         let speak_owner = ModuleInstanceId::new(builtin::speak(), ReplicaIndex::ZERO);
@@ -4228,7 +4633,7 @@ mod tests {
     }
 
     #[test]
-    fn resumed_generation_keeps_id_sequence_and_pushes_assistant_prefill() {
+    fn resumed_generation_keeps_id_sequence_and_uses_user_prompt_continuation() {
         let mut draft = GenerationDraft::new(11, "Koro");
         let args = test_prepare_speech_args("Koro");
         let mut session = Session::new();
@@ -4241,21 +4646,23 @@ mod tests {
         assert_eq!(draft.generation_id, 11);
         assert_eq!(draft.sequence, 2);
         assert_eq!(draft.accumulated, "hello world");
-        assert_eq!(items.len(), 3);
+        assert_eq!(items.len(), 1);
         let text =
             model_input_message_text(&items[0], InputMessageRole::User, "user generation context");
-        assert_eq!(text, GENERATION_TURN_USER_PROMPT);
-        let ModelInputItem::Assistant(AssistantInputItem::Text(text)) = &items[1] else {
-            panic!("expected assistant thinking prefill");
-        };
-        assert!(text.contains("<think>\nPreparing speech to `Koro`."));
-        assert!(text.contains(
-            "my_speech_intent:\nTell Koro to stay close because Koro asks for help.\n</think>\nMe:\n"
-        ));
-        let ModelInputItem::Assistant(AssistantInputItem::Text(text)) = &items[2] else {
-            panic!("expected assistant prefill");
-        };
-        assert_eq!(text, "hello world");
+        assert!(text.contains("Generate an utterance to `Koro`."));
+        assert!(
+            text.contains(
+                "Your Speech Intent:\nTell Koro to stay close because Koro asks for help."
+            )
+        );
+        assert!(text.contains("Continue the utterance after the already emitted text below."));
+        assert!(text.contains("Emit only the next new text"));
+        assert!(text.contains("Do not repeat, restate, or include any already emitted text."));
+        assert!(text.ends_with("Already emitted:\nhello world"));
+        assert!(!text.contains("Already said:"));
+        assert!(!text.contains("Output only the remaining continuation"));
+        assert!(!text.contains("<think>"));
+        assert!(!text.contains("</think>"));
     }
 
     #[test]
