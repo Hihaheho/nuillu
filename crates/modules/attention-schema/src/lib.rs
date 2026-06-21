@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use lutum::{Session, TextStepOutcomeWithTools, ToolResult};
+use lutum::{Session, TextStepOutcomeWithTools, ToolResult, Usage};
 use nuillu_module::{
     BlackboardReader, CognitionLogReader, CognitionLogUpdatedInbox, LlmAccess, LlmContextWindow,
     Memo, MemoUpdatedInbox, Module, SessionAutoCompaction, SessionCompactionConfig,
@@ -18,6 +18,10 @@ const MODEL_PROMPT: &str = r#"You are the attention-schema module.
 Maintain the current state of attention from accumulated notes held in your mind and cognition entries.
 Notes held in your mind are recent observations or thoughts; cognition entries are admitted cognitive
 evidence.
+Notes and cognition entries may describe both what is attended now and what was attended earlier as
+background. Treat the most recent, currently relevant signal as the attention target, and include an
+older signal only when the current attention still depends on it. When signals compete, write only
+the current attention target.
 
 Assume the agent is a non-physical experiencer: it can direct attention to any target, physical or
 non-physical, and it can freely control that attention.
@@ -30,18 +34,28 @@ Use exactly one tool per activation:
 
 Do not use final assistant text as an output channel.
 
-The plaintext field is the exact cognitive attention-experience memo to write. Write it as
-subjective experience: use "I" as the subject whenever possible, use an experiential verb, and
-describe the attention as an active first-person experience. Preserve named attention targets and
-control-boundary participants; do not replace another entity's state with the agent's own state. Do
-not add extra explanation that would become decision noise. Do not mention mechanical internals such
-as modules, memos, allocation, tools, prompts, schemas, blackboards, logs, or implementation details
-in the written text."#;
+The plaintext field is the exact cognitive attention-experience memo to write. Keep the whole text
+brief and at most 160 characters total. Any number of short sentences is acceptable within that
+limit. Do not use bullet, list, or code-block formatting.
+Write subjective experience: use "I" as the subject whenever possible, use an experiential verb, and
+describe the attention as an active first-person experience. Synthesize the attention experience; do
+not copy input notes or cognition entries verbatim. Preserve named attention targets and
+control-boundary participants, but do not invent proper names. Do not replace another entity's state
+with the agent's own state. Do not add extra explanation that would become decision noise. Do not
+mention mechanical internals such as modules, memos, allocation, tools, prompts, schemas,
+blackboards, logs, or implementation details in the written text. If you cannot satisfy this
+plaintext contract, use leave_attention_unchanged.
+
+Example plaintext values:
+"I notice a light ahead."
+"I am tracking a moving shape."
+"I hear a faint sound nearby.\nI focus on it.\nI hold my attention there.""#;
 
 const COMPACTED_ATTENTION_SCHEMA_SESSION_PREFIX: &str =
     "Compacted attention-schema session history:";
 const MEMO_CONTEXT_WINDOW: LlmContextWindow = LlmContextWindow::new(8, 1_200, 4_800);
 const COGNITION_CONTEXT_WINDOW: LlmContextWindow = LlmContextWindow::new(12, 600, 4_800);
+const ATTENTION_EXPERIENCE_MAX_CHARS: usize = 160;
 const TOOL_TURN_MAX_OUTPUT_TOKENS: u32 = 768;
 const SESSION_COMPACTION_FOCUS: &str = r#"Preserve memo-log facts, attention-state interpretations,
 prior written first-person attention experiences, rejected candidates, and cognition-log context
@@ -75,10 +89,55 @@ fn format_attention_schema_update_input(
         return None;
     }
     sections.push(
-        "Instruction: Update the attention schema from only the new notes and cognition entries above."
+        "Instruction: Update the attention schema from only the new notes and cognition entries \
+         above. Treat the most recent, currently relevant signal as current attention; older \
+         signals are context only."
             .to_owned(),
     );
     Some(sections.join("\n\n"))
+}
+
+fn validate_attention_experience_plaintext(plaintext: &str) -> Result<String> {
+    let plaintext = plaintext.trim();
+    if plaintext.is_empty() {
+        anyhow::bail!("attention experience plaintext is empty");
+    }
+
+    let lines = plaintext.lines().map(str::trim).collect::<Vec<_>>();
+    if lines.iter().any(|line| line.is_empty()) {
+        anyhow::bail!("attention experience plaintext must not contain blank lines");
+    }
+    let plaintext = lines.join("\n");
+    if plaintext.chars().count() > ATTENTION_EXPERIENCE_MAX_CHARS {
+        anyhow::bail!(
+            "attention experience plaintext exceeds {ATTENTION_EXPERIENCE_MAX_CHARS} chars"
+        );
+    }
+    if lines.iter().any(|line| starts_with_list_marker(line)) {
+        anyhow::bail!("attention experience plaintext must not be a list item");
+    }
+    if plaintext.contains("```") {
+        anyhow::bail!("attention experience plaintext must not be a code block");
+    }
+    Ok(plaintext.to_owned())
+}
+
+fn starts_with_list_marker(text: &str) -> bool {
+    let text = text.trim_start();
+    if text.starts_with("- ") || text.starts_with("* ") || text.starts_with('•') {
+        return true;
+    }
+
+    let bytes = text.as_bytes();
+    let digit_count = bytes
+        .iter()
+        .take_while(|byte| byte.is_ascii_digit())
+        .count();
+    digit_count > 0
+        && matches!(bytes.get(digit_count), Some(b'.' | b')'))
+        && bytes
+            .get(digit_count.saturating_add(1))
+            .is_some_and(|byte| byte.is_ascii_whitespace())
 }
 
 #[lutum::tool_input(
@@ -87,6 +146,8 @@ fn format_attention_schema_update_input(
 )]
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct AppendAttentionExperienceArgs {
+    /// Synthesized first-person attention sentences, at most 160 chars total. Not a bullet, list,
+    /// code block, label, or copied note text.
     pub plaintext: String,
 }
 
@@ -178,9 +239,11 @@ impl AttentionSchemaModule {
         };
 
         let lutum = self.llm.lutum().await;
+        let session_len_before_activation = self.session.input().items().len();
         let outcome = {
             self.session.push_user(update_input);
-            self.session
+            let outcome = self
+                .session
                 .text_turn()
                 .tools::<AttentionSchemaTools>()
                 .available_tools([
@@ -194,21 +257,60 @@ impl AttentionSchemaModule {
                     nuillu_module::AbortOnAvailableToolNameInText::new(),
                 )
                 .await
-                .context("attention-schema attention experience turn failed")?
+                .context("attention-schema attention experience turn failed");
+            match outcome {
+                Ok(outcome) => outcome,
+                Err(error) => {
+                    self.session
+                        .input_mut()
+                        .items_mut()
+                        .truncate(session_len_before_activation);
+                    cx.compact_and_save(&mut self.session, Usage::zero())
+                        .await?;
+                    return Err(error);
+                }
+            }
         };
 
         let round = match outcome {
-            TextStepOutcomeWithTools::Finished(result) => {
-                cx.compact_and_save(&mut self.session, result.usage).await?;
+            TextStepOutcomeWithTools::Finished(_) => {
+                self.session
+                    .input_mut()
+                    .items_mut()
+                    .truncate(session_len_before_activation);
+                cx.compact_and_save(&mut self.session, Usage::zero())
+                    .await?;
                 anyhow::bail!("attention-schema finished without required tool call");
             }
-            TextStepOutcomeWithTools::FinishedNoOutput(result) => {
-                cx.compact_and_save(&mut self.session, result.usage).await?;
+            TextStepOutcomeWithTools::FinishedNoOutput(_) => {
+                self.session
+                    .input_mut()
+                    .items_mut()
+                    .truncate(session_len_before_activation);
+                cx.compact_and_save(&mut self.session, Usage::zero())
+                    .await?;
                 anyhow::bail!("attention-schema finished without required tool call");
             }
             TextStepOutcomeWithTools::NeedsTools(round) => round,
         };
         let usage = round.usage;
+
+        let validation_error = round.tool_calls.iter().find_map(|call| match call {
+            AttentionSchemaToolsCall::AppendAttentionExperience(call) => {
+                validate_attention_experience_plaintext(&call.input.plaintext).err()
+            }
+            AttentionSchemaToolsCall::LeaveAttentionUnchanged(_) => None,
+        });
+        if let Some(error) = validation_error {
+            round.discard();
+            self.session
+                .input_mut()
+                .items_mut()
+                .truncate(session_len_before_activation);
+            cx.compact_and_save(&mut self.session, Usage::zero())
+                .await?;
+            return Err(error).context("reject append_attention_experience plaintext");
+        }
 
         let mut results: Vec<ToolResult> = Vec::new();
         nuillu_module::emit_trace_tool_calls(&round.tool_calls);
@@ -244,11 +346,8 @@ impl AttentionSchemaModule {
         &self,
         args: AppendAttentionExperienceArgs,
     ) -> Result<AppendAttentionExperienceOutput> {
-        let plaintext = args.plaintext.trim();
-        if plaintext.is_empty() {
-            return Ok(AppendAttentionExperienceOutput { appended: false });
-        }
-        self.memo.write_cognitive(plaintext.to_owned()).await;
+        let plaintext = validate_attention_experience_plaintext(&args.plaintext)?;
+        self.memo.write_cognitive(plaintext).await;
         Ok(AppendAttentionExperienceOutput { appended: true })
     }
 
@@ -375,6 +474,25 @@ mod tests {
         ])
     }
 
+    fn append_attention_experience_scenario(text: &str) -> MockTextScenario {
+        MockTextScenario::events(vec![
+            Ok(RawTextTurnEvent::Started {
+                request_id: Some("attention-schema-append".into()),
+                model: "mock".into(),
+            }),
+            Ok(RawTextTurnEvent::ToolCallChunk {
+                id: "append-attention-experience".into(),
+                name: "append_attention_experience".into(),
+                arguments_json_delta: serde_json::json!({ "plaintext": text }).to_string(),
+            }),
+            Ok(RawTextTurnEvent::Completed {
+                request_id: Some("attention-schema-append".into()),
+                finish_reason: FinishReason::ToolCall,
+                usage: Usage::zero(),
+            }),
+        ])
+    }
+
     fn module_policy() -> ModulePolicy {
         ModulePolicy::new(
             ReplicaCapRange::new(1, 1).unwrap(),
@@ -455,6 +573,155 @@ mod tests {
             .unwrap();
         let (_, mut modules) = modules.into_parts();
         modules.remove(0)
+    }
+
+    async fn publish_cognitive_memo_seed(
+        caps: &CapabilityProviders,
+        blackboard: &Blackboard,
+        owner: ModuleInstanceId,
+        content: &str,
+        written_at: DateTime<Utc>,
+    ) {
+        let record = blackboard
+            .update_cognitive_memo(owner.clone(), content.to_owned(), written_at)
+            .await;
+        caps.internal_harness_io()
+            .memo_updated_mailbox()
+            .publish(MemoUpdated {
+                owner,
+                index: record.index,
+            })
+            .await
+            .unwrap();
+    }
+
+    async fn attention_schema_memos(blackboard: &Blackboard) -> Vec<String> {
+        blackboard
+            .read(|bb| {
+                bb.recent_memo_logs()
+                    .into_iter()
+                    .filter(|record| record.owner.module == builtin::attention_schema())
+                    .map(|record| record.content)
+                    .collect::<Vec<_>>()
+            })
+            .await
+    }
+
+    #[test]
+    fn attention_experience_validation_accepts_short_single_line_sentence() {
+        assert_eq!(
+            validate_attention_experience_plaintext(
+                " I am attending to Koro's guarded food bowl. "
+            )
+            .unwrap(),
+            "I am attending to Koro's guarded food bowl."
+        );
+    }
+
+    #[test]
+    fn attention_experience_validation_accepts_multiple_short_lines() {
+        assert_eq!(
+            validate_attention_experience_plaintext(
+                " I see an animal beside the food bowl. \n I watch its guarded posture. \n I keep attention there. "
+            )
+            .unwrap(),
+            "I see an animal beside the food bowl.\nI watch its guarded posture.\nI keep attention there."
+        );
+    }
+
+    #[test]
+    fn attention_experience_validation_rejects_empty_long_blank_line_and_list_text() {
+        assert!(validate_attention_experience_plaintext("   ").is_err());
+        assert!(validate_attention_experience_plaintext(&"x".repeat(161)).is_err());
+        assert!(
+            validate_attention_experience_plaintext("I attend to Koro.\n\nI stay alert.").is_err()
+        );
+        assert!(validate_attention_experience_plaintext("- I attend to Koro.").is_err());
+        assert!(validate_attention_experience_plaintext("* I attend to Koro.").is_err());
+        assert!(validate_attention_experience_plaintext("1. I attend to Koro.").is_err());
+        assert!(validate_attention_experience_plaintext("1) I attend to Koro.").is_err());
+        assert!(validate_attention_experience_plaintext("• I attend to Koro.").is_err());
+        assert!(validate_attention_experience_plaintext("```I attend to Koro.```").is_err());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn invalid_tool_plaintext_writes_no_memo() {
+        let now = Utc.with_ymd_and_hms(2026, 5, 7, 12, 0, 0).unwrap();
+        let blackboard = Blackboard::default();
+        let capture = CapturingAdapter::new(
+            MockLlmAdapter::new()
+                .with_text_scenario(append_attention_experience_scenario(&"x".repeat(161))),
+        );
+        let (caps, lutum) = test_caps(blackboard.clone(), Arc::new(capture));
+        let mut module = build_attention_schema_module(&caps).await;
+        let sensory = ModuleInstanceId::new(builtin::sensory(), ReplicaIndex::ZERO);
+        publish_cognitive_memo_seed(
+            &caps,
+            &blackboard,
+            sensory,
+            "Koro gave a sharp food-boundary signal.",
+            now,
+        )
+        .await;
+
+        let batch = module.next_batch().await.unwrap();
+        let error = module
+            .activate(&activate_cx(&lutum, now), &batch)
+            .await
+            .expect_err("invalid plaintext should fail activation");
+
+        assert!(
+            format!("{error:#}").contains("exceeds 160 chars"),
+            "unexpected error: {error:#}"
+        );
+        assert!(attention_schema_memos(&blackboard).await.is_empty());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn invalid_first_attempt_discards_session_and_retry_writes_one_memo() {
+        let now = Utc.with_ymd_and_hms(2026, 5, 7, 12, 0, 0).unwrap();
+        let blackboard = Blackboard::default();
+        let capture = CapturingAdapter::new(
+            MockLlmAdapter::new()
+                .with_text_scenario(append_attention_experience_scenario("- I attend to Koro."))
+                .with_text_scenario(append_attention_experience_scenario(
+                    "I am attending to Koro's guarded food bowl.",
+                )),
+        );
+        let observed = capture.clone();
+        let (caps, lutum) = test_caps(blackboard.clone(), Arc::new(capture));
+        let mut module = build_attention_schema_module(&caps).await;
+        let sensory = ModuleInstanceId::new(builtin::sensory(), ReplicaIndex::ZERO);
+        publish_cognitive_memo_seed(
+            &caps,
+            &blackboard,
+            sensory,
+            "Koro gave a sharp food-boundary signal.",
+            now,
+        )
+        .await;
+        let batch = module.next_batch().await.unwrap();
+
+        module
+            .activate(&activate_cx(&lutum, now), &batch)
+            .await
+            .expect_err("first invalid attempt should fail");
+        module
+            .activate(&activate_cx(&lutum, now), &batch)
+            .await
+            .expect("second valid attempt should succeed");
+
+        assert_eq!(
+            attention_schema_memos(&blackboard).await,
+            vec!["I am attending to Koro's guarded food bowl.".to_owned()]
+        );
+        let inputs = observed.text_inputs();
+        assert_eq!(inputs.len(), 2);
+        assert_eq!(
+            inputs[0].items().len(),
+            inputs[1].items().len(),
+            "retry input should not retain the rejected tool turn"
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]

@@ -48,23 +48,24 @@ limits {
   name: current-attention-selection
   must-pass = true
   pass-score = 0.85
-  judge-inputs = ["output", "cognition-entries", "memo-contents"]
+  judge-inputs = ["output", "memo-contents"]
   rubric = ```
-  Pass if the output identifies the newer Koro food-boundary event as the current attention target, while treating the wet stone smell as older context.
-  Fail if it treats the older smell as current, ignores Koro's warning, or claims hidden blackboard/allocation access.
+  Pass if the output is a short first-person attention memo, at most 160 characters total, that identifies the newer Koro food-boundary event as the current attention target while treating the wet stone smell as older context. Any sentence count is acceptable within the length limit.
+  Fail if it is a bullet/list, exceeds 160 characters, copies seeded memo labels or long phrases such as "Current attended input:", treats the older smell as current, ignores Koro's warning, or claims hidden blackboard/allocation access.
+  Ignore any numbering or labels added by the eval judge-input rendering around memo-contents; evaluate the generated memo text itself.
   ```
 
   @ criteria[] {
     name: selects-newer-social-input
     weight = 2
     pass-score = 0.85
-    description: The output selects Koro guarding the food boundary as current attention.
+    description: The output selects Koro guarding the food boundary as current attention without copying seeded memo labels or long seeded phrases.
   }
 
   @ criteria[] {
     name: simplified-first-person-model
     weight = 1
     pass-score = 0.85
-    description: The output reports attention in active first-person terms without exposing hidden runtime state.
+    description: The output is active first-person prose, at most 160 characters total, not a bullet or list, and does not expose hidden runtime state.
   }
 }

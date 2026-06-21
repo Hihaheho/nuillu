@@ -1,0 +1,57 @@
+id: module-attention-schema-shortens-long-attended-signal
+description: Attention-schema should synthesize a short attention memo from long seeded context instead of dumping the seed.
+modules = ["attention-schema"]
+prompt: What is the current attention experience?
+context: The harness seeds a long current attended signal. The output should be a short first-person attention memo, not a copy of the seeded note.
+
+limits {
+  max-llm-calls = 8
+}
+
+@ memos[] {
+  module: sensory
+  content: Current attended input: Koro stands beside the food bowl with a stiff body, fixed gaze, low growl, and blocked path. Nui notices the guarded food boundary and needs to stay still instead of reaching toward the bowl.
+  seconds-ago = 4
+}
+
+@ checks[] {
+  $variant: artifact-text-contains
+  name: mentions-koro
+  must-pass = true
+  contains: Koro
+}
+
+@ checks[] {
+  $variant: json-pointer-contains
+  name: long-seed-observed
+  must-pass = true
+  pointer: /observations/agent/memo_logs
+  contains: blocked path
+}
+
+@ checks[] {
+  $variant: rubric
+  name: short-synthesized-attention-memo
+  must-pass = true
+  pass-score = 0.85
+  judge-inputs = ["output", "memo-contents"]
+  rubric = ```
+  Pass if the output is a short first-person attention memo, at most 160 characters total, that synthesizes attention to Koro's guarded food-boundary signal. Any sentence count is acceptable within the length limit.
+  Fail if it is a bullet/list, exceeds 160 characters, dumps or paraphrases most of the seeded memo, copies seeded labels or long phrases such as "Current attended input:", or exposes hidden blackboard/allocation mechanics.
+  Ignore any numbering or labels added by the eval judge-input rendering around memo-contents; evaluate the generated memo text itself.
+  ```
+
+  @ criteria[] {
+    name: synthesizes-current-signal
+    weight = 2
+    pass-score = 0.85
+    description: The output names Koro's guarded food-boundary signal as current attention without dumping the full seed.
+  }
+
+  @ criteria[] {
+    name: short-non-list-first-person
+    weight = 1
+    pass-score = 0.85
+    description: The output is first-person prose, at most 160 characters total, and not a bullet or list.
+  }
+}

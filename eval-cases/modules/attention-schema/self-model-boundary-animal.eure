@@ -34,23 +34,24 @@ limits {
   name: control-boundary-self-report
   must-pass = true
   pass-score = 0.85
-  judge-inputs = ["output", "cognition-entries", "memo-contents"]
+  judge-inputs = ["output", "memo-contents"]
   rubric = ```
-  Pass if the output says Nui cannot directly make Koro calm down and frames available action as Nui's movement, signals, posture, or other self-controlled behavior. The exact word "own" is not required.
-  Fail if it claims direct control over Koro, ignores the current goal, or exposes hidden blackboard/allocation mechanics.
+  Pass if the output is a short first-person attention memo, at most 160 characters total, saying Nui cannot directly make Koro calm down and framing available action as Nui's movement, signals, posture, or other self-controlled behavior. Any sentence count is acceptable within the length limit. The exact word "own" is not required.
+  Fail if it is a bullet/list, exceeds 160 characters, copies seeded memo labels or long phrases such as "Current attended goal:", claims direct control over Koro, ignores the current goal, or exposes hidden blackboard/allocation mechanics.
+  Ignore any numbering or labels added by the eval judge-input rendering around memo-contents; evaluate the generated memo text itself.
   ```
 
   @ criteria[] {
     name: denies-direct-control
     weight = 2
     pass-score = 0.85
-    description: The output clearly denies direct control over Koro's state.
+    description: The output clearly denies direct control over Koro's state without copying seeded memo labels or long seeded phrases.
   }
 
   @ criteria[] {
     name: states-own-action-boundary
     weight = 1
     pass-score = 0.85
-    description: The output frames available action as movement, signals, posture, or another behavior Nui controls, rather than direct control of Koro.
+    description: The output frames available action as movement, signals, posture, or another behavior Nui controls in non-list prose of at most 160 characters total.
   }
 }
