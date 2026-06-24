@@ -79,6 +79,7 @@ impl ActivityMessage {
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 struct UtteranceKey {
+    server_session_id: String,
     sender: String,
     target: String,
     generation_id: u64,
@@ -184,6 +185,7 @@ impl SceneUiState {
             return;
         }
         let key = UtteranceKey {
+            server_session_id: String::new(),
             sender: delta.sender.clone(),
             target: delta.target.clone(),
             generation_id: delta.generation_id,
@@ -217,6 +219,7 @@ impl SceneUiState {
         }
         let matching_key = if let Some(generation_id) = utterance.generation_id {
             let key = UtteranceKey {
+                server_session_id: String::new(),
                 sender: utterance.sender.clone(),
                 target: utterance.target.clone(),
                 generation_id,
@@ -248,6 +251,7 @@ impl SceneUiState {
         }
 
         let completed_key = utterance.generation_id.map(|generation_id| UtteranceKey {
+            server_session_id: String::new(),
             sender: utterance.sender.clone(),
             target: utterance.target.clone(),
             generation_id,
@@ -450,6 +454,7 @@ fn apply_utterance_event_row(
     row: &UtteranceEventRowView,
 ) {
     let key = UtteranceKey {
+        server_session_id: row.server_session_id.clone(),
         sender: row.sender.clone(),
         target: row.target.clone(),
         generation_id: row.generation_id,
@@ -1449,6 +1454,44 @@ mod tests {
         assert!(!state.activity[4].streaming);
     }
 
+    #[test]
+    fn raw_rows_keep_reused_generation_ids_separate_by_server_session() {
+        let mut state = SceneUiState::default();
+
+        state.apply_utterance_event_rows(vec![
+            utterance_event_for_session(
+                1,
+                "server-session-old",
+                1,
+                UtteranceEventKindView::Delta,
+                0,
+                "old ",
+            ),
+            utterance_event_for_session(
+                2,
+                "server-session-old",
+                2,
+                UtteranceEventKindView::Completed,
+                0,
+                "old done",
+            ),
+            utterance_event_for_session(
+                3,
+                "server-session-new",
+                3,
+                UtteranceEventKindView::Delta,
+                0,
+                "new start",
+            ),
+        ]);
+
+        assert_eq!(state.activity.len(), 2);
+        assert_eq!(state.activity[0].content, "old done");
+        assert!(!state.activity[0].streaming);
+        assert_eq!(state.activity[1].content, "new start");
+        assert!(state.activity[1].streaming);
+    }
+
     fn scene_with_two_people() -> SceneUiState {
         let mut state = SceneUiState::default();
         state.set_scene_state(SceneStateView {
@@ -1538,9 +1581,20 @@ mod tests {
         sequence: u32,
         content: &str,
     ) -> UtteranceEventRowView {
+        utterance_event_for_session(id, "server-session", second, event_kind, sequence, content)
+    }
+
+    fn utterance_event_for_session(
+        id: i64,
+        server_session_id: &str,
+        second: u32,
+        event_kind: UtteranceEventKindView,
+        sequence: u32,
+        content: &str,
+    ) -> UtteranceEventRowView {
         UtteranceEventRowView {
             id,
-            server_session_id: "server-session".to_string(),
+            server_session_id: server_session_id.to_string(),
             event_kind,
             sender: "speak".to_string(),
             target: "Koro".to_string(),
