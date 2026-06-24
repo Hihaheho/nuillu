@@ -50,6 +50,12 @@ struct Args {
     /// Back up existing agent.db under --state before connecting, then start with a fresh DB.
     #[arg(long)]
     fresh_agent_db: bool,
+
+    /// Path to an existing visualizer GUI binary.
+    ///
+    /// Defaults to building the visualizer bin target.
+    #[arg(long = "visualizer-bin", value_name = "PATH")]
+    visualizer_bin: Option<PathBuf>,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -77,6 +83,7 @@ fn main() -> anyhow::Result<()> {
         disabled_modules: args.disable_module,
         participants: args.participants,
         fresh_agent_db: args.fresh_agent_db,
+        visualizer_bin: args.visualizer_bin,
     })
     .context("run nuillu server")
 }
@@ -168,5 +175,15 @@ mod tests {
         let args = Args::parse_from(["nuillu-server"]);
 
         assert!(!args.fresh_agent_db);
+    }
+
+    #[test]
+    fn args_parse_visualizer_bin_path() {
+        let args = Args::parse_from(["nuillu-server", "--visualizer-bin", "/custom/visualizer"]);
+
+        assert_eq!(
+            args.visualizer_bin,
+            Some(PathBuf::from("/custom/visualizer"))
+        );
     }
 }

@@ -1,5 +1,4 @@
 use std::{
-    env,
     io::Read as _,
     net::{TcpListener, TcpStream},
     path::{Path, PathBuf},
@@ -14,9 +13,7 @@ use nuillu_visualizer_protocol::{
     VisualizerAction, VisualizerClientMessage, VisualizerEvent, VisualizerServerMessage,
 };
 
-const VISUALIZER_GUI_BIN_ENV: &str = "NUILLU_VISUALIZER_GUI_BIN";
 const VISUALIZER_GUI_PACKAGE: &str = "nuillu-visualizer-egui";
-const VISUALIZER_GUI_BIN: &str = "nuillu-visualizer-gui";
 
 #[derive(Clone, Debug)]
 pub struct VisualizerEventSink {
@@ -112,33 +109,31 @@ pub fn accept_visualizer_connection(
     }
 }
 
-pub fn spawn_visualizer_gui(host: &str) -> anyhow::Result<Child> {
-    let mut command = visualizer_gui_command(host)?;
+pub fn spawn_visualizer_gui(host: &str, binary_path: Option<&Path>) -> anyhow::Result<Child> {
+    let mut command = visualizer_gui_command(host, binary_path)?;
     command
         .stdin(Stdio::null())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
         .spawn()
-        .context("spawn nuillu-visualizer-gui")
+        .context("spawn visualizer GUI")
 }
 
-fn visualizer_gui_command(host: &str) -> anyhow::Result<Command> {
-    let override_path = env::var(VISUALIZER_GUI_BIN_ENV).ok();
-    let path =
-        resolve_visualizer_gui_binary(override_path.as_deref(), build_visualizer_gui_binary)?;
+fn visualizer_gui_command(host: &str, binary_path: Option<&Path>) -> anyhow::Result<Command> {
+    let path = resolve_visualizer_gui_binary(binary_path, build_visualizer_gui_binary)?;
     let mut command = Command::new(path);
     command.arg("--host").arg(host);
     Ok(command)
 }
 
 fn resolve_visualizer_gui_binary(
-    override_path: Option<&str>,
+    override_path: Option<&Path>,
     build: impl FnOnce() -> anyhow::Result<PathBuf>,
 ) -> anyhow::Result<PathBuf> {
     if let Some(path) = override_path
-        && !path.trim().is_empty()
+        && !path.as_os_str().is_empty()
     {
-        return Ok(PathBuf::from(path));
+        return Ok(path.to_path_buf());
     }
     build()
 }
@@ -149,16 +144,14 @@ fn build_visualizer_gui_binary() -> anyhow::Result<PathBuf> {
         .arg("--release")
         .arg("-p")
         .arg(VISUALIZER_GUI_PACKAGE)
-        .arg("--bin")
-        .arg(VISUALIZER_GUI_BIN)
         .arg("--message-format=json-render-diagnostics")
         .current_dir(workspace_root())
         .output()
-        .context("build nuillu-visualizer-gui")?;
+        .context("build visualizer GUI")?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         anyhow::bail!(
-            "cargo build for {VISUALIZER_GUI_BIN} failed with {}\n{}",
+            "cargo build for {VISUALIZER_GUI_PACKAGE} failed with {}\n{}",
             output.status,
             stderr.trim_end()
         );
@@ -170,7 +163,7 @@ fn build_visualizer_gui_binary() -> anyhow::Result<PathBuf> {
     let executable = required_visualizer_executable_from_cargo_messages(stdout)?;
     if !executable.exists() {
         anyhow::bail!(
-            "cargo build for {VISUALIZER_GUI_BIN} reported executable {}, but it does not exist",
+            "cargo build for {VISUALIZER_GUI_PACKAGE} reported executable {}, but it does not exist",
             executable.display()
         );
     }
@@ -180,7 +173,7 @@ fn build_visualizer_gui_binary() -> anyhow::Result<PathBuf> {
 fn required_visualizer_executable_from_cargo_messages(messages: &str) -> anyhow::Result<PathBuf> {
     visualizer_executable_from_cargo_messages(messages)?.ok_or_else(|| {
         anyhow::anyhow!(
-            "cargo build for {VISUALIZER_GUI_BIN} succeeded but did not report an executable path"
+            "cargo build for {VISUALIZER_GUI_PACKAGE} succeeded but did not report an executable path"
         )
     })
 }
@@ -192,7 +185,7 @@ fn visualizer_executable_from_cargo_messages(messages: &str) -> anyhow::Result<O
         }
         let message: serde_json::Value = serde_json::from_str(line).with_context(|| {
             format!(
-                "parse cargo JSON message line {} while building {VISUALIZER_GUI_BIN}",
+                "parse cargo JSON message line {} while building {VISUALIZER_GUI_PACKAGE}",
                 line_index + 1
             )
         })?;
@@ -214,7 +207,7 @@ fn is_visualizer_compiler_artifact(message: &serde_json::Value) -> bool {
         && message
             .pointer("/target/name")
             .and_then(serde_json::Value::as_str)
-            == Some(VISUALIZER_GUI_BIN)
+            == Some(VISUALIZER_GUI_PACKAGE)
         && message
             .pointer("/target/kind")
             .and_then(serde_json::Value::as_array)
@@ -270,19 +263,19 @@ mod tests {
     #[test]
     fn cargo_messages_extract_visualizer_gui_executable() {
         let messages = r#"{"reason":"compiler-artifact","target":{"kind":["bin"],"name":"other-bin"},"executable":"/tmp/other-bin"}
-{"reason":"compiler-artifact","target":{"kind":["bin"],"name":"nuillu-visualizer-gui"},"executable":"/custom-target/release/nuillu-visualizer-gui"}"#;
+{"reason":"compiler-artifact","target":{"kind":["bin"],"name":"nuillu-visualizer-egui"},"executable":"/custom-target/release/nuillu-visualizer-egui"}"#;
 
         assert_eq!(
             visualizer_executable_from_cargo_messages(messages).unwrap(),
             Some(PathBuf::from(
-                "/custom-target/release/nuillu-visualizer-gui"
+                "/custom-target/release/nuillu-visualizer-egui"
             ))
         );
     }
 
     #[test]
     fn cargo_messages_ignore_null_executable_and_other_bins() {
-        let messages = r#"{"reason":"compiler-artifact","target":{"kind":["bin"],"name":"nuillu-visualizer-gui"},"executable":null}
+        let messages = r#"{"reason":"compiler-artifact","target":{"kind":["bin"],"name":"nuillu-visualizer-egui"},"executable":null}
 {"reason":"compiler-artifact","target":{"kind":["bin"],"name":"other-bin"},"executable":"/tmp/other-bin"}"#;
 
         assert_eq!(
@@ -306,7 +299,8 @@ mod tests {
 
     #[test]
     fn resolve_visualizer_gui_binary_prefers_non_empty_override() {
-        let path = resolve_visualizer_gui_binary(Some("/custom/visualizer"), || {
+        let override_path = Path::new("/custom/visualizer");
+        let path = resolve_visualizer_gui_binary(Some(override_path), || {
             panic!("build should not be called when override is set")
         })
         .unwrap();
@@ -317,7 +311,8 @@ mod tests {
     #[test]
     fn resolve_visualizer_gui_binary_builds_when_override_is_empty() {
         let path =
-            resolve_visualizer_gui_binary(Some("  "), || Ok(PathBuf::from("/built/gui"))).unwrap();
+            resolve_visualizer_gui_binary(Some(Path::new("")), || Ok(PathBuf::from("/built/gui")))
+                .unwrap();
 
         assert_eq!(path, PathBuf::from("/built/gui"));
     }

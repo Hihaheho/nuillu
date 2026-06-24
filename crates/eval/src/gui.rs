@@ -30,7 +30,7 @@ pub fn run_suite_with_visualizer(config: RunnerConfig) -> anyhow::Result<()> {
     listener
         .set_nonblocking(true)
         .context("set visualizer RPC listener nonblocking")?;
-    let mut child = spawn_visualizer_gui(&addr.to_string())?;
+    let mut child = spawn_visualizer_gui(&addr.to_string(), None)?;
     eprintln!("visualizer process started pid={}", child.id());
     let stream = accept_visualizer_connection(&listener, &mut child)?;
     eprintln!("visualizer RPC connected");

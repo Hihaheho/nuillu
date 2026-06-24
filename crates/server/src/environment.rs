@@ -744,6 +744,7 @@ mod tests {
             disabled_modules: Vec::new(),
             participants: Vec::new(),
             fresh_agent_db: false,
+            visualizer_bin: None,
         };
 
         let context = server_llm_log_context(&config);

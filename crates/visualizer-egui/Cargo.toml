@@ -6,14 +6,6 @@ license.workspace = true
 repository.workspace = true
 publish.workspace = true
 
-[[bin]]
-name = "nuillu-visualizer-gui"
-path = "src/main.rs"
-
-[[bin]]
-name = "visualizer"
-path = "src/bin/visualizer.rs"
-
 [dependencies]
 chrono = { workspace = true }
 eframe = { version = "0.34.2", features = ["persistence"] }

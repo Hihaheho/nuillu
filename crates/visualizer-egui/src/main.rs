@@ -59,7 +59,7 @@ impl Args {
                     parsed.host = Some(host);
                 }
                 "-h" | "--help" => {
-                    println!("Usage: nuillu-visualizer-gui [--host HOST:PORT]");
+                    println!("Usage: nuillu-visualizer-egui [--host HOST:PORT]");
                     std::process::exit(0);
                 }
                 other => {

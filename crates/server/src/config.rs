@@ -27,6 +27,7 @@ pub struct ServerConfig {
     pub disabled_modules: Vec<RuntimeModule>,
     pub participants: Vec<String>,
     pub fresh_agent_db: bool,
+    pub visualizer_bin: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone)]
