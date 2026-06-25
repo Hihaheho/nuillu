@@ -169,6 +169,12 @@ enum FreshSpeechPlan {
     None,
 }
 
+struct CommittedSpeechPlan {
+    plan: FreshSpeechPlan,
+    session: Session,
+    usage: Usage,
+}
+
 #[derive(Debug)]
 pub struct SpeakBatch {
     pub(crate) updates: Vec<CognitionLogUpdated>,
@@ -378,20 +384,26 @@ impl SpeakModule {
             return Ok(());
         };
 
-        let plan = match self.plan_speech(cx, &planning_context).await? {
-            FreshSpeechPlan::Prepare(plan) => plan,
+        let committed = self.plan_speech(cx, &planning_context).await?;
+        match committed.plan {
+            FreshSpeechPlan::Prepare(plan) => {
+                self.record_completed_speech(cx, &plan, committed.session, committed.usage)
+                    .await?;
+            }
             FreshSpeechPlan::Decline {
                 blocking_reason,
                 inhibit_reason,
             } => {
                 self.record_declined_speech(&blocking_reason, inhibit_reason.as_deref())
                     .await;
-                return Ok(());
+                self.save_planning_session(cx, committed.session, committed.usage)
+                    .await?;
             }
-            FreshSpeechPlan::None => return Ok(()),
-        };
-
-        self.record_completed_speech(cx, &plan).await?;
+            FreshSpeechPlan::None => {
+                self.save_planning_session(cx, committed.session, committed.usage)
+                    .await?;
+            }
+        }
         Ok(())
     }
 
@@ -412,7 +424,7 @@ impl SpeakModule {
         &mut self,
         cx: &nuillu_module::ActivateCx<'_>,
         cognition_context: &str,
-    ) -> Result<FreshSpeechPlan> {
+    ) -> Result<CommittedSpeechPlan> {
         self.ensure_planning_session_seeded(cx);
         let scene_target_schema = self.scene.target_schema();
         let target_hints = target_hints_from_schema(&scene_target_schema);
@@ -502,9 +514,11 @@ impl SpeakModule {
                 round
                     .commit(&mut turn_session, results)
                     .context("commit speak planning tool round")?;
-                cx.compact_and_save(&mut turn_session, usage).await?;
-                self.planning_session = turn_session;
-                Ok(plan)
+                Ok(CommittedSpeechPlan {
+                    plan,
+                    session: turn_session,
+                    usage,
+                })
             }
         }
     }
@@ -513,6 +527,8 @@ impl SpeakModule {
         &mut self,
         cx: &nuillu_module::ActivateCx<'_>,
         plan: &PlannedSpeech,
+        planning_session: Session,
+        planning_usage: Usage,
     ) -> Result<()> {
         let generation_id = self.utterance.next_generation_id();
         self.memo
@@ -536,13 +552,26 @@ impl SpeakModule {
                 plan.speech_content.clone(),
             )
             .await;
+        self.planning_session = planning_session;
         self.ensure_planning_session_seeded(cx);
         self.planning_session
             .push_system(render_completed_utterance_planning_record(
                 &plan.target,
                 &plan.speech_content,
             ));
-        cx.compact_and_save(&mut self.planning_session, Usage::zero())
+        cx.compact_and_save(&mut self.planning_session, planning_usage)
+            .await?;
+        Ok(())
+    }
+
+    async fn save_planning_session(
+        &mut self,
+        cx: &nuillu_module::ActivateCx<'_>,
+        planning_session: Session,
+        planning_usage: Usage,
+    ) -> Result<()> {
+        self.planning_session = planning_session;
+        cx.compact_and_save(&mut self.planning_session, planning_usage)
             .await?;
         Ok(())
     }
@@ -704,7 +733,68 @@ mod tests {
         }
     }
 
+    struct OrderingAdapter<T> {
+        inner: Arc<T>,
+        events: Arc<Mutex<Vec<&'static str>>>,
+    }
+
+    impl<T> OrderingAdapter<T> {
+        fn new(inner: T, events: Arc<Mutex<Vec<&'static str>>>) -> Self {
+            Self {
+                inner: Arc::new(inner),
+                events,
+            }
+        }
+    }
+
+    #[async_trait]
+    impl<T> TurnAdapter for OrderingAdapter<T>
+    where
+        T: TurnAdapter,
+    {
+        async fn text_turn(
+            &self,
+            input: ModelInput,
+            turn: AdapterTextTurn,
+        ) -> Result<ErasedTextTurnEventStream, AgentError> {
+            if model_input_text(&input)
+                .contains("You compact a module's persistent session history")
+            {
+                self.events.lock().unwrap().push("compaction_text_turn");
+            }
+            self.inner.text_turn(input, turn).await
+        }
+
+        async fn structured_turn(
+            &self,
+            input: ModelInput,
+            turn: AdapterStructuredTurn,
+        ) -> Result<ErasedStructuredTurnEventStream, AgentError> {
+            self.inner.structured_turn(input, turn).await
+        }
+    }
+
+    struct OrderingCompleteSink {
+        events: Arc<Mutex<Vec<&'static str>>>,
+    }
+
+    #[async_trait(?Send)]
+    impl UtteranceSink for OrderingCompleteSink {
+        async fn on_complete(&self, _utterance: Utterance) -> Result<(), PortError> {
+            self.events.lock().unwrap().push("utterance_complete");
+            Ok(())
+        }
+    }
+
     fn prepare_speech_scenario(target: &str, speech_content: &str) -> MockTextScenario {
+        prepare_speech_scenario_with_input_tokens(target, speech_content, 0)
+    }
+
+    fn prepare_speech_scenario_with_input_tokens(
+        target: &str,
+        speech_content: &str,
+        input_tokens: u64,
+    ) -> MockTextScenario {
         let arguments_json = serde_json::json!({
             "target": target,
             "speech_content": speech_content
@@ -723,6 +813,26 @@ mod tests {
             Ok(RawTextTurnEvent::Completed {
                 request_id: Some("prepare-speech".into()),
                 finish_reason: FinishReason::ToolCall,
+                usage: Usage {
+                    input_tokens,
+                    ..Usage::zero()
+                },
+            }),
+        ])
+    }
+
+    fn compaction_summary_scenario(summary: &str) -> MockTextScenario {
+        MockTextScenario::events(vec![
+            Ok(RawTextTurnEvent::Started {
+                request_id: Some("planning-compaction".into()),
+                model: "mock".into(),
+            }),
+            Ok(RawTextTurnEvent::TextDelta {
+                delta: summary.into(),
+            }),
+            Ok(RawTextTurnEvent::Completed {
+                request_id: Some("planning-compaction".into()),
+                finish_reason: FinishReason::Stop,
                 usage: Usage::zero(),
             }),
         ])
@@ -894,6 +1004,19 @@ mod tests {
         module: &SpeakModule,
         now: chrono::DateTime<chrono::Utc>,
     ) -> nuillu_module::ActivateCx<'static> {
+        test_activate_cx_with_policy(
+            module,
+            now,
+            nuillu_module::SessionCompactionPolicy::default(),
+        )
+        .await
+    }
+
+    async fn test_activate_cx_with_policy(
+        module: &SpeakModule,
+        now: chrono::DateTime<chrono::Utc>,
+        policy: nuillu_module::SessionCompactionPolicy,
+    ) -> nuillu_module::ActivateCx<'static> {
         let compaction_lutum = module.planning_llm.lutum().await;
         nuillu_module::ActivateCx::new(
             &[],
@@ -903,7 +1026,7 @@ mod tests {
                 compaction_lutum.lutum().clone(),
                 nuillu_module::LlmConcurrencyLimiter::new(None),
                 nuillu_types::ModelTier::Cheap,
-                nuillu_module::SessionCompactionPolicy::default(),
+                policy,
             ),
             now,
         )
@@ -1396,6 +1519,52 @@ mod tests {
         assert!(planning_input.contains("Koro asks Nuillu to help them stay safe."));
         assert!(!planning_input.contains("Already emitted"));
         assert!(!planning_input.contains("Planner Directive"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn prepare_speech_emits_before_planning_compaction() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let adapter = MockLlmAdapter::new()
+            .with_text_scenario(prepare_speech_scenario_with_input_tokens(
+                "Koro",
+                "Koro, stay close.",
+                2,
+            ))
+            .with_text_scenario(compaction_summary_scenario("- old speak planning history"));
+        let adapter = OrderingAdapter::new(adapter, Arc::clone(&events));
+        let mut allocation = ResourceAllocation::default();
+        allocation.set_activation(builtin::speak(), ActivationRatio::ONE);
+        let blackboard = Blackboard::with_allocation(allocation);
+        let sink: Rc<dyn crate::utterance::UtteranceSink> = Rc::new(OrderingCompleteSink {
+            events: Arc::clone(&events),
+        });
+        let (mut module, caps) =
+            speak_module_with_turn_adapter(blackboard.clone(), Arc::new(adapter), sink).await;
+        caps.scene().set([Participant::new("Koro")]);
+        let now = SystemClock.now();
+        publish_cognition_update(
+            &blackboard,
+            &caps,
+            now,
+            "Koro asks Nuillu to help them stay safe.",
+        )
+        .await;
+
+        let batch = module.next_batch().await.unwrap();
+        let cx = test_activate_cx_with_policy(
+            &module,
+            now,
+            nuillu_module::SessionCompactionPolicy::new(1, 1, 1),
+        )
+        .await;
+        SpeakModule::activate(&mut module, &cx, &batch)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            events.lock().unwrap().as_slice(),
+            &["utterance_complete", "compaction_text_turn"]
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
