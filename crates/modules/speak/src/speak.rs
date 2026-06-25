@@ -1,5 +1,5 @@
 use std::borrow::Cow;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 
@@ -82,7 +82,7 @@ const GENERATION_APPEND_INSTRUCTION: &str = "The output is appended directly aft
 
 const COGNITION_CONTEXT_WINDOW: LlmContextWindow = LlmContextWindow::new(12, 600, 4_800);
 const SPEECH_PLANNING_TURN_MAX_OUTPUT_TOKENS: u32 = 1024;
-const SPEECH_GENERATION_TEXT_DELTA_SLICE_LIMIT: usize = 8;
+const SPEECH_GENERATION_TEXT_DELTA_SLICE_LIMIT: usize = 16;
 const SPEECH_GENERATION_TEXT_DELTA_CHAR_LIMIT: usize = 20;
 const SPEECH_GENERATION_SLICES_PER_PLAN: u8 = 3;
 const ACTIVE_SPEECH_PLANNING_ALREADY_EMITTED_CHARS: usize = 600;
@@ -865,7 +865,6 @@ pub struct SpeakModule {
     planning_session: Session,
     generation_session: Session,
     generation_reflected_cognition_indices: HashSet<u64>,
-    generation_emitted_deltas: HashMap<u64, HashSet<String>>,
     self_wake: SelfWake,
     active_speech: Option<ActiveSpeech>,
     plan_prompt: std::sync::OnceLock<String>,
@@ -917,7 +916,6 @@ impl SpeakModule {
             planning_session,
             generation_session,
             generation_reflected_cognition_indices: HashSet::new(),
-            generation_emitted_deltas: HashMap::new(),
             self_wake,
             active_speech: None,
             plan_prompt: std::sync::OnceLock::new(),
@@ -1534,7 +1532,6 @@ impl SpeakModule {
                 text.to_owned(),
             ))
             .await;
-        self.generation_emitted_deltas.remove(&draft.generation_id);
         if text.is_empty() {
             return Ok(());
         }
@@ -1577,7 +1574,6 @@ impl SpeakModule {
                 draft.accumulated.clone(),
             ))
             .await;
-        self.generation_emitted_deltas.remove(&draft.generation_id);
         self.utterance
             .abort(
                 draft.target.clone(),
@@ -1655,16 +1651,6 @@ impl SpeakModule {
     ) {
         let mut emitted = false;
         for delta in deltas {
-            if !delta.is_empty() {
-                let seen = self
-                    .generation_emitted_deltas
-                    .entry(draft.generation_id)
-                    .or_default();
-                if seen.contains(&delta) {
-                    continue;
-                }
-                seen.insert(delta.clone());
-            }
             emitted = true;
             let sequence = draft.push_delta(&delta);
             self.utterance
@@ -1913,7 +1899,9 @@ mod tests {
         }
 
         const DELTAS: [&str; SPEECH_GENERATION_TEXT_DELTA_SLICE_LIMIT] =
-            ["A", "B", "C", "D", "E", "F", "G", "H"];
+            [
+                "A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L", "M", "N", "O", "P",
+            ];
 
         let stream = futures::stream::unfold(State::Started, move |state| {
             let release_completion = Arc::clone(&release_completion);
@@ -1940,7 +1928,7 @@ mod tests {
                                 finish_reason: FinishReason::Stop,
                                 usage: Usage::zero(),
                                 committed_turn: Arc::new(AssistantTurnView::from_items(&[
-                                    AssistantTurnItem::Text("ABCDEFGH".to_string()),
+                                    AssistantTurnItem::Text("ABCDEFGHIJKLMNOP".to_string()),
                                 ])),
                             }),
                             State::Done,
@@ -3351,9 +3339,11 @@ mod tests {
     #[test]
     fn generation_delta_buffer_seals_after_slice_limit() {
         let mut buffer = GenerationDeltaBuffer::default();
-        let first_seven = ["K", "o", "r", "o", ",", " ", "s"];
+        let first_fifteen = [
+            "K", "o", "r", "o", ",", " ", "s", "t", "a", "y", " ", "c", "l", "o", "s",
+        ];
 
-        for delta in first_seven {
+        for delta in first_fifteen {
             assert_eq!(buffer.push(delta.to_string()), None);
             assert!(!buffer.limit_reached());
         }
@@ -3361,7 +3351,10 @@ mod tests {
         assert_eq!(
             buffer.push("t".to_string()),
             Some(
-                ["K", "o", "r", "o", ",", " ", "s", "t"]
+                [
+                    "K", "o", "r", "o", ",", " ", "s", "t", "a", "y", " ", "c", "l", "o", "s",
+                    "t",
+                ]
                     .into_iter()
                     .map(str::to_string)
                     .collect()
@@ -3511,7 +3504,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn exact_duplicate_generation_delta_is_dropped_without_advancing_draft() {
+    async fn exact_duplicate_generation_delta_is_emitted_and_advances_draft() {
         let blackboard = Blackboard::with_allocation(ResourceAllocation::default());
         let deltas = Rc::new(RefCell::new(Vec::new()));
         let sink: Rc<dyn UtteranceSink> = Rc::new(CapturingDeltaSink {
@@ -3528,14 +3521,17 @@ mod tests {
 
         assert_eq!(
             deltas.borrow().as_slice(),
-            &[("Ryo".to_string(), 7, 0, "最近".to_string())]
+            &[
+                ("Ryo".to_string(), 7, 0, "最近".to_string()),
+                ("Ryo".to_string(), 7, 1, "最近".to_string()),
+            ]
         );
-        assert_eq!(draft.sequence, 1);
-        assert_eq!(draft.accumulated, "最近");
+        assert_eq!(draft.sequence, 2);
+        assert_eq!(draft.accumulated, "最近最近");
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn non_exact_generation_delta_repetitions_are_not_dropped() {
+    async fn generation_delta_repetitions_are_not_dropped() {
         let blackboard = Blackboard::with_allocation(ResourceAllocation::default());
         let deltas = Rc::new(RefCell::new(Vec::new()));
         let sink: Rc<dyn UtteranceSink> = Rc::new(CapturingDeltaSink {
@@ -3551,6 +3547,7 @@ mod tests {
                 &mut draft,
                 vec![
                     "最近".to_string(),
+                    "最近".to_string(),
                     "最近あった".to_string(),
                     " 最近".to_string(),
                     "Nuilluとは".to_string(),
@@ -3563,23 +3560,62 @@ mod tests {
             deltas.borrow().as_slice(),
             &[
                 ("Ryo".to_string(), 7, 0, "最近".to_string()),
-                ("Ryo".to_string(), 7, 1, "最近あった".to_string()),
-                ("Ryo".to_string(), 7, 2, " 最近".to_string()),
-                ("Ryo".to_string(), 7, 3, "Nuilluとは".to_string()),
-                ("Ryo".to_string(), 7, 4, "Nuillu".to_string()),
+                ("Ryo".to_string(), 7, 1, "最近".to_string()),
+                ("Ryo".to_string(), 7, 2, "最近あった".to_string()),
+                ("Ryo".to_string(), 7, 3, " 最近".to_string()),
+                ("Ryo".to_string(), 7, 4, "Nuilluとは".to_string()),
+                ("Ryo".to_string(), 7, 5, "Nuillu".to_string()),
             ]
         );
-        assert_eq!(draft.sequence, 5);
-        assert_eq!(draft.accumulated, "最近最近あった 最近NuilluとはNuillu");
+        assert_eq!(draft.sequence, 6);
+        assert_eq!(draft.accumulated, "最近最近最近あった 最近NuilluとはNuillu");
+    }
 
-        let mut other_generation = GenerationDraft::new(8, "Ryo");
+    #[tokio::test(flavor = "current_thread")]
+    async fn repeated_japanese_name_chunks_are_preserved() {
+        let blackboard = Blackboard::with_allocation(ResourceAllocation::default());
+        let deltas = Rc::new(RefCell::new(Vec::new()));
+        let sink: Rc<dyn UtteranceSink> = Rc::new(CapturingDeltaSink {
+            deltas: Rc::clone(&deltas),
+            first_delta: RefCell::new(None),
+        });
+        let (mut module, _caps) =
+            speak_module_with_turn_adapter(blackboard, Arc::new(MockLlmAdapter::new()), sink).await;
+        let mut draft = GenerationDraft::new(7, "Ryo");
+
         module
-            .emit_generation_delta_batch(&mut other_generation, vec!["最近".to_string()])
+            .emit_generation_delta_batch(
+                &mut draft,
+                vec![
+                    "リ".to_string(),
+                    "ョ".to_string(),
+                    "ウ".to_string(),
+                    "さん".to_string(),
+                    "、".to_string(),
+                    "リ".to_string(),
+                    "ョ".to_string(),
+                    "ウ".to_string(),
+                    "さん".to_string(),
+                ],
+            )
             .await;
 
+        assert_eq!(draft.sequence, 9);
+        assert_eq!(draft.accumulated, "リョウさん、リョウさん");
+
         assert_eq!(
-            deltas.borrow().last(),
-            Some(&("Ryo".to_string(), 8, 0, "最近".to_string()))
+            deltas.borrow().as_slice(),
+            &[
+                ("Ryo".to_string(), 7, 0, "リ".to_string()),
+                ("Ryo".to_string(), 7, 1, "ョ".to_string()),
+                ("Ryo".to_string(), 7, 2, "ウ".to_string()),
+                ("Ryo".to_string(), 7, 3, "さん".to_string()),
+                ("Ryo".to_string(), 7, 4, "、".to_string()),
+                ("Ryo".to_string(), 7, 5, "リ".to_string()),
+                ("Ryo".to_string(), 7, 6, "ョ".to_string()),
+                ("Ryo".to_string(), 7, 7, "ウ".to_string()),
+                ("Ryo".to_string(), 7, 8, "さん".to_string()),
+            ]
         );
     }
 
@@ -3615,7 +3651,7 @@ mod tests {
             let captured = futures::select_biased! {
                 captured = first_delta => captured.expect("first generation delta should be captured"),
                 result = collect => panic!("generation returned before any delta was emitted: {result:?}"),
-                _ = timeout => panic!("generation did not flush the 8-delta slice before completion"),
+                _ = timeout => panic!("generation did not flush the 16-delta slice before completion"),
             };
 
             assert_eq!(captured, ("Koro".to_string(), 0, 0, "A".to_string()));
@@ -3630,20 +3666,31 @@ mod tests {
                     ("Koro".to_string(), 0, 5, "F".to_string()),
                     ("Koro".to_string(), 0, 6, "G".to_string()),
                     ("Koro".to_string(), 0, 7, "H".to_string()),
+                    ("Koro".to_string(), 0, 8, "I".to_string()),
+                    ("Koro".to_string(), 0, 9, "J".to_string()),
+                    ("Koro".to_string(), 0, 10, "K".to_string()),
+                    ("Koro".to_string(), 0, 11, "L".to_string()),
+                    ("Koro".to_string(), 0, 12, "M".to_string()),
+                    ("Koro".to_string(), 0, 13, "N".to_string()),
+                    ("Koro".to_string(), 0, 14, "O".to_string()),
+                    ("Koro".to_string(), 0, 15, "P".to_string()),
                 ]
             );
             release_completion.notify_waiters();
             collect.await.unwrap()
         };
         assert!(matches!(outcome, GenerationStreamOutcome::LengthLimited));
-        assert_eq!(draft.accumulated, "ABCDEFGH");
+        assert_eq!(draft.accumulated, "ABCDEFGHIJKLMNOP");
     }
 
     #[tokio::test(flavor = "current_thread")]
     async fn generation_slice_limit_ignores_text_deltas_after_cap() {
         let adapter = MockLlmAdapter::new().with_text_scenario(
             generation_text_deltas_scenario_with_finish_reason(
-                &["A", "B", "C", "D", "E", "F", "G", "H", "ignored"],
+                &[
+                    "A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L", "M", "N", "O",
+                    "P", "ignored",
+                ],
                 FinishReason::Stop,
             ),
         );
@@ -3679,9 +3726,17 @@ mod tests {
                 ("Koro".to_string(), 0, 5, "F".to_string()),
                 ("Koro".to_string(), 0, 6, "G".to_string()),
                 ("Koro".to_string(), 0, 7, "H".to_string()),
+                ("Koro".to_string(), 0, 8, "I".to_string()),
+                ("Koro".to_string(), 0, 9, "J".to_string()),
+                ("Koro".to_string(), 0, 10, "K".to_string()),
+                ("Koro".to_string(), 0, 11, "L".to_string()),
+                ("Koro".to_string(), 0, 12, "M".to_string()),
+                ("Koro".to_string(), 0, 13, "N".to_string()),
+                ("Koro".to_string(), 0, 14, "O".to_string()),
+                ("Koro".to_string(), 0, 15, "P".to_string()),
             ]
         );
-        assert_eq!(draft.accumulated, "ABCDEFGH");
+        assert_eq!(draft.accumulated, "ABCDEFGHIJKLMNOP");
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -3729,7 +3784,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn generation_accumulated_char_limit_stops_before_eight_deltas() {
+    async fn generation_accumulated_char_limit_stops_before_slice_delta_limit() {
         let adapter = MockLlmAdapter::new().with_text_scenario(
             generation_text_deltas_scenario_with_finish_reason(
                 &["1234567890", "abcdefghijklmno", "ignored"],
