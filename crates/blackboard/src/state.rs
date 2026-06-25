@@ -7,6 +7,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use chrono::{DateTime, Utc};
 use nuillu_types::{MemoryIndex, ModuleId, ModuleInstanceId, PolicyIndex};
+use serde::de::DeserializeOwned;
 use tokio::sync::{RwLock, oneshot};
 
 use crate::{
@@ -83,6 +84,16 @@ pub struct MemoAppendResult {
     pub evicted: Vec<MemoLogRecord>,
 }
 
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum MemoLogPayload {
+    Plain,
+    Typed {
+        type_name: String,
+        json: serde_json::Value,
+    },
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct CognitionLogAppendResult {
     pub record: CognitionLogEntryRecord,
@@ -110,7 +121,18 @@ impl<T: 'static> TypedMemoLogRecord<T> {
 
 struct MemoLogEntry {
     record: MemoLogRecord,
-    payload: Arc<dyn Any>,
+    payload: MemoPayload,
+}
+
+#[derive(Clone)]
+enum MemoPayload {
+    InMemory {
+        payload: Arc<dyn Any>,
+    },
+    Serialized {
+        type_name: String,
+        json: serde_json::Value,
+    },
 }
 
 impl fmt::Debug for MemoLogEntry {
@@ -122,7 +144,7 @@ impl fmt::Debug for MemoLogEntry {
 }
 
 impl MemoLogEntry {
-    fn new(record: MemoLogRecord, payload: Arc<dyn Any>) -> Self {
+    fn new(record: MemoLogRecord, payload: MemoPayload) -> Self {
         Self { record, payload }
     }
 
@@ -130,15 +152,59 @@ impl MemoLogEntry {
         self.record.clone()
     }
 
-    fn typed_record<T: 'static>(&self) -> TypedMemoLogRecord<T> {
-        TypedMemoLogRecord {
+    fn typed_record<T: DeserializeOwned + 'static>(&self) -> Option<TypedMemoLogRecord<T>> {
+        let payload = self.payload.typed_payload::<T>()?;
+        Some(TypedMemoLogRecord {
             owner: self.record.owner.clone(),
             index: self.record.index,
             written_at: self.record.written_at,
             content: self.record.content.clone(),
             cognitive: self.record.cognitive,
-            payload: Arc::clone(&self.payload),
+            payload,
             _marker: PhantomData,
+        })
+    }
+}
+
+impl MemoPayload {
+    fn in_memory<T: 'static>(payload: T) -> Self {
+        Self::InMemory {
+            payload: Arc::new(payload),
+        }
+    }
+
+    fn from_persisted(payload: MemoLogPayload) -> Self {
+        match payload {
+            MemoLogPayload::Plain => Self::in_memory(()),
+            MemoLogPayload::Typed { type_name, json } => Self::Serialized { type_name, json },
+        }
+    }
+
+    fn typed_payload<T: DeserializeOwned + 'static>(&self) -> Option<Arc<dyn Any>> {
+        match self {
+            Self::InMemory { payload } => Some(Arc::clone(payload)),
+            Self::Serialized { type_name, json } => {
+                let expected = std::any::type_name::<T>();
+                if type_name != expected {
+                    tracing::warn!(
+                        persisted_type = type_name,
+                        requested_type = expected,
+                        "skipping persisted typed memo payload with mismatched type"
+                    );
+                    return None;
+                }
+                match serde_json::from_value::<T>(json.clone()) {
+                    Ok(payload) => Some(Arc::new(payload)),
+                    Err(error) => {
+                        tracing::warn!(
+                            requested_type = expected,
+                            error = %error,
+                            "skipping persisted typed memo payload that failed to deserialize"
+                        );
+                        None
+                    }
+                }
+            }
         }
     }
 }
@@ -423,7 +489,22 @@ impl Blackboard {
         cognitive: bool,
     ) -> MemoAppendResult {
         let mut guard = self.inner.write().await;
-        guard.append_memo(owner, memo, Arc::new(payload), written_at, cognitive)
+        guard.append_memo(
+            owner,
+            memo,
+            MemoPayload::in_memory(payload),
+            written_at,
+            cognitive,
+        )
+    }
+
+    pub async fn restore_memo_log_entry(
+        &self,
+        record: MemoLogRecord,
+        payload: MemoLogPayload,
+    ) -> MemoAppendResult {
+        let mut guard = self.inner.write().await;
+        guard.restore_memo_log_entry(record, payload)
     }
 
     pub async fn append_cognition_log(
@@ -435,7 +516,7 @@ impl Blackboard {
         guard.append_cognition_log(source, entry)
     }
 
-    pub async fn typed_memo_logs<T: 'static>(
+    pub async fn typed_memo_logs<T: DeserializeOwned + 'static>(
         &self,
         owner: &ModuleInstanceId,
     ) -> Vec<TypedMemoLogRecord<T>> {
@@ -613,14 +694,14 @@ impl BlackboardInner {
         records
     }
 
-    pub fn typed_memo_logs<T: 'static>(
+    pub fn typed_memo_logs<T: DeserializeOwned + 'static>(
         &self,
         owner: &ModuleInstanceId,
     ) -> Vec<TypedMemoLogRecord<T>> {
         self.memos
             .get(owner)
             .into_iter()
-            .flat_map(|records| records.iter().map(MemoLogEntry::typed_record))
+            .flat_map(|records| records.iter().filter_map(MemoLogEntry::typed_record))
             .collect()
     }
 
@@ -882,7 +963,7 @@ impl BlackboardInner {
                 memo,
                 written_at,
             } => {
-                self.append_memo(owner, memo, Arc::new(()), written_at, false);
+                self.append_memo(owner, memo, MemoPayload::in_memory(()), written_at, false);
             }
             BlackboardCommand::SetModuleRunStatus { owner, status } => {
                 self.module_statuses.insert(owner, status);
@@ -1013,7 +1094,7 @@ impl BlackboardInner {
         &mut self,
         owner: ModuleInstanceId,
         content: String,
-        payload: Arc<dyn Any>,
+        payload: MemoPayload,
         written_at: DateTime<Utc>,
         cognitive: bool,
     ) -> MemoAppendResult {
@@ -1030,12 +1111,33 @@ impl BlackboardInner {
         let retained = self.memo_retained_per_owner.max(1);
         let records = self.memos.entry(owner).or_default();
         records.push_back(MemoLogEntry::new(record.clone(), payload));
-        let mut evicted = Vec::new();
-        while records.len() > retained {
-            if let Some(entry) = records.pop_front() {
-                evicted.push(entry.record());
-            }
-        }
+        let evicted = truncate_memo_records(records, retained);
+        MemoAppendResult { record, evicted }
+    }
+
+    fn restore_memo_log_entry(
+        &mut self,
+        record: MemoLogRecord,
+        payload: MemoLogPayload,
+    ) -> MemoAppendResult {
+        let owner = record.owner.clone();
+        let next_index = record.index.saturating_add(1);
+        self.memo_next_indices
+            .entry(owner.clone())
+            .and_modify(|current| *current = (*current).max(next_index))
+            .or_insert(next_index);
+
+        let records = self.memos.entry(owner).or_default();
+        records.push_back(MemoLogEntry::new(
+            record.clone(),
+            MemoPayload::from_persisted(payload),
+        ));
+        let mut sorted = records.drain(..).collect::<Vec<_>>();
+        sorted.sort_by(|left, right| left.record.index.cmp(&right.record.index));
+        records.extend(sorted);
+
+        let retained = self.memo_retained_per_owner.max(1);
+        let evicted = truncate_memo_records(records, retained);
         MemoAppendResult { record, evicted }
     }
 
@@ -1043,11 +1145,7 @@ impl BlackboardInner {
         let retained = self.memo_retained_per_owner.max(1);
         let mut evicted = Vec::new();
         for records in self.memos.values_mut() {
-            while records.len() > retained {
-                if let Some(entry) = records.pop_front() {
-                    evicted.push(entry.record());
-                }
-            }
+            evicted.extend(truncate_memo_records(records, retained));
         }
         sort_memo_logs(&mut evicted);
         evicted
@@ -1186,6 +1284,19 @@ fn sort_memo_logs(records: &mut [MemoLogRecord]) {
     });
 }
 
+fn truncate_memo_records(
+    records: &mut VecDeque<MemoLogEntry>,
+    retained: usize,
+) -> Vec<MemoLogRecord> {
+    let mut evicted = Vec::new();
+    while records.len() > retained {
+        if let Some(entry) = records.pop_front() {
+            evicted.push(entry.record());
+        }
+    }
+    evicted
+}
+
 fn cognition_record_is_from_owner(
     record: &CognitionLogEntryRecord,
     owner: &ModuleInstanceId,
@@ -1239,7 +1350,7 @@ mod tests {
 
     #[tokio::test]
     async fn typed_memo_round_trip_keeps_plaintext_view() {
-        #[derive(Debug, Clone, PartialEq, Eq)]
+        #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
         struct TestPayload {
             value: String,
         }
@@ -1323,7 +1434,7 @@ mod tests {
 
     #[tokio::test]
     async fn typed_cognitive_memo_keeps_payload_and_cognitive_flag() {
-        #[derive(Debug, Clone, PartialEq, Eq)]
+        #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
         struct TestPayload {
             value: String,
         }
@@ -1350,6 +1461,47 @@ mod tests {
                 value: "structured".into()
             }
         );
+    }
+
+    #[tokio::test]
+    async fn restored_typed_memo_keeps_payload_and_advances_next_index() {
+        #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+        struct TestPayload {
+            value: String,
+        }
+
+        let bb = Blackboard::new();
+        let owner = ModuleInstanceId::new(builtin::query_memory(), ReplicaIndex::ZERO);
+        bb.restore_memo_log_entry(
+            MemoLogRecord {
+                owner: owner.clone(),
+                index: 7,
+                written_at: memo_time(0),
+                content: "restored memo".into(),
+                cognitive: true,
+            },
+            MemoLogPayload::Typed {
+                type_name: std::any::type_name::<TestPayload>().to_owned(),
+                json: serde_json::json!({ "value": "restored" }),
+            },
+        )
+        .await;
+
+        let typed_logs = bb.typed_memo_logs::<TestPayload>(&owner).await;
+        assert_eq!(typed_logs.len(), 1);
+        assert_eq!(typed_logs[0].index, 7);
+        assert!(typed_logs[0].cognitive);
+        assert_eq!(
+            typed_logs[0].data(),
+            &TestPayload {
+                value: "restored".into()
+            }
+        );
+
+        let next = bb
+            .update_memo(owner, "after restore".into(), memo_time(1))
+            .await;
+        assert_eq!(next.index, 8);
     }
 
     #[tokio::test]

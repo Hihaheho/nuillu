@@ -95,6 +95,7 @@ pub(super) async fn build_server_environment(
     let policy_store: Rc<dyn PolicyStore> = Rc::new(agent_store.policy_store());
     let session_store = Rc::new(agent_store.session_store());
     let allocation_store = Rc::new(agent_store.allocation_store());
+    let memo_log_repository = Rc::new(agent_store.memo_log_repository());
     let cognition_log_repository = Rc::new(agent_store.cognition_log_repository());
     let llm_transcript_store = agent_store.llm_transcript_store();
     let db_trace_sink =
@@ -127,6 +128,7 @@ pub(super) async fn build_server_environment(
             policy: server_runtime_policy(config),
             session_store,
             allocation_store,
+            memo_log_repository,
         },
     });
 

@@ -1,12 +1,16 @@
 use std::marker::PhantomData;
 use std::rc::Rc;
 
-use nuillu_blackboard::{Blackboard, MemoLogRecord, TypedMemoLogRecord};
+use nuillu_blackboard::{Blackboard, MemoLogPayload, MemoLogRecord, TypedMemoLogRecord};
 use nuillu_types::ModuleInstanceId;
+use serde::{Serialize, de::DeserializeOwned};
 
 use crate::ports::Clock;
 use crate::runtime_events::RuntimeEventEmitter;
-use crate::{MemoLogEvictedMailbox, MemoUpdated, MemoUpdatedMailbox};
+use crate::{
+    MemoLogEvictedMailbox, MemoLogRepository, MemoUpdated, MemoUpdatedMailbox,
+    PersistedMemoLogEntry,
+};
 
 /// Plaintext write handle for the activating module's own memo log.
 ///
@@ -34,6 +38,7 @@ pub struct TypedMemo<T> {
 struct MemoCore {
     owner: ModuleInstanceId,
     blackboard: Blackboard,
+    memo_log_repository: Rc<dyn MemoLogRepository>,
     updates: MemoUpdatedMailbox,
     evictions: MemoLogEvictedMailbox,
     clock: Rc<dyn Clock>,
@@ -44,13 +49,22 @@ impl Memo {
     pub(crate) fn new(
         owner: ModuleInstanceId,
         blackboard: Blackboard,
+        memo_log_repository: Rc<dyn MemoLogRepository>,
         updates: MemoUpdatedMailbox,
         evictions: MemoLogEvictedMailbox,
         clock: Rc<dyn Clock>,
         events: RuntimeEventEmitter,
     ) -> Self {
         Self {
-            core: MemoCore::new(owner, blackboard, updates, evictions, clock, events),
+            core: MemoCore::new(
+                owner,
+                blackboard,
+                memo_log_repository,
+                updates,
+                evictions,
+                clock,
+                events,
+            ),
         }
     }
 
@@ -67,17 +81,29 @@ impl Memo {
     }
 }
 
-impl<T: 'static> TypedMemo<T> {
+impl<T> TypedMemo<T>
+where
+    T: Serialize + DeserializeOwned + 'static,
+{
     pub(crate) fn new(
         owner: ModuleInstanceId,
         blackboard: Blackboard,
+        memo_log_repository: Rc<dyn MemoLogRepository>,
         updates: MemoUpdatedMailbox,
         evictions: MemoLogEvictedMailbox,
         clock: Rc<dyn Clock>,
         events: RuntimeEventEmitter,
     ) -> Self {
         Self {
-            core: MemoCore::new(owner, blackboard, updates, evictions, clock, events),
+            core: MemoCore::new(
+                owner,
+                blackboard,
+                memo_log_repository,
+                updates,
+                evictions,
+                clock,
+                events,
+            ),
             _marker: PhantomData,
         }
     }
@@ -103,6 +129,7 @@ impl MemoCore {
     fn new(
         owner: ModuleInstanceId,
         blackboard: Blackboard,
+        memo_log_repository: Rc<dyn MemoLogRepository>,
         updates: MemoUpdatedMailbox,
         evictions: MemoLogEvictedMailbox,
         clock: Rc<dyn Clock>,
@@ -111,6 +138,7 @@ impl MemoCore {
         Self {
             owner,
             blackboard,
+            memo_log_repository,
             updates,
             evictions,
             clock,
@@ -129,18 +157,35 @@ impl MemoCore {
                 .update_memo_with_evictions(self.owner.clone(), memo, self.clock.now())
                 .await
         };
+        self.persist_memo(&result.record, MemoLogPayload::Plain)
+            .await;
         self.publish_update(result.record.index, char_count).await;
         self.publish_evictions(result.evicted).await;
         result.record
     }
 
-    async fn write_typed<T: 'static>(
+    async fn write_typed<T: Serialize + 'static>(
         &self,
         payload: T,
         memo: String,
         cognitive: bool,
     ) -> MemoLogRecord {
         let char_count = memo.chars().count();
+        let persisted_payload = match serde_json::to_value(&payload) {
+            Ok(json) => MemoLogPayload::Typed {
+                type_name: std::any::type_name::<T>().to_owned(),
+                json,
+            },
+            Err(error) => {
+                tracing::warn!(
+                    owner = %self.owner,
+                    payload_type = std::any::type_name::<T>(),
+                    error = %error,
+                    "typed memo payload serialization failed; persisting plaintext memo only"
+                );
+                MemoLogPayload::Plain
+            }
+        };
         let result = if cognitive {
             self.blackboard
                 .update_typed_cognitive_memo_with_evictions(
@@ -160,9 +205,25 @@ impl MemoCore {
                 )
                 .await
         };
+        self.persist_memo(&result.record, persisted_payload).await;
         self.publish_update(result.record.index, char_count).await;
         self.publish_evictions(result.evicted).await;
         result.record
+    }
+
+    async fn persist_memo(&self, record: &MemoLogRecord, payload: MemoLogPayload) {
+        let entry = PersistedMemoLogEntry {
+            record: record.clone(),
+            payload,
+        };
+        if let Err(error) = self.memo_log_repository.append(&entry).await {
+            tracing::warn!(
+                owner = %record.owner,
+                index = record.index,
+                error = ?error,
+                "memo log repository append failed"
+            );
+        }
     }
 
     async fn publish_update(&self, index: u64, char_count: usize) {

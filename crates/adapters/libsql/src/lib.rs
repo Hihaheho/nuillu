@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use libsql::{Connection, Transaction, Value, params, params_from_iter};
-use nuillu_blackboard::{CognitionLogEntry, CognitionLogOrigin};
+use nuillu_blackboard::{CognitionLogEntry, CognitionLogOrigin, MemoLogPayload, MemoLogRecord};
 use nuillu_memory::{
     IndexedMemory, LinkedMemoryQuery, LinkedMemoryRecord, MemoryConcept, MemoryKind, MemoryLink,
     MemoryLinkDirection, MemoryLinkRelation, MemoryQuery, MemoryRecord, MemoryStore, MemoryTag,
@@ -17,8 +17,8 @@ use nuillu_memory::{
 };
 pub use nuillu_module::ports::Embedder;
 use nuillu_module::{
-    AllocationStore, AmbientSensoryEntry, PersistedAllocationSnapshot, PersistedSessionSnapshot,
-    SessionKey, SessionStore,
+    AllocationStore, AmbientSensoryEntry, MemoLogRepository, PersistedAllocationSnapshot,
+    PersistedMemoLogEntry, PersistedSessionSnapshot, SessionKey, SessionStore,
     ports::{CognitionLogRepository, PersistedCognitionLogEntry, PortError},
 };
 use nuillu_reward::{
@@ -161,6 +161,11 @@ pub struct LibsqlAllocationStore {
 
 #[derive(Clone)]
 pub struct LibsqlCognitionLogRepository {
+    conn: Connection,
+}
+
+#[derive(Clone)]
+pub struct LibsqlMemoLogRepository {
     conn: Connection,
 }
 
@@ -357,6 +362,12 @@ impl LibsqlAgentStore {
         }
     }
 
+    pub fn memo_log_repository(&self) -> LibsqlMemoLogRepository {
+        LibsqlMemoLogRepository {
+            conn: self.conn.clone(),
+        }
+    }
+
     pub fn llm_transcript_store(&self) -> LibsqlLlmTranscriptStore {
         LibsqlLlmTranscriptStore {
             conn: self.conn.clone(),
@@ -519,6 +530,80 @@ impl CognitionLogRepository for LibsqlCognitionLogRepository {
                     )?,
                 },
             });
+        }
+        Ok(entries)
+    }
+}
+
+#[async_trait(?Send)]
+impl MemoLogRepository for LibsqlMemoLogRepository {
+    async fn append(&self, entry: &PersistedMemoLogEntry) -> Result<(), PortError> {
+        let (payload_type, payload_json) = memo_payload_columns(&entry.payload)?;
+        self.conn
+            .execute(
+                "INSERT INTO memo_log_entries (
+                    owner_module,
+                    owner_replica,
+                    memo_index,
+                    written_at_ms,
+                    cognitive,
+                    content,
+                    payload_type,
+                    payload_json,
+                    created_at_ms
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                params![
+                    entry.record.owner.module.as_str(),
+                    i64::from(entry.record.owner.replica.get()),
+                    i64::try_from(entry.record.index).map_err(|_| {
+                        PortError::InvalidInput(format!(
+                            "memo index is too large for libSQL: {}",
+                            entry.record.index
+                        ))
+                    })?,
+                    entry.record.written_at.timestamp_millis(),
+                    bool_to_i64(entry.record.cognitive),
+                    entry.record.content.as_str(),
+                    payload_type,
+                    payload_json,
+                    now_ms(),
+                ],
+            )
+            .await
+            .map_err(map_libsql_error)?;
+        Ok(())
+    }
+
+    async fn recent_per_owner(
+        &self,
+        retained_per_owner: usize,
+    ) -> Result<Vec<PersistedMemoLogEntry>, PortError> {
+        if retained_per_owner == 0 {
+            return Ok(Vec::new());
+        }
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT owner_module, owner_replica, memo_index, written_at_ms,
+                        cognitive, content, payload_type, payload_json
+                   FROM (
+                        SELECT owner_module, owner_replica, memo_index, written_at_ms,
+                               cognitive, content, payload_type, payload_json,
+                               ROW_NUMBER() OVER (
+                                   PARTITION BY owner_module, owner_replica
+                                   ORDER BY memo_index DESC
+                               ) AS owner_rank
+                          FROM memo_log_entries
+                   )
+                  WHERE owner_rank <= ?1
+                  ORDER BY owner_module ASC, owner_replica ASC, memo_index ASC",
+                params![limit_to_i64(retained_per_owner)],
+            )
+            .await
+            .map_err(map_libsql_error)?;
+        let mut entries = Vec::new();
+        while let Some(row) = rows.next().await.map_err(map_libsql_error)? {
+            entries.push(memo_log_entry_from_row(&row)?);
         }
         Ok(entries)
     }
@@ -3095,6 +3180,55 @@ impl MemoryStore for LibsqlMemoryStore {
     }
 }
 
+fn memo_payload_columns(
+    payload: &MemoLogPayload,
+) -> Result<(Option<String>, Option<String>), PortError> {
+    match payload {
+        MemoLogPayload::Plain => Ok((None, None)),
+        MemoLogPayload::Typed { type_name, json } => {
+            let payload_json = serde_json::to_string(json)
+                .map_err(|error| PortError::InvalidData(error.to_string()))?;
+            Ok((Some(type_name.clone()), Some(payload_json)))
+        }
+    }
+}
+
+fn memo_log_entry_from_row(row: &libsql::Row) -> Result<PersistedMemoLogEntry, PortError> {
+    let owner_module: String = row.get(0).map_err(map_libsql_error)?;
+    let owner_replica: i64 = row.get(1).map_err(map_libsql_error)?;
+    let memo_index: i64 = row.get(2).map_err(map_libsql_error)?;
+    let written_at_ms: i64 = row.get(3).map_err(map_libsql_error)?;
+    let cognitive: i64 = row.get(4).map_err(map_libsql_error)?;
+    let content: String = row.get(5).map_err(map_libsql_error)?;
+    let payload_type: Option<String> = row.get(6).map_err(map_libsql_error)?;
+    let payload_json: Option<String> = row.get(7).map_err(map_libsql_error)?;
+    let payload = match (payload_type, payload_json) {
+        (None, None) => MemoLogPayload::Plain,
+        (Some(type_name), Some(json)) => MemoLogPayload::Typed {
+            type_name,
+            json: serde_json::from_str(&json)
+                .map_err(|error| PortError::InvalidData(error.to_string()))?,
+        },
+        _ => {
+            return Err(PortError::InvalidData(
+                "memo log payload_type and payload_json must both be null or both be set"
+                    .to_owned(),
+            ));
+        }
+    };
+    Ok(PersistedMemoLogEntry {
+        record: MemoLogRecord {
+            owner: module_instance_from_row(owner_module, owner_replica)?,
+            index: u64::try_from(memo_index)
+                .map_err(|_| PortError::InvalidData(format!("invalid memo index: {memo_index}")))?,
+            written_at: datetime_from_millis("memo written_at", written_at_ms)?,
+            content,
+            cognitive: i64_to_bool("memo cognitive", cognitive)?,
+        },
+        payload,
+    })
+}
+
 fn one_shot_sensory_input_record_from_row(
     row: &libsql::Row,
 ) -> Result<OneShotSensoryInputRecord, PortError> {
@@ -3413,6 +3547,20 @@ fn limit_to_i64(limit: usize) -> i64 {
     i64::try_from(limit).unwrap_or(i64::MAX)
 }
 
+fn bool_to_i64(value: bool) -> i64 {
+    if value { 1 } else { 0 }
+}
+
+fn i64_to_bool(label: &str, value: i64) -> Result<bool, PortError> {
+    match value {
+        0 => Ok(false),
+        1 => Ok(true),
+        _ => Err(PortError::InvalidData(format!(
+            "{label} must be 0 or 1, got {value}"
+        ))),
+    }
+}
+
 fn module_instance_from_row(
     owner_module: String,
     owner_replica: i64,
@@ -3559,6 +3707,7 @@ mod tests {
         assert!(table_exists(&store.conn, "one_shot_sensory_inputs").await);
         assert!(table_exists(&store.conn, "ambient_sensory_snapshots").await);
         assert!(table_exists(&store.conn, "utterance_events").await);
+        assert!(table_exists(&store.conn, "memo_log_entries").await);
         assert_eq!(
             version,
             SchemaVersion {
@@ -4011,7 +4160,10 @@ mod tests {
         assert!(column_exists(&store, "cognition_log_entries", "origin_memo_index").await);
         assert!(column_exists(&store, "cognition_log_entries", "occurred_at_ms").await);
         assert!(column_exists(&store, "cognition_log_entries", "text").await);
-        assert_eq!(dev_task_count(&store.conn, 0, 1).await, 6);
+        assert!(column_exists(&store, "memo_log_entries", "memo_index").await);
+        assert!(column_exists(&store, "memo_log_entries", "cognitive").await);
+        assert!(column_exists(&store, "memo_log_entries", "payload_json").await);
+        assert_eq!(dev_task_count(&store.conn, 0, 1).await, 7);
     }
 
     #[tokio::test]
@@ -5185,6 +5337,85 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn memo_log_repository_round_trips_recent_per_owner() {
+        let repo = memo_log_repository().await;
+        let owner_a = ModuleInstanceId::new(ModuleId::new("sensory").unwrap(), ReplicaIndex::ZERO);
+        let owner_b =
+            ModuleInstanceId::new(ModuleId::new("query-memory").unwrap(), ReplicaIndex::new(1));
+        let at = chrono::Utc.with_ymd_and_hms(2025, 6, 1, 12, 0, 0).unwrap();
+
+        for (owner, index, content, cognitive, payload) in [
+            (
+                owner_a.clone(),
+                0,
+                "old sensory",
+                false,
+                MemoLogPayload::Plain,
+            ),
+            (
+                owner_a.clone(),
+                1,
+                "new sensory",
+                true,
+                MemoLogPayload::Plain,
+            ),
+            (
+                owner_b.clone(),
+                0,
+                "typed query",
+                true,
+                MemoLogPayload::Typed {
+                    type_name: "query-payload".to_owned(),
+                    json: serde_json::json!({ "hits": ["memory-1"] }),
+                },
+            ),
+        ] {
+            repo.append(&PersistedMemoLogEntry {
+                record: MemoLogRecord {
+                    owner,
+                    index,
+                    written_at: at + chrono::Duration::seconds(index as i64),
+                    content: content.to_owned(),
+                    cognitive,
+                },
+                payload,
+            })
+            .await
+            .unwrap();
+        }
+
+        let entries = repo.recent_per_owner(1).await.unwrap();
+        assert_eq!(
+            entries,
+            vec![
+                PersistedMemoLogEntry {
+                    record: MemoLogRecord {
+                        owner: owner_b,
+                        index: 0,
+                        written_at: at,
+                        content: "typed query".to_owned(),
+                        cognitive: true,
+                    },
+                    payload: MemoLogPayload::Typed {
+                        type_name: "query-payload".to_owned(),
+                        json: serde_json::json!({ "hits": ["memory-1"] }),
+                    },
+                },
+                PersistedMemoLogEntry {
+                    record: MemoLogRecord {
+                        owner: owner_a,
+                        index: 1,
+                        written_at: at + chrono::Duration::seconds(1),
+                        content: "new sensory".to_owned(),
+                        cognitive: true,
+                    },
+                    payload: MemoLogPayload::Plain,
+                },
+            ]
+        );
+    }
+
     async fn store() -> LibsqlMemoryStore {
         LibsqlAgentStore::connect(
             LibsqlAgentStoreConfig::local(test_db_path(), 3, 3),
@@ -5205,6 +5436,17 @@ mod tests {
         .await
         .unwrap()
         .cognition_log_repository()
+    }
+
+    async fn memo_log_repository() -> LibsqlMemoLogRepository {
+        LibsqlAgentStore::connect(
+            LibsqlAgentStoreConfig::local(test_db_path(), 3, 3),
+            TestEmbedder::boxed(3),
+            TestEmbedder::boxed(3),
+        )
+        .await
+        .unwrap()
+        .memo_log_repository()
     }
 
     fn new_memory(

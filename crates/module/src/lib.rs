@@ -32,6 +32,7 @@ mod dependencies;
 mod interoception;
 mod llm;
 mod memo;
+mod memo_persistence;
 mod memory_render;
 mod mind_format;
 mod mind_session;
@@ -83,6 +84,7 @@ pub use llm::{
     with_activation_llm_request_metadata,
 };
 pub use memo::{Memo, TypedMemo};
+pub use memo_persistence::{MemoLogRepository, NoopMemoLogRepository, PersistedMemoLogEntry};
 pub use memory_render::render_memory_for_llm;
 pub use mind_format::{
     CognitionLogBatchFormat, LlmContextWindow, MemoLogBatchFormat, MemoryRankCounts,

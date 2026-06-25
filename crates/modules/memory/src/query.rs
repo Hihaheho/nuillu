@@ -189,7 +189,7 @@ pub enum QueryMemoryPlanTools {
     PlanMemoryQueries(PlanMemoryQueriesArgs),
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct QueryMemoryMemo {
     pub requests: Vec<String>,
     pub searches: Vec<QueryMemoryMemoSearch>,
@@ -197,14 +197,14 @@ pub struct QueryMemoryMemo {
     pub linked_hits: Vec<QueryMemoryMemoLinkedHit>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct QueryMemoryMemoSearch {
     pub query: String,
     pub limit: usize,
     pub hit_indices: Vec<MemoryIndex>,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct QueryMemoryMemoHit {
     pub index: MemoryIndex,
     pub rank: MemoryRank,
@@ -216,7 +216,7 @@ pub struct QueryMemoryMemoHit {
     pub emotion: String,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct QueryMemoryMemoLinkedHit {
     pub index: MemoryIndex,
     pub rank: MemoryRank,

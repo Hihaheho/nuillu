@@ -31,3 +31,8 @@ next-minor = 1
   tag = "recent-activity-traces"
   file = "dev/v0.1.recent-activity-traces.sql"
 }
+
+@ tasks[] {
+  tag = "memo-log"
+  file = "dev/v0.1.memo-log.sql"
+}

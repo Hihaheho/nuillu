@@ -34,10 +34,11 @@ use crate::{
     CognitionLogUpdatedInbox, CognitionLogUpdatedMailbox, CognitionWriter,
     InteroceptionRuntimePolicy, InteroceptiveReader, InteroceptiveUpdated,
     InteroceptiveUpdatedInbox, InteroceptiveUpdatedMailbox, InteroceptiveWriter, LlmAccess, Memo,
-    MemoLogEvictedInbox, MemoLogEvictedMailbox, MemoUpdated, MemoUpdatedInbox, MemoUpdatedMailbox,
-    MemoryMetadataReader, Module, ModuleBatch, ModuleStatusReader, NoopAllocationStore,
-    SensoryInput, SensoryInputInbox, SensoryInputMailbox, SessionCompactionPolicy, TimeDivision,
-    TopicInbox, TopicMailbox, TypedMemo,
+    MemoLogEvictedInbox, MemoLogEvictedMailbox, MemoLogRepository, MemoUpdated, MemoUpdatedInbox,
+    MemoUpdatedMailbox, MemoryMetadataReader, Module, ModuleBatch, ModuleStatusReader,
+    NoopAllocationStore, NoopMemoLogRepository, PersistedMemoLogEntry, SensoryInput,
+    SensoryInputInbox, SensoryInputMailbox, SessionCompactionPolicy, TimeDivision, TopicInbox,
+    TopicMailbox, TypedMemo,
 };
 
 /// Provides [capabilities](crate) at agent boot.
@@ -71,6 +72,7 @@ struct CapabilityProvidersInner {
     scene: SceneRegistry,
     session_store: Rc<dyn SessionStore>,
     allocation_store: Rc<dyn AllocationStore>,
+    memo_log_repository: Rc<dyn MemoLogRepository>,
 }
 
 /// Owner-stamped handle for requesting another scheduler pass for the holder.
@@ -221,6 +223,7 @@ pub struct CapabilityProviderRuntime {
     pub policy: RuntimePolicy,
     pub session_store: Rc<dyn SessionStore>,
     pub allocation_store: Rc<dyn AllocationStore>,
+    pub memo_log_repository: Rc<dyn MemoLogRepository>,
 }
 
 impl Default for CapabilityProviderRuntime {
@@ -230,6 +233,7 @@ impl Default for CapabilityProviderRuntime {
             policy: RuntimePolicy::default(),
             session_store: Rc::new(NoopSessionStore),
             allocation_store: Rc::new(NoopAllocationStore),
+            memo_log_repository: Rc::new(NoopMemoLogRepository),
         }
     }
 }
@@ -264,6 +268,7 @@ impl CapabilityProviders {
             policy,
             session_store,
             allocation_store,
+            memo_log_repository,
         } = runtime;
         let runtime_events = RuntimeEventEmitter::new(event_sink);
         let wakes = WakeRegistry::default();
@@ -314,6 +319,7 @@ impl CapabilityProviders {
                 scene: SceneRegistry::empty(),
                 session_store,
                 allocation_store,
+                memo_log_repository,
             }),
         }
     }
@@ -452,6 +458,36 @@ impl CapabilityProviders {
                     source: record.source,
                     entry: record.entry,
                 })
+                .await;
+        }
+        Ok(count)
+    }
+
+    pub async fn restore_memo_log_entries(&self) -> Result<usize, PortError> {
+        let already_hydrated = self
+            .inner
+            .blackboard
+            .read(|bb| !bb.recent_memo_logs().is_empty())
+            .await;
+        if already_hydrated {
+            return Ok(0);
+        }
+
+        let retained_per_owner = self
+            .inner
+            .blackboard
+            .read(|bb| bb.memo_retained_per_owner())
+            .await;
+        let records = self
+            .inner
+            .memo_log_repository
+            .recent_per_owner(retained_per_owner)
+            .await?;
+        let count = records.len();
+        for PersistedMemoLogEntry { record, payload } in records {
+            self.inner
+                .blackboard
+                .restore_memo_log_entry(record, payload)
                 .await;
         }
         Ok(count)
@@ -920,6 +956,7 @@ impl ModuleCapabilityFactory {
         Memo::new(
             self.owner.clone(),
             self.root.inner.blackboard.clone(),
+            self.root.inner.memo_log_repository.clone(),
             TopicMailbox::new(self.owner.clone(), self.root.inner.memo_updates.clone()),
             TopicMailbox::new(
                 self.owner.clone(),
@@ -930,11 +967,15 @@ impl ModuleCapabilityFactory {
         )
     }
 
-    pub fn typed_memo<T: 'static>(&self) -> TypedMemo<T> {
+    pub fn typed_memo<T>(&self) -> TypedMemo<T>
+    where
+        T: serde::Serialize + serde::de::DeserializeOwned + 'static,
+    {
         self.claim_memo();
         TypedMemo::new(
             self.owner.clone(),
             self.root.inner.blackboard.clone(),
+            self.root.inner.memo_log_repository.clone(),
             TopicMailbox::new(self.owner.clone(), self.root.inner.memo_updates.clone()),
             TopicMailbox::new(
                 self.owner.clone(),
@@ -1458,6 +1499,9 @@ impl ModuleRegistry {
                 .collect(),
         )
         .await;
+        caps.restore_memo_log_entries()
+            .await
+            .map_err(ModuleRegistryError::MemoLogRestore)?;
         caps.restore_allocation_snapshots()
             .await
             .map_err(ModuleRegistryError::AllocationRestore)?;
@@ -1633,6 +1677,8 @@ pub enum ModuleRegistryError {
     },
     #[error("failed to restore persisted allocation snapshots: {0}")]
     AllocationRestore(PortError),
+    #[error("failed to restore persisted memo log entries: {0}")]
+    MemoLogRestore(PortError),
     #[error("failed to restore persisted cognition log entries: {0}")]
     CognitionLogRestore(PortError),
 }
@@ -1648,7 +1694,7 @@ mod tests {
     use chrono::{DateTime, Utc};
     use nuillu_blackboard::{
         ActivationRatio, AllocationCommand, AllocationEffectLevel, Blackboard, BlackboardCommand,
-        CognitionLogEntry, CognitionLogOrigin, ResourceAllocation,
+        CognitionLogEntry, CognitionLogOrigin, MemoLogPayload, MemoLogRecord, ResourceAllocation,
     };
     use nuillu_types::{ModuleId, ReplicaCapRange, builtin};
 
@@ -1784,6 +1830,66 @@ mod tests {
         }
     }
 
+    #[derive(Clone, Default)]
+    struct RecordingMemoLogRepository {
+        records: Rc<RefCell<Vec<PersistedMemoLogEntry>>>,
+        appends: Rc<RefCell<Vec<PersistedMemoLogEntry>>>,
+    }
+
+    impl RecordingMemoLogRepository {
+        fn with_records(records: Vec<PersistedMemoLogEntry>) -> Self {
+            Self {
+                records: Rc::new(RefCell::new(records)),
+                appends: Rc::new(RefCell::new(Vec::new())),
+            }
+        }
+
+        fn appends(&self) -> Vec<PersistedMemoLogEntry> {
+            self.appends.borrow().clone()
+        }
+    }
+
+    #[async_trait(?Send)]
+    impl MemoLogRepository for RecordingMemoLogRepository {
+        async fn append(&self, entry: &PersistedMemoLogEntry) -> Result<(), PortError> {
+            self.appends.borrow_mut().push(entry.clone());
+            Ok(())
+        }
+
+        async fn recent_per_owner(
+            &self,
+            retained_per_owner: usize,
+        ) -> Result<Vec<PersistedMemoLogEntry>, PortError> {
+            if retained_per_owner == 0 {
+                return Ok(Vec::new());
+            }
+            let mut grouped =
+                std::collections::BTreeMap::<String, Vec<PersistedMemoLogEntry>>::new();
+            for entry in self.records.borrow().iter().cloned() {
+                grouped
+                    .entry(entry.record.owner.to_string())
+                    .or_default()
+                    .push(entry);
+            }
+            let mut records = Vec::new();
+            for group in grouped.values_mut() {
+                group.sort_by(|left, right| left.record.index.cmp(&right.record.index));
+                let keep_from = group.len().saturating_sub(retained_per_owner);
+                records.extend(group[keep_from..].iter().cloned());
+            }
+            records.sort_by(|left, right| {
+                left.record
+                    .owner
+                    .module
+                    .as_str()
+                    .cmp(right.record.owner.module.as_str())
+                    .then_with(|| left.record.owner.replica.cmp(&right.record.owner.replica))
+                    .then_with(|| left.record.index.cmp(&right.record.index))
+            });
+            Ok(records)
+        }
+    }
+
     #[async_trait(?Send)]
     impl CognitionLogRepository for RecordingCognitionLogRepository {
         async fn append(
@@ -1901,6 +2007,29 @@ mod tests {
             },
             runtime: CapabilityProviderRuntime {
                 allocation_store,
+                ..CapabilityProviderRuntime::default()
+            },
+        })
+    }
+
+    fn test_caps_with_memo_log_repository(
+        blackboard: Blackboard,
+        memo_log_repository: Rc<dyn MemoLogRepository>,
+        policy: RuntimePolicy,
+    ) -> CapabilityProviders {
+        let adapter = Arc::new(lutum::MockLlmAdapter::new());
+        let budget = lutum::SharedPoolBudgetManager::new(lutum::SharedPoolBudgetOptions::default());
+        let lutum = lutum::Lutum::new(adapter, budget);
+        CapabilityProviders::new(CapabilityProviderConfig {
+            ports: CapabilityProviderPorts {
+                blackboard,
+                cognition_log_port: Rc::new(crate::ports::NoopCognitionLogRepository),
+                clock: Rc::new(SystemClock),
+                tiers: LutumTiers::from_shared_lutum(lutum),
+            },
+            runtime: CapabilityProviderRuntime {
+                policy,
+                memo_log_repository,
                 ..CapabilityProviderRuntime::default()
             },
         })
@@ -2333,7 +2462,7 @@ mod tests {
 
     #[tokio::test]
     async fn typed_memo_writes_plaintext_publishes_and_keeps_typed_payload() {
-        #[derive(Debug, Clone, PartialEq, Eq)]
+        #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
         struct TestMemoPayload {
             value: String,
         }
@@ -2373,6 +2502,127 @@ mod tests {
                 value: "typed".into()
             }
         );
+    }
+
+    #[tokio::test]
+    async fn memo_write_persists_plain_payload() {
+        let blackboard = Blackboard::default();
+        let repo = RecordingMemoLogRepository::default();
+        let caps = test_caps_with_memo_log_repository(
+            blackboard,
+            Rc::new(repo.clone()),
+            RuntimePolicy::default(),
+        );
+        let sensory = scoped(&caps, builtin::sensory(), 0);
+        let owner = ModuleInstanceId::new(builtin::sensory(), ReplicaIndex::ZERO);
+
+        sensory.memo().write_cognitive("salient memo").await;
+
+        let appends = repo.appends();
+        assert_eq!(
+            appends,
+            vec![PersistedMemoLogEntry {
+                record: MemoLogRecord {
+                    owner,
+                    index: 0,
+                    written_at: appends[0].record.written_at,
+                    content: "salient memo".to_owned(),
+                    cognitive: true,
+                },
+                payload: MemoLogPayload::Plain,
+            }]
+        );
+    }
+
+    #[tokio::test]
+    async fn typed_memo_write_persists_json_payload() {
+        #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+        struct TestMemoPayload {
+            value: String,
+        }
+
+        let blackboard = Blackboard::default();
+        let repo = RecordingMemoLogRepository::default();
+        let caps = test_caps_with_memo_log_repository(
+            blackboard,
+            Rc::new(repo.clone()),
+            RuntimePolicy::default(),
+        );
+        let query_memory = scoped(&caps, builtin::query_memory(), 0);
+        let owner = ModuleInstanceId::new(builtin::query_memory(), ReplicaIndex::ZERO);
+
+        query_memory
+            .typed_memo::<TestMemoPayload>()
+            .write_cognitive(
+                TestMemoPayload {
+                    value: "typed".into(),
+                },
+                "typed memo",
+            )
+            .await;
+
+        let appends = repo.appends();
+        assert_eq!(appends.len(), 1);
+        assert_eq!(appends[0].record.owner, owner);
+        assert_eq!(appends[0].record.index, 0);
+        assert!(appends[0].record.cognitive);
+        assert_eq!(appends[0].record.content, "typed memo");
+        assert_eq!(
+            appends[0].payload,
+            MemoLogPayload::Typed {
+                type_name: std::any::type_name::<TestMemoPayload>().to_owned(),
+                json: serde_json::json!({ "value": "typed" }),
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn registry_build_restores_recent_memo_log_entries() {
+        let blackboard = Blackboard::default();
+        let owner = ModuleInstanceId::new(builtin::sensory(), ReplicaIndex::ZERO);
+        let repo = RecordingMemoLogRepository::with_records(vec![
+            PersistedMemoLogEntry {
+                record: MemoLogRecord {
+                    owner: owner.clone(),
+                    index: 0,
+                    written_at: Utc::now() - chrono::Duration::seconds(2),
+                    content: "old memo".to_owned(),
+                    cognitive: false,
+                },
+                payload: MemoLogPayload::Plain,
+            },
+            PersistedMemoLogEntry {
+                record: MemoLogRecord {
+                    owner: owner.clone(),
+                    index: 1,
+                    written_at: Utc::now() - chrono::Duration::seconds(1),
+                    content: "kept memo".to_owned(),
+                    cognitive: true,
+                },
+                payload: MemoLogPayload::Plain,
+            },
+        ]);
+        let caps = test_caps_with_memo_log_repository(
+            blackboard.clone(),
+            Rc::new(repo),
+            RuntimePolicy {
+                memo_retained_per_owner: 1,
+                ..RuntimePolicy::default()
+            },
+        );
+
+        ModuleRegistry::new().build(&caps).await.unwrap();
+
+        let memos = blackboard.read(|bb| bb.recent_memo_logs()).await;
+        assert_eq!(memos.len(), 1);
+        assert_eq!(memos[0].index, 1);
+        assert_eq!(memos[0].content, "kept memo");
+        assert!(memos[0].cognitive);
+
+        let next = blackboard
+            .update_memo(owner, "after restore".to_owned(), Utc::now())
+            .await;
+        assert_eq!(next.index, 2);
     }
 
     #[tokio::test]
