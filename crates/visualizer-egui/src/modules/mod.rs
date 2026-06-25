@@ -25,6 +25,8 @@ use crate::{
     memos, module_filter,
     module_filter::ModuleFilterState,
     text::{hard_wrap_long_segments, wrapped_label},
+    visualizer_error_banner_fill, visualizer_error_row_fill, visualizer_error_subtle_fill,
+    visualizer_selection_card_fill, visualizer_selection_cell_fill, visualizer_selection_row_fill,
 };
 
 #[derive(Debug)]
@@ -1143,7 +1145,7 @@ fn selector_button(selected: bool, label: String) -> egui::Button<'static> {
 fn failed_turn_frame(ui: &egui::Ui, status: ModuleSessionStatus) -> egui::Frame {
     if status == ModuleSessionStatus::Failed {
         egui::Frame::new()
-            .fill(ui.visuals().error_fg_color.linear_multiply(0.14))
+            .fill(visualizer_error_subtle_fill(ui.visuals()))
             .inner_margin(egui::Margin::symmetric(2, 0))
     } else {
         egui::Frame::new().inner_margin(egui::Margin::symmetric(2, 0))
@@ -1257,7 +1259,7 @@ fn render_llm_turn_summary(
     summary_index: usize,
 ) {
     let fill = if turn.status == ModuleSessionStatus::Failed {
-        ui.visuals().error_fg_color.linear_multiply(0.12)
+        visualizer_error_subtle_fill(ui.visuals())
     } else {
         ui.visuals().extreme_bg_color
     };
@@ -1444,7 +1446,7 @@ fn render_output_item(
     index: usize,
 ) {
     egui::Frame::new()
-        .fill(ui.visuals().selection.bg_fill.linear_multiply(0.45))
+        .fill(visualizer_selection_card_fill(ui.visuals()))
         .stroke(ui.visuals().widgets.noninteractive.bg_stroke)
         .corner_radius(egui::CornerRadius::same(6))
         .inner_margin(egui::Margin::same(8))
@@ -1659,7 +1661,7 @@ fn overview_header(ui: &mut egui::Ui) {
 fn render_error_banner(ui: &mut egui::Ui, label: String, message: &str) {
     let display = hard_wrap_long_segments(message, 96);
     egui::Frame::new()
-        .fill(ui.visuals().error_fg_color.linear_multiply(0.16))
+        .fill(visualizer_error_banner_fill(ui.visuals()))
         .stroke(egui::Stroke::new(1.0, ui.visuals().error_fg_color))
         .corner_radius(egui::CornerRadius::same(6))
         .inner_margin(egui::Margin::same(8))
@@ -1767,10 +1769,8 @@ fn overview_row_fill(
     visuals: &egui::Visuals,
 ) -> Option<egui::Color32> {
     match overview_row_fill_kind(row, index) {
-        Some(OverviewRowFill::Failed) => Some(visuals.error_fg_color.linear_multiply(0.18)),
-        Some(OverviewRowFill::LlmStreaming) => {
-            Some(visuals.selection.bg_fill.linear_multiply(0.22))
-        }
+        Some(OverviewRowFill::Failed) => Some(visualizer_error_row_fill(visuals)),
+        Some(OverviewRowFill::LlmStreaming) => Some(visualizer_selection_row_fill(visuals)),
         Some(OverviewRowFill::Zebra) => Some(visuals.faint_bg_color),
         None => None,
     }
@@ -2058,7 +2058,7 @@ fn overview_replica_cell(ui: &mut egui::Ui, row: &ModuleOverviewRow) {
     let visuals = ui.visuals();
     let (fill, stroke, hover) = match highlight {
         ActiveReplicaHighlight::AllocationDriven => (
-            Some(visuals.selection.bg_fill.linear_multiply(0.55)),
+            Some(visualizer_selection_cell_fill(visuals)),
             visuals.selection.stroke,
             "Allocation-active replica",
         ),

@@ -24,7 +24,7 @@ use std::time::Instant;
 use egui_hooks::UseHookExt as _;
 use font_kit::family_name::FamilyName;
 use font_kit::handle::Handle;
-use font_kit::properties::Properties;
+use font_kit::properties::{Properties, Weight};
 use font_kit::source::SystemSource;
 use i18n::{EguiI18nExt as _, I18nArg, I18nCatalog, LOCALE_PERSISTENCE_KEY, Locale};
 use nuillu_module::RuntimeEvent;
@@ -32,6 +32,7 @@ pub use nuillu_visualizer_protocol::*;
 
 const NOTO_SANS_JP_FONT_KEY: &str = "noto-sans-jp";
 const NOTO_SANS_JP_FAMILY_NAME: &str = "Noto Sans JP";
+const NOTO_SANS_JP_FONT_WEIGHT: Weight = Weight::MEDIUM;
 const THEME_PERSISTENCE_KEY: &str = "visualizer-theme";
 const ZOOM_FACTOR_PERSISTENCE_KEY: &str = "visualizer-zoom-factor";
 const DEFAULT_ZOOM_FACTOR: f32 = 1.0;
@@ -117,6 +118,16 @@ fn install_visualizer_fonts(ctx: &egui::Context) {
 fn install_visualizer_theme_styles(ctx: &egui::Context) {
     for theme in [egui::Theme::Light, egui::Theme::Dark] {
         ctx.style_mut_of(theme, |style| {
+            style.visuals.override_text_color = visualizer_override_text_color(theme);
+            style.visuals.weak_text_color = visualizer_weak_text_color(theme);
+            style.visuals.text_options.alpha_from_coverage =
+                visualizer_text_alpha_from_coverage(theme);
+            style.visuals.selection.bg_fill = visualizer_selection_fill(theme);
+            style.visuals.selection.stroke =
+                egui::Stroke::new(1.0, visualizer_selection_text_color(theme));
+            style.visuals.hyperlink_color = visualizer_hyperlink_color(theme);
+            style.visuals.warn_fg_color = visualizer_warning_text_color(theme);
+            style.visuals.error_fg_color = visualizer_error_text_color(theme);
             style.visuals.widgets.noninteractive.fg_stroke.color =
                 visualizer_normal_text_color(theme);
             style.visuals.widgets.inactive.fg_stroke.color =
@@ -136,6 +147,27 @@ fn visualizer_normal_text_color(theme: egui::Theme) -> egui::Color32 {
     }
 }
 
+fn visualizer_override_text_color(theme: egui::Theme) -> Option<egui::Color32> {
+    match theme {
+        egui::Theme::Light => Some(visualizer_normal_text_color(theme)),
+        egui::Theme::Dark => None,
+    }
+}
+
+fn visualizer_weak_text_color(theme: egui::Theme) -> Option<egui::Color32> {
+    match theme {
+        egui::Theme::Light => Some(egui::Color32::from_gray(64)),
+        egui::Theme::Dark => None,
+    }
+}
+
+fn visualizer_text_alpha_from_coverage(theme: egui::Theme) -> egui::epaint::AlphaFromCoverage {
+    match theme {
+        egui::Theme::Light => egui::epaint::AlphaFromCoverage::TwoCoverageMinusCoverageSq,
+        egui::Theme::Dark => egui::epaint::AlphaFromCoverage::DARK_MODE_DEFAULT,
+    }
+}
+
 fn visualizer_interactive_text_color(theme: egui::Theme) -> egui::Color32 {
     match theme {
         egui::Theme::Light => egui::Color32::from_gray(0),
@@ -143,8 +175,100 @@ fn visualizer_interactive_text_color(theme: egui::Theme) -> egui::Color32 {
     }
 }
 
-fn visualizer_font_definitions(font_data: egui::FontData) -> egui::FontDefinitions {
+fn visualizer_selection_fill(theme: egui::Theme) -> egui::Color32 {
+    match theme {
+        egui::Theme::Light => egui::Color32::from_rgb(206, 232, 255),
+        egui::Theme::Dark => egui::Color32::from_rgb(0, 92, 128),
+    }
+}
+
+fn visualizer_selection_text_color(theme: egui::Theme) -> egui::Color32 {
+    match theme {
+        egui::Theme::Light => egui::Color32::from_gray(0),
+        egui::Theme::Dark => egui::Color32::from_rgb(192, 222, 255),
+    }
+}
+
+fn visualizer_hyperlink_color(theme: egui::Theme) -> egui::Color32 {
+    match theme {
+        egui::Theme::Light => egui::Color32::from_rgb(0, 86, 160),
+        egui::Theme::Dark => egui::Color32::from_rgb(90, 170, 255),
+    }
+}
+
+fn visualizer_warning_text_color(theme: egui::Theme) -> egui::Color32 {
+    match theme {
+        egui::Theme::Light => egui::Color32::from_rgb(142, 72, 0),
+        egui::Theme::Dark => egui::Color32::from_rgb(255, 143, 0),
+    }
+}
+
+fn visualizer_error_text_color(theme: egui::Theme) -> egui::Color32 {
+    match theme {
+        egui::Theme::Light => egui::Color32::from_rgb(176, 0, 0),
+        egui::Theme::Dark => egui::Color32::from_rgb(255, 0, 0),
+    }
+}
+
+pub(crate) fn visualizer_selection_message_fill(visuals: &egui::Visuals) -> egui::Color32 {
+    if visuals.dark_mode {
+        visuals.selection.bg_fill.linear_multiply(0.65)
+    } else {
+        egui::Color32::from_rgb(226, 242, 255)
+    }
+}
+
+pub(crate) fn visualizer_selection_card_fill(visuals: &egui::Visuals) -> egui::Color32 {
+    if visuals.dark_mode {
+        visuals.selection.bg_fill.linear_multiply(0.45)
+    } else {
+        egui::Color32::from_rgb(232, 245, 255)
+    }
+}
+
+pub(crate) fn visualizer_selection_cell_fill(visuals: &egui::Visuals) -> egui::Color32 {
+    if visuals.dark_mode {
+        visuals.selection.bg_fill.linear_multiply(0.55)
+    } else {
+        egui::Color32::from_rgb(219, 239, 255)
+    }
+}
+
+pub(crate) fn visualizer_selection_row_fill(visuals: &egui::Visuals) -> egui::Color32 {
+    if visuals.dark_mode {
+        visuals.selection.bg_fill.linear_multiply(0.22)
+    } else {
+        egui::Color32::from_rgb(240, 248, 255)
+    }
+}
+
+pub(crate) fn visualizer_error_subtle_fill(visuals: &egui::Visuals) -> egui::Color32 {
+    if visuals.dark_mode {
+        visuals.error_fg_color.linear_multiply(0.12)
+    } else {
+        egui::Color32::from_rgb(255, 242, 242)
+    }
+}
+
+pub(crate) fn visualizer_error_banner_fill(visuals: &egui::Visuals) -> egui::Color32 {
+    if visuals.dark_mode {
+        visuals.error_fg_color.linear_multiply(0.16)
+    } else {
+        egui::Color32::from_rgb(255, 237, 237)
+    }
+}
+
+pub(crate) fn visualizer_error_row_fill(visuals: &egui::Visuals) -> egui::Color32 {
+    if visuals.dark_mode {
+        visuals.error_fg_color.linear_multiply(0.18)
+    } else {
+        egui::Color32::from_rgb(255, 232, 232)
+    }
+}
+
+fn visualizer_font_definitions(mut font_data: egui::FontData) -> egui::FontDefinitions {
     let mut fonts = egui::FontDefinitions::default();
+    font_data.tweak = visualizer_font_tweak();
     fonts
         .font_data
         .insert(NOTO_SANS_JP_FONT_KEY.to_owned(), Arc::new(font_data));
@@ -158,10 +282,23 @@ fn visualizer_font_definitions(font_data: egui::FontData) -> egui::FontDefinitio
     fonts
 }
 
+fn visualizer_font_properties() -> Properties {
+    let mut properties = Properties::new();
+    properties.weight(NOTO_SANS_JP_FONT_WEIGHT);
+    properties
+}
+
+fn visualizer_font_tweak() -> egui::FontTweak {
+    egui::FontTweak {
+        coords: egui::epaint::text::VariationCoords::new([(b"wght", NOTO_SANS_JP_FONT_WEIGHT.0)]),
+        ..Default::default()
+    }
+}
+
 fn load_noto_sans_jp() -> Option<egui::FontData> {
     let handle = match SystemSource::new().select_best_match(
         &[FamilyName::Title(NOTO_SANS_JP_FAMILY_NAME.to_owned())],
-        &Properties::new(),
+        &visualizer_font_properties(),
     ) {
         Ok(handle) => handle,
         Err(error) => {
@@ -1807,6 +1944,38 @@ mod tests {
         for theme in [egui::Theme::Light, egui::Theme::Dark] {
             let style = ctx.style_of(theme);
             assert_eq!(
+                style.visuals.override_text_color,
+                visualizer_override_text_color(theme)
+            );
+            assert_eq!(
+                style.visuals.weak_text_color,
+                visualizer_weak_text_color(theme)
+            );
+            assert_eq!(
+                style.visuals.text_options.alpha_from_coverage,
+                visualizer_text_alpha_from_coverage(theme)
+            );
+            assert_eq!(
+                style.visuals.selection.bg_fill,
+                visualizer_selection_fill(theme)
+            );
+            assert_eq!(
+                style.visuals.selection.stroke.color,
+                visualizer_selection_text_color(theme)
+            );
+            assert_eq!(
+                style.visuals.hyperlink_color,
+                visualizer_hyperlink_color(theme)
+            );
+            assert_eq!(
+                style.visuals.warn_fg_color,
+                visualizer_warning_text_color(theme)
+            );
+            assert_eq!(
+                style.visuals.error_fg_color,
+                visualizer_error_text_color(theme)
+            );
+            assert_eq!(
                 style.visuals.widgets.noninteractive.fg_stroke.color,
                 visualizer_normal_text_color(theme)
             );
@@ -1826,6 +1995,92 @@ mod tests {
                 style.visuals.widgets.open.fg_stroke.color,
                 visualizer_interactive_text_color(theme)
             );
+        }
+    }
+
+    #[test]
+    fn visualizer_light_theme_text_colors_keep_readable_contrast() {
+        let ctx = egui::Context::default();
+
+        install_visualizer_theme_styles(&ctx);
+
+        let style = ctx.style_of(egui::Theme::Light);
+        let visuals = &style.visuals;
+        let panel_fill = visuals.panel_fill;
+        assert_contrast_at_least(visuals.text_color(), panel_fill, 4.5);
+        assert_contrast_at_least(visuals.weak_text_color(), panel_fill, 4.5);
+        assert_contrast_at_least(visuals.widgets.inactive.text_color(), panel_fill, 4.5);
+        assert_contrast_at_least(visuals.widgets.hovered.text_color(), panel_fill, 4.5);
+        assert_contrast_at_least(visuals.widgets.active.text_color(), panel_fill, 4.5);
+        assert_contrast_at_least(visuals.widgets.open.text_color(), panel_fill, 4.5);
+        assert_contrast_at_least(
+            visuals.selection.stroke.color,
+            visuals.selection.bg_fill,
+            4.5,
+        );
+        assert_contrast_at_least(visuals.hyperlink_color, panel_fill, 4.5);
+        assert_contrast_at_least(visuals.warn_fg_color, panel_fill, 4.5);
+        assert_contrast_at_least(visuals.error_fg_color, panel_fill, 4.5);
+    }
+
+    #[test]
+    fn visualizer_light_theme_tinted_fills_keep_readable_contrast() {
+        let ctx = egui::Context::default();
+
+        install_visualizer_theme_styles(&ctx);
+
+        let style = ctx.style_of(egui::Theme::Light);
+        let visuals = &style.visuals;
+        let text = visuals.text_color();
+        for fill in [
+            visualizer_selection_message_fill(visuals),
+            visualizer_selection_card_fill(visuals),
+            visualizer_selection_cell_fill(visuals),
+            visualizer_selection_row_fill(visuals),
+            visualizer_error_subtle_fill(visuals),
+            visualizer_error_banner_fill(visuals),
+            visualizer_error_row_fill(visuals),
+        ] {
+            assert_contrast_at_least(text, fill, 4.5);
+        }
+        assert_contrast_at_least(
+            visuals.error_fg_color,
+            visualizer_error_banner_fill(visuals),
+            4.5,
+        );
+    }
+
+    fn assert_contrast_at_least(
+        foreground: egui::Color32,
+        background: egui::Color32,
+        minimum: f32,
+    ) {
+        let actual = contrast_ratio(foreground, background);
+        assert!(
+            actual >= minimum,
+            "contrast ratio {actual:.2} is below {minimum:.2} for {foreground:?} on {background:?}"
+        );
+    }
+
+    fn contrast_ratio(left: egui::Color32, right: egui::Color32) -> f32 {
+        let lighter = relative_luminance(left).max(relative_luminance(right));
+        let darker = relative_luminance(left).min(relative_luminance(right));
+        (lighter + 0.05) / (darker + 0.05)
+    }
+
+    fn relative_luminance(color: egui::Color32) -> f32 {
+        let [r, g, b, _] = color.to_srgba_unmultiplied();
+        0.2126 * srgb_channel_luminance(r)
+            + 0.7152 * srgb_channel_luminance(g)
+            + 0.0722 * srgb_channel_luminance(b)
+    }
+
+    fn srgb_channel_luminance(channel: u8) -> f32 {
+        let channel = f32::from(channel) / 255.0;
+        if channel <= 0.04045 {
+            channel / 12.92
+        } else {
+            ((channel + 0.055) / 1.055).powf(2.4)
         }
     }
 
@@ -2125,7 +2380,11 @@ mod tests {
     fn visualizer_fonts_prioritize_noto_for_proportional_and_monospace_text() {
         let fonts = visualizer_font_definitions(egui::FontData::from_owned(Vec::new()));
 
-        assert!(fonts.font_data.contains_key(NOTO_SANS_JP_FONT_KEY));
+        let font_data = fonts
+            .font_data
+            .get(NOTO_SANS_JP_FONT_KEY)
+            .expect("visualizer font is installed");
+        assert_eq!(font_data.tweak, visualizer_font_tweak());
         for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
             assert_eq!(
                 fonts
@@ -2136,5 +2395,13 @@ mod tests {
                 Some(NOTO_SANS_JP_FONT_KEY)
             );
         }
+    }
+
+    #[test]
+    fn visualizer_font_selection_requests_medium_weight() {
+        assert_eq!(
+            visualizer_font_properties().weight,
+            NOTO_SANS_JP_FONT_WEIGHT
+        );
     }
 }

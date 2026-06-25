@@ -9,6 +9,7 @@ use crate::{
     SceneRowKind, SceneSoundRowView, SceneStateView, UtteranceDeltaView, UtteranceEventKindView,
     UtteranceEventRowView, UtteranceView, VisualizerClientMessage, VisualizerCommand,
     VisualizerTabId, derive_scene_ambient, i18n::EguiI18nExt as _, text::wrapped_label,
+    visualizer_selection_message_fill,
 };
 
 const FIELD_HEIGHT: f32 = 24.0;
@@ -1007,7 +1008,7 @@ fn person_display_name(person: &ScenePersonRowView) -> String {
 fn activity_message_ui(ui: &mut egui::Ui, message: &ActivityMessage) {
     egui::Frame::new()
         .fill(match message.role {
-            ActivityRole::User => ui.visuals().selection.bg_fill.linear_multiply(0.65),
+            ActivityRole::User => visualizer_selection_message_fill(ui.visuals()),
             ActivityRole::Environment => ui.visuals().faint_bg_color,
             ActivityRole::Assistant => ui.visuals().extreme_bg_color,
         })
