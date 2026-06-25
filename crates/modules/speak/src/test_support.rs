@@ -3,7 +3,6 @@ use std::rc::Rc;
 
 use anyhow::Result;
 use async_trait::async_trait;
-use lutum::{FinishReason, MockTextScenario, RawTextTurnEvent, Usage};
 use nuillu_module::Module;
 use nuillu_module::ports::PortError;
 
@@ -67,18 +66,3 @@ macro_rules! noop_stub {
 }
 
 noop_stub!(SpeakStub, "speak");
-
-pub(crate) fn generation_text_scenario(text: &str) -> MockTextScenario {
-    MockTextScenario::events(vec![
-        Ok(RawTextTurnEvent::Started {
-            request_id: Some("speak-text".into()),
-            model: "mock".into(),
-        }),
-        Ok(RawTextTurnEvent::TextDelta { delta: text.into() }),
-        Ok(RawTextTurnEvent::Completed {
-            request_id: Some("speak-text".into()),
-            finish_reason: FinishReason::Stop,
-            usage: Usage::zero(),
-        }),
-    ])
-}

@@ -413,7 +413,6 @@ fn register_server_module(
         RuntimeModule::Speak => {
             let utterance_sink = utterance_sink.clone();
             let planning_tier = spec.session_tier("planning");
-            let generation_tier = spec.session_tier("generation");
             registry.register_server(spec, move |caps| {
                 let utterance_sink = utterance_sink.clone();
                 async move {
@@ -430,25 +429,13 @@ fn register_server_module(
                                 caps.clock(),
                             ),
                             planning_llm: caps.llm("planning").with_tier(planning_tier).into(),
-                            generation_llm: caps
-                                .llm("generation")
-                                .with_tier(generation_tier)
-                                .into(),
                             scene: caps.scene_reader(),
                             clock: caps.clock(),
-                            self_wake: caps.self_wake(),
                             planning_session: caps
                                 .session("planning")
                                 .with_tier(planning_tier)
                                 .with_auto_compaction(
                                     nuillu_speak::planning_session_auto_compaction(),
-                                )
-                                .await?,
-                            generation_session: caps
-                                .session("generation")
-                                .with_tier(generation_tier)
-                                .with_auto_compaction(
-                                    nuillu_speak::generation_session_auto_compaction(),
                                 )
                                 .await?,
                         },

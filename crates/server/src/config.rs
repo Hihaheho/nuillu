@@ -278,10 +278,7 @@ impl RuntimeModule {
             Self::Reward => &[("main", ModelTier::Default)],
             Self::Predict => &[("main", ModelTier::Cheap)],
             Self::Surprise => &[("main", ModelTier::Default)],
-            Self::Speak => &[
-                ("planning", ModelTier::Premium),
-                ("generation", ModelTier::Default),
-            ],
+            Self::Speak => &[("planning", ModelTier::Premium)],
             Self::Sleep => &[("main", ModelTier::Cheap)],
             Self::Poet => &[("main", ModelTier::Cheap)],
         }
@@ -777,7 +774,6 @@ mod tests {
         assert_eq!(speak.bpm_min, 6.0);
         assert_eq!(speak.bpm_max, 18.0);
         assert_eq!(speak.session_tier("planning"), ModelTier::Premium);
-        assert_eq!(speak.session_tier("generation"), ModelTier::Default);
     }
 
     #[test]
@@ -812,10 +808,6 @@ activation-table = [1.0, 0.5]
     tier = "premium"
   }
 
-  @ sessions[] {
-    key = "generation"
-    tier = "default"
-  }
 }
 "#,
             Path::new(".tmp/server/config.eure"),
@@ -830,10 +822,6 @@ activation-table = [1.0, 0.5]
         assert_eq!(
             config.modules[1].session_tier("planning"),
             ModelTier::Premium
-        );
-        assert_eq!(
-            config.modules[1].session_tier("generation"),
-            ModelTier::Default
         );
         assert_eq!(
             config.modules[1].groups,

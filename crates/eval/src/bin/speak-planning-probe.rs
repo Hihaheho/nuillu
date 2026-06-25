@@ -24,8 +24,13 @@ Call prepare_speech only when new cognition supports a new outward utterance. ta
 For direct speech heard from a named speaker, target that speaker. Use everyone only when the cognition explicitly calls for group or broadcast speech.
 Call decline_speech_now when no new outward utterance is appropriate now. If speak should not be prioritized again until new cognition arrives, include inhibit_reason.
 Predictions, expected dialogue flow, and my own previous speech are not new outward speech motivation by themselves.
-facts must be short quotes or summaries from identity memory or the cognition log only.
-my_speech_intent is what I should convey outwardly. Nui is my own name; do not treat my name as the listener. Do not write the target's future reply, expression, feeling, action, or narration there.
+speech_content is exact listener-visible utterance text, not a directive, summary, rationale, or future plan.
+Write speech_content as one short in-world utterance that can be safely preempted.
+If the cognition log contains an explicit language request, write speech_content itself in that language.
+Do not wrap speech_content in quotation marks.
+Do not summarize the request or say what the user wants.
+Do not output introspection, narration, analysis, implementation mechanics, lookup, reasoning, prompts, rubrics, judges, or evaluation mechanics.
+Nui is my own name; do not treat my name as the listener. Do not write the target's future reply, expression, feeling, action, or narration there.
 Do not invent policy, actions, identity, memory, visible evidence, unknown-state evidence, or other facts not supported by the provided context."#;
 
 #[derive(Debug, Parser)]
@@ -256,8 +261,7 @@ mod current_schema {
     #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
     pub(super) struct PrepareSpeechArgs {
         pub(super) target: SpeechTarget,
-        pub(super) facts: Vec<String>,
-        pub(super) my_speech_intent: String,
+        pub(super) speech_content: String,
     }
 
     #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema, lutum::Toolset)]
@@ -273,8 +277,7 @@ mod required_with_silent_schema {
     #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
     pub(super) struct PrepareSpeechArgs {
         pub(super) target: SpeechTarget,
-        pub(super) facts: Vec<String>,
-        pub(super) my_speech_intent: String,
+        pub(super) speech_content: String,
     }
 
     #[lutum::tool_input(name = "decline_speech_now", output = DeclineSpeechNowOutput)]
@@ -302,9 +305,7 @@ mod single_decision_schema {
         #[serde(default)]
         pub(super) target: Option<SpeechTarget>,
         #[serde(default)]
-        pub(super) facts: Vec<String>,
-        #[serde(default)]
-        pub(super) my_speech_intent: Option<String>,
+        pub(super) speech_content: Option<String>,
         #[serde(default)]
         pub(super) reason: Option<String>,
     }
@@ -319,7 +320,7 @@ mod single_decision_schema {
 enum CandidateDecision {
     Speak {
         target: String,
-        my_speech_intent: String,
+        speech_content: String,
     },
     Silent {
         reason: String,
@@ -331,7 +332,7 @@ struct ValidationReport {
     success: bool,
     failure: Option<String>,
     target: Option<String>,
-    my_speech_intent: Option<String>,
+    speech_content: Option<String>,
     pseudo_tool_text: bool,
     target_validity_failure: bool,
 }
@@ -344,7 +345,7 @@ struct TrialReport {
     success: bool,
     failure: Option<String>,
     target: Option<String>,
-    my_speech_intent: Option<String>,
+    speech_content: Option<String>,
     transport_error: bool,
     pseudo_tool_text: bool,
     target_validity_failure: bool,
@@ -612,7 +613,7 @@ async fn run_current_trial(
         |call| match call {
             current_schema::ToolsCall::PrepareSpeech(call) => Some(CandidateDecision::Speak {
                 target: call.input.target.as_str().to_owned(),
-                my_speech_intent: call.input.my_speech_intent.clone(),
+                speech_content: call.input.speech_content.clone(),
             }),
         },
     )
@@ -646,7 +647,7 @@ async fn run_required_with_silent_trial(
             required_with_silent_schema::ToolsCall::PrepareSpeech(call) => {
                 Some(CandidateDecision::Speak {
                     target: call.input.target.as_str().to_owned(),
-                    my_speech_intent: call.input.my_speech_intent.clone(),
+                    speech_content: call.input.speech_content.clone(),
                 })
             }
             required_with_silent_schema::ToolsCall::DeclineSpeechNow(call) => {
@@ -689,7 +690,7 @@ async fn run_single_decision_trial(
                             .as_ref()
                             .map(|target| target.as_str().to_owned())
                             .unwrap_or_default(),
-                        my_speech_intent: call.input.my_speech_intent.clone().unwrap_or_default(),
+                        speech_content: call.input.speech_content.clone().unwrap_or_default(),
                     })
                 } else {
                     Some(CandidateDecision::Silent {
@@ -740,7 +741,7 @@ where
                         success: false,
                         failure: Some(failure),
                         target: None,
-                        my_speech_intent: None,
+                        speech_content: None,
                         pseudo_tool_text: false,
                         target_validity_failure: false,
                     }
@@ -749,7 +750,7 @@ where
                 success,
                 failure,
                 target,
-                my_speech_intent,
+                speech_content,
                 pseudo_tool_text,
                 target_validity_failure,
             } = validation;
@@ -760,7 +761,7 @@ where
                 success,
                 failure,
                 target,
-                my_speech_intent,
+                speech_content,
                 transport_error: false,
                 pseudo_tool_text,
                 target_validity_failure,
@@ -784,7 +785,7 @@ where
                     format!("finished_without_tool:{:?}", result.finish_reason)
                 }),
                 target: None,
-                my_speech_intent: None,
+                speech_content: None,
                 transport_error: false,
                 pseudo_tool_text,
                 target_validity_failure: false,
@@ -804,7 +805,7 @@ where
                 result.finish_reason
             )),
             target: None,
-            my_speech_intent: None,
+            speech_content: None,
             transport_error: false,
             pseudo_tool_text: false,
             target_validity_failure: false,
@@ -821,7 +822,7 @@ where
                 trial,
                 success: false,
                 target: None,
-                my_speech_intent: None,
+                speech_content: None,
                 transport_error: is_transport_failure(&failure),
                 failure: Some(failure),
                 pseudo_tool_text: false,
@@ -845,52 +846,52 @@ fn validate_candidate_decision(decision: CandidateDecision) -> ValidationReport 
             success: false,
             failure: Some("silent_on_greeting".to_owned()),
             target: None,
-            my_speech_intent: None,
+            speech_content: None,
             pseudo_tool_text: false,
             target_validity_failure: false,
         },
         CandidateDecision::Speak {
             target,
-            my_speech_intent,
+            speech_content,
         } => {
             let target = target.trim().to_owned();
-            let my_speech_intent = my_speech_intent.trim().to_owned();
+            let speech_content = speech_content.trim().to_owned();
             if target != TARGET_PEER {
                 return ValidationReport {
                     success: false,
                     failure: Some("invalid_target".to_owned()),
                     target: Some(target),
-                    my_speech_intent: Some(my_speech_intent),
+                    speech_content: Some(speech_content),
                     pseudo_tool_text: false,
                     target_validity_failure: true,
                 };
             }
-            if my_speech_intent.is_empty() {
+            if speech_content.is_empty() {
                 return ValidationReport {
                     success: false,
-                    failure: Some("empty_my_speech_intent".to_owned()),
+                    failure: Some("empty_speech_content".to_owned()),
                     target: Some(target),
-                    my_speech_intent: Some(my_speech_intent),
+                    speech_content: Some(speech_content),
                     pseudo_tool_text: false,
                     target_validity_failure: false,
                 };
             }
-            if contains_bad_my_speech_intent(&my_speech_intent) {
+            if contains_bad_speech_content(&speech_content) {
                 return ValidationReport {
                     success: false,
-                    failure: Some("bad_my_speech_intent".to_owned()),
+                    failure: Some("bad_speech_content".to_owned()),
                     target: Some(target),
-                    my_speech_intent: Some(my_speech_intent),
+                    speech_content: Some(speech_content),
                     pseudo_tool_text: false,
                     target_validity_failure: false,
                 };
             }
-            if !looks_like_greeting_acknowledgement(&my_speech_intent) {
+            if !looks_like_greeting_acknowledgement(&speech_content) {
                 return ValidationReport {
                     success: false,
                     failure: Some("not_greeting_acknowledgement".to_owned()),
                     target: Some(target),
-                    my_speech_intent: Some(my_speech_intent),
+                    speech_content: Some(speech_content),
                     pseudo_tool_text: false,
                     target_validity_failure: false,
                 };
@@ -899,7 +900,7 @@ fn validate_candidate_decision(decision: CandidateDecision) -> ValidationReport 
                 success: true,
                 failure: None,
                 target: Some(target),
-                my_speech_intent: Some(my_speech_intent),
+                speech_content: Some(speech_content),
                 pseudo_tool_text: false,
                 target_validity_failure: false,
             }
@@ -907,7 +908,7 @@ fn validate_candidate_decision(decision: CandidateDecision) -> ValidationReport 
     }
 }
 
-fn contains_bad_my_speech_intent(text: &str) -> bool {
+fn contains_bad_speech_content(text: &str) -> bool {
     let normalized = text.to_ascii_lowercase();
     [
         "idle",
@@ -1307,7 +1308,7 @@ mod tests {
     fn validator_accepts_peer_greeting_acknowledgement() {
         let report = validate_candidate_decision(CandidateDecision::Speak {
             target: "Peer".to_owned(),
-            my_speech_intent: "Say hi back to Peer.".to_owned(),
+            speech_content: "Say hi back to Peer.".to_owned(),
         });
 
         assert_eq!(
@@ -1316,7 +1317,7 @@ mod tests {
                 success: true,
                 failure: None,
                 target: Some("Peer".to_owned()),
-                my_speech_intent: Some("Say hi back to Peer.".to_owned()),
+                speech_content: Some("Say hi back to Peer.".to_owned()),
                 pseudo_tool_text: false,
                 target_validity_failure: false,
             }
@@ -1337,7 +1338,7 @@ mod tests {
     fn validator_rejects_target_outside_scene() {
         let report = validate_candidate_decision(CandidateDecision::Speak {
             target: "Koro".to_owned(),
-            my_speech_intent: "Say hello.".to_owned(),
+            speech_content: "Say hello.".to_owned(),
         });
 
         assert_eq!(report.failure.as_deref(), Some("invalid_target"));
@@ -1358,24 +1359,24 @@ mod tests {
     }
 
     #[test]
-    fn validator_rejects_idle_or_internal_my_speech_intent() {
+    fn validator_rejects_idle_or_internal_speech_content() {
         let report = validate_candidate_decision(CandidateDecision::Speak {
             target: "Peer".to_owned(),
-            my_speech_intent: "I have been idle for one second.".to_owned(),
+            speech_content: "I have been idle for one second.".to_owned(),
         });
 
-        assert_eq!(report.failure.as_deref(), Some("bad_my_speech_intent"));
+        assert_eq!(report.failure.as_deref(), Some("bad_speech_content"));
         assert!(!report.success);
     }
 
     #[test]
-    fn validator_rejects_listener_reaction_as_my_speech_intent() {
+    fn validator_rejects_listener_reaction_as_speech_content() {
         let report = validate_candidate_decision(CandidateDecision::Speak {
             target: "Peer".to_owned(),
-            my_speech_intent: "Peer replies warmly and smiles.".to_owned(),
+            speech_content: "Peer replies warmly and smiles.".to_owned(),
         });
 
-        assert_eq!(report.failure.as_deref(), Some("bad_my_speech_intent"));
+        assert_eq!(report.failure.as_deref(), Some("bad_speech_content"));
         assert!(!report.success);
     }
 
@@ -1383,7 +1384,7 @@ mod tests {
     fn validator_rejects_non_greeting_content() {
         let report = validate_candidate_decision(CandidateDecision::Speak {
             target: "Peer".to_owned(),
-            my_speech_intent: "I can see the bench.".to_owned(),
+            speech_content: "I can see the bench.".to_owned(),
         });
 
         assert_eq!(
@@ -1396,7 +1397,7 @@ mod tests {
     #[test]
     fn pseudo_tool_detection_catches_textual_tool_forms() {
         assert!(looks_like_pseudo_tool(
-            r#"prepare_speech(target="Peer", my_speech_intent="Hi")"#
+            r#"prepare_speech(target="Peer", speech_content="Hi")"#
         ));
         assert!(looks_like_pseudo_tool(r#"{"target":"Peer"}"#));
         assert!(!looks_like_pseudo_tool("Hello, Peer."));
@@ -1614,7 +1615,7 @@ mod tests {
             transport_error: failure.as_deref().is_some_and(is_transport_failure),
             failure,
             target: target.map(ToOwned::to_owned),
-            my_speech_intent: success.then(|| "Say hi back.".to_owned()),
+            speech_content: success.then(|| "Say hi back.".to_owned()),
             pseudo_tool_text: false,
             target_validity_failure,
             tool_call_count: usize::from(success),
