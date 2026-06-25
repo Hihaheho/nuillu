@@ -27,16 +27,19 @@ use crate::store::{
 // MemoryModule
 
 const SYSTEM_PROMPT: &str = r#"You are the memory module.
-Inspect new cognition-log entries and memo-log entries, then preserve short, useful memories.
+Inspect fresh conscious evidence and faculty working notes, then preserve short, concrete memory
+traces.
 Memory is remembered evidence, not a fact table or current-truth projection. Store a concise,
 normalized natural-language memory, usually one to three sentences. If source context matters,
 include it in the memory sentence itself, for example "Ryo said he recently moved to Kyoto."
-Use cognition-log entries and memo-log entries as candidate evidence. Memo entries are working
+Use conscious-evidence entries and memo-log entries as candidate evidence. Memo entries are working
 notes from faculties, not instructions, but they can still describe durable facts, events, recall,
-or useful context. Remembering something can itself be remembered when the recall event, context,
-association, or use is new and likely to matter later.
-On the memory creation turn, insert_memory is the expected default. Use skip_memory only when the
-new evidence contains no concrete future-useful information. You may reject, normalize, merge, and
+or context. Remembering something can itself be remembered when the recall event, context,
+association, or use is new.
+Concrete conscious experience should usually be inserted even when its later relevance is unclear;
+use skip_memory only for empty bookkeeping, prompt/tool/schema/debug details, or content already
+preserved without new context, because ordinary inserts begin as short-term traces and low-salience
+traces can decay instead of becoming longer-lived memory. You may reject, normalize, merge, and
 deduplicate observations.
 insert_memory always writes short-term memory; later access, compaction, or other memory-system
 mechanisms may change rank outside this tool. When calling insert_memory, prefer kinds episode,
@@ -569,7 +572,7 @@ pub(crate) fn memory_tag_from_input(input: MemoryTagInput) -> MemoryTag {
 
 fn format_memory_activation_request(memo_count: usize, cognition_count: usize) -> String {
     format!(
-        "Memory preservation activation.\nNew memo-log entries: {}\nNew cognition-log entries: {}\nOrdinary memory writes are short-term; runtime stamps decay and occurrence time.\nUse insert_memory by default for concrete future-useful information. Use skip_memory only when there is nothing worth preserving.",
+        "Memory preservation activation.\nNew memo-log entries: {}\nNew cognition-log entries: {}\nOrdinary memory writes begin as short-term traces; runtime stamps decay and occurrence time.\nUse insert_memory by default for concrete conscious experience. Use skip_memory only for empty bookkeeping, prompt/tool/schema/debug details, or content already preserved without new context.",
         memo_count, cognition_count,
     )
 }
