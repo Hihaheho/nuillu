@@ -13,6 +13,7 @@ chrono = { workspace = true }
 clap = { workspace = true }
 eure = { workspace = true }
 eure-document = { workspace = true }
+eure-json = { workspace = true }
 lutum = { workspace = true }
 lutum-libsql-adapter = { workspace = true }
 lutum-openai = { workspace = true }

@@ -1623,6 +1623,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "eure-json"
+version = "0.1.9"
+source = "git+https://github.com/Hihaheho/eure#cb76968a8831b532c11f9d6a37ef5a35261c5f38"
+dependencies = [
+ "ahash",
+ "eure",
+ "eure-document",
+ "eure-fmt",
+ "eure-parol",
+ "eure-schema",
+ "indexmap",
+ "num-bigint",
+ "query-flow",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "eure-macros"
 version = "0.1.9"
 source = "git+https://github.com/Hihaheho/eure#cb76968a8831b532c11f9d6a37ef5a35261c5f38"
@@ -3511,6 +3530,7 @@ dependencies = [
  "clap",
  "eure",
  "eure-document",
+ "eure-json",
  "lutum",
  "lutum-libsql-adapter",
  "lutum-openai",

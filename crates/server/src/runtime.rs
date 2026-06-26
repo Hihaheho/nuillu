@@ -122,7 +122,11 @@ async fn run_server(config: ServerConfig, visualizer: &mut VisualizerHook) -> an
         .caps
         .host_io()
         .action_affordance_writer()
-        .set_all(action_affordances.affordances())
+        .set_all(
+            config
+                .boot_config
+                .overlay_action_affordances(action_affordances.affordances()),
+        )
         .await
         .context("seed action affordances")?;
     env.caps.scene().set(scene.participants());
@@ -181,6 +185,7 @@ async fn run_server(config: ServerConfig, visualizer: &mut VisualizerHook) -> an
                 &mut scene,
                 &mut module_settings,
                 &mut action_affordances,
+                &config.boot_config,
                 &sensory,
                 &env,
                 &run_controller,

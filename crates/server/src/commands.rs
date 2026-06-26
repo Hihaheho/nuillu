@@ -1,4 +1,4 @@
-use std::time::Duration;
+use std::{collections::HashSet, time::Duration};
 
 use chrono::{DateTime, Utc};
 use lutum_libsql_adapter::{
@@ -10,7 +10,9 @@ use nuillu_blackboard::{
     Blackboard, BlackboardCommand, Bpm, ModulePolicy, ZeroReplicaWindowPolicy,
 };
 use nuillu_memory::{LinkedMemoryQuery, MemoryLinkDirection, MemoryLinkRelation, MemoryQuery};
-use nuillu_module::{AmbientSensoryEntry, SensoryInput, SensoryInputMailbox, SensoryModality};
+use nuillu_module::{
+    ActionAffordance, AmbientSensoryEntry, SensoryInput, SensoryInputMailbox, SensoryModality,
+};
 use nuillu_types::{MemoryIndex, ModuleId, ModuleInstanceId, ReplicaCapRange, ReplicaIndex};
 use nuillu_visualizer_protocol::{
     AmbientSensorySnapshotRowView, MemoryRecordScope, ModuleSettingsView,
@@ -20,6 +22,7 @@ use nuillu_visualizer_protocol::{
 };
 
 use crate::SERVER_TAB_ID;
+use crate::config::ServerBootConfig;
 use crate::environment::ServerEnvironment;
 use crate::gui::VisualizerHook;
 use crate::runtime::set_runtime_running;
@@ -37,6 +40,7 @@ pub(super) async fn drive_server_until_shutdown(
     scene: &mut SceneState,
     module_settings: &mut ModuleSettingsState,
     action_affordances: &mut ActionAffordanceState,
+    boot_config: &ServerBootConfig,
     sensory: &SensoryInputMailbox,
     env: &ServerEnvironment,
     run_controller: &AgentRunController,
@@ -54,6 +58,7 @@ pub(super) async fn drive_server_until_shutdown(
                 scene,
                 module_settings,
                 action_affordances,
+                boot_config,
                 sensory,
                 env,
                 run_controller,
@@ -79,6 +84,7 @@ async fn handle_server_visualizer_message(
     scene: &mut SceneState,
     module_settings: &mut ModuleSettingsState,
     action_affordances: &mut ActionAffordanceState,
+    boot_config: &ServerBootConfig,
     sensory: &SensoryInputMailbox,
     env: &ServerEnvironment,
     run_controller: &AgentRunController,
@@ -278,18 +284,36 @@ async fn handle_server_visualizer_message(
             tab_id: command_tab,
             affordances,
         } if command_tab == *tab_id => {
-            apply_action_affordance_set(action_affordances, affordances, visualizer, tab_id, env)
-                .await;
+            apply_action_affordance_set(
+                action_affordances,
+                boot_config,
+                affordances,
+                visualizer,
+                tab_id,
+                env,
+            )
+            .await;
             false
         }
         VisualizerCommand::UpsertAgentActionAffordance {
             tab_id: command_tab,
             affordance,
         } if command_tab == *tab_id => {
-            let writer = env.caps.host_io().action_affordance_writer();
-            match writer.upsert(affordance.clone()).await {
+            match affordance.validate() {
+                Ok(()) => {}
+                Err(error) => {
+                    visualizer.send_event(VisualizerEvent::Log {
+                        tab_id: tab_id.clone(),
+                        message: format!("rejected action affordance update: {error}"),
+                    });
+                    return false;
+                }
+            }
+            let mut base = action_affordances.affordances();
+            upsert_affordance(&mut base, affordance);
+            match set_merged_action_affordances(base.clone(), boot_config, env).await {
                 Ok(snapshot) => {
-                    action_affordances.upsert(affordance);
+                    action_affordances.replace(base);
                     if let Err(error) = action_affordances.save() {
                         visualizer.send_event(VisualizerEvent::Log {
                             tab_id: tab_id.clone(),
@@ -309,20 +333,24 @@ async fn handle_server_visualizer_message(
             tab_id: command_tab,
             action_id,
         } if command_tab == *tab_id => {
-            let snapshot = env
-                .caps
-                .host_io()
-                .action_affordance_writer()
-                .remove(&action_id)
-                .await;
-            action_affordances.remove(&action_id);
-            if let Err(error) = action_affordances.save() {
-                visualizer.send_event(VisualizerEvent::Log {
+            let mut base = action_affordances.affordances();
+            base.retain(|affordance| affordance.id != action_id);
+            match set_merged_action_affordances(base.clone(), boot_config, env).await {
+                Ok(snapshot) => {
+                    action_affordances.replace(base);
+                    if let Err(error) = action_affordances.save() {
+                        visualizer.send_event(VisualizerEvent::Log {
+                            tab_id: tab_id.clone(),
+                            message: format!("failed to save action affordances: {error}"),
+                        });
+                    }
+                    emit_action_affordances(visualizer, tab_id, snapshot.affordances);
+                }
+                Err(error) => visualizer.send_event(VisualizerEvent::Log {
                     tab_id: tab_id.clone(),
-                    message: format!("failed to save action affordances: {error}"),
-                });
+                    message: format!("rejected action affordance removal: {error}"),
+                }),
             }
-            emit_action_affordances(visualizer, tab_id, snapshot.affordances);
             false
         }
         VisualizerCommand::CompleteAgentActionInvocation {
@@ -465,15 +493,22 @@ async fn handle_server_visualizer_message(
 
 async fn apply_action_affordance_set(
     action_affordances: &mut ActionAffordanceState,
-    affordances: Vec<nuillu_module::ActionAffordance>,
+    boot_config: &ServerBootConfig,
+    affordances: Vec<ActionAffordance>,
     visualizer: &VisualizerHook,
     tab_id: &VisualizerTabId,
     env: &ServerEnvironment,
 ) {
-    let writer = env.caps.host_io().action_affordance_writer();
-    match writer.set_all(affordances.clone()).await {
+    if let Err(error) = validate_base_action_affordances(&affordances) {
+        visualizer.send_event(VisualizerEvent::Log {
+            tab_id: tab_id.clone(),
+            message: format!("rejected action affordance set: {error}"),
+        });
+        return;
+    }
+    match set_merged_action_affordances(affordances.clone(), boot_config, env).await {
         Ok(snapshot) => {
-            action_affordances.replace(snapshot.affordances.clone());
+            action_affordances.replace(affordances);
             if let Err(error) = action_affordances.save() {
                 visualizer.send_event(VisualizerEvent::Log {
                     tab_id: tab_id.clone(),
@@ -489,10 +524,47 @@ async fn apply_action_affordance_set(
     }
 }
 
+async fn set_merged_action_affordances(
+    base: Vec<ActionAffordance>,
+    boot_config: &ServerBootConfig,
+    env: &ServerEnvironment,
+) -> Result<nuillu_module::ActionAffordanceSnapshot, nuillu_module::ActionAffordanceError> {
+    env.caps
+        .host_io()
+        .action_affordance_writer()
+        .set_all(boot_config.overlay_action_affordances(base))
+        .await
+}
+
+fn validate_base_action_affordances(
+    affordances: &[ActionAffordance],
+) -> Result<(), nuillu_module::ActionAffordanceError> {
+    let mut seen = HashSet::new();
+    for affordance in affordances {
+        affordance.validate()?;
+        if !seen.insert(affordance.id.as_str()) {
+            return Err(nuillu_module::ActionAffordanceError::DuplicateId(
+                affordance.id.clone(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn upsert_affordance(affordances: &mut Vec<ActionAffordance>, affordance: ActionAffordance) {
+    match affordances
+        .iter_mut()
+        .find(|candidate| candidate.id == affordance.id)
+    {
+        Some(existing) => *existing = affordance,
+        None => affordances.push(affordance),
+    }
+}
+
 pub(super) fn emit_action_affordances(
     visualizer: &VisualizerHook,
     tab_id: &VisualizerTabId,
-    affordances: Vec<nuillu_module::ActionAffordance>,
+    affordances: Vec<ActionAffordance>,
 ) {
     visualizer.send_event(VisualizerEvent::AgentActionAffordances {
         tab_id: tab_id.clone(),
@@ -1002,6 +1074,9 @@ async fn build_module_policy_update(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
+
+    use crate::config::parse_server_boot_config_content;
 
     #[test]
     fn parse_module_owner_accepts_zero_replica_display_form() {
@@ -1025,5 +1100,43 @@ mod tests {
         assert!(parse_module_owner("Predict").is_err());
         assert!(parse_module_owner("predict[not-a-replica]").is_err());
         assert!(parse_module_owner("predict[1").is_err());
+    }
+
+    #[test]
+    fn visualizer_base_updates_keep_config_action_precedence() {
+        let boot_config = parse_server_boot_config_content(
+            r#"
+@ actions[] {
+  name = "poet"
+  description = "Config poet."
+
+  json_schema {
+    type = "object"
+  }
+}
+"#,
+            Path::new(".tmp/server/config.eure"),
+        )
+        .unwrap();
+        let mut base = vec![action_affordance("poet", "Persisted Poet")];
+
+        upsert_affordance(&mut base, action_affordance("poet", "Visualizer Poet"));
+        let merged = boot_config.overlay_action_affordances(base.clone());
+        assert_eq!(merged, vec![action_affordance("poet", "Config poet.")]);
+
+        base.retain(|affordance| affordance.id != "poet");
+        let merged = boot_config.overlay_action_affordances(base);
+        assert_eq!(merged, vec![action_affordance("poet", "Config poet.")]);
+    }
+
+    fn action_affordance(id: &str, description: &str) -> ActionAffordance {
+        ActionAffordance {
+            id: id.to_owned(),
+            label: id.to_owned(),
+            description: description.to_owned(),
+            use_when: String::new(),
+            effect: String::new(),
+            input_schema: serde_json::json!({"type": "object"}),
+        }
     }
 }

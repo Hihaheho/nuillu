@@ -55,6 +55,7 @@ uuid = { version = "1", features = ["v4", "v7", "serde"] }
 eure = { git = "https://github.com/Hihaheho/eure" }
 eure-document = { git = "https://github.com/Hihaheho/eure" }
 eure-fmt = { git = "https://github.com/Hihaheho/eure" }
+eure-json = { git = "https://github.com/Hihaheho/eure" }
 anyhow = "1"
 clap = { version = "4", features = ["derive", "env"] }
 reqwest = { version = "0.13", features = ["json"] }

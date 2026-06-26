@@ -1,5 +1,5 @@
 use std::{
-    collections::HashSet,
+    collections::{BTreeMap, HashSet},
     fs, io,
     num::NonZeroUsize,
     path::{Path, PathBuf},
@@ -8,6 +8,11 @@ use std::{
 
 use chrono::Utc;
 use eure::FromEure;
+use eure::document::{
+    EureDocument,
+    parse::{ParseContext, ParseError, ParseErrorKind},
+};
+use nuillu_module::ActionAffordance;
 use nuillu_types::{ModelTier, ModuleId, ReplicaCapRange, builtin};
 use tracing_subscriber::layer::SubscriberExt as _;
 use uuid::Uuid;
@@ -107,6 +112,8 @@ pub struct ServerBootConfig {
     pub activation_table: Vec<f64>,
     #[eure(default)]
     pub modules: Vec<ServerModuleSpec>,
+    #[eure(default)]
+    pub actions: Vec<ServerActionSpec>,
 }
 
 #[derive(Debug, Clone, PartialEq, FromEure)]
@@ -154,6 +161,43 @@ pub struct ServerModuleSessionSpec {
     pub tier: ServerSessionTier,
 }
 
+#[derive(Debug, Clone, PartialEq, FromEure)]
+#[eure(crate = ::eure::document, rename_all = "kebab-case")]
+pub struct ServerActionSpec {
+    pub name: String,
+    #[eure(default)]
+    pub label: Option<String>,
+    pub description: String,
+    #[eure(default)]
+    pub use_when: Option<String>,
+    #[eure(default)]
+    pub effect: Option<String>,
+    #[eure(rename = "json_schema")]
+    json_schema: ServerActionJsonSchema,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct ServerActionJsonSchema(serde_json::Value);
+
+impl eure::document::parse::FromEure<'_> for ServerActionJsonSchema {
+    type Error = ParseError;
+
+    fn parse(ctx: &ParseContext<'_>) -> Result<Self, Self::Error> {
+        let doc: EureDocument = ctx.parse()?;
+        let value =
+            eure_json::document_to_value(&doc, &eure_json::Config::default()).map_err(|error| {
+                ParseError {
+                    node_id: ctx.node_id(),
+                    kind: ParseErrorKind::InvalidPattern {
+                        kind: "json_schema".to_owned(),
+                        reason: error.to_string(),
+                    },
+                }
+            })?;
+        Ok(Self(value))
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, FromEure)]
 #[eure(crate = ::eure::document, rename_all = "kebab-case")]
 pub enum ServerModuleGroup {
@@ -191,6 +235,7 @@ impl Default for ServerBootConfig {
         Self {
             activation_table: default_activation_table_values(),
             modules: default_server_modules(),
+            actions: Vec::new(),
         }
     }
 }
@@ -300,6 +345,24 @@ impl ServerBootConfig {
             .collect()
     }
 
+    pub fn action_affordances(&self) -> Vec<ActionAffordance> {
+        self.actions
+            .iter()
+            .map(ServerActionSpec::affordance)
+            .collect()
+    }
+
+    pub fn overlay_action_affordances(&self, base: Vec<ActionAffordance>) -> Vec<ActionAffordance> {
+        let mut affordances = base
+            .into_iter()
+            .map(|affordance| (affordance.id.clone(), affordance))
+            .collect::<BTreeMap<_, _>>();
+        for affordance in self.action_affordances() {
+            affordances.insert(affordance.id.clone(), affordance);
+        }
+        affordances.into_values().collect()
+    }
+
     fn validate(&self, path: &Path) -> anyhow::Result<()> {
         validate_activation_table(&self.activation_table, path)?;
         let mut seen = HashSet::new();
@@ -313,6 +376,7 @@ impl ServerBootConfig {
             }
             module.validate(path)?;
         }
+        validate_config_actions(&self.action_affordances(), path)?;
         Ok(())
     }
 }
@@ -427,6 +491,40 @@ impl ServerModuleSpec {
     }
 }
 
+impl ServerActionSpec {
+    fn affordance(&self) -> ActionAffordance {
+        ActionAffordance {
+            id: self.name.clone(),
+            label: self.label.clone().unwrap_or_else(|| self.name.clone()),
+            description: self.description.clone(),
+            use_when: self.use_when.clone().unwrap_or_default(),
+            effect: self.effect.clone().unwrap_or_default(),
+            input_schema: self.json_schema.0.clone(),
+        }
+    }
+}
+
+fn validate_config_actions(affordances: &[ActionAffordance], path: &Path) -> anyhow::Result<()> {
+    let mut seen = HashSet::new();
+    for affordance in affordances {
+        affordance.validate().map_err(|error| {
+            anyhow::anyhow!(
+                "server config {} has invalid action {}: {error}",
+                path.display(),
+                affordance.id
+            )
+        })?;
+        if !seen.insert(affordance.id.as_str()) {
+            anyhow::bail!(
+                "server config {} declares action {} more than once",
+                path.display(),
+                affordance.id
+            );
+        }
+    }
+    Ok(())
+}
+
 pub fn load_server_boot_config(state_dir: &Path) -> anyhow::Result<ServerBootConfig> {
     let path = state_dir.join(SERVER_BOOT_CONFIG_FILE);
     match fs::read_to_string(&path) {
@@ -439,7 +537,7 @@ pub fn load_server_boot_config(state_dir: &Path) -> anyhow::Result<ServerBootCon
     }
 }
 
-fn parse_server_boot_config_content(
+pub(crate) fn parse_server_boot_config_content(
     content: &str,
     path: &Path,
 ) -> anyhow::Result<ServerBootConfig> {
@@ -803,6 +901,207 @@ activation-table = [1.0, 0.5]
         assert_eq!(
             config.modules[1].depends_on,
             vec![RuntimeModule::CognitionGate]
+        );
+    }
+
+    #[test]
+    fn parse_server_boot_config_reads_action_specs() {
+        let config = parse_server_boot_config_content(
+            r#"
+@ actions[] {
+  name = "move"
+  description = "Move through the scene."
+
+  json_schema {
+    type = "object"
+    additionalProperties = false
+    required = ["direction"]
+
+    properties {
+      direction {
+        type = "string"
+        description = "Direction to move."
+      }
+    }
+  }
+}
+
+@ actions[] {
+  name = "poet"
+  label = "Poet"
+  description = "Record a short poem."
+  use-when = "when quiet writing is appropriate"
+  effect = "a poem is recorded"
+
+  json_schema {
+    type = "object"
+    additionalProperties = false
+    required = ["poem"]
+
+    properties {
+      poem {
+        type = "string"
+        description = "The poem text."
+      }
+    }
+  }
+}
+"#,
+            Path::new(".tmp/server/config.eure"),
+        )
+        .unwrap();
+
+        assert_eq!(
+            config.action_affordances(),
+            vec![
+                ActionAffordance {
+                    id: "move".to_owned(),
+                    label: "move".to_owned(),
+                    description: "Move through the scene.".to_owned(),
+                    use_when: String::new(),
+                    effect: String::new(),
+                    input_schema: serde_json::json!({
+                        "type": "object",
+                        "additionalProperties": false,
+                        "required": ["direction"],
+                        "properties": {
+                            "direction": {
+                                "type": "string",
+                                "description": "Direction to move."
+                            }
+                        }
+                    }),
+                },
+                ActionAffordance {
+                    id: "poet".to_owned(),
+                    label: "Poet".to_owned(),
+                    description: "Record a short poem.".to_owned(),
+                    use_when: "when quiet writing is appropriate".to_owned(),
+                    effect: "a poem is recorded".to_owned(),
+                    input_schema: serde_json::json!({
+                        "type": "object",
+                        "additionalProperties": false,
+                        "required": ["poem"],
+                        "properties": {
+                            "poem": {
+                                "type": "string",
+                                "description": "The poem text."
+                            }
+                        }
+                    }),
+                }
+            ]
+        );
+    }
+
+    #[test]
+    fn config_actions_override_base_affordances() {
+        let config = parse_server_boot_config_content(
+            r#"
+@ actions[] {
+  name = "poet"
+  description = "Config poet."
+
+  json_schema {
+    type = "object"
+  }
+}
+"#,
+            Path::new(".tmp/server/config.eure"),
+        )
+        .unwrap();
+
+        let base = vec![ActionAffordance {
+            id: "poet".to_owned(),
+            label: "Persisted Poet".to_owned(),
+            description: "Persisted poet.".to_owned(),
+            use_when: "persisted".to_owned(),
+            effect: "persisted".to_owned(),
+            input_schema: serde_json::json!({"type": "object", "properties": {}}),
+        }];
+
+        assert_eq!(
+            config.overlay_action_affordances(base),
+            vec![ActionAffordance {
+                id: "poet".to_owned(),
+                label: "poet".to_owned(),
+                description: "Config poet.".to_owned(),
+                use_when: String::new(),
+                effect: String::new(),
+                input_schema: serde_json::json!({"type": "object"}),
+            }]
+        );
+    }
+
+    #[test]
+    fn parse_server_boot_config_rejects_duplicate_action_names() {
+        let error = parse_server_boot_config_content(
+            r#"
+@ actions[] {
+  name = "move"
+  description = "Move."
+  json_schema {
+    type = "object"
+  }
+}
+
+@ actions[] {
+  name = "move"
+  description = "Move again."
+  json_schema {
+    type = "object"
+  }
+}
+"#,
+            Path::new(".tmp/server/config.eure"),
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(error.contains("action move more than once"), "{error}");
+    }
+
+    #[test]
+    fn parse_server_boot_config_rejects_reserved_action_names() {
+        let error = parse_server_boot_config_content(
+            r#"
+@ actions[] {
+  name = "sleep"
+  description = "Sleep."
+  json_schema {
+    type = "object"
+  }
+}
+"#,
+            Path::new(".tmp/server/config.eure"),
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(
+            error.contains("reserved for a built-in action: sleep"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn parse_server_boot_config_rejects_non_object_action_schema() {
+        let error = parse_server_boot_config_content(
+            r#"
+@ actions[] {
+  name = "move"
+  description = "Move."
+  json_schema = true
+}
+"#,
+            Path::new(".tmp/server/config.eure"),
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(
+            error.contains("action input schema must be a JSON object: move"),
+            "{error}"
         );
     }
 

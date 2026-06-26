@@ -30,7 +30,7 @@ use nuillu_memory::{
 };
 use nuillu_module::ports::{Clock, PortError, SystemClock};
 use nuillu_module::{
-    ActionAffordance, AmbientSensoryEntry, CapabilityProviderConfig, CapabilityProviderPorts,
+    AmbientSensoryEntry, CapabilityProviderConfig, CapabilityProviderPorts,
     CapabilityProviderRuntime, CapabilityProviders, CognitionLogUpdated, ExternalActionExecutor,
     ExternalActionInvocation, ExternalActionInvocationResult, InternalHarnessIo,
     InteroceptionRuntimePolicy, LlmConcurrencyPool, ModuleRegistry, Participant, RuntimeEvent,
@@ -4525,12 +4525,6 @@ pub(crate) async fn build_eval_environment(
             ..CapabilityProviderRuntime::default()
         },
     });
-    caps.host_io()
-        .action_affordance_writer()
-        .set_all(vec![default_poet_affordance()])
-        .await
-        .context("seed eval action affordances")?;
-
     let utterance_sink: Rc<dyn UtteranceSink> = utterances.clone();
 
     Ok(EvalEnvironment {
@@ -6664,30 +6658,6 @@ impl ExternalActionExecutor for EvalExternalActionExecutor {
             accepted: true,
             message: "external action accepted by eval host".to_owned(),
         })
-    }
-}
-
-fn default_poet_affordance() -> ActionAffordance {
-    ActionAffordance {
-        id: "poet".to_owned(),
-        label: "Poet".to_owned(),
-        description: "Record a short poem through the host.".to_owned(),
-        use_when:
-            "Use during idle or low-salience moments when quiet creative note writing is appropriate."
-                .to_owned(),
-        effect: "The host records the poem and any meaningful outcome must arrive as sensory input."
-            .to_owned(),
-        input_schema: serde_json::json!({
-            "type": "object",
-            "additionalProperties": false,
-            "required": ["poem"],
-            "properties": {
-                "poem": {
-                    "type": "string",
-                    "description": "The poem text to record."
-                }
-            }
-        }),
     }
 }
 

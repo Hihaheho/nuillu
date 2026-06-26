@@ -32,10 +32,7 @@ pub(super) struct ActionAffordanceState {
 impl ActionAffordanceState {
     pub(super) fn load(path: PathBuf) -> anyhow::Result<Self> {
         if !path.exists() {
-            return Ok(Self::from_affordances(
-                path,
-                vec![default_poet_affordance()],
-            ));
+            return Ok(Self::from_affordances(path, Vec::new()));
         }
         let text = fs::read_to_string(&path)
             .with_context(|| format!("read action affordances from {}", path.display()))?;
@@ -73,37 +70,8 @@ impl ActionAffordanceState {
             .collect();
     }
 
-    pub(super) fn upsert(&mut self, affordance: ActionAffordance) {
-        self.affordances.insert(affordance.id.clone(), affordance);
-    }
-
-    pub(super) fn remove(&mut self, action_id: &str) {
-        self.affordances.remove(action_id);
-    }
-
     pub(super) fn affordances(&self) -> Vec<ActionAffordance> {
         self.affordances.values().cloned().collect()
-    }
-}
-
-fn default_poet_affordance() -> ActionAffordance {
-    ActionAffordance {
-        id: "poet".to_owned(),
-        label: "Poet".to_owned(),
-        description: "Record a short poem through the visualizer.".to_owned(),
-        use_when: "Use during idle or low-salience moments when quiet creative note writing is appropriate.".to_owned(),
-        effect: "The visualizer records and displays the poem, then emits sensory feedback describing that the poem was written.".to_owned(),
-        input_schema: serde_json::json!({
-            "type": "object",
-            "additionalProperties": false,
-            "required": ["poem"],
-            "properties": {
-                "poem": {
-                    "type": "string",
-                    "description": "The poem text to record."
-                }
-            }
-        }),
     }
 }
 
@@ -455,7 +423,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn action_affordance_state_seeds_and_round_trips() {
+    fn action_affordance_state_loads_empty_and_round_trips() {
         let path = PathBuf::from(format!(
             ".tmp/action-affordances-{}.json",
             uuid::Uuid::now_v7()
@@ -468,7 +436,7 @@ mod tests {
                 .into_iter()
                 .map(|affordance| affordance.id)
                 .collect::<Vec<_>>(),
-            vec!["poet".to_string()]
+            Vec::<String>::new()
         );
 
         state.replace(vec![ActionAffordance {

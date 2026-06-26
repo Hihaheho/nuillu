@@ -8,6 +8,9 @@ activation-table.$optional = true
 modules = [`$types.server-module`]
 modules.$optional = true
 
+actions = [`$types.server-action`]
+actions.$optional = true
+
 @ $types.runtime-module
 $variant: union
 variants.sensory = { = "sensory", $variant => "literal" }
@@ -63,3 +66,14 @@ sessions.$optional = true
 @ $types.server-module-session
 key = `text`
 tier = `$types.model-tier`
+
+@ $types.server-action
+name = `text`
+label = `text`
+label.$optional = true
+description = `text`
+use-when = `text`
+use-when.$optional = true
+effect = `text`
+effect.$optional = true
+json_schema = `any`
