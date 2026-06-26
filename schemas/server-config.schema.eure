@@ -30,8 +30,6 @@ variants.reward = { = "reward", $variant => "literal" }
 variants.predict = { = "predict", $variant => "literal" }
 variants.surprise = { = "surprise", $variant => "literal" }
 variants.speak = { = "speak", $variant => "literal" }
-variants.sleep = { = "sleep", $variant => "literal" }
-variants.poet = { = "poet", $variant => "literal" }
 
 @ $types.model-tier
 $variant: union

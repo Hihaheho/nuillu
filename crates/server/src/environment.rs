@@ -1,4 +1,6 @@
-use std::{fs, path::Path, rc::Rc, sync::Arc};
+use std::{
+    cell::RefCell, collections::BTreeMap, fs, path::Path, rc::Rc, sync::Arc, time::Duration,
+};
 
 use anyhow::Context as _;
 use async_trait::async_trait;
@@ -20,13 +22,16 @@ use nuillu_memory::{MemoryCapabilities, MemoryStore};
 use nuillu_module::ports::{Clock, Embedder, PortError, SystemClock};
 use nuillu_module::{
     CapabilityProviderConfig, CapabilityProviderPorts, CapabilityProviderRuntime,
-    CapabilityProviders, LlmConcurrencyPool, LlmTierHandle, LutumTiers, RuntimeEvent,
+    CapabilityProviders, ExternalActionExecutor, ExternalActionInvocation,
+    ExternalActionInvocationResult, LlmConcurrencyPool, LlmTierHandle, LutumTiers, RuntimeEvent,
     RuntimeEventSink, RuntimePolicy, SessionCompactionPolicy,
 };
 use nuillu_openai_embedding_adapter::{OpenAiEmbedder, OpenAiEmbedderConfig};
 use nuillu_reward::{PolicyCapabilities, PolicyStore};
 use nuillu_speak::{Utterance, UtteranceAbort, UtteranceDelta, UtteranceSink};
-use nuillu_visualizer_protocol::{VisualizerEvent, VisualizerTabId};
+use nuillu_visualizer_protocol::{
+    AgentActionInvocationCompletion, AgentActionInvocationRequest, VisualizerEvent, VisualizerTabId,
+};
 
 use super::SERVER_TAB_ID;
 use super::config::{EmbeddingBackendConfig, LlmBackendConfig, LlmGenerationConfig, ServerConfig};
@@ -53,6 +58,82 @@ pub(super) struct ServerEnvironment {
     pub(super) one_shot_sensory_input_store: LibsqlOneShotSensoryInputStore,
     pub(super) ambient_sensory_snapshot_store: LibsqlAmbientSensorySnapshotStore,
     pub(super) utterance_event_store: LibsqlUtteranceEventStore,
+    pub(super) external_actions: Rc<ServerExternalActionState>,
+}
+
+pub(super) struct ServerExternalActionState {
+    tab_id: VisualizerTabId,
+    visualizer: VisualizerEventSink,
+    pending:
+        RefCell<BTreeMap<String, tokio::sync::oneshot::Sender<ExternalActionInvocationResult>>>,
+    next_invocation: RefCell<u64>,
+}
+
+impl ServerExternalActionState {
+    fn new(tab_id: VisualizerTabId, visualizer: VisualizerEventSink) -> Self {
+        Self {
+            tab_id,
+            visualizer,
+            pending: RefCell::new(BTreeMap::new()),
+            next_invocation: RefCell::new(0),
+        }
+    }
+
+    pub(super) fn complete(&self, completion: AgentActionInvocationCompletion) -> bool {
+        let sender = self.pending.borrow_mut().remove(&completion.invocation_id);
+        let Some(sender) = sender else {
+            return false;
+        };
+        let _ = sender.send(ExternalActionInvocationResult {
+            accepted: completion.accepted,
+            message: completion.message,
+        });
+        true
+    }
+
+    fn next_invocation_id(&self) -> String {
+        let mut next = self.next_invocation.borrow_mut();
+        *next = next.saturating_add(1);
+        format!("agent-action-{}", *next)
+    }
+}
+
+#[async_trait(?Send)]
+impl ExternalActionExecutor for ServerExternalActionState {
+    async fn invoke(
+        &self,
+        invocation: ExternalActionInvocation,
+    ) -> Result<ExternalActionInvocationResult, PortError> {
+        let invocation_id = self.next_invocation_id();
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        self.pending
+            .borrow_mut()
+            .insert(invocation_id.clone(), sender);
+        self.visualizer
+            .send(VisualizerEvent::AgentActionInvocationRequested {
+                tab_id: self.tab_id.clone(),
+                request: AgentActionInvocationRequest {
+                    invocation_id: invocation_id.clone(),
+                    action_id: invocation.action_id,
+                    arguments: invocation.arguments,
+                },
+            });
+
+        match tokio::time::timeout(Duration::from_secs(30), receiver).await {
+            Ok(Ok(result)) => Ok(result),
+            Ok(Err(_)) => Ok(ExternalActionInvocationResult {
+                accepted: false,
+                message: "external action completion channel closed".to_owned(),
+            }),
+            Err(_) => {
+                self.pending.borrow_mut().remove(&invocation_id);
+                Ok(ExternalActionInvocationResult {
+                    accepted: false,
+                    message: "external action timed out".to_owned(),
+                })
+            }
+        }
+    }
 }
 
 pub(super) async fn build_server_environment(
@@ -87,7 +168,7 @@ pub(super) async fn build_server_environment(
     let utterance_sink = Rc::new(ServerUtteranceSink::new(
         SERVER_TAB_ID.to_string(),
         config.session_id.clone(),
-        visualizer,
+        visualizer.clone(),
         utterance_event_store.clone(),
         clock.clone(),
     ));
@@ -106,6 +187,10 @@ pub(super) async fn build_server_environment(
         runtime_event_log,
         llm_observer.clone(),
         db_trace_sink.clone(),
+    ));
+    let external_actions = Rc::new(ServerExternalActionState::new(
+        VisualizerTabId::new(SERVER_TAB_ID.to_string()),
+        visualizer.clone(),
     ));
     let llm_concurrency_pool = LlmConcurrencyPool::default();
     let caps = CapabilityProviders::new(CapabilityProviderConfig {
@@ -129,6 +214,7 @@ pub(super) async fn build_server_environment(
             session_store,
             allocation_store,
             memo_log_repository,
+            external_action_executor: external_actions.clone(),
         },
     });
 
@@ -169,6 +255,7 @@ pub(super) async fn build_server_environment(
         one_shot_sensory_input_store,
         ambient_sensory_snapshot_store,
         utterance_event_store,
+        external_actions,
     })
 }
 

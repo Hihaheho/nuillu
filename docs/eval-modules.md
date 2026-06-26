@@ -60,8 +60,6 @@ reward
 predict
 surprise
 speak
-sleep
-poet
 ```
 
 ## Case Design Rules
@@ -140,10 +138,8 @@ The intended artifact boundaries by module family are:
 | memo-writing modules | target memo |
 | cognitive memo writers (`attention-schema`, `query-memory`, `self-model`, `predict`, `surprise`, `dreaming`) | target memo |
 | cognition writers (`interpreter`, `cognition-gate`) | target cognition-log entries |
-| `action` | allocation drive/cap changes for action targets |
+| `action` | speak allocation, built-in sleep interoception patch, or external host action invocation |
 | `speak` | completed utterance |
-| `sleep` | interoception state plus sleep decision memo |
-| `poet` | target memo |
 | `memory` | inserted or changed memory entries |
 | `memory-compaction` | merged memory result plus consolidation metadata |
 | `dreaming` | source-tagged dream/hypothesis cognitive memo |

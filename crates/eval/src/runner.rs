@@ -30,8 +30,9 @@ use nuillu_memory::{
 };
 use nuillu_module::ports::{Clock, PortError, SystemClock};
 use nuillu_module::{
-    AmbientSensoryEntry, CapabilityProviderConfig, CapabilityProviderPorts,
-    CapabilityProviderRuntime, CapabilityProviders, CognitionLogUpdated, InternalHarnessIo,
+    ActionAffordance, AmbientSensoryEntry, CapabilityProviderConfig, CapabilityProviderPorts,
+    CapabilityProviderRuntime, CapabilityProviders, CognitionLogUpdated, ExternalActionExecutor,
+    ExternalActionInvocation, ExternalActionInvocationResult, InternalHarnessIo,
     InteroceptionRuntimePolicy, LlmConcurrencyPool, ModuleRegistry, Participant, RuntimeEvent,
     RuntimeEventSink, RuntimePolicy, SceneRegistry, SensoryInput, SensoryInputMailbox,
     SensoryModality, SessionCompactionPolicy, apply_standard_dependencies,
@@ -268,6 +269,10 @@ impl VisualizerHook {
                 | VisualizerCommand::DeleteMemory { tab_id, .. }
                 | VisualizerCommand::SetModuleDisabled { tab_id, .. }
                 | VisualizerCommand::SetModuleSettings { tab_id, .. }
+                | VisualizerCommand::SetAgentActionAffordances { tab_id, .. }
+                | VisualizerCommand::UpsertAgentActionAffordance { tab_id, .. }
+                | VisualizerCommand::RemoveAgentActionAffordance { tab_id, .. }
+                | VisualizerCommand::CompleteAgentActionInvocation { tab_id, .. }
                 | VisualizerCommand::ResetModuleSessionHistory { tab_id, .. } => {
                     self.send_event(VisualizerEvent::Log {
                         tab_id,
@@ -2608,24 +2613,6 @@ async fn execute_module_case(
                                 )
                                 .await
                         }
-                        ModuleEvalTarget::Sleep => {
-                            let sleeping = blackboard
-                                .read(|bb| {
-                                    matches!(
-                                        bb.interoception().mode,
-                                        nuillu_blackboard::InteroceptiveMode::NremPressure
-                                            | nuillu_blackboard::InteroceptiveMode::RemPressure
-                                    )
-                                })
-                                .await;
-                            sleeping
-                                || module_activation_finished(
-                                    &blackboard,
-                                    events.as_ref(),
-                                    &shutdown_target_module,
-                                )
-                                .await
-                        }
                         _ => last_memo_log_content_for_module(&blackboard, &shutdown_target_module)
                             .await
                             .is_some(),
@@ -2940,14 +2927,6 @@ async fn activate_module_case_target(
                 .await
                 .expect("module eval failed to publish InteroceptiveUpdated");
         }
-        ModuleEvalTarget::Sleep => {
-            harness
-                .interoception_updated_mailbox()
-                .publish(nuillu_module::InteroceptiveUpdated)
-                .await
-                .expect("module eval failed to publish InteroceptiveUpdated");
-        }
-        ModuleEvalTarget::Poet => {}
         ModuleEvalTarget::Predict => {
             if has_cognition_log_seed {
                 harness
@@ -4470,6 +4449,11 @@ pub(crate) async fn build_eval_environment(
         actions.clone(),
         visualizer.clone(),
     ));
+    let external_action_executor = Rc::new(EvalExternalActionExecutor::new(
+        case_id.to_string(),
+        reporter.clone(),
+        actions.clone(),
+    ));
     let clock: Rc<dyn Clock> = match case_now {
         Some(now) => Rc::new(AnchoredRealtimeClock::new(now.with_timezone(&Utc))),
         None => Rc::new(SystemClock),
@@ -4537,9 +4521,15 @@ pub(crate) async fn build_eval_environment(
         runtime: CapabilityProviderRuntime {
             event_sink: events.clone(),
             policy: runtime_policy,
+            external_action_executor,
             ..CapabilityProviderRuntime::default()
         },
     });
+    caps.host_io()
+        .action_affordance_writer()
+        .set_all(vec![default_poet_affordance()])
+        .await
+        .context("seed eval action affordances")?;
 
     let utterance_sink: Rc<dyn UtteranceSink> = utterances.clone();
 
@@ -4965,8 +4955,6 @@ fn sleep_suppressed_modules() -> Vec<ModuleId> {
         nuillu_types::builtin::predict(),
         nuillu_types::builtin::surprise(),
         nuillu_types::builtin::speak(),
-        nuillu_types::builtin::sleep(),
-        nuillu_types::builtin::poet(),
     ]
 }
 
@@ -5113,11 +5101,15 @@ fn register_eval_module(
                                 caps.memo_updated_inbox(),
                                 caps.cognition_log_updated_inbox(),
                                 caps.interoception_updated_inbox(),
+                                caps.action_affordances_updated_inbox(),
                                 caps.blackboard_reader(),
                                 caps.cognition_log_reader(),
                                 caps.allocation_reader(),
                                 caps.interoception_reader(),
+                                caps.action_affordance_reader(),
+                                caps.external_action_invoker(),
                                 caps.allocation_writer(action_targets.clone(), Vec::new()),
+                                caps.interoception_writer(),
                                 caps.memo(),
                                 caps.llm("main").with_tier(main_tier).into(),
                                 caps.session("main")
@@ -5546,47 +5538,6 @@ fn register_eval_module(
                 },
             )
             .expect("eval module registration should be unique"),
-        EvalModule::Sleep => registry
-            .register_eval(
-                eval_policy(0..=1, Bpm::range(1.0, 3.0)),
-                replica_hard_cap,
-                {
-                    let main_tier = eval_session_tier(module, "main");
-                    move |caps| async move {
-                        Ok(nuillu_sleep::SleepModule::new(
-                            caps.interoception_updated_inbox(),
-                            caps.interoception_reader(),
-                            caps.interoception_writer(),
-                            caps.memo(),
-                            caps.llm("main").with_tier(main_tier).into(),
-                            caps.session("main")
-                                .with_tier(main_tier)
-                                .with_auto_compaction(nuillu_sleep::session_auto_compaction())
-                                .await?,
-                        ))
-                    }
-                },
-            )
-            .expect("eval module registration should be unique"),
-        EvalModule::Poet => registry
-            .register_eval(
-                eval_policy(0..=1, Bpm::range(1.0, 3.0)),
-                replica_hard_cap,
-                {
-                    let main_tier = eval_session_tier(module, "main");
-                    move |caps| async move {
-                        Ok(nuillu_poet::PoetModule::new(
-                            caps.typed_memo::<nuillu_poet::PoetMemo>(),
-                            caps.llm("main").with_tier(main_tier).into(),
-                            caps.session("main")
-                                .with_tier(main_tier)
-                                .with_auto_compaction(nuillu_poet::session_auto_compaction())
-                                .await?,
-                        ))
-                    }
-                },
-            )
-            .expect("eval module registration should be unique"),
     }
 }
 
@@ -5618,9 +5569,7 @@ pub(crate) fn full_agent_allocation(
             | EvalModule::Reward
             | EvalModule::Predict
             | EvalModule::Surprise
-            | EvalModule::Speak
-            | EvalModule::Sleep
-            | EvalModule::Poet => 0.0,
+            | EvalModule::Speak => 0.0,
         };
         set_allocation_module(&mut allocation, module.module_id(), activation);
     }
@@ -5679,8 +5628,6 @@ fn module_id_for_target(target: ModuleEvalTarget) -> ModuleId {
 fn eval_module_tier(module: EvalModule) -> ModelTier {
     match module {
         EvalModule::Sensory
-        | EvalModule::Sleep
-        | EvalModule::Poet
         | EvalModule::CognitionGate
         | EvalModule::QueryMemory
         | EvalModule::Memory
@@ -6677,6 +6624,70 @@ impl ActionActivityTracker {
             now.checked_duration_since(completed_at)
                 .is_some_and(|elapsed| elapsed >= window)
         })
+    }
+}
+
+struct EvalExternalActionExecutor {
+    case_id: String,
+    reporter: LiveReporter,
+    actions: Rc<ActionActivityTracker>,
+}
+
+impl EvalExternalActionExecutor {
+    fn new(case_id: String, reporter: LiveReporter, actions: Rc<ActionActivityTracker>) -> Self {
+        Self {
+            case_id,
+            reporter,
+            actions,
+        }
+    }
+}
+
+#[async_trait(?Send)]
+impl ExternalActionExecutor for EvalExternalActionExecutor {
+    async fn invoke(
+        &self,
+        invocation: ExternalActionInvocation,
+    ) -> Result<ExternalActionInvocationResult, PortError> {
+        self.actions.record_completed(&builtin::action());
+        self.reporter.emit_port(
+            Some(&self.case_id),
+            "external_action_invoked",
+            serde_json::json!({
+                "sender": invocation.invoked_by.to_string(),
+                "action_id": invocation.action_id,
+                "arguments": invocation.arguments,
+            }),
+            format!("{} external_action_invoked", self.reporter.log_prefix()),
+        )?;
+        Ok(ExternalActionInvocationResult {
+            accepted: true,
+            message: "external action accepted by eval host".to_owned(),
+        })
+    }
+}
+
+fn default_poet_affordance() -> ActionAffordance {
+    ActionAffordance {
+        id: "poet".to_owned(),
+        label: "Poet".to_owned(),
+        description: "Record a short poem through the host.".to_owned(),
+        use_when:
+            "Use during idle or low-salience moments when quiet creative note writing is appropriate."
+                .to_owned(),
+        effect: "The host records the poem and any meaningful outcome must arrive as sensory input."
+            .to_owned(),
+        input_schema: serde_json::json!({
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["poem"],
+            "properties": {
+                "poem": {
+                    "type": "string",
+                    "description": "The poem text to record."
+                }
+            }
+        }),
     }
 }
 

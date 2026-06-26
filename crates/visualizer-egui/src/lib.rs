@@ -27,7 +27,7 @@ use font_kit::handle::Handle;
 use font_kit::properties::{Properties, Weight};
 use font_kit::source::SystemSource;
 use i18n::{EguiI18nExt as _, I18nArg, I18nCatalog, LOCALE_PERSISTENCE_KEY, Locale};
-use nuillu_module::RuntimeEvent;
+use nuillu_module::{ActionAffordance, RuntimeEvent};
 pub use nuillu_visualizer_protocol::*;
 
 const NOTO_SANS_JP_FONT_KEY: &str = "noto-sans-jp";
@@ -93,7 +93,10 @@ impl VisualizerApp {
     fn drain_server_messages(&mut self) {
         loop {
             match self.server_messages.try_recv() {
-                Ok(message) => self.state.apply_server_message(message),
+                Ok(message) => {
+                    dispatch_agent_action_event(&message, &self.client_messages);
+                    self.state.apply_server_message(message);
+                }
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => {
                     if self.remote {
@@ -697,6 +700,122 @@ impl eframe::App for VisualizerApp {
     }
 }
 
+fn dispatch_agent_action_event(
+    message: &VisualizerServerMessage,
+    commands: &Sender<VisualizerClientMessage>,
+) {
+    let VisualizerServerMessage::Event {
+        event: VisualizerEvent::AgentActionInvocationRequested { tab_id, request },
+    } = message
+    else {
+        return;
+    };
+
+    if request.action_id == "poet" {
+        handle_poet_action(tab_id, request, commands);
+    } else {
+        handle_generic_external_action(tab_id, request, commands);
+    }
+}
+
+fn handle_poet_action(
+    tab_id: &VisualizerTabId,
+    request: &AgentActionInvocationRequest,
+    commands: &Sender<VisualizerClientMessage>,
+) {
+    let poem = request
+        .arguments
+        .get("poem")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .trim();
+    if poem.is_empty() {
+        send_agent_action_completion(
+            tab_id,
+            &request.invocation_id,
+            false,
+            "poet action requires a non-empty poem",
+            commands,
+        );
+        return;
+    }
+    send_agent_action_completion(
+        tab_id,
+        &request.invocation_id,
+        true,
+        "poem recorded by visualizer",
+        commands,
+    );
+    send_action_sensory_feedback(
+        tab_id,
+        format!("The poet action recorded a poem:\n{poem}"),
+        commands,
+    );
+}
+
+fn handle_generic_external_action(
+    tab_id: &VisualizerTabId,
+    request: &AgentActionInvocationRequest,
+    commands: &Sender<VisualizerClientMessage>,
+) {
+    let arguments =
+        serde_json::to_string(&request.arguments).unwrap_or_else(|_| "<invalid-json>".to_owned());
+    send_agent_action_completion(
+        tab_id,
+        &request.invocation_id,
+        true,
+        format!(
+            "external action {} accepted by visualizer",
+            request.action_id
+        ),
+        commands,
+    );
+    send_action_sensory_feedback(
+        tab_id,
+        format!(
+            "External action {} was invoked with arguments: {}",
+            request.action_id, arguments
+        ),
+        commands,
+    );
+}
+
+fn send_agent_action_completion(
+    tab_id: &VisualizerTabId,
+    invocation_id: &str,
+    accepted: bool,
+    message: impl Into<String>,
+    commands: &Sender<VisualizerClientMessage>,
+) {
+    let _ = commands.send(VisualizerClientMessage::Command {
+        command: VisualizerCommand::CompleteAgentActionInvocation {
+            tab_id: tab_id.clone(),
+            completion: AgentActionInvocationCompletion {
+                invocation_id: invocation_id.to_owned(),
+                accepted,
+                message: message.into(),
+            },
+        },
+    });
+}
+
+fn send_action_sensory_feedback(
+    tab_id: &VisualizerTabId,
+    content: String,
+    commands: &Sender<VisualizerClientMessage>,
+) {
+    let _ = commands.send(VisualizerClientMessage::Command {
+        command: VisualizerCommand::SendOneShotSensoryInput {
+            tab_id: tab_id.clone(),
+            input: OneShotSensoryInput {
+                modality: "action".to_owned(),
+                direction: None,
+                content,
+            },
+        },
+    });
+}
+
 #[derive(Default)]
 pub struct VisualizerState {
     tabs: BTreeMap<VisualizerTabId, RuntimeTab>,
@@ -855,6 +974,23 @@ impl VisualizerState {
             VisualizerEvent::SceneState { tab_id, state } => {
                 self.tab_mut(tab_id).scene.set_scene_state(state);
             }
+            VisualizerEvent::AgentActionAffordances {
+                tab_id,
+                affordances,
+            } => {
+                let tab = self.tab_mut(tab_id);
+                tab.action_affordances = affordances;
+                tab.push_log(format!(
+                    "agent action affordances updated: {} available",
+                    tab.action_affordances.len()
+                ));
+            }
+            VisualizerEvent::AgentActionInvocationRequested { tab_id, request } => {
+                self.tab_mut(tab_id).push_log(format!(
+                    "agent invoked external action {}",
+                    request.action_id
+                ));
+            }
         }
     }
 
@@ -902,6 +1038,7 @@ pub struct RuntimeTab {
     llm_turns_module_filter: module_filter::ModuleFilterState,
     resource_monitor_module_filter: module_filter::ModuleFilterState,
     resource_monitor_started_at: Instant,
+    action_affordances: Vec<ActionAffordance>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -959,6 +1096,7 @@ impl RuntimeTab {
             llm_turns_module_filter: module_filter::ModuleFilterState::default(),
             resource_monitor_module_filter: module_filter::ModuleFilterState::default(),
             resource_monitor_started_at: Instant::now(),
+            action_affordances: Vec::new(),
         }
     }
 

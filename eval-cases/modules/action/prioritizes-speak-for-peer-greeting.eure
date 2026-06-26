@@ -3,8 +3,6 @@ description: Action should route a direct admitted peer greeting toward speak ra
 modules = [
   "action",
   "speak",
-  "sleep",
-  "poet",
   "cognition-gate",
   "sensory",
 ]
@@ -23,17 +21,9 @@ participants = ["Peer"]
 
 @ checks[] {
   $variant: trace-tool-call
-  name: uses-reprioritize-actions
+  name: uses-activate-speak
   must-pass = true
-  tool-name: reprioritize_actions
-}
-
-@ checks[] {
-  $variant: trace-tool-call
-  name: priority-includes-speak
-  must-pass = true
-  tool-name: reprioritize_actions
-  args-json-contains = `{"priority_module_ids":["speak"]}`
+  tool-name: activate_speak
 }
 
 @ checks[] {
@@ -52,7 +42,7 @@ participants = ["Peer"]
   judge-inputs = ["output", "memo-contents", "tool-calls"]
   rubric = ```
   Pass if the action decision treats the admitted direct greeting as needing an outward response path and raises speak as a concrete action target.
-  Fail if it targets cognitive/support modules, omits speak, routes the greeting primarily to sleep or poet, or leaks hidden eval/runtime mechanics.
+  Fail if it uses hold_actions, sleep, or an unrelated external action, omits speak, or leaks hidden eval/runtime mechanics.
   ```
 
   @ criteria[] {
@@ -66,7 +56,7 @@ participants = ["Peer"]
     name: action-target-boundary
     weight = 2
     pass-score = 0.9
-    description: The tool call uses reprioritize_actions with live action target ids rather than cognitive/support module ids.
+    description: The tool call uses activate_speak for the concrete outward action instead of cognitive/support module ids.
   }
 
   @ criteria[] {

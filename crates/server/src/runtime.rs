@@ -11,8 +11,8 @@ use tokio::{runtime::Builder, task::LocalSet};
 
 use crate::SERVER_TAB_ID;
 use crate::commands::{
-    apply_persisted_module_settings, drive_server_until_shutdown, emit_recent_activity_rows,
-    emit_scene_state,
+    apply_persisted_module_settings, drive_server_until_shutdown, emit_action_affordances,
+    emit_recent_activity_rows, emit_scene_state,
 };
 use crate::config::ServerConfig;
 use crate::environment::build_server_environment;
@@ -23,7 +23,7 @@ use crate::gui::{
 use crate::llm_db_trace::emit_persisted_llm_transcripts;
 use crate::registry::{full_agent_allocation, server_registry};
 use crate::snapshot::emit_visualizer_blackboard_snapshot;
-use crate::state::{ModuleSettingsState, SceneState};
+use crate::state::{ActionAffordanceState, ModuleSettingsState, SceneState};
 
 const SERVER_TITLE: &str = "nuillu-server";
 
@@ -107,6 +107,9 @@ async fn run_server(config: ServerConfig, visualizer: &mut VisualizerHook) -> an
     scene.save()?;
     let mut module_settings =
         ModuleSettingsState::load(config.state_dir.join("module-settings.json"))?;
+    let mut action_affordances =
+        ActionAffordanceState::load(config.state_dir.join("action-affordances.json"))?;
+    action_affordances.save()?;
 
     let active_modules = config.active_modules();
     let env = build_server_environment(
@@ -115,8 +118,16 @@ async fn run_server(config: ServerConfig, visualizer: &mut VisualizerHook) -> an
         visualizer.event_sender(),
     )
     .await?;
+    let action_snapshot = env
+        .caps
+        .host_io()
+        .action_affordance_writer()
+        .set_all(action_affordances.affordances())
+        .await
+        .context("seed action affordances")?;
     env.caps.scene().set(scene.participants());
     emit_scene_state(&scene, visualizer, &tab_id);
+    emit_action_affordances(visualizer, &tab_id, action_snapshot.affordances);
     emit_recent_activity_rows(&env, visualizer, &tab_id).await;
     for module in config
         .disabled_modules
@@ -169,6 +180,7 @@ async fn run_server(config: ServerConfig, visualizer: &mut VisualizerHook) -> an
                 &tab_id,
                 &mut scene,
                 &mut module_settings,
+                &mut action_affordances,
                 &sensory,
                 &env,
                 &run_controller,

@@ -7,11 +7,11 @@ use std::{
 };
 
 use chrono::{DateTime, Utc};
-use nuillu_module::{AmbientSensoryEntry, RuntimeEvent, SensoryInput};
+use nuillu_module::{ActionAffordance, AmbientSensoryEntry, RuntimeEvent, SensoryInput};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use thiserror::Error;
 
-pub const VISUALIZER_PROTOCOL_VERSION: u32 = 3;
+pub const VISUALIZER_PROTOCOL_VERSION: u32 = 4;
 pub const START_SUITE_ACTION_ID: &str = "suite:start";
 
 pub fn start_activation_action_id(tab_id: &VisualizerTabId) -> String {
@@ -244,6 +244,14 @@ pub enum VisualizerEvent {
         tab_id: VisualizerTabId,
         state: SceneStateView,
     },
+    AgentActionAffordances {
+        tab_id: VisualizerTabId,
+        affordances: Vec<ActionAffordance>,
+    },
+    AgentActionInvocationRequested {
+        tab_id: VisualizerTabId,
+        request: AgentActionInvocationRequest,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -297,6 +305,22 @@ pub enum VisualizerCommand {
         tab_id: VisualizerTabId,
         settings: ModuleSettingsView,
     },
+    SetAgentActionAffordances {
+        tab_id: VisualizerTabId,
+        affordances: Vec<ActionAffordance>,
+    },
+    UpsertAgentActionAffordance {
+        tab_id: VisualizerTabId,
+        affordance: ActionAffordance,
+    },
+    RemoveAgentActionAffordance {
+        tab_id: VisualizerTabId,
+        action_id: String,
+    },
+    CompleteAgentActionInvocation {
+        tab_id: VisualizerTabId,
+        completion: AgentActionInvocationCompletion,
+    },
     ResetModuleSessionHistory {
         tab_id: VisualizerTabId,
         owner: String,
@@ -319,6 +343,20 @@ pub enum VisualizerCommand {
         memory_index: String,
     },
     Shutdown,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AgentActionInvocationRequest {
+    pub invocation_id: String,
+    pub action_id: String,
+    pub arguments: serde_json::Value,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentActionInvocationCompletion {
+    pub invocation_id: String,
+    pub accepted: bool,
+    pub message: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1594,7 +1632,9 @@ mod tests {
             let client = port.recv().unwrap();
             assert!(matches!(
                 client,
-                VisualizerClientMessage::Hello { version: 3 }
+                VisualizerClientMessage::Hello {
+                    version: VISUALIZER_PROTOCOL_VERSION
+                }
             ));
             let tab_id = VisualizerTabId::new("case-1");
             port.send(VisualizerServerMessage::event(VisualizerEvent::OpenTab {
@@ -1615,7 +1655,9 @@ mod tests {
         let (incoming, outgoing) = client.into_channels();
         assert!(matches!(
             incoming.recv().unwrap(),
-            VisualizerServerMessage::Hello { version: 3 }
+            VisualizerServerMessage::Hello {
+                version: VISUALIZER_PROTOCOL_VERSION
+            }
         ));
         let event = incoming.recv().unwrap();
         let VisualizerServerMessage::Event {
@@ -1646,7 +1688,9 @@ mod tests {
             let message = port.recv_timeout(Duration::from_secs(1)).unwrap();
             assert!(matches!(
                 message,
-                Some(VisualizerClientMessage::Hello { version: 3 })
+                Some(VisualizerClientMessage::Hello {
+                    version: VISUALIZER_PROTOCOL_VERSION
+                })
             ));
         });
 
@@ -1657,7 +1701,9 @@ mod tests {
         let (incoming, _) = client.into_channels();
         assert!(matches!(
             incoming.recv_timeout(Duration::from_secs(1)).unwrap(),
-            VisualizerServerMessage::Hello { version: 3 }
+            VisualizerServerMessage::Hello {
+                version: VISUALIZER_PROTOCOL_VERSION
+            }
         ));
 
         server.join().unwrap();

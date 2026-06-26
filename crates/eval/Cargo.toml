@@ -40,8 +40,6 @@ nuillu-reward = { workspace = true }
 nuillu-sensory = { workspace = true }
 nuillu-self-model = { workspace = true }
 nuillu-speak = { workspace = true }
-nuillu-sleep = { workspace = true }
-nuillu-poet = { workspace = true }
 nuillu-cognition-gate = { workspace = true }
 nuillu-surprise = { workspace = true }
 nuillu-server = { workspace = true }

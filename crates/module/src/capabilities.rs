@@ -28,17 +28,19 @@ use crate::session::{
 use crate::tiers::{LlmTierHandle, LutumTiers};
 use crate::r#trait::ErasedModule;
 use crate::{
+    ActionAffordanceReader, ActionAffordanceRegistry, ActionAffordanceWriter,
+    ActionAffordancesUpdated, ActionAffordancesUpdatedInbox, ActionAffordancesUpdatedMailbox,
     AllocationReader, AllocationStore, AllocationWriter, AttentionControlRequest,
     AttentionControlRequestInbox, AttentionControlRequestMailbox, BlackboardReader,
     CognitionLogEvictedInbox, CognitionLogEvictedMailbox, CognitionLogReader, CognitionLogUpdated,
-    CognitionLogUpdatedInbox, CognitionLogUpdatedMailbox, CognitionWriter,
-    InteroceptionRuntimePolicy, InteroceptiveReader, InteroceptiveUpdated,
+    CognitionLogUpdatedInbox, CognitionLogUpdatedMailbox, CognitionWriter, ExternalActionExecutor,
+    ExternalActionInvoker, InteroceptionRuntimePolicy, InteroceptiveReader, InteroceptiveUpdated,
     InteroceptiveUpdatedInbox, InteroceptiveUpdatedMailbox, InteroceptiveWriter, LlmAccess, Memo,
     MemoLogEvictedInbox, MemoLogEvictedMailbox, MemoLogRepository, MemoUpdated, MemoUpdatedInbox,
     MemoUpdatedMailbox, MemoryMetadataReader, Module, ModuleBatch, ModuleStatusReader,
-    NoopAllocationStore, NoopMemoLogRepository, PersistedMemoLogEntry, SensoryInput,
-    SensoryInputInbox, SensoryInputMailbox, SessionCompactionPolicy, TimeDivision, TopicInbox,
-    TopicMailbox, TypedMemo,
+    NoopAllocationStore, NoopExternalActionExecutor, NoopMemoLogRepository, PersistedMemoLogEntry,
+    SensoryInput, SensoryInputInbox, SensoryInputMailbox, SessionCompactionPolicy, TimeDivision,
+    TopicInbox, TopicMailbox, TypedMemo,
 };
 
 /// Provides [capabilities](crate) at agent boot.
@@ -59,6 +61,7 @@ struct CapabilityProvidersInner {
     cognition_log_updates: Topic<CognitionLogUpdated>,
     cognition_log_evictions: Topic<nuillu_blackboard::CognitionLogEntryRecord>,
     interoception_updates: Topic<InteroceptiveUpdated>,
+    action_affordance_updates: Topic<ActionAffordancesUpdated>,
     memo_updates: Topic<MemoUpdated>,
     memo_log_evictions: Topic<nuillu_blackboard::MemoLogRecord>,
     sensory_input_topic: Topic<SensoryInput>,
@@ -70,6 +73,8 @@ struct CapabilityProvidersInner {
     runtime_events: RuntimeEventEmitter,
     runtime_policy: RuntimePolicy,
     scene: SceneRegistry,
+    action_affordances: ActionAffordanceRegistry,
+    external_action_executor: Rc<dyn ExternalActionExecutor>,
     session_store: Rc<dyn SessionStore>,
     allocation_store: Rc<dyn AllocationStore>,
     memo_log_repository: Rc<dyn MemoLogRepository>,
@@ -224,6 +229,7 @@ pub struct CapabilityProviderRuntime {
     pub session_store: Rc<dyn SessionStore>,
     pub allocation_store: Rc<dyn AllocationStore>,
     pub memo_log_repository: Rc<dyn MemoLogRepository>,
+    pub external_action_executor: Rc<dyn ExternalActionExecutor>,
 }
 
 impl Default for CapabilityProviderRuntime {
@@ -234,6 +240,7 @@ impl Default for CapabilityProviderRuntime {
             session_store: Rc::new(NoopSessionStore),
             allocation_store: Rc::new(NoopAllocationStore),
             memo_log_repository: Rc::new(NoopMemoLogRepository),
+            external_action_executor: Rc::new(NoopExternalActionExecutor),
         }
     }
 }
@@ -269,6 +276,7 @@ impl CapabilityProviders {
             session_store,
             allocation_store,
             memo_log_repository,
+            external_action_executor,
         } = runtime;
         let runtime_events = RuntimeEventEmitter::new(event_sink);
         let wakes = WakeRegistry::default();
@@ -297,6 +305,11 @@ impl CapabilityProviders {
                     wakes.clone(),
                     TopicPolicy::Fanout,
                 ),
+                action_affordance_updates: Topic::new(
+                    blackboard.clone(),
+                    wakes.clone(),
+                    TopicPolicy::Fanout,
+                ),
                 memo_updates: Topic::new(blackboard.clone(), wakes.clone(), TopicPolicy::Fanout),
                 memo_log_evictions: Topic::new(
                     blackboard.clone(),
@@ -317,6 +330,8 @@ impl CapabilityProviders {
                 runtime_events,
                 runtime_policy: policy,
                 scene: SceneRegistry::empty(),
+                action_affordances: ActionAffordanceRegistry::default(),
+                external_action_executor,
                 session_store,
                 allocation_store,
                 memo_log_repository,
@@ -805,6 +820,16 @@ impl HostIo {
             self.root.inner.sensory_input_topic.clone(),
         )
     }
+
+    pub fn action_affordance_writer(&self) -> ActionAffordanceWriter {
+        ActionAffordanceWriter::new(
+            self.root.inner.action_affordances.clone(),
+            ActionAffordancesUpdatedMailbox::new(
+                self.owner.clone(),
+                self.root.inner.action_affordance_updates.clone(),
+            ),
+        )
+    }
 }
 
 #[derive(Clone)]
@@ -909,6 +934,13 @@ impl ModuleCapabilityFactory {
         TopicInbox::new_excluding_self(
             self.owner.clone(),
             self.root.inner.interoception_updates.clone(),
+        )
+    }
+
+    pub fn action_affordances_updated_inbox(&self) -> ActionAffordancesUpdatedInbox {
+        TopicInbox::new_excluding_self(
+            self.owner.clone(),
+            self.root.inner.action_affordance_updates.clone(),
         )
     }
 
@@ -1080,6 +1112,17 @@ impl ModuleCapabilityFactory {
                 self.root.inner.interoception_updates.clone(),
             ),
             self.root.inner.clock.clone(),
+        )
+    }
+
+    pub fn action_affordance_reader(&self) -> ActionAffordanceReader {
+        ActionAffordanceReader::new(self.root.inner.action_affordances.clone())
+    }
+
+    pub fn external_action_invoker(&self) -> ExternalActionInvoker {
+        ExternalActionInvoker::new(
+            self.owner.clone(),
+            self.root.inner.external_action_executor.clone(),
         )
     }
 

@@ -22,6 +22,7 @@ pub use nuillu_blackboard::{
     ModuleRunStatusRecord, ResourceAllocation, UtteranceProgress, UtteranceProgressState,
 };
 
+mod action;
 mod activation_gate;
 mod allocation_persistence;
 mod allocation_writer;
@@ -53,6 +54,12 @@ mod r#trait;
 #[cfg(test)]
 mod test_support;
 
+pub use action::{
+    ActionAffordance, ActionAffordanceError, ActionAffordanceReader, ActionAffordanceRegistry,
+    ActionAffordanceSnapshot, ActionAffordanceWriter, ExternalActionExecutor,
+    ExternalActionInvocation, ExternalActionInvocationResult, ExternalActionInvoker,
+    NoopExternalActionExecutor,
+};
 pub use activation_gate::{
     ActivationGate, ActivationGateEvent, ActivationGateRecvError, ActivationGateVote,
 };
@@ -67,6 +74,7 @@ pub use capabilities::{
     ModuleRegisterer, ModuleRegistry, ModuleRegistryError, SelfWake, SelfWakePermitClaim,
 };
 pub use channels::{
+    ActionAffordancesUpdated, ActionAffordancesUpdatedInbox, ActionAffordancesUpdatedMailbox,
     AmbientSensoryEntry, AttentionControlRequest, AttentionControlRequestInbox,
     AttentionControlRequestKind, AttentionControlRequestMailbox, CognitionLogEvictedInbox,
     CognitionLogEvictedMailbox, CognitionLogUpdated, CognitionLogUpdatedInbox,

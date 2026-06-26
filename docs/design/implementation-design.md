@@ -571,17 +571,24 @@ Wakes on memo updates, excluding its own memo writes, and internal `AttentionCon
 
 The controller prompt receives a registry-derived JSON Schema. The schema enumerates known module ids and exposes exactly `memo` and `priority_module_ids`. Runtime maps priority positions through the current activation table; active replicas are derived later from the target module's policy.
 
-When current memo logs and cognition logs suggest that the agent should gather evidence before speaking, the controller enters an evidence-gathering allocation phase: it keeps or raises query and cognition-gate activation priority. Query modules continue to write memo-authoritative results as log entries; cognition-gate may later promote useful query memo-log content into cognition logs. Once cognition-log state indicates that a concrete outward/internal action may be useful, the controller can allocate Action; Action then chooses among concrete action targets such as Speak, Sleep, and Poet.
+When current memo logs and cognition logs suggest that the agent should gather evidence before speaking, the controller enters an evidence-gathering allocation phase: it keeps or raises query and cognition-gate activation priority. Query modules continue to write memo-authoritative results as log entries; cognition-gate may later promote useful query memo-log content into cognition logs. Once cognition-log state indicates that a concrete outward/internal action may be useful, the controller can allocate Action; Action then executes one concrete action tool.
 
 This is not a request/response wait and not a query-completion correlation protocol. The controller allocates work from memo logs, attention-control requests, cognition logs, and allocation state, while query results remain durable only through query-module memo logs. Attention-control requests are admitted, deferred, or rejected in the controller memo; deferred requests are not stored in a separate pending queue.
 
 ### Action
 
-Capabilities: `MemoUpdatedInbox`, `CognitionLogUpdatedInbox`, `InteroceptiveUpdatedInbox`, `BlackboardReader`, `CognitionLogReader`, `AllocationReader`, `InteroceptiveReader`, `AllocationWriter`, `Memo`, `LlmAccess`.
+Capabilities: `MemoUpdatedInbox`, `CognitionLogUpdatedInbox`, `InteroceptiveUpdatedInbox`, `ActionAffordancesUpdatedInbox`, `BlackboardReader`, `CognitionLogReader`, `AllocationReader`, `InteroceptiveReader`, `ActionAffordanceReader`, `ExternalActionInvoker`, `AllocationWriter`, `InteroceptiveWriter`, `Memo`, `LlmAccess`.
 
-Action is the concrete action selector. It reads recent memo/cognition/interoceptive context and writes allocation effects only for action targets granted by boot wiring: `speak`, `sleep`, and `poet`. It has no `CognitionWriter`, no memory capability, no `UtteranceWriter`, and no `InteroceptiveWriter`.
+Action is the concrete action executor. It reads recent memo/cognition/interoceptive context and the latest live external action affordance snapshot. It has no `CognitionWriter`, no memory capability, and no `UtteranceWriter`.
 
-The action prompt receives a registry-derived JSON Schema for `reprioritize_actions { memo, priority_module_ids }`. It prefers Speak for outward response opportunities, Sleep for low wake arousal or sleep pressure, and Poet for idle low-salience creative note writing. It writes an action decision memo and action-target allocation effects; omitted action targets fall back to host/base allocation.
+Its tool surface is mixed:
+
+- `activate_speak` is the narrow allocation-backed action. It submits Action's complete allocation effect for `speak`.
+- `hold_actions` clears Action's previous speak allocation effect.
+- `sleep` is a built-in one-shot action. It validates sleep-ready interoception, patches interoception into NREM pressure, and lets Homeostasis react through `InteroceptiveUpdated`.
+- External dynamic tools come from the live host/visualizer affordance registry. Each affordance has a stable tool name, JSON Schema, label, description, `use_when`, and effect text. Action invokes the host handler and commits only an acknowledgement/error tool result; semantic effects return later through sensory input or scene changes.
+
+Poet is not a module. It is a third-party external action affordance supplied by the visualizer/host with a schema such as `{ "poem": "string" }`.
 
 ### Attention Schema
 
@@ -739,17 +746,11 @@ ordinary abort bookkeeping remain non-cognitive. A completed utterance memo-log 
 controller as ordinary output context, but speech start itself is not controlled through memo
 structure, memo JSON, or allocation priority state.
 
-### Sleep
+### External Actions
 
-Capabilities: `InteroceptiveUpdatedInbox`, `InteroceptiveReader`, `InteroceptiveWriter`, `Memo`, `LlmAccess`.
+External action execution is host-owned. The runtime keeps a persisted snapshot of host/visualizer affordances and publishes update notifications when the snapshot changes. Action reads the latest snapshot per activation and exposes those entries as dynamic Lutum tools. Invocation arguments are raw JSON that already passed the model/tool schema boundary; the host decides whether to accept the invocation.
 
-Sleep is activated by Action and does not hold `AllocationWriter`. On activation it first checks the current `InteroceptiveState`. If `wake_arousal > 0.25` or the mode is already sleep-like, it returns without an LLM call. Otherwise it asks the LLM through `decide_sleep`; an affirmative decision patches interoception to `NremPressure`, drops `wake_arousal` to `0.05`, and raises NREM/REM pressure floors so existing Homeostasis can cycle compacting/dreaming phases.
-
-### Poet
-
-Capabilities: `TypedMemo<PoetMemo>`, `LlmAccess`.
-
-Poet is activated by Action during idle periods. It has no blackboard, cognition, allocation, interoception, memory, or utterance capabilities. Its tool surface is only `read_recent_poets` and `write_a_poet`; poems are retained in the module's own typed memo log and are not inserted into long-term memory.
+External action tool results are deliberately acknowledgement-only. If the action changes the world, reads a clock, moves the avatar, interacts with an item, or writes a poem, the host/visualizer publishes the resulting observation through sensory input or scene state.
 
 ---
 
@@ -828,7 +829,7 @@ Implementations may persist utterances, stream deltas to UI, or both. The `on_co
 
 Full-agent boundary eval cases live under `eval-cases/full-agent/**/*.eure`. They model app input and therefore support batched `inputs[]` whose `heard`, `seen`, and `one-shot` variants all publish `SensoryInput::OneShot`. They may seed memories, but the user-facing request still enters only through sensory input; memory-required full-agent cases exercise whether controller/query/cognition-gate/speak can surface stored context without direct harness messages. The runner publishes all inputs through `CapabilityProviders::host_io().sensory_input_mailbox()`, yields the current-thread runtime while module tasks react to channel updates, waits until the latest completed action has been silent for one second, max loop iterations, or runtime-event shutdown, and returns the latest complete `Utterance` as `CaseArtifact::output`.
 
-Full-agent eval boot uses a minimal bootstrap allocation rather than waking every module. Sensory and allocation start with positive activation ratios; cognition-gate starts low and is raised by allocation after sensory memo writes; action starts at zero and is raised by allocation; lower-priority speak, sleep, poet, query-memory, memory, memory-compaction, policy, reward, prediction, surprise, attention-schema, interpreter, and self-model modules start at zero activation ratio until allocation/action propose an effective allocation. This keeps full-agent evals testing the controller path instead of bypassing it with an all-on static schedule.
+Full-agent eval boot uses a minimal bootstrap allocation rather than waking every module. Sensory and allocation start with positive activation ratios; cognition-gate starts low and is raised by allocation after sensory memo writes; action starts at zero and is raised by allocation; lower-priority speak, query-memory, memory, memory-compaction, policy, reward, prediction, surprise, attention-schema, interpreter, and self-model modules start at zero activation ratio until allocation/action propose an effective allocation. This keeps full-agent evals testing the controller path instead of bypassing it with an all-on static schedule.
 
 Module eval cases live under `eval-cases/modules/**`. They are explicit internal harnesses, not app-facing scenarios. The runner publishes the target module's natural trigger, such as cognition-log, memo, sensory, eviction, or interoceptive input, and scores the target module's memo-log or cognition-log entries as the artifact depending on the module boundary. Module cases may seed `cognition-log[]` entries for cognition-log consumers, and may seed `memos[]` entries as input syntax; those seeds append memo-log entries rather than latest snapshots. Memo seeds are non-cognitive by default unless `cognitive = true` is specified or the target harness deliberately treats memo seeds as cognitive evidence. Query evals statically check that retrieved content reached the artifact, while rubrics can judge generated search/tool arguments by opting into `tool-calls` as a rubric `judge-inputs[]` value.
 
@@ -873,7 +874,7 @@ This keeps realistic artifacts observable without adding request/response correl
 | Interpreter reads only cognition | it receives `CognitionLogUpdatedInbox`, `CognitionLogReader`, `CognitionWriter`, and `LlmAccess`, not `Memo`, `BlackboardReader`, `AllocationReader`, memory, attention-control, allocation-write, or utterance capabilities |
 | Cognition-log inboxes filter self writes | `CognitionLogUpdatedInbox` is constructed with the same self-exclusion policy as `MemoUpdatedInbox` |
 | Cognition-log writes cannot wake controller directly | cognition-log appends publish `CognitionLogUpdated`, which the controller does not receive |
-| Allocation writes are role-bound | boot-time wiring grants `AllocationWriter` to allocation for cognitive/support proposals, to action for concrete action proposals, and to homeostasis for interoceptive sleep/REM drive and action suppression; runtime computes effective allocation |
+| Allocation writes are role-bound | boot-time wiring grants `AllocationWriter` to allocation for cognitive/support proposals, to action only for `speak`, and to homeostasis for interoceptive sleep/REM drive and action suppression; runtime computes effective allocation |
 | Attention schema models attention only | it receives memo and cognition-log wake capabilities, blackboard/cognition-log read capabilities, `Memo`, and `LlmAccess`, not `AllocationReader`, `CognitionWriter`, attention-control inbox, `AllocationWriter`, or memory capabilities |
 | Self-model handles self-report | self-model receives `CognitionLogUpdatedInbox`, reads current memo/cognition context, and writes self-model answers to its own memo |
 | Self-model is not raw memory retrieval | stable self-knowledge is surfaced through query memo logs; self-model integrates that knowledge with attention-schema attention-experience memos or promoted cognition-log entries and current memo-log context |

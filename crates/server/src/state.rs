@@ -5,7 +5,7 @@ use std::{
 };
 
 use anyhow::Context as _;
-use nuillu_module::Participant;
+use nuillu_module::{ActionAffordance, Participant};
 use nuillu_visualizer_protocol::{
     AmbientSensoryRowView, DerivedAmbientSensoryRowView, EditableSceneStateView,
     ModuleSettingsView, SceneAtmosphereRowView, SceneObjectRowView, ScenePersonRowView,
@@ -16,6 +16,95 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct ModuleSettingsFile {
     modules: Vec<ModuleSettingsView>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ActionAffordancesFile {
+    affordances: Vec<ActionAffordance>,
+}
+
+#[derive(Debug)]
+pub(super) struct ActionAffordanceState {
+    path: PathBuf,
+    affordances: BTreeMap<String, ActionAffordance>,
+}
+
+impl ActionAffordanceState {
+    pub(super) fn load(path: PathBuf) -> anyhow::Result<Self> {
+        if !path.exists() {
+            return Ok(Self::from_affordances(
+                path,
+                vec![default_poet_affordance()],
+            ));
+        }
+        let text = fs::read_to_string(&path)
+            .with_context(|| format!("read action affordances from {}", path.display()))?;
+        let file: ActionAffordancesFile = serde_json::from_str(&text)
+            .with_context(|| format!("parse action affordances from {}", path.display()))?;
+        Ok(Self::from_affordances(path, file.affordances))
+    }
+
+    fn from_affordances(path: PathBuf, affordances: Vec<ActionAffordance>) -> Self {
+        Self {
+            path,
+            affordances: affordances
+                .into_iter()
+                .map(|affordance| (affordance.id.clone(), affordance))
+                .collect(),
+        }
+    }
+
+    pub(super) fn save(&self) -> anyhow::Result<()> {
+        if let Some(parent) = self.path.parent() {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("create action affordance dir {}", parent.display()))?;
+        }
+        let text = serde_json::to_string_pretty(&ActionAffordancesFile {
+            affordances: self.affordances(),
+        })?;
+        fs::write(&self.path, text)
+            .with_context(|| format!("write action affordances to {}", self.path.display()))
+    }
+
+    pub(super) fn replace(&mut self, affordances: Vec<ActionAffordance>) {
+        self.affordances = affordances
+            .into_iter()
+            .map(|affordance| (affordance.id.clone(), affordance))
+            .collect();
+    }
+
+    pub(super) fn upsert(&mut self, affordance: ActionAffordance) {
+        self.affordances.insert(affordance.id.clone(), affordance);
+    }
+
+    pub(super) fn remove(&mut self, action_id: &str) {
+        self.affordances.remove(action_id);
+    }
+
+    pub(super) fn affordances(&self) -> Vec<ActionAffordance> {
+        self.affordances.values().cloned().collect()
+    }
+}
+
+fn default_poet_affordance() -> ActionAffordance {
+    ActionAffordance {
+        id: "poet".to_owned(),
+        label: "Poet".to_owned(),
+        description: "Record a short poem through the visualizer.".to_owned(),
+        use_when: "Use during idle or low-salience moments when quiet creative note writing is appropriate.".to_owned(),
+        effect: "The visualizer records and displays the poem, then emits sensory feedback describing that the poem was written.".to_owned(),
+        input_schema: serde_json::json!({
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["poem"],
+            "properties": {
+                "poem": {
+                    "type": "string",
+                    "description": "The poem text to record."
+                }
+            }
+        }),
+    }
 }
 
 #[derive(Debug)]
@@ -364,6 +453,44 @@ fn legacy_modality_aspect(modality: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn action_affordance_state_seeds_and_round_trips() {
+        let path = PathBuf::from(format!(
+            ".tmp/action-affordances-{}.json",
+            uuid::Uuid::now_v7()
+        ));
+
+        let mut state = ActionAffordanceState::load(path.clone()).unwrap();
+        assert_eq!(
+            state
+                .affordances()
+                .into_iter()
+                .map(|affordance| affordance.id)
+                .collect::<Vec<_>>(),
+            vec!["poet".to_string()]
+        );
+
+        state.replace(vec![ActionAffordance {
+            id: "clock".to_string(),
+            label: "Clock".to_string(),
+            description: "Check the current time.".to_string(),
+            use_when: "when time matters".to_string(),
+            effect: "The host reports the current time as sensory input.".to_string(),
+            input_schema: serde_json::json!({"type": "object"}),
+        }]);
+        state.save().unwrap();
+
+        let reloaded = ActionAffordanceState::load(path).unwrap();
+        assert_eq!(
+            reloaded
+                .affordances()
+                .into_iter()
+                .map(|affordance| affordance.id)
+                .collect::<Vec<_>>(),
+            vec!["clock".to_string()]
+        );
+    }
 
     #[test]
     fn scene_state_derives_people_objects_sounds_and_atmosphere() {

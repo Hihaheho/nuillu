@@ -96,8 +96,6 @@ pub enum RuntimeModule {
     Predict,
     Surprise,
     Speak,
-    Sleep,
-    Poet,
 }
 
 const SERVER_BOOT_CONFIG_FILE: &str = "config.eure";
@@ -186,8 +184,6 @@ pub const DEFAULT_MODULES: &[RuntimeModule] = &[
     RuntimeModule::Predict,
     RuntimeModule::Surprise,
     RuntimeModule::Speak,
-    RuntimeModule::Sleep,
-    RuntimeModule::Poet,
 ];
 
 impl Default for ServerBootConfig {
@@ -222,8 +218,6 @@ impl RuntimeModule {
             Self::Predict => "predict",
             Self::Surprise => "surprise",
             Self::Speak => "speak",
-            Self::Sleep => "sleep",
-            Self::Poet => "poet",
         }
     }
 
@@ -249,8 +243,6 @@ impl RuntimeModule {
             Self::Predict => builtin::predict(),
             Self::Surprise => builtin::surprise(),
             Self::Speak => builtin::speak(),
-            Self::Sleep => builtin::sleep(),
-            Self::Poet => builtin::poet(),
         }
     }
 
@@ -279,8 +271,6 @@ impl RuntimeModule {
             Self::Predict => &[("main", ModelTier::Cheap)],
             Self::Surprise => &[("main", ModelTier::Default)],
             Self::Speak => &[("planning", ModelTier::Premium)],
-            Self::Sleep => &[("main", ModelTier::Cheap)],
-            Self::Poet => &[("main", ModelTier::Cheap)],
         }
     }
 }
@@ -687,26 +677,6 @@ fn default_server_modules() -> Vec<ServerModuleSpec> {
                 M::Surprise,
                 M::CognitionGate,
             ],
-        ),
-        module_spec(
-            M::Sleep,
-            0,
-            1,
-            1.0,
-            3.0,
-            0.0,
-            [G::SleepSuppressed, G::ActionTarget],
-            [],
-        ),
-        module_spec(
-            M::Poet,
-            0,
-            1,
-            1.0,
-            3.0,
-            0.0,
-            [G::SleepSuppressed, G::ActionTarget],
-            [],
         ),
     ]
 }

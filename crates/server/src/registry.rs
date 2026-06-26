@@ -128,11 +128,15 @@ fn register_server_module(
                         caps.memo_updated_inbox(),
                         caps.cognition_log_updated_inbox(),
                         caps.interoception_updated_inbox(),
+                        caps.action_affordances_updated_inbox(),
                         caps.blackboard_reader(),
                         caps.cognition_log_reader(),
                         caps.allocation_reader(),
                         caps.interoception_reader(),
+                        caps.action_affordance_reader(),
+                        caps.external_action_invoker(),
                         caps.allocation_writer(action_targets.clone(), Vec::new()),
+                        caps.interoception_writer(),
                         caps.memo(),
                         caps.llm("main").with_tier(main_tier).into(),
                         caps.session("main")
@@ -443,35 +447,6 @@ fn register_server_module(
                 }
             })
         }
-        RuntimeModule::Sleep => {
-            let main_tier = spec.session_tier("main");
-            registry.register_server(spec, move |caps| async move {
-                Ok(nuillu_sleep::SleepModule::new(
-                    caps.interoception_updated_inbox(),
-                    caps.interoception_reader(),
-                    caps.interoception_writer(),
-                    caps.memo(),
-                    caps.llm("main").with_tier(main_tier).into(),
-                    caps.session("main")
-                        .with_tier(main_tier)
-                        .with_auto_compaction(nuillu_sleep::session_auto_compaction())
-                        .await?,
-                ))
-            })
-        }
-        RuntimeModule::Poet => {
-            let main_tier = spec.session_tier("main");
-            registry.register_server(spec, move |caps| async move {
-                Ok(nuillu_poet::PoetModule::new(
-                    caps.typed_memo::<nuillu_poet::PoetMemo>(),
-                    caps.llm("main").with_tier(main_tier).into(),
-                    caps.session("main")
-                        .with_tier(main_tier)
-                        .with_auto_compaction(nuillu_poet::session_auto_compaction())
-                        .await?,
-                ))
-            })
-        }
     }
 }
 
@@ -536,9 +511,10 @@ mod tests {
 
     use lutum::Session;
     use nuillu_module::{
-        AllocationReader, AllocationWriter, BlackboardReader, CognitionLogReader,
-        CognitionLogUpdatedInbox, CognitionWriter, InteroceptiveReader, InteroceptiveUpdatedInbox,
-        InteroceptiveWriter, LlmAccess, Memo, MemoUpdatedInbox, TypedMemo,
+        ActionAffordanceReader, ActionAffordancesUpdatedInbox, AllocationReader, AllocationWriter,
+        BlackboardReader, CognitionLogReader, CognitionLogUpdatedInbox, CognitionWriter,
+        ExternalActionInvoker, InteroceptiveReader, InteroceptiveUpdatedInbox, InteroceptiveWriter,
+        LlmAccess, Memo, MemoUpdatedInbox,
     };
     use nuillu_types::builtin;
 
@@ -554,27 +530,19 @@ mod tests {
         MemoUpdatedInbox,
         CognitionLogUpdatedInbox,
         InteroceptiveUpdatedInbox,
+        ActionAffordancesUpdatedInbox,
         BlackboardReader,
         CognitionLogReader,
         AllocationReader,
         InteroceptiveReader,
+        ActionAffordanceReader,
+        ExternalActionInvoker,
         AllocationWriter,
-        Memo,
-        LlmAccess,
-        Session,
-    ) -> nuillu_action::ActionModule;
-
-    type SleepConstructor = fn(
-        InteroceptiveUpdatedInbox,
-        InteroceptiveReader,
         InteroceptiveWriter,
         Memo,
         LlmAccess,
         Session,
-    ) -> nuillu_sleep::SleepModule;
-
-    type PoetConstructor =
-        fn(TypedMemo<nuillu_poet::PoetMemo>, LlmAccess, Session) -> nuillu_poet::PoetModule;
+    ) -> nuillu_action::ActionModule;
 
     #[test]
     fn interpreter_constructor_uses_only_direct_cognition_capabilities() {
@@ -586,12 +554,8 @@ mod tests {
     #[test]
     fn new_action_module_constructors_use_expected_capabilities() {
         fn accepts_action_signature(_constructor: ActionConstructor) {}
-        fn accepts_sleep_signature(_constructor: SleepConstructor) {}
-        fn accepts_poet_signature(_constructor: PoetConstructor) {}
 
         accepts_action_signature(nuillu_action::ActionModule::new);
-        accepts_sleep_signature(nuillu_sleep::SleepModule::new);
-        accepts_poet_signature(nuillu_poet::PoetModule::new);
     }
 
     #[test]
@@ -618,8 +582,7 @@ mod tests {
         assert!(voluntary.contains(&builtin::action()));
         assert!(!voluntary.contains(&builtin::speak()));
         assert!(action_targets.contains(&builtin::speak()));
-        assert!(action_targets.contains(&builtin::sleep()));
-        assert!(action_targets.contains(&builtin::poet()));
+        assert_eq!(action_targets, vec![builtin::speak()]);
         assert!(voluntary.contains(&builtin::interpreter()));
         assert!(voluntary.contains(&builtin::dreaming()));
         assert!(!voluntary.contains(&builtin::sensory()));

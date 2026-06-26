@@ -434,6 +434,11 @@ pub enum CognitionLogUpdated {
 pub struct InteroceptiveUpdated;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct ActionAffordancesUpdated {
+    pub version: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct MemoUpdated {
     pub owner: ModuleInstanceId,
     pub index: u64,
@@ -445,6 +450,8 @@ pub type CognitionLogUpdatedMailbox = TopicMailbox<CognitionLogUpdated>;
 pub type CognitionLogUpdatedInbox = TopicInbox<CognitionLogUpdated>;
 pub type InteroceptiveUpdatedMailbox = TopicMailbox<InteroceptiveUpdated>;
 pub type InteroceptiveUpdatedInbox = TopicInbox<InteroceptiveUpdated>;
+pub type ActionAffordancesUpdatedMailbox = TopicMailbox<ActionAffordancesUpdated>;
+pub type ActionAffordancesUpdatedInbox = TopicInbox<ActionAffordancesUpdated>;
 pub type MemoUpdatedMailbox = TopicMailbox<MemoUpdated>;
 pub type MemoUpdatedInbox = TopicInbox<MemoUpdated>;
 pub type MemoLogEvictedMailbox = TopicMailbox<MemoLogRecord>;

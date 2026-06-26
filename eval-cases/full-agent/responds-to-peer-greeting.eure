@@ -25,10 +25,9 @@ participants = ["Peer"]
 
 @ checks[] {
   $variant: trace-tool-call
-  name: action-prioritizes-speak
+  name: action-activates-speak
   must-pass = true
-  tool-name: reprioritize_actions
-  args-json-contains = `{"priority_module_ids":["speak"]}`
+  tool-name: activate_speak
 }
 
 @ checks[] {

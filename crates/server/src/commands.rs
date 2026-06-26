@@ -26,7 +26,7 @@ use crate::runtime::set_runtime_running;
 use crate::snapshot::{
     emit_visualizer_blackboard_snapshot, linked_memory_record_view, memory_record_view,
 };
-use crate::state::{ModuleSettingsState, SceneState};
+use crate::state::{ActionAffordanceState, ModuleSettingsState, SceneState};
 
 const SNAPSHOT_INTERVAL: Duration = Duration::from_millis(100);
 const RECENT_ACTIVITY_ROW_LIMIT: usize = 512;
@@ -36,6 +36,7 @@ pub(super) async fn drive_server_until_shutdown(
     tab_id: &VisualizerTabId,
     scene: &mut SceneState,
     module_settings: &mut ModuleSettingsState,
+    action_affordances: &mut ActionAffordanceState,
     sensory: &SensoryInputMailbox,
     env: &ServerEnvironment,
     run_controller: &AgentRunController,
@@ -52,6 +53,7 @@ pub(super) async fn drive_server_until_shutdown(
                 tab_id,
                 scene,
                 module_settings,
+                action_affordances,
                 sensory,
                 env,
                 run_controller,
@@ -76,6 +78,7 @@ async fn handle_server_visualizer_message(
     tab_id: &VisualizerTabId,
     scene: &mut SceneState,
     module_settings: &mut ModuleSettingsState,
+    action_affordances: &mut ActionAffordanceState,
     sensory: &SensoryInputMailbox,
     env: &ServerEnvironment,
     run_controller: &AgentRunController,
@@ -271,6 +274,70 @@ async fn handle_server_visualizer_message(
             }
             false
         }
+        VisualizerCommand::SetAgentActionAffordances {
+            tab_id: command_tab,
+            affordances,
+        } if command_tab == *tab_id => {
+            apply_action_affordance_set(action_affordances, affordances, visualizer, tab_id, env)
+                .await;
+            false
+        }
+        VisualizerCommand::UpsertAgentActionAffordance {
+            tab_id: command_tab,
+            affordance,
+        } if command_tab == *tab_id => {
+            let writer = env.caps.host_io().action_affordance_writer();
+            match writer.upsert(affordance.clone()).await {
+                Ok(snapshot) => {
+                    action_affordances.upsert(affordance);
+                    if let Err(error) = action_affordances.save() {
+                        visualizer.send_event(VisualizerEvent::Log {
+                            tab_id: tab_id.clone(),
+                            message: format!("failed to save action affordances: {error}"),
+                        });
+                    }
+                    emit_action_affordances(visualizer, tab_id, snapshot.affordances);
+                }
+                Err(error) => visualizer.send_event(VisualizerEvent::Log {
+                    tab_id: tab_id.clone(),
+                    message: format!("rejected action affordance update: {error}"),
+                }),
+            }
+            false
+        }
+        VisualizerCommand::RemoveAgentActionAffordance {
+            tab_id: command_tab,
+            action_id,
+        } if command_tab == *tab_id => {
+            let snapshot = env
+                .caps
+                .host_io()
+                .action_affordance_writer()
+                .remove(&action_id)
+                .await;
+            action_affordances.remove(&action_id);
+            if let Err(error) = action_affordances.save() {
+                visualizer.send_event(VisualizerEvent::Log {
+                    tab_id: tab_id.clone(),
+                    message: format!("failed to save action affordances: {error}"),
+                });
+            }
+            emit_action_affordances(visualizer, tab_id, snapshot.affordances);
+            false
+        }
+        VisualizerCommand::CompleteAgentActionInvocation {
+            tab_id: command_tab,
+            completion,
+        } if command_tab == *tab_id => {
+            if !env.external_actions.complete(completion) {
+                visualizer.send_event(VisualizerEvent::Log {
+                    tab_id: tab_id.clone(),
+                    message: "external action completion did not match a pending invocation"
+                        .to_owned(),
+                });
+            }
+            false
+        }
         VisualizerCommand::ResetModuleSessionHistory {
             tab_id: command_tab,
             owner,
@@ -394,6 +461,43 @@ async fn handle_server_visualizer_message(
         }
         _ => false,
     }
+}
+
+async fn apply_action_affordance_set(
+    action_affordances: &mut ActionAffordanceState,
+    affordances: Vec<nuillu_module::ActionAffordance>,
+    visualizer: &VisualizerHook,
+    tab_id: &VisualizerTabId,
+    env: &ServerEnvironment,
+) {
+    let writer = env.caps.host_io().action_affordance_writer();
+    match writer.set_all(affordances.clone()).await {
+        Ok(snapshot) => {
+            action_affordances.replace(snapshot.affordances.clone());
+            if let Err(error) = action_affordances.save() {
+                visualizer.send_event(VisualizerEvent::Log {
+                    tab_id: tab_id.clone(),
+                    message: format!("failed to save action affordances: {error}"),
+                });
+            }
+            emit_action_affordances(visualizer, tab_id, snapshot.affordances);
+        }
+        Err(error) => visualizer.send_event(VisualizerEvent::Log {
+            tab_id: tab_id.clone(),
+            message: format!("rejected action affordance set: {error}"),
+        }),
+    }
+}
+
+pub(super) fn emit_action_affordances(
+    visualizer: &VisualizerHook,
+    tab_id: &VisualizerTabId,
+    affordances: Vec<nuillu_module::ActionAffordance>,
+) {
+    visualizer.send_event(VisualizerEvent::AgentActionAffordances {
+        tab_id: tab_id.clone(),
+        affordances,
+    });
 }
 
 async fn load_memory_records(
