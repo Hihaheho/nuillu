@@ -4,7 +4,7 @@
 //! profile owns a dimension-specific table so one memory can carry multiple
 //! embedding versions without losing libSQL's `F32_BLOB(N)` typing.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -189,6 +189,11 @@ pub struct LibsqlUtteranceEventStore {
     conn: Connection,
 }
 
+#[derive(Clone)]
+pub struct LibsqlConversationHistoryStore {
+    conn: Connection,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct NewLlmTranscriptTurn {
     pub server_session_id: String,
@@ -303,6 +308,34 @@ pub struct UtteranceEventRecord {
     pub created_at_ms: i64,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ConversationHistoryRole {
+    User,
+    Agent,
+}
+
+impl ConversationHistoryRole {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::User => "user",
+            Self::Agent => "agent",
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ConversationHistoryEntryRecord {
+    pub source_table: String,
+    pub source_id: i64,
+    pub server_session_id: String,
+    pub occurred_at_ms: i64,
+    pub role: ConversationHistoryRole,
+    pub speaker: String,
+    pub target: Option<String>,
+    pub content: String,
+    pub generation_id: Option<u64>,
+}
+
 impl LibsqlAgentStore {
     pub async fn connect(
         config: LibsqlAgentStoreConfig,
@@ -389,6 +422,126 @@ impl LibsqlAgentStore {
     pub fn utterance_event_store(&self) -> LibsqlUtteranceEventStore {
         LibsqlUtteranceEventStore {
             conn: self.conn.clone(),
+        }
+    }
+}
+
+impl LibsqlConversationHistoryStore {
+    pub async fn open(path: impl AsRef<Path>) -> Result<Self, PortError> {
+        let path = path.as_ref();
+        if !path.exists() {
+            return Err(PortError::NotFound(format!(
+                "agent db does not exist: {}",
+                path.display()
+            )));
+        }
+        let database = libsql::Builder::new_local(path)
+            .flags(libsql::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .build()
+            .await
+            .map_err(map_libsql_error)?;
+        let conn = database.connect().map_err(map_libsql_error)?;
+        Ok(Self { conn })
+    }
+
+    pub async fn entries(
+        &self,
+        session_ids: &[String],
+    ) -> Result<Vec<ConversationHistoryEntryRecord>, PortError> {
+        self.ensure_required_tables().await?;
+        let mut rows = self
+            .conn
+            .query(
+                r#"
+                SELECT role,
+                       source_table,
+                       source_id,
+                       server_session_id,
+                       occurred_at_ms,
+                       speaker,
+                       target,
+                       content,
+                       generation_id
+                  FROM (
+                    SELECT 'user' AS role,
+                           'one_shot_sensory_inputs' AS source_table,
+                           id AS source_id,
+                           server_session_id,
+                           observed_at_ms AS occurred_at_ms,
+                           TRIM(direction) AS speaker,
+                           NULL AS target,
+                           content,
+                           NULL AS generation_id,
+                           0 AS source_order
+                      FROM one_shot_sensory_inputs
+                     WHERE LOWER(modality) = 'audition'
+                       AND direction IS NOT NULL
+                       AND TRIM(direction) != ''
+                    UNION ALL
+                    SELECT 'agent' AS role,
+                           'utterance_events' AS source_table,
+                           id AS source_id,
+                           server_session_id,
+                           occurred_at_ms,
+                           sender_module AS speaker,
+                           target,
+                           content,
+                           generation_id,
+                           1 AS source_order
+                      FROM utterance_events
+                     WHERE event_kind = 'completed'
+                  )
+                 ORDER BY server_session_id ASC,
+                          occurred_at_ms ASC,
+                          source_order ASC,
+                          source_id ASC
+                "#,
+                (),
+            )
+            .await
+            .map_err(map_libsql_error)?;
+        let mut entries = Vec::new();
+        while let Some(row) = rows.next().await.map_err(map_libsql_error)? {
+            let entry = conversation_history_entry_from_row(&row)?;
+            if session_ids.is_empty()
+                || session_ids
+                    .iter()
+                    .any(|session_id| session_id == &entry.server_session_id)
+            {
+                entries.push(entry);
+            }
+        }
+        Ok(entries)
+    }
+
+    async fn ensure_required_tables(&self) -> Result<(), PortError> {
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT name
+                   FROM sqlite_master
+                  WHERE type = 'table'
+                    AND name IN ('one_shot_sensory_inputs', 'utterance_events')",
+                (),
+            )
+            .await
+            .map_err(map_libsql_error)?;
+        let mut found = Vec::new();
+        while let Some(row) = rows.next().await.map_err(map_libsql_error)? {
+            let name: String = row.get(0).map_err(map_libsql_error)?;
+            found.push(name);
+        }
+        let missing = ["one_shot_sensory_inputs", "utterance_events"]
+            .into_iter()
+            .filter(|table| !found.iter().any(|name| name == table))
+            .collect::<Vec<_>>();
+        if missing.is_empty() {
+            Ok(())
+        } else {
+            Err(PortError::NotFound(format!(
+                "agent db is missing conversation history tables: {}",
+                missing.join(", ")
+            )))
         }
     }
 }
@@ -3278,6 +3431,36 @@ fn utterance_event_record_from_row(row: &libsql::Row) -> Result<UtteranceEventRe
     })
 }
 
+fn conversation_history_entry_from_row(
+    row: &libsql::Row,
+) -> Result<ConversationHistoryEntryRecord, PortError> {
+    let role: String = row.get(0).map_err(map_libsql_error)?;
+    let generation_id: Option<i64> = row.get(8).map_err(map_libsql_error)?;
+    Ok(ConversationHistoryEntryRecord {
+        source_table: row.get(1).map_err(map_libsql_error)?,
+        source_id: row.get(2).map_err(map_libsql_error)?,
+        server_session_id: row.get(3).map_err(map_libsql_error)?,
+        occurred_at_ms: row.get(4).map_err(map_libsql_error)?,
+        role: conversation_history_role_from_str(&role)?,
+        speaker: row.get(5).map_err(map_libsql_error)?,
+        target: row.get(6).map_err(map_libsql_error)?,
+        content: row.get(7).map_err(map_libsql_error)?,
+        generation_id: generation_id
+            .map(|value| u64_from_i64("conversation generation_id", value))
+            .transpose()?,
+    })
+}
+
+fn conversation_history_role_from_str(value: &str) -> Result<ConversationHistoryRole, PortError> {
+    match value {
+        "user" => Ok(ConversationHistoryRole::User),
+        "agent" => Ok(ConversationHistoryRole::Agent),
+        _ => Err(PortError::InvalidData(format!(
+            "unknown conversation history role: {value}"
+        ))),
+    }
+}
+
 fn utterance_event_kind_from_str(value: &str) -> Result<UtteranceEventKind, PortError> {
     match value {
         "delta" => Ok(UtteranceEventKind::Delta),
@@ -3962,6 +4145,172 @@ mod tests {
         assert_eq!(one_shot.recent(10).await.unwrap(), vec![one_shot_record]);
         assert_eq!(ambient.recent(10).await.unwrap(), vec![ambient_record]);
         assert_eq!(utterance.recent(10).await.unwrap(), vec![utterance_record]);
+    }
+
+    #[tokio::test]
+    async fn conversation_history_entries_merge_user_inputs_and_completed_utterances() {
+        let path = test_db_path();
+        let sender = ModuleInstanceId::new(ModuleId::new("speak").unwrap(), ReplicaIndex::ZERO);
+        let (input_a, input_b, completed_a) = {
+            let agent = LibsqlAgentStore::connect(
+                LibsqlAgentStoreConfig::local(path.clone(), 3, 3),
+                TestEmbedder::boxed(3),
+                TestEmbedder::boxed(3),
+            )
+            .await
+            .unwrap();
+            let one_shot = agent.one_shot_sensory_input_store();
+            let utterance = agent.utterance_event_store();
+            let input_a = one_shot
+                .append(NewOneShotSensoryInput {
+                    server_session_id: "session-a".to_string(),
+                    modality: "audition".to_string(),
+                    direction: Some("Ryo".to_string()),
+                    content: "Ryo says, \"hello\"".to_string(),
+                    observed_at_ms: 20,
+                })
+                .await
+                .unwrap();
+            one_shot
+                .append(NewOneShotSensoryInput {
+                    server_session_id: "session-a".to_string(),
+                    modality: "vision".to_string(),
+                    direction: Some("Ryo".to_string()),
+                    content: "Ryo waves.".to_string(),
+                    observed_at_ms: 21,
+                })
+                .await
+                .unwrap();
+            one_shot
+                .append(NewOneShotSensoryInput {
+                    server_session_id: "session-a".to_string(),
+                    modality: "audition".to_string(),
+                    direction: None,
+                    content: "An unnamed sound.".to_string(),
+                    observed_at_ms: 22,
+                })
+                .await
+                .unwrap();
+            utterance
+                .append(NewUtteranceEvent {
+                    server_session_id: "session-a".to_string(),
+                    event_kind: UtteranceEventKind::Delta,
+                    sender: sender.clone(),
+                    target: "Ryo".to_string(),
+                    generation_id: 7,
+                    sequence: 0,
+                    content: "hel".to_string(),
+                    reason: None,
+                    occurred_at_ms: 23,
+                })
+                .await
+                .unwrap();
+            let completed_a = utterance
+                .append(NewUtteranceEvent {
+                    server_session_id: "session-a".to_string(),
+                    event_kind: UtteranceEventKind::Completed,
+                    sender: sender.clone(),
+                    target: "Ryo".to_string(),
+                    generation_id: 7,
+                    sequence: 0,
+                    content: "hello back".to_string(),
+                    reason: None,
+                    occurred_at_ms: 24,
+                })
+                .await
+                .unwrap();
+            let input_b = one_shot
+                .append(NewOneShotSensoryInput {
+                    server_session_id: "session-b".to_string(),
+                    modality: "AUDITION".to_string(),
+                    direction: Some("Koro".to_string()),
+                    content: "Koro says, \"wait\"".to_string(),
+                    observed_at_ms: 10,
+                })
+                .await
+                .unwrap();
+            (input_a, input_b, completed_a)
+        };
+
+        let store = LibsqlConversationHistoryStore::open(&path).await.unwrap();
+
+        assert_eq!(
+            store.entries(&[]).await.unwrap(),
+            vec![
+                ConversationHistoryEntryRecord {
+                    source_table: "one_shot_sensory_inputs".to_string(),
+                    source_id: input_a.id,
+                    server_session_id: "session-a".to_string(),
+                    occurred_at_ms: 20,
+                    role: ConversationHistoryRole::User,
+                    speaker: "Ryo".to_string(),
+                    target: None,
+                    content: "Ryo says, \"hello\"".to_string(),
+                    generation_id: None,
+                },
+                ConversationHistoryEntryRecord {
+                    source_table: "utterance_events".to_string(),
+                    source_id: completed_a.id,
+                    server_session_id: "session-a".to_string(),
+                    occurred_at_ms: 24,
+                    role: ConversationHistoryRole::Agent,
+                    speaker: "speak".to_string(),
+                    target: Some("Ryo".to_string()),
+                    content: "hello back".to_string(),
+                    generation_id: Some(7),
+                },
+                ConversationHistoryEntryRecord {
+                    source_table: "one_shot_sensory_inputs".to_string(),
+                    source_id: input_b.id,
+                    server_session_id: "session-b".to_string(),
+                    occurred_at_ms: 10,
+                    role: ConversationHistoryRole::User,
+                    speaker: "Koro".to_string(),
+                    target: None,
+                    content: "Koro says, \"wait\"".to_string(),
+                    generation_id: None,
+                },
+            ]
+        );
+        assert_eq!(
+            store.entries(&["session-b".to_string()]).await.unwrap(),
+            vec![ConversationHistoryEntryRecord {
+                source_table: "one_shot_sensory_inputs".to_string(),
+                source_id: input_b.id,
+                server_session_id: "session-b".to_string(),
+                occurred_at_ms: 10,
+                role: ConversationHistoryRole::User,
+                speaker: "Koro".to_string(),
+                target: None,
+                content: "Koro says, \"wait\"".to_string(),
+                generation_id: None,
+            }]
+        );
+    }
+
+    #[tokio::test]
+    async fn conversation_history_open_rejects_missing_db() {
+        let path = test_db_path();
+
+        let error = match LibsqlConversationHistoryStore::open(&path).await {
+            Ok(_) => panic!("missing db should be rejected"),
+            Err(error) => error,
+        };
+
+        assert!(matches!(error, PortError::NotFound(_)));
+    }
+
+    #[tokio::test]
+    async fn conversation_history_entries_reject_missing_tables() {
+        let path = test_db_path();
+        drop(open_test_conn(path.clone()).await);
+
+        let store = LibsqlConversationHistoryStore::open(&path).await.unwrap();
+        let error = store.entries(&[]).await.unwrap_err();
+
+        assert!(
+            matches!(error, PortError::NotFound(message) if message.contains("one_shot_sensory_inputs"))
+        );
     }
 
     #[tokio::test]

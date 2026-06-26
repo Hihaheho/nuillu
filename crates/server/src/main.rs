@@ -1,9 +1,11 @@
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
 use anyhow::Context as _;
-use clap::Parser;
+use clap::{Args as ClapArgs, Parser, Subcommand, ValueEnum};
 use nuillu_server::{
     EmbeddingBackendConfig, EmbeddingRole, RuntimeModule, ServerConfig, default_server_session_id,
+    history::{export_conversation_history, render_conversation_history_markdown},
     install_lutum_trace_subscriber, load_server_boot_config, parse_model_set_file,
     resolve_llm_backends, resolve_token_fields, run_server_with_visualizer,
 };
@@ -17,6 +19,23 @@ const STATE_MODEL_SET_FILE: &str = "model-set.eure";
     about = "Run a nuillu server with the visualizer GUI"
 )]
 struct Args {
+    #[command(flatten)]
+    run: RunArgs,
+
+    #[command(subcommand)]
+    command: Option<Command>,
+}
+
+#[derive(Debug, Subcommand)]
+enum Command {
+    /// Run a nuillu server with the visualizer GUI.
+    Run(RunArgs),
+    /// Export user/agent conversation history from the server agent DB.
+    History(HistoryArgs),
+}
+
+#[derive(Debug, ClapArgs)]
+struct RunArgs {
     /// Persistent server runtime state directory.
     #[arg(long, default_value = ".tmp/server")]
     state: PathBuf,
@@ -58,9 +77,42 @@ struct Args {
     visualizer_bin: Option<PathBuf>,
 }
 
+#[derive(Debug, ClapArgs)]
+struct HistoryArgs {
+    /// Persistent server runtime state directory. Defaults to the top-level --state.
+    #[arg(long)]
+    state: Option<PathBuf>,
+
+    /// Output format.
+    #[arg(long, value_enum, default_value_t = HistoryOutputFormat::Json)]
+    output: HistoryOutputFormat,
+
+    /// Server session id to export. Can be repeated.
+    #[arg(long = "session-id", value_name = "ID")]
+    session_ids: Vec<String>,
+
+    /// Display name used for agent utterances.
+    #[arg(long, default_value = "Nui")]
+    agent_name: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum HistoryOutputFormat {
+    Json,
+    Markdown,
+}
+
 fn main() -> anyhow::Result<()> {
     install_lutum_trace_subscriber()?;
     let args = Args::parse();
+    match args.command {
+        Some(Command::Run(run_args)) => run_server(run_args),
+        Some(Command::History(history_args)) => export_history(history_args, args.run.state),
+        None => run_server(args.run),
+    }
+}
+
+fn run_server(args: RunArgs) -> anyhow::Result<()> {
     let model_set_path = resolve_model_set_path(&args.state, args.model_set);
     let model_set = parse_model_set_file(&model_set_path)?;
     let backends = resolve_llm_backends(&model_set)?;
@@ -86,6 +138,31 @@ fn main() -> anyhow::Result<()> {
         visualizer_bin: args.visualizer_bin,
     })
     .context("run nuillu server")
+}
+
+fn export_history(args: HistoryArgs, default_state: PathBuf) -> anyhow::Result<()> {
+    let state = args.state.unwrap_or(default_state);
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .context("build history export runtime")?;
+    let export = runtime.block_on(export_conversation_history(
+        &state,
+        &args.session_ids,
+        &args.agent_name,
+    ))?;
+    match args.output {
+        HistoryOutputFormat::Json => {
+            let stdout = std::io::stdout();
+            let mut lock = stdout.lock();
+            serde_json::to_writer_pretty(&mut lock, &export).context("write history JSON")?;
+            writeln!(lock).context("write history JSON newline")?;
+        }
+        HistoryOutputFormat::Markdown => {
+            print!("{}", render_conversation_history_markdown(&export));
+        }
+    }
+    Ok(())
 }
 
 fn resolve_session_id(session_id: Option<String>, run_id_alias: Option<String>) -> String {
@@ -167,14 +244,16 @@ mod tests {
     fn args_parse_fresh_agent_db_flag() {
         let args = Args::parse_from(["nuillu-server", "--fresh-agent-db"]);
 
-        assert!(args.fresh_agent_db);
+        assert!(args.run.fresh_agent_db);
+        assert!(args.command.is_none());
     }
 
     #[test]
     fn args_default_to_reusing_agent_db() {
         let args = Args::parse_from(["nuillu-server"]);
 
-        assert!(!args.fresh_agent_db);
+        assert!(!args.run.fresh_agent_db);
+        assert!(args.command.is_none());
     }
 
     #[test]
@@ -182,8 +261,69 @@ mod tests {
         let args = Args::parse_from(["nuillu-server", "--visualizer-bin", "/custom/visualizer"]);
 
         assert_eq!(
-            args.visualizer_bin,
+            args.run.visualizer_bin,
             Some(PathBuf::from("/custom/visualizer"))
         );
+        assert!(args.command.is_none());
+    }
+
+    #[test]
+    fn args_parse_explicit_run_subcommand() {
+        let args = Args::parse_from([
+            "nuillu-server",
+            "run",
+            "--state",
+            ".tmp/exhibition",
+            "--fresh-agent-db",
+            "--visualizer-bin",
+            "/custom/visualizer",
+        ]);
+
+        let Some(Command::Run(run)) = args.command else {
+            panic!("expected run subcommand");
+        };
+        assert_eq!(run.state, PathBuf::from(".tmp/exhibition"));
+        assert!(run.fresh_agent_db);
+        assert_eq!(
+            run.visualizer_bin,
+            Some(PathBuf::from("/custom/visualizer"))
+        );
+    }
+
+    #[test]
+    fn args_parse_history_subcommand() {
+        let args = Args::parse_from([
+            "nuillu-server",
+            "history",
+            "--state",
+            ".tmp/exhibition",
+            "--output",
+            "markdown",
+            "--session-id",
+            "server-a",
+            "--session-id",
+            "server-b",
+            "--agent-name",
+            "Nui",
+        ]);
+
+        let Some(Command::History(history)) = args.command else {
+            panic!("expected history subcommand");
+        };
+        assert_eq!(history.state, Some(PathBuf::from(".tmp/exhibition")));
+        assert_eq!(history.output, HistoryOutputFormat::Markdown);
+        assert_eq!(history.session_ids, vec!["server-a", "server-b"]);
+        assert_eq!(history.agent_name, "Nui");
+    }
+
+    #[test]
+    fn args_parse_history_with_top_level_state() {
+        let args = Args::parse_from(["nuillu-server", "--state", ".tmp/exhibition", "history"]);
+
+        assert_eq!(args.run.state, PathBuf::from(".tmp/exhibition"));
+        let Some(Command::History(history)) = args.command else {
+            panic!("expected history subcommand");
+        };
+        assert_eq!(history.state, None);
     }
 }
