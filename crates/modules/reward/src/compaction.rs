@@ -134,6 +134,9 @@ impl PolicyCompactionModule {
             .list_compaction_candidates()
             .await
             .context("list policy compaction candidates")?;
+        if policies.is_empty() {
+            return Ok(());
+        }
         let reinforcement_counts = self.reinforcement_counts().await;
         let policy_views = policies
             .into_iter()
@@ -377,6 +380,146 @@ impl Module for PolicyCompactionModule {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use std::cell::RefCell;
+    use std::rc::Rc;
+    use std::sync::Arc;
+
+    use chrono::{TimeZone, Utc};
+    use lutum::{Lutum, MockLlmAdapter, SharedPoolBudgetManager, SharedPoolBudgetOptions};
+    use nuillu_blackboard::{Blackboard, Bpm, ModulePolicy, linear_ratio_fn};
+    use nuillu_module::ports::{NoopCognitionLogRepository, PortError, SystemClock};
+    use nuillu_module::{
+        ActivateCx, CapabilityProviderConfig, CapabilityProviderPorts, CapabilityProviderRuntime,
+        CapabilityProviders, InteroceptiveUpdated, LlmConcurrencyLimiter, LutumTiers,
+        ModuleRegistry, RuntimeEvent, RuntimeEventSink, SessionCompactionPolicy,
+        SessionCompactionRuntime,
+    };
+    use nuillu_types::{ModelTier, ReplicaCapRange};
+
+    use crate::{NoopPolicyStore, PolicyCapabilities};
+
+    #[derive(Clone, Default)]
+    struct RecordingRuntimeEventSink {
+        events: Rc<RefCell<Vec<RuntimeEvent>>>,
+    }
+
+    impl RecordingRuntimeEventSink {
+        fn events(&self) -> Vec<RuntimeEvent> {
+            self.events.borrow().clone()
+        }
+    }
+
+    impl RuntimeEventSink for RecordingRuntimeEventSink {
+        fn on_event(&self, event: RuntimeEvent) -> Result<(), PortError> {
+            self.events.borrow_mut().push(event);
+            Ok(())
+        }
+    }
+
+    fn test_policy() -> ModulePolicy {
+        ModulePolicy::new(
+            ReplicaCapRange::new(1, 1).unwrap(),
+            Bpm::from_f64(60_000.0)..=Bpm::from_f64(60_000.0),
+            linear_ratio_fn,
+        )
+    }
+
+    fn test_caps_with_adapter(
+        blackboard: Blackboard,
+        adapter: MockLlmAdapter,
+    ) -> (CapabilityProviders, Lutum, RecordingRuntimeEventSink) {
+        let sink = RecordingRuntimeEventSink::default();
+        let budget = SharedPoolBudgetManager::new(SharedPoolBudgetOptions::default());
+        let lutum = Lutum::new(Arc::new(adapter), budget);
+        let caps = CapabilityProviders::new(CapabilityProviderConfig {
+            ports: CapabilityProviderPorts {
+                blackboard,
+                cognition_log_port: Rc::new(NoopCognitionLogRepository),
+                clock: Rc::new(SystemClock),
+                tiers: LutumTiers::from_shared_lutum(lutum.clone()),
+            },
+            runtime: CapabilityProviderRuntime {
+                event_sink: Rc::new(sink.clone()),
+                ..CapabilityProviderRuntime::default()
+            },
+        });
+        (caps, lutum, sink)
+    }
+
+    fn activate_cx(lutum: &Lutum, now: chrono::DateTime<chrono::Utc>) -> ActivateCx<'static> {
+        ActivateCx::new(
+            &[],
+            &[],
+            &[],
+            SessionCompactionRuntime::new(
+                lutum.clone(),
+                LlmConcurrencyLimiter::new(None),
+                ModelTier::Cheap,
+                SessionCompactionPolicy::default(),
+            ),
+            now,
+        )
+    }
+
+    async fn build_policy_compaction_module(
+        caps: &CapabilityProviders,
+        policy_caps: PolicyCapabilities,
+    ) -> nuillu_module::AllocatedModule {
+        let modules = ModuleRegistry::new()
+            .register(test_policy(), move |caps| {
+                let policy_caps = policy_caps.clone();
+                async move {
+                    Ok(PolicyCompactionModule::new(
+                        caps.interoception_updated_inbox(),
+                        caps.blackboard_reader(),
+                        policy_caps.compactor(),
+                        caps.llm("main")
+                            .with_tier(nuillu_types::ModelTier::Cheap)
+                            .into(),
+                    ))
+                }
+            })
+            .unwrap()
+            .build(caps)
+            .await
+            .unwrap();
+        let (_, mut modules) = modules.into_parts();
+        modules.remove(0)
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn policy_compaction_without_candidates_does_not_access_llm() {
+        let now = Utc.timestamp_opt(10, 0).unwrap();
+        let blackboard = Blackboard::default();
+        let (caps, lutum, events) =
+            test_caps_with_adapter(blackboard.clone(), MockLlmAdapter::new());
+        let policy_caps = PolicyCapabilities::new(
+            blackboard,
+            Rc::new(SystemClock),
+            Rc::new(NoopPolicyStore),
+            Vec::new(),
+        );
+        let mut module = build_policy_compaction_module(&caps, policy_caps).await;
+
+        caps.internal_harness_io()
+            .interoception_updated_mailbox()
+            .publish(InteroceptiveUpdated)
+            .await
+            .unwrap();
+        let batch = module.next_batch().await.unwrap();
+        module
+            .activate(&activate_cx(&lutum, now), &batch)
+            .await
+            .unwrap();
+
+        assert!(
+            !events
+                .events()
+                .iter()
+                .any(|event| matches!(event, RuntimeEvent::LlmAccessed { .. }))
+        );
+    }
 
     #[test]
     fn compact_duplicate_policies_args_accepts_indexes_only_payload() {

@@ -155,6 +155,9 @@ impl MemoryAssociationModule {
                 metadata
             })
             .await;
+        if memory_metadata.is_empty() {
+            return Ok(());
+        }
 
         let mut input = ModelInput::new()
             .system(self.system_prompt(cx))
@@ -391,6 +394,218 @@ impl Module for MemoryAssociationModule {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use std::cell::RefCell;
+    use std::rc::Rc;
+    use std::sync::Arc;
+
+    use chrono::{TimeZone, Utc};
+    use lutum::{
+        FinishReason, Lutum, MockLlmAdapter, MockTextScenario, RawTextTurnEvent,
+        SharedPoolBudgetManager, SharedPoolBudgetOptions, Usage,
+    };
+    use nuillu_blackboard::{Blackboard, BlackboardCommand, Bpm, MemoryMetaPatch, ModulePolicy};
+    use nuillu_module::ports::{NoopCognitionLogRepository, PortError, SystemClock};
+    use nuillu_module::{
+        ActivateCx, CapabilityProviderConfig, CapabilityProviderPorts, CapabilityProviderRuntime,
+        CapabilityProviders, InteroceptiveUpdated, LlmConcurrencyLimiter, LutumTiers,
+        ModuleRegistry, RuntimeEvent, RuntimeEventSink, SessionCompactionPolicy,
+        SessionCompactionRuntime,
+    };
+    use nuillu_types::{ModelTier, ReplicaCapRange};
+
+    use crate::{MemoryCapabilities, NoopMemoryStore};
+
+    #[derive(Clone, Default)]
+    struct RecordingRuntimeEventSink {
+        events: Rc<RefCell<Vec<RuntimeEvent>>>,
+    }
+
+    impl RecordingRuntimeEventSink {
+        fn events(&self) -> Vec<RuntimeEvent> {
+            self.events.borrow().clone()
+        }
+    }
+
+    impl RuntimeEventSink for RecordingRuntimeEventSink {
+        fn on_event(&self, event: RuntimeEvent) -> Result<(), PortError> {
+            self.events.borrow_mut().push(event);
+            Ok(())
+        }
+    }
+
+    fn test_policy() -> ModulePolicy {
+        ModulePolicy::new(
+            ReplicaCapRange::new(1, 1).unwrap(),
+            Bpm::from_f64(60_000.0)..=Bpm::from_f64(60_000.0),
+            nuillu_blackboard::linear_ratio_fn,
+        )
+    }
+
+    fn test_caps_with_adapter(
+        blackboard: Blackboard,
+        adapter: MockLlmAdapter,
+    ) -> (CapabilityProviders, Lutum, RecordingRuntimeEventSink) {
+        let sink = RecordingRuntimeEventSink::default();
+        let budget = SharedPoolBudgetManager::new(SharedPoolBudgetOptions::default());
+        let lutum = Lutum::new(Arc::new(adapter), budget);
+        let caps = CapabilityProviders::new(CapabilityProviderConfig {
+            ports: CapabilityProviderPorts {
+                blackboard,
+                cognition_log_port: Rc::new(NoopCognitionLogRepository),
+                clock: Rc::new(SystemClock),
+                tiers: LutumTiers::from_shared_lutum(lutum.clone()),
+            },
+            runtime: CapabilityProviderRuntime {
+                event_sink: Rc::new(sink.clone()),
+                ..CapabilityProviderRuntime::default()
+            },
+        });
+        (caps, lutum, sink)
+    }
+
+    fn activate_cx(lutum: &Lutum, now: chrono::DateTime<chrono::Utc>) -> ActivateCx<'static> {
+        ActivateCx::new(
+            &[],
+            &[],
+            &[],
+            SessionCompactionRuntime::new(
+                lutum.clone(),
+                LlmConcurrencyLimiter::new(None),
+                ModelTier::Cheap,
+                SessionCompactionPolicy::default(),
+            ),
+            now,
+        )
+    }
+
+    fn finished_text_scenario() -> MockTextScenario {
+        MockTextScenario::events(vec![
+            Ok(RawTextTurnEvent::Started {
+                request_id: Some("memory-association-text".into()),
+                model: "mock".into(),
+            }),
+            Ok(RawTextTurnEvent::TextDelta {
+                delta: "no association changes".into(),
+            }),
+            Ok(RawTextTurnEvent::Completed {
+                request_id: Some("memory-association-text".into()),
+                finish_reason: FinishReason::Stop,
+                usage: Usage {
+                    input_tokens: 1,
+                    ..Usage::zero()
+                },
+            }),
+        ])
+    }
+
+    async fn build_memory_association_module(
+        caps: &CapabilityProviders,
+        memory_caps: MemoryCapabilities,
+    ) -> nuillu_module::AllocatedModule {
+        let modules = ModuleRegistry::new()
+            .register(test_policy(), move |caps| {
+                let memory_caps = memory_caps.clone();
+                async move {
+                    Ok(MemoryAssociationModule::new(
+                        caps.interoception_updated_inbox(),
+                        caps.blackboard_reader(),
+                        memory_caps.content_reader(),
+                        memory_caps.writer(),
+                        memory_caps.associator(),
+                        caps.llm("main")
+                            .with_tier(nuillu_types::ModelTier::Cheap)
+                            .into(),
+                    ))
+                }
+            })
+            .unwrap()
+            .build(caps)
+            .await
+            .unwrap();
+        let (_, mut modules) = modules.into_parts();
+        modules.remove(0)
+    }
+
+    async fn activate_module_once(
+        caps: &CapabilityProviders,
+        lutum: &Lutum,
+        module: &mut nuillu_module::AllocatedModule,
+        now: chrono::DateTime<chrono::Utc>,
+    ) {
+        caps.internal_harness_io()
+            .interoception_updated_mailbox()
+            .publish(InteroceptiveUpdated)
+            .await
+            .unwrap();
+        let batch = module.next_batch().await.unwrap();
+        module
+            .activate(&activate_cx(lutum, now), &batch)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn activation_without_memory_candidates_does_not_access_llm() {
+        let now = Utc.timestamp_opt(10, 0).unwrap();
+        let blackboard = Blackboard::default();
+        let (caps, lutum, events) =
+            test_caps_with_adapter(blackboard.clone(), MockLlmAdapter::new());
+        let memory_caps = MemoryCapabilities::new(
+            blackboard,
+            Rc::new(SystemClock),
+            Rc::new(NoopMemoryStore),
+            Vec::new(),
+        );
+        let mut module = build_memory_association_module(&caps, memory_caps).await;
+
+        activate_module_once(&caps, &lutum, &mut module, now).await;
+
+        assert!(
+            !events
+                .events()
+                .iter()
+                .any(|event| matches!(event, RuntimeEvent::LlmAccessed { .. }))
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn activation_with_memory_candidates_accesses_llm() {
+        let now = Utc.timestamp_opt(10, 0).unwrap();
+        let blackboard = Blackboard::default();
+        blackboard
+            .apply(BlackboardCommand::UpsertMemoryMetadata {
+                index: MemoryIndex::new("candidate-memory"),
+                rank_if_new: MemoryRank::LongTerm,
+                occurred_at_if_new: Some(now),
+                decay_if_new_secs: 60,
+                now,
+                patch: MemoryMetaPatch::default(),
+            })
+            .await;
+        let (caps, lutum, events) = test_caps_with_adapter(
+            blackboard.clone(),
+            MockLlmAdapter::new().with_text_scenario(finished_text_scenario()),
+        );
+        let memory_caps = MemoryCapabilities::new(
+            blackboard,
+            Rc::new(SystemClock),
+            Rc::new(NoopMemoryStore),
+            Vec::new(),
+        );
+        let mut module = build_memory_association_module(&caps, memory_caps).await;
+
+        activate_module_once(&caps, &lutum, &mut module, now).await;
+
+        assert_eq!(
+            events
+                .events()
+                .iter()
+                .filter(|event| matches!(event, RuntimeEvent::LlmAccessed { .. }))
+                .count(),
+            1
+        );
+    }
 
     #[test]
     fn association_summary_schema_does_not_expose_runtime_metadata_or_links() {
