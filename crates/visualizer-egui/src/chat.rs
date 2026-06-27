@@ -1021,9 +1021,10 @@ fn person_message_composer_ui(
     tab_id: &VisualizerTabId,
     state: &mut SceneUiState,
     commands: &Sender<VisualizerClientMessage>,
-) {
+) -> Option<egui::Response> {
     let has_people = !state.draft_scene.people.is_empty();
     let mut send_requested = false;
+    let mut message_response = None;
     ui.horizontal(|ui| {
         let message_width =
             composer_message_input_width(ui.available_width(), ui.spacing().item_spacing.x);
@@ -1043,7 +1044,7 @@ fn person_message_composer_ui(
                 });
             state.set_person_message_selection(next_selection);
         });
-        let message_response = ui.add_enabled(
+        let response = ui.add_enabled(
             has_people,
             egui::TextEdit::singleline(&mut state.person_message_draft)
                 .desired_width(message_width)
@@ -1061,15 +1062,21 @@ fn person_message_composer_ui(
             .inner
             .clicked();
         send_requested |= has_people
-            && message_response.lost_focus()
+            && response.lost_focus()
             && ui.input(|input| input.key_pressed(egui::Key::Enter));
+        message_response = Some(response);
     });
 
     if send_requested {
         for command in state.send_person_message_commands(tab_id) {
             let _ = commands.send(command);
         }
+        if has_people && let Some(message_response) = &message_response {
+            message_response.request_focus();
+        }
     }
+
+    message_response
 }
 
 fn composer_message_input_width(row_width: f32, item_spacing: f32) -> f32 {
@@ -1258,7 +1265,27 @@ fn text_field_with_id(
 mod tests {
     use super::*;
     use crate::ScenePersonRowView;
+    use crate::i18n::{I18nCatalog, Locale};
     use chrono::{TimeZone, Utc};
+
+    fn test_i18n_context(locale: Locale) -> egui::Context {
+        let ctx = egui::Context::default();
+        let catalog = I18nCatalog::embedded().expect("embedded translations load");
+        ctx.install_i18n(catalog.for_locale(locale));
+        ctx
+    }
+
+    fn test_raw_input(time: f64, events: Vec<egui::Event>) -> egui::RawInput {
+        egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(900.0, 700.0),
+            )),
+            time: Some(time),
+            events,
+            ..egui::RawInput::default()
+        }
+    }
 
     #[test]
     fn person_message_send_only_sends_message_when_scene_is_clean() {
@@ -1393,6 +1420,71 @@ mod tests {
 
         assert_eq!(narrow, SCENE_COMPOSER_MESSAGE_MIN_WIDTH);
         assert!((wide - 390.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn person_message_enter_send_restores_composer_focus() {
+        let tab_id = VisualizerTabId::new("live");
+        let mut state = scene_with_two_people();
+        state.selected_person_message_row_id = Some("person-2".to_string());
+        state.person_message_draft = " hello two ".to_string();
+        let (commands, received_commands) = std::sync::mpsc::channel();
+        let ctx = test_i18n_context(Locale::EnUs);
+        let mut draft_response_id = None;
+
+        let _ = ctx.run_ui(test_raw_input(0.0, Vec::new()), |ui| {
+            let response = person_message_composer_ui(ui, &tab_id, &mut state, &commands)
+                .expect("composer draft field was rendered");
+            draft_response_id = Some(response.id);
+            response.request_focus();
+        });
+        let draft_response_id = draft_response_id.expect("composer draft field was rendered");
+        assert_eq!(
+            ctx.memory(|memory| memory.focused()),
+            Some(draft_response_id)
+        );
+
+        let _ = ctx.run_ui(
+            test_raw_input(
+                1.0 / 60.0,
+                vec![egui::Event::Key {
+                    key: egui::Key::Enter,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::default(),
+                }],
+            ),
+            |ui| {
+                ui.memory_mut(|memory| memory.surrender_focus(draft_response_id));
+                let response = person_message_composer_ui(ui, &tab_id, &mut state, &commands)
+                    .expect("composer draft field was rendered");
+                assert_eq!(response.id, draft_response_id);
+            },
+        );
+
+        let commands = received_commands.try_iter().collect::<Vec<_>>();
+        assert_eq!(commands.len(), 1);
+        match &commands[0] {
+            VisualizerClientMessage::Command {
+                command:
+                    VisualizerCommand::SendScenePersonMessage {
+                        tab_id: command_tab,
+                        row_id,
+                        message,
+                    },
+            } => {
+                assert_eq!(command_tab, &tab_id);
+                assert_eq!(row_id, "person-2");
+                assert_eq!(message, "hello two");
+            }
+            other => panic!("expected target person message, got {other:?}"),
+        }
+        assert_eq!(state.person_message_draft, "");
+        assert_eq!(
+            ctx.memory(|memory| memory.focused()),
+            Some(draft_response_id)
+        );
     }
 
     #[test]
