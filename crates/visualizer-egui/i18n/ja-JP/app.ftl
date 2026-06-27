@@ -221,6 +221,7 @@ scene-save = 保存
 scene-activity-role-sensory = 感覚入力
 scene-activity-role-ambient = 環境
 scene-activity-role-agent = agent
+scene-activity-role-action = アクション
 scene-atmosphere-aspect-light = 光
 scene-atmosphere-aspect-smell = 匂い
 scene-atmosphere-aspect-temperature = 温度

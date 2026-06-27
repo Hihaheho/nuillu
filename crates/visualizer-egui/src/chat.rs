@@ -5,8 +5,9 @@ use nuillu_module::{AmbientSensoryEntry, SensoryInput};
 
 use crate::{
     AmbientSensorySnapshotRowView, DerivedAmbientSensoryRowView, EditableSceneStateView,
-    OneShotSensoryInputRowView, SceneAtmosphereRowView, SceneObjectRowView, ScenePersonRowView,
-    SceneRowKind, SceneSoundRowView, SceneStateView, UtteranceDeltaView, UtteranceEventKindView,
+    ExternalActionEventRowView, ExternalActionEventStatusView, OneShotSensoryInputRowView,
+    SceneAtmosphereRowView, SceneObjectRowView, ScenePersonRowView, SceneRowKind,
+    SceneSoundRowView, SceneStateView, UtteranceDeltaView, UtteranceEventKindView,
     UtteranceEventRowView, UtteranceView, VisualizerClientMessage, VisualizerCommand,
     VisualizerTabId, derive_scene_ambient, i18n::EguiI18nExt as _, text::wrapped_label,
     visualizer_selection_message_fill,
@@ -45,6 +46,7 @@ enum ActivityRole {
     User,
     Environment,
     Assistant,
+    Action,
 }
 
 impl ActivityRole {
@@ -53,6 +55,7 @@ impl ActivityRole {
             Self::User => "scene-activity-role-sensory",
             Self::Environment => "scene-activity-role-ambient",
             Self::Assistant => "scene-activity-role-agent",
+            Self::Action => "scene-activity-role-action",
         }
     }
 }
@@ -98,6 +101,7 @@ pub struct SceneUiState {
     one_shot_sensory_rows: BTreeMap<i64, OneShotSensoryInputRowView>,
     ambient_sensory_rows: BTreeMap<i64, AmbientSensorySnapshotRowView>,
     utterance_event_rows: BTreeMap<i64, UtteranceEventRowView>,
+    external_action_event_rows: BTreeMap<i64, ExternalActionEventRowView>,
     selected_person_message_row_id: Option<String>,
     person_message_draft: String,
 }
@@ -302,6 +306,21 @@ impl SceneUiState {
         self.rebuild_activity_from_raw_rows();
     }
 
+    pub fn apply_external_action_event_rows(&mut self, rows: Vec<ExternalActionEventRowView>) {
+        self.external_action_event_rows = rows.into_iter().map(|row| (row.id, row)).collect();
+        self.rebuild_activity_from_raw_rows();
+    }
+
+    pub fn append_external_action_event_row(&mut self, row: ExternalActionEventRowView) {
+        self.external_action_event_rows.insert(row.id, row);
+        self.rebuild_activity_from_raw_rows();
+    }
+
+    pub fn update_external_action_event_row(&mut self, row: ExternalActionEventRowView) {
+        self.external_action_event_rows.insert(row.id, row);
+        self.rebuild_activity_from_raw_rows();
+    }
+
     fn rebuild_activity_from_raw_rows(&mut self) {
         self.activity_authoritative = true;
         self.activity.clear();
@@ -325,6 +344,11 @@ impl SceneUiState {
             self.utterance_event_rows
                 .values()
                 .map(ActivitySourceRow::Utterance),
+        );
+        rows.extend(
+            self.external_action_event_rows
+                .values()
+                .map(ActivitySourceRow::ExternalAction),
         );
         rows.sort_by_key(ActivitySourceRow::sort_key);
 
@@ -365,6 +389,20 @@ impl SceneUiState {
                     &mut utterance_messages,
                     row,
                 ),
+                ActivitySourceRow::ExternalAction(row) => {
+                    interrupt_streaming_messages(
+                        &mut self.activity,
+                        &mut self.streaming_utterances,
+                    );
+                    let mut message =
+                        ActivityMessage::new(ActivityRole::Action, external_action_content(row));
+                    message.id = Some(format!("external-action:{}", row.id));
+                    message.source = Some(format!(
+                        "{} invoked by {} at {}",
+                        row.action_id, row.invoked_by, row.requested_at
+                    ));
+                    self.activity.push(message);
+                }
             }
         }
     }
@@ -417,6 +455,7 @@ enum ActivitySourceRow<'a> {
     OneShot(&'a OneShotSensoryInputRowView),
     Ambient(&'a AmbientSensorySnapshotRowView),
     Utterance(&'a UtteranceEventRowView),
+    ExternalAction(&'a ExternalActionEventRowView),
 }
 
 impl ActivitySourceRow<'_> {
@@ -432,6 +471,7 @@ impl ActivitySourceRow<'_> {
             Self::OneShot(row) => (row.observed_at, row.created_at, 0, row.id),
             Self::Ambient(row) => (row.observed_at, row.created_at, 1, row.id),
             Self::Utterance(row) => (row.occurred_at, row.created_at, 2, row.id),
+            Self::ExternalAction(row) => (row.requested_at, row.created_at, 3, row.id),
         }
     }
 }
@@ -545,6 +585,38 @@ fn one_shot_source(row: &OneShotSensoryInputRowView) -> String {
         )
     } else {
         format!("one-shot {} at {}", row.modality, row.observed_at)
+    }
+}
+
+fn external_action_content(row: &ExternalActionEventRowView) -> String {
+    format!(
+        "action: {}\narguments: {}\nstatus: {}",
+        row.action_id,
+        external_action_arguments_json(&row.arguments),
+        external_action_status(row)
+    )
+}
+
+fn external_action_arguments_json(arguments: &serde_json::Value) -> String {
+    match arguments {
+        serde_json::Value::Array(_) | serde_json::Value::Object(_) => {
+            serde_json::to_string_pretty(arguments).unwrap_or_else(|_| arguments.to_string())
+        }
+        _ => arguments.to_string(),
+    }
+}
+
+fn external_action_status(row: &ExternalActionEventRowView) -> String {
+    match row.status {
+        ExternalActionEventStatusView::Pending => "pending".to_string(),
+        ExternalActionEventStatusView::Completed => {
+            let message = row.message.as_deref().unwrap_or_default();
+            if row.accepted.unwrap_or(false) {
+                format!("accepted: {message}")
+            } else {
+                format!("rejected: {message}")
+            }
+        }
     }
 }
 
@@ -1011,6 +1083,7 @@ fn activity_message_ui(ui: &mut egui::Ui, message: &ActivityMessage) {
             ActivityRole::User => visualizer_selection_message_fill(ui.visuals()),
             ActivityRole::Environment => ui.visuals().faint_bg_color,
             ActivityRole::Assistant => ui.visuals().extreme_bg_color,
+            ActivityRole::Action => ui.visuals().widgets.inactive.weak_bg_fill,
         })
         .stroke(ui.visuals().widgets.noninteractive.bg_stroke)
         .corner_radius(egui::CornerRadius::same(6))
@@ -1493,6 +1566,57 @@ mod tests {
         assert!(state.activity[1].streaming);
     }
 
+    #[test]
+    fn raw_rows_place_external_actions_between_speech_and_later_feedback() {
+        let mut state = SceneUiState::default();
+
+        state.apply_utterance_event_rows(vec![utterance_event(
+            1,
+            1,
+            UtteranceEventKindView::Completed,
+            0,
+            "I'll write it down.",
+        )]);
+        state.append_external_action_event_row(external_action_event(
+            2,
+            2,
+            ExternalActionEventStatusView::Pending,
+            None,
+            None,
+        ));
+        state.append_one_shot_sensory_input_row(one_shot_row(
+            3,
+            3,
+            "The poet action recorded a poem.",
+        ));
+
+        assert_eq!(state.activity.len(), 3);
+        assert_eq!(state.activity[0].role, ActivityRole::Assistant);
+        assert_eq!(state.activity[1].role, ActivityRole::Action);
+        assert!(state.activity[1].content.contains("status: pending"));
+        assert_eq!(state.activity[2].role, ActivityRole::User);
+
+        state.update_external_action_event_row(external_action_event(
+            2,
+            2,
+            ExternalActionEventStatusView::Completed,
+            Some(true),
+            Some("poem recorded"),
+        ));
+
+        assert_eq!(state.activity.len(), 3);
+        assert_eq!(state.activity[1].role, ActivityRole::Action);
+        assert!(
+            state.activity[1]
+                .content
+                .contains("status: accepted: poem recorded")
+        );
+        assert_eq!(
+            state.activity[2].content,
+            "The poet action recorded a poem."
+        );
+    }
+
     fn scene_with_two_people() -> SceneUiState {
         let mut state = SceneUiState::default();
         state.set_scene_state(SceneStateView {
@@ -1605,6 +1729,30 @@ mod tests {
             reason: None,
             occurred_at: at(second),
             created_at: at(second),
+        }
+    }
+
+    fn external_action_event(
+        id: i64,
+        second: u32,
+        status: ExternalActionEventStatusView,
+        accepted: Option<bool>,
+        message: Option<&str>,
+    ) -> ExternalActionEventRowView {
+        ExternalActionEventRowView {
+            id,
+            server_session_id: "server-session".to_string(),
+            invocation_id: format!("agent-action-{id}"),
+            invoked_by: "action".to_string(),
+            action_id: "poet".to_string(),
+            arguments: serde_json::json!({ "poem": "quiet rain" }),
+            status,
+            accepted,
+            message: message.map(str::to_string),
+            requested_at: at(second),
+            completed_at: (status == ExternalActionEventStatusView::Completed).then(|| at(second)),
+            created_at: at(second),
+            updated_at: at(second),
         }
     }
 }

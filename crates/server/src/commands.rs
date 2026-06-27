@@ -2,8 +2,9 @@ use std::{collections::HashSet, time::Duration};
 
 use chrono::{DateTime, Utc};
 use lutum_libsql_adapter::{
-    AmbientSensorySnapshotRecord, NewAmbientSensorySnapshot, NewOneShotSensoryInput,
-    OneShotSensoryInputRecord, UtteranceEventKind, UtteranceEventRecord,
+    AmbientSensorySnapshotRecord, ExternalActionEventRecord, ExternalActionEventStatus,
+    NewAmbientSensorySnapshot, NewOneShotSensoryInput, OneShotSensoryInputRecord,
+    UtteranceEventKind, UtteranceEventRecord,
 };
 use nuillu_agent::AgentRunController;
 use nuillu_blackboard::{
@@ -15,10 +16,10 @@ use nuillu_module::{
 };
 use nuillu_types::{MemoryIndex, ModuleId, ModuleInstanceId, ReplicaCapRange, ReplicaIndex};
 use nuillu_visualizer_protocol::{
-    AmbientSensorySnapshotRowView, MemoryRecordScope, ModuleSettingsView,
-    OneShotSensoryInputRowView, UtteranceEventKindView, UtteranceEventRowView,
-    VisualizerClientMessage, VisualizerCommand, VisualizerEvent, VisualizerTabId,
-    ZeroReplicaWindowView, run_runtime_action_id, stop_runtime_action_id,
+    AmbientSensorySnapshotRowView, ExternalActionEventRowView, ExternalActionEventStatusView,
+    MemoryRecordScope, ModuleSettingsView, OneShotSensoryInputRowView, UtteranceEventKindView,
+    UtteranceEventRowView, VisualizerClientMessage, VisualizerCommand, VisualizerEvent,
+    VisualizerTabId, ZeroReplicaWindowView, run_runtime_action_id, stop_runtime_action_id,
 };
 
 use crate::SERVER_TAB_ID;
@@ -357,7 +358,7 @@ async fn handle_server_visualizer_message(
             tab_id: command_tab,
             completion,
         } if command_tab == *tab_id => {
-            if !env.external_actions.complete(completion) {
+            if !env.external_actions.complete(completion).await {
                 visualizer.send_event(VisualizerEvent::Log {
                     tab_id: tab_id.clone(),
                     message: "external action completion did not match a pending invocation"
@@ -795,6 +796,23 @@ pub(super) async fn emit_recent_activity_rows(
             message: format!("failed to load utterance event rows: {error}"),
         }),
     }
+    match env
+        .external_action_event_store
+        .recent(RECENT_ACTIVITY_ROW_LIMIT)
+        .await
+    {
+        Ok(rows) => visualizer.send_event(VisualizerEvent::ExternalActionEventRows {
+            tab_id: tab_id.clone(),
+            rows: rows
+                .into_iter()
+                .map(external_action_event_row_view)
+                .collect(),
+        }),
+        Err(error) => visualizer.send_event(VisualizerEvent::Log {
+            tab_id: tab_id.clone(),
+            message: format!("failed to load external action event rows: {error}"),
+        }),
+    }
 }
 
 async fn record_sensory_input(
@@ -896,6 +914,29 @@ pub(super) fn utterance_event_row_view(row: UtteranceEventRecord) -> UtteranceEv
         reason: row.reason,
         occurred_at: timestamp_from_ms(row.occurred_at_ms),
         created_at: timestamp_from_ms(row.created_at_ms),
+    }
+}
+
+pub(super) fn external_action_event_row_view(
+    row: ExternalActionEventRecord,
+) -> ExternalActionEventRowView {
+    ExternalActionEventRowView {
+        id: row.id,
+        server_session_id: row.server_session_id,
+        invocation_id: row.invocation_id,
+        invoked_by: row.invoked_by.to_string(),
+        action_id: row.action_id,
+        arguments: row.arguments,
+        status: match row.status {
+            ExternalActionEventStatus::Pending => ExternalActionEventStatusView::Pending,
+            ExternalActionEventStatus::Completed => ExternalActionEventStatusView::Completed,
+        },
+        accepted: row.accepted,
+        message: row.message,
+        requested_at: timestamp_from_ms(row.requested_at_ms),
+        completed_at: row.completed_at_ms.map(timestamp_from_ms),
+        created_at: timestamp_from_ms(row.created_at_ms),
+        updated_at: timestamp_from_ms(row.updated_at_ms),
     }
 }
 

@@ -240,6 +240,18 @@ pub enum VisualizerEvent {
         tab_id: VisualizerTabId,
         row: UtteranceEventRowView,
     },
+    ExternalActionEventRows {
+        tab_id: VisualizerTabId,
+        rows: Vec<ExternalActionEventRowView>,
+    },
+    ExternalActionEventAppended {
+        tab_id: VisualizerTabId,
+        row: ExternalActionEventRowView,
+    },
+    ExternalActionEventUpdated {
+        tab_id: VisualizerTabId,
+        row: ExternalActionEventRowView,
+    },
     SceneState {
         tab_id: VisualizerTabId,
         state: SceneStateView,
@@ -858,6 +870,33 @@ pub struct UtteranceEventRowView {
     pub reason: Option<String>,
     pub occurred_at: DateTime<Utc>,
     pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExternalActionEventStatusView {
+    Pending,
+    Completed,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ExternalActionEventRowView {
+    pub id: i64,
+    pub server_session_id: String,
+    pub invocation_id: String,
+    pub invoked_by: String,
+    pub action_id: String,
+    pub arguments: serde_json::Value,
+    pub status: ExternalActionEventStatusView,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub accepted: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+    pub requested_at: DateTime<Utc>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completed_at: Option<DateTime<Utc>>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -1529,6 +1568,26 @@ mod tests {
             occurred_at: at,
             created_at: at,
         };
+        let action_pending = ExternalActionEventRowView {
+            id: 4,
+            server_session_id: "server-session".to_string(),
+            invocation_id: "agent-action-1".to_string(),
+            invoked_by: "action".to_string(),
+            action_id: "poet".to_string(),
+            arguments: serde_json::json!({ "poem": "quiet rain" }),
+            status: ExternalActionEventStatusView::Pending,
+            accepted: None,
+            message: None,
+            requested_at: at,
+            completed_at: None,
+            created_at: at,
+            updated_at: at,
+        };
+        let mut action_completed = action_pending.clone();
+        action_completed.status = ExternalActionEventStatusView::Completed;
+        action_completed.accepted = Some(true);
+        action_completed.message = Some("poem recorded".to_string());
+        action_completed.completed_at = Some(at);
 
         let messages = [
             VisualizerServerMessage::event(VisualizerEvent::OneShotSensoryInputRows {
@@ -1542,6 +1601,18 @@ mod tests {
             VisualizerServerMessage::event(VisualizerEvent::UtteranceEventAppended {
                 tab_id: VisualizerTabId::new("live"),
                 row: utterance.clone(),
+            }),
+            VisualizerServerMessage::event(VisualizerEvent::ExternalActionEventRows {
+                tab_id: VisualizerTabId::new("live"),
+                rows: vec![action_pending.clone()],
+            }),
+            VisualizerServerMessage::event(VisualizerEvent::ExternalActionEventAppended {
+                tab_id: VisualizerTabId::new("live"),
+                row: action_pending.clone(),
+            }),
+            VisualizerServerMessage::event(VisualizerEvent::ExternalActionEventUpdated {
+                tab_id: VisualizerTabId::new("live"),
+                row: action_completed.clone(),
             }),
         ];
 
@@ -1558,6 +1629,15 @@ mod tests {
                 VisualizerServerMessage::Event {
                     event: VisualizerEvent::UtteranceEventAppended { row, .. },
                 } => assert_eq!(row, utterance.clone()),
+                VisualizerServerMessage::Event {
+                    event: VisualizerEvent::ExternalActionEventRows { rows, .. },
+                } => assert_eq!(rows, vec![action_pending.clone()]),
+                VisualizerServerMessage::Event {
+                    event: VisualizerEvent::ExternalActionEventAppended { row, .. },
+                } => assert_eq!(row, action_pending.clone()),
+                VisualizerServerMessage::Event {
+                    event: VisualizerEvent::ExternalActionEventUpdated { row, .. },
+                } => assert_eq!(row, action_completed.clone()),
                 other => panic!("unexpected raw activity row message: {other:?}"),
             }
         }

@@ -190,6 +190,11 @@ pub struct LibsqlUtteranceEventStore {
 }
 
 #[derive(Clone)]
+pub struct LibsqlExternalActionEventStore {
+    conn: Connection,
+}
+
+#[derive(Clone)]
 pub struct LibsqlConversationHistoryStore {
     conn: Connection,
 }
@@ -309,6 +314,48 @@ pub struct UtteranceEventRecord {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExternalActionEventStatus {
+    Pending,
+    Completed,
+}
+
+impl ExternalActionEventStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Completed => "completed",
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct NewExternalActionEvent {
+    pub server_session_id: String,
+    pub invocation_id: String,
+    pub invoked_by: ModuleInstanceId,
+    pub action_id: String,
+    pub arguments: serde_json::Value,
+    pub requested_at_ms: i64,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct ExternalActionEventRecord {
+    pub id: i64,
+    pub server_session_id: String,
+    pub invocation_id: String,
+    pub invoked_by: ModuleInstanceId,
+    pub action_id: String,
+    pub arguments: serde_json::Value,
+    pub status: ExternalActionEventStatus,
+    pub accepted: Option<bool>,
+    pub message: Option<String>,
+    pub requested_at_ms: i64,
+    pub completed_at_ms: Option<i64>,
+    pub created_at_ms: i64,
+    pub updated_at_ms: i64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ConversationHistoryRole {
     User,
     Agent,
@@ -421,6 +468,12 @@ impl LibsqlAgentStore {
 
     pub fn utterance_event_store(&self) -> LibsqlUtteranceEventStore {
         LibsqlUtteranceEventStore {
+            conn: self.conn.clone(),
+        }
+    }
+
+    pub fn external_action_event_store(&self) -> LibsqlExternalActionEventStore {
+        LibsqlExternalActionEventStore {
             conn: self.conn.clone(),
         }
     }
@@ -1261,6 +1314,157 @@ impl LibsqlUtteranceEventStore {
         let mut records = Vec::new();
         while let Some(row) = rows.next().await.map_err(map_libsql_error)? {
             records.push(utterance_event_record_from_row(&row)?);
+        }
+        records.reverse();
+        Ok(records)
+    }
+}
+
+impl LibsqlExternalActionEventStore {
+    pub async fn append_pending(
+        &self,
+        event: NewExternalActionEvent,
+    ) -> Result<ExternalActionEventRecord, PortError> {
+        let arguments_json = serde_json::to_string(&event.arguments)
+            .map_err(|error| PortError::InvalidData(error.to_string()))?;
+        let created_at_ms = now_ms();
+        let mut rows = self
+            .conn
+            .query(
+                "INSERT INTO external_action_events (
+                    server_session_id,
+                    invocation_id,
+                    invoked_by_module,
+                    invoked_by_replica,
+                    action_id,
+                    arguments_json,
+                    status,
+                    accepted,
+                    message,
+                    requested_at_ms,
+                    completed_at_ms,
+                    created_at_ms,
+                    updated_at_ms
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL, NULL, ?8, NULL, ?9, ?9)
+                 RETURNING
+                    id,
+                    server_session_id,
+                    invocation_id,
+                    invoked_by_module,
+                    invoked_by_replica,
+                    action_id,
+                    arguments_json,
+                    status,
+                    accepted,
+                    message,
+                    requested_at_ms,
+                    completed_at_ms,
+                    created_at_ms,
+                    updated_at_ms",
+                params![
+                    event.server_session_id,
+                    event.invocation_id,
+                    event.invoked_by.module.as_str(),
+                    i64::from(event.invoked_by.replica.get()),
+                    event.action_id,
+                    arguments_json,
+                    ExternalActionEventStatus::Pending.as_str(),
+                    event.requested_at_ms,
+                    created_at_ms,
+                ],
+            )
+            .await
+            .map_err(map_libsql_error)?;
+        let row = rows
+            .next()
+            .await
+            .map_err(map_libsql_error)?
+            .ok_or_else(|| {
+                PortError::InvalidData("external action event insert returned no row".to_string())
+            })?;
+        external_action_event_record_from_row(&row)
+    }
+
+    pub async fn complete(
+        &self,
+        id: i64,
+        accepted: bool,
+        message: String,
+        completed_at_ms: i64,
+    ) -> Result<ExternalActionEventRecord, PortError> {
+        let mut rows = self
+            .conn
+            .query(
+                "UPDATE external_action_events
+                    SET status = ?1,
+                        accepted = ?2,
+                        message = ?3,
+                        completed_at_ms = ?4,
+                        updated_at_ms = ?5
+                  WHERE id = ?6
+                  RETURNING
+                    id,
+                    server_session_id,
+                    invocation_id,
+                    invoked_by_module,
+                    invoked_by_replica,
+                    action_id,
+                    arguments_json,
+                    status,
+                    accepted,
+                    message,
+                    requested_at_ms,
+                    completed_at_ms,
+                    created_at_ms,
+                    updated_at_ms",
+                params![
+                    ExternalActionEventStatus::Completed.as_str(),
+                    bool_to_i64(accepted),
+                    message,
+                    completed_at_ms,
+                    now_ms(),
+                    id,
+                ],
+            )
+            .await
+            .map_err(map_libsql_error)?;
+        let row = rows
+            .next()
+            .await
+            .map_err(map_libsql_error)?
+            .ok_or_else(|| PortError::NotFound(format!("external action event not found: {id}")))?;
+        external_action_event_record_from_row(&row)
+    }
+
+    pub async fn recent(&self, limit: usize) -> Result<Vec<ExternalActionEventRecord>, PortError> {
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT
+                    id,
+                    server_session_id,
+                    invocation_id,
+                    invoked_by_module,
+                    invoked_by_replica,
+                    action_id,
+                    arguments_json,
+                    status,
+                    accepted,
+                    message,
+                    requested_at_ms,
+                    completed_at_ms,
+                    created_at_ms,
+                    updated_at_ms
+                   FROM external_action_events
+                  ORDER BY id DESC
+                  LIMIT ?1",
+                params![limit_to_i64(limit)],
+            )
+            .await
+            .map_err(map_libsql_error)?;
+        let mut records = Vec::new();
+        while let Some(row) = rows.next().await.map_err(map_libsql_error)? {
+            records.push(external_action_event_record_from_row(&row)?);
         }
         records.reverse();
         Ok(records)
@@ -3431,6 +3635,34 @@ fn utterance_event_record_from_row(row: &libsql::Row) -> Result<UtteranceEventRe
     })
 }
 
+fn external_action_event_record_from_row(
+    row: &libsql::Row,
+) -> Result<ExternalActionEventRecord, PortError> {
+    let invoked_by_module: String = row.get(3).map_err(map_libsql_error)?;
+    let invoked_by_replica: i64 = row.get(4).map_err(map_libsql_error)?;
+    let arguments_json: String = row.get(6).map_err(map_libsql_error)?;
+    let status: String = row.get(7).map_err(map_libsql_error)?;
+    let accepted: Option<i64> = row.get(8).map_err(map_libsql_error)?;
+    Ok(ExternalActionEventRecord {
+        id: row.get(0).map_err(map_libsql_error)?,
+        server_session_id: row.get(1).map_err(map_libsql_error)?,
+        invocation_id: row.get(2).map_err(map_libsql_error)?,
+        invoked_by: module_instance_from_row(invoked_by_module, invoked_by_replica)?,
+        action_id: row.get(5).map_err(map_libsql_error)?,
+        arguments: serde_json::from_str(&arguments_json)
+            .map_err(|error| PortError::InvalidData(error.to_string()))?,
+        status: external_action_event_status_from_str(&status)?,
+        accepted: accepted
+            .map(|value| i64_to_bool("external action accepted", value))
+            .transpose()?,
+        message: row.get(9).map_err(map_libsql_error)?,
+        requested_at_ms: row.get(10).map_err(map_libsql_error)?,
+        completed_at_ms: row.get(11).map_err(map_libsql_error)?,
+        created_at_ms: row.get(12).map_err(map_libsql_error)?,
+        updated_at_ms: row.get(13).map_err(map_libsql_error)?,
+    })
+}
+
 fn conversation_history_entry_from_row(
     row: &libsql::Row,
 ) -> Result<ConversationHistoryEntryRecord, PortError> {
@@ -3468,6 +3700,18 @@ fn utterance_event_kind_from_str(value: &str) -> Result<UtteranceEventKind, Port
         "aborted" => Ok(UtteranceEventKind::Aborted),
         _ => Err(PortError::InvalidData(format!(
             "unknown utterance event kind: {value}"
+        ))),
+    }
+}
+
+fn external_action_event_status_from_str(
+    value: &str,
+) -> Result<ExternalActionEventStatus, PortError> {
+    match value {
+        "pending" => Ok(ExternalActionEventStatus::Pending),
+        "completed" => Ok(ExternalActionEventStatus::Completed),
+        _ => Err(PortError::InvalidData(format!(
+            "unknown external action event status: {value}"
         ))),
     }
 }
@@ -4148,6 +4392,59 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn external_action_event_store_round_trips_pending_and_completed_events() {
+        let agent = LibsqlAgentStore::connect(
+            LibsqlAgentStoreConfig::local(test_db_path(), 3, 3),
+            TestEmbedder::boxed(3),
+            TestEmbedder::boxed(3),
+        )
+        .await
+        .unwrap();
+        let store = agent.external_action_event_store();
+        let invoked_by =
+            ModuleInstanceId::new(ModuleId::new("action").unwrap(), ReplicaIndex::ZERO);
+
+        let first = store
+            .append_pending(NewExternalActionEvent {
+                server_session_id: "server-session".to_string(),
+                invocation_id: "agent-action-1".to_string(),
+                invoked_by: invoked_by.clone(),
+                action_id: "poet".to_string(),
+                arguments: serde_json::json!({ "poem": "quiet rain" }),
+                requested_at_ms: 10,
+            })
+            .await
+            .unwrap();
+        let second = store
+            .append_pending(NewExternalActionEvent {
+                server_session_id: "server-session".to_string(),
+                invocation_id: "agent-action-2".to_string(),
+                invoked_by,
+                action_id: "look".to_string(),
+                arguments: serde_json::json!({ "direction": "left" }),
+                requested_at_ms: 11,
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(first.status, ExternalActionEventStatus::Pending);
+        assert_eq!(first.accepted, None);
+        assert_eq!(first.message, None);
+        assert_eq!(first.arguments, serde_json::json!({ "poem": "quiet rain" }));
+
+        let completed = store
+            .complete(first.id, true, "poem recorded".to_string(), 12)
+            .await
+            .unwrap();
+
+        assert_eq!(completed.status, ExternalActionEventStatus::Completed);
+        assert_eq!(completed.accepted, Some(true));
+        assert_eq!(completed.message.as_deref(), Some("poem recorded"));
+        assert_eq!(completed.completed_at_ms, Some(12));
+        assert_eq!(store.recent(10).await.unwrap(), vec![completed, second]);
+    }
+
+    #[tokio::test]
     async fn conversation_history_entries_merge_user_inputs_and_completed_utterances() {
         let path = test_db_path();
         let sender = ModuleInstanceId::new(ModuleId::new("speak").unwrap(), ReplicaIndex::ZERO);
@@ -4512,7 +4809,10 @@ mod tests {
         assert!(column_exists(&store, "memo_log_entries", "memo_index").await);
         assert!(column_exists(&store, "memo_log_entries", "cognitive").await);
         assert!(column_exists(&store, "memo_log_entries", "payload_json").await);
-        assert_eq!(dev_task_count(&store.conn, 0, 1).await, 7);
+        assert!(column_exists(&store, "external_action_events", "invocation_id").await);
+        assert!(column_exists(&store, "external_action_events", "arguments_json").await);
+        assert!(column_exists(&store, "external_action_events", "status").await);
+        assert_eq!(dev_task_count(&store.conn, 0, 1).await, 8);
     }
 
     #[tokio::test]

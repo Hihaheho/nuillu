@@ -36,3 +36,8 @@ next-minor = 1
   tag = "memo-log"
   file = "dev/v0.1.memo-log.sql"
 }
+
+@ tasks[] {
+  tag = "external-action-events"
+  file = "dev/v0.1.external-action-events.sql"
+}

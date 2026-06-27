@@ -905,6 +905,21 @@ impl VisualizerState {
             VisualizerEvent::UtteranceEventAppended { tab_id, row } => {
                 self.tab_mut(tab_id).scene.append_utterance_event_row(row);
             }
+            VisualizerEvent::ExternalActionEventRows { tab_id, rows } => {
+                self.tab_mut(tab_id)
+                    .scene
+                    .apply_external_action_event_rows(rows);
+            }
+            VisualizerEvent::ExternalActionEventAppended { tab_id, row } => {
+                self.tab_mut(tab_id)
+                    .scene
+                    .append_external_action_event_row(row);
+            }
+            VisualizerEvent::ExternalActionEventUpdated { tab_id, row } => {
+                self.tab_mut(tab_id)
+                    .scene
+                    .update_external_action_event_row(row);
+            }
             VisualizerEvent::RuntimeEvent { tab_id, event } => {
                 let tab = self.tab_mut(tab_id);
                 let now_secs = tab.resource_monitor_elapsed_secs();

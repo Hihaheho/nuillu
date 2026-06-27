@@ -12,8 +12,8 @@ use lutum::{
 };
 use lutum_libsql_adapter::{
     EmbeddingProfile, LibsqlAgentStore, LibsqlAgentStoreConfig, LibsqlAmbientSensorySnapshotStore,
-    LibsqlLlmTranscriptStore, LibsqlOneShotSensoryInputStore, LibsqlUtteranceEventStore,
-    NewUtteranceEvent, UtteranceEventKind,
+    LibsqlExternalActionEventStore, LibsqlLlmTranscriptStore, LibsqlOneShotSensoryInputStore,
+    LibsqlUtteranceEventStore, NewExternalActionEvent, NewUtteranceEvent, UtteranceEventKind,
 };
 use lutum_openai::{FeatureFlags, OpenAiAdapter, OpenAiReasoningEffort};
 use nuillu_blackboard::{AllocationLimits, Blackboard};
@@ -58,36 +58,61 @@ pub(super) struct ServerEnvironment {
     pub(super) one_shot_sensory_input_store: LibsqlOneShotSensoryInputStore,
     pub(super) ambient_sensory_snapshot_store: LibsqlAmbientSensorySnapshotStore,
     pub(super) utterance_event_store: LibsqlUtteranceEventStore,
+    pub(super) external_action_event_store: LibsqlExternalActionEventStore,
     pub(super) external_actions: Rc<ServerExternalActionState>,
 }
 
+struct PendingExternalActionInvocation {
+    event_id: Option<i64>,
+    sender: tokio::sync::oneshot::Sender<ExternalActionInvocationResult>,
+}
+
 pub(super) struct ServerExternalActionState {
+    server_session_id: String,
     tab_id: VisualizerTabId,
     visualizer: VisualizerEventSink,
-    pending:
-        RefCell<BTreeMap<String, tokio::sync::oneshot::Sender<ExternalActionInvocationResult>>>,
+    store: LibsqlExternalActionEventStore,
+    clock: Rc<dyn Clock>,
+    pending: RefCell<BTreeMap<String, PendingExternalActionInvocation>>,
     next_invocation: RefCell<u64>,
 }
 
 impl ServerExternalActionState {
-    fn new(tab_id: VisualizerTabId, visualizer: VisualizerEventSink) -> Self {
+    fn new(
+        server_session_id: String,
+        tab_id: VisualizerTabId,
+        visualizer: VisualizerEventSink,
+        store: LibsqlExternalActionEventStore,
+        clock: Rc<dyn Clock>,
+    ) -> Self {
         Self {
+            server_session_id,
             tab_id,
             visualizer,
+            store,
+            clock,
             pending: RefCell::new(BTreeMap::new()),
             next_invocation: RefCell::new(0),
         }
     }
 
-    pub(super) fn complete(&self, completion: AgentActionInvocationCompletion) -> bool {
-        let sender = self.pending.borrow_mut().remove(&completion.invocation_id);
-        let Some(sender) = sender else {
+    pub(super) async fn complete(&self, completion: AgentActionInvocationCompletion) -> bool {
+        let pending = self.pending.borrow_mut().remove(&completion.invocation_id);
+        let Some(pending) = pending else {
             return false;
         };
-        let _ = sender.send(ExternalActionInvocationResult {
+        let result = ExternalActionInvocationResult {
             accepted: completion.accepted,
             message: completion.message,
-        });
+        };
+        self.complete_persisted_event(
+            pending.event_id,
+            result.accepted,
+            result.message.clone(),
+            self.clock.now().timestamp_millis(),
+        )
+        .await;
+        let _ = pending.sender.send(result);
         true
     }
 
@@ -95,6 +120,71 @@ impl ServerExternalActionState {
         let mut next = self.next_invocation.borrow_mut();
         *next = next.saturating_add(1);
         format!("agent-action-{}", *next)
+    }
+
+    async fn append_pending_event(
+        &self,
+        invocation_id: &str,
+        invocation: &ExternalActionInvocation,
+    ) -> Option<i64> {
+        let event = NewExternalActionEvent {
+            server_session_id: self.server_session_id.clone(),
+            invocation_id: invocation_id.to_owned(),
+            invoked_by: invocation.invoked_by.clone(),
+            action_id: invocation.action_id.clone(),
+            arguments: invocation.arguments.clone(),
+            requested_at_ms: self.clock.now().timestamp_millis(),
+        };
+        match self.store.append_pending(event).await {
+            Ok(record) => {
+                let id = record.id;
+                self.visualizer
+                    .send(VisualizerEvent::ExternalActionEventAppended {
+                        tab_id: self.tab_id.clone(),
+                        row: super::commands::external_action_event_row_view(record),
+                    });
+                Some(id)
+            }
+            Err(error) => {
+                tracing::warn!(error = ?error, "external action event persistence failed");
+                self.visualizer.send(VisualizerEvent::Log {
+                    tab_id: self.tab_id.clone(),
+                    message: format!("failed to persist external action event: {error}"),
+                });
+                None
+            }
+        }
+    }
+
+    async fn complete_persisted_event(
+        &self,
+        event_id: Option<i64>,
+        accepted: bool,
+        message: String,
+        completed_at_ms: i64,
+    ) {
+        let Some(event_id) = event_id else {
+            return;
+        };
+        match self
+            .store
+            .complete(event_id, accepted, message, completed_at_ms)
+            .await
+        {
+            Ok(record) => self
+                .visualizer
+                .send(VisualizerEvent::ExternalActionEventUpdated {
+                    tab_id: self.tab_id.clone(),
+                    row: super::commands::external_action_event_row_view(record),
+                }),
+            Err(error) => {
+                tracing::warn!(error = ?error, "external action event completion failed");
+                self.visualizer.send(VisualizerEvent::Log {
+                    tab_id: self.tab_id.clone(),
+                    message: format!("failed to update external action event: {error}"),
+                });
+            }
+        }
     }
 }
 
@@ -106,9 +196,11 @@ impl ExternalActionExecutor for ServerExternalActionState {
     ) -> Result<ExternalActionInvocationResult, PortError> {
         let invocation_id = self.next_invocation_id();
         let (sender, receiver) = tokio::sync::oneshot::channel();
-        self.pending
-            .borrow_mut()
-            .insert(invocation_id.clone(), sender);
+        let event_id = self.append_pending_event(&invocation_id, &invocation).await;
+        self.pending.borrow_mut().insert(
+            invocation_id.clone(),
+            PendingExternalActionInvocation { event_id, sender },
+        );
         self.visualizer
             .send(VisualizerEvent::AgentActionInvocationRequested {
                 tab_id: self.tab_id.clone(),
@@ -121,16 +213,34 @@ impl ExternalActionExecutor for ServerExternalActionState {
 
         match tokio::time::timeout(Duration::from_secs(30), receiver).await {
             Ok(Ok(result)) => Ok(result),
-            Ok(Err(_)) => Ok(ExternalActionInvocationResult {
-                accepted: false,
-                message: "external action completion channel closed".to_owned(),
-            }),
+            Ok(Err(_)) => {
+                let result = ExternalActionInvocationResult {
+                    accepted: false,
+                    message: "external action completion channel closed".to_owned(),
+                };
+                self.complete_persisted_event(
+                    event_id,
+                    result.accepted,
+                    result.message.clone(),
+                    self.clock.now().timestamp_millis(),
+                )
+                .await;
+                Ok(result)
+            }
             Err(_) => {
                 self.pending.borrow_mut().remove(&invocation_id);
-                Ok(ExternalActionInvocationResult {
+                let result = ExternalActionInvocationResult {
                     accepted: false,
                     message: "external action timed out".to_owned(),
-                })
+                };
+                self.complete_persisted_event(
+                    event_id,
+                    result.accepted,
+                    result.message.clone(),
+                    self.clock.now().timestamp_millis(),
+                )
+                .await;
+                Ok(result)
             }
         }
     }
@@ -165,6 +275,7 @@ pub(super) async fn build_server_environment(
     let one_shot_sensory_input_store = agent_store.one_shot_sensory_input_store();
     let ambient_sensory_snapshot_store = agent_store.ambient_sensory_snapshot_store();
     let utterance_event_store = agent_store.utterance_event_store();
+    let external_action_event_store = agent_store.external_action_event_store();
     let utterance_sink = Rc::new(ServerUtteranceSink::new(
         SERVER_TAB_ID.to_string(),
         config.session_id.clone(),
@@ -189,8 +300,11 @@ pub(super) async fn build_server_environment(
         db_trace_sink.clone(),
     ));
     let external_actions = Rc::new(ServerExternalActionState::new(
+        config.session_id.clone(),
         VisualizerTabId::new(SERVER_TAB_ID.to_string()),
         visualizer.clone(),
+        external_action_event_store.clone(),
+        clock.clone(),
     ));
     let llm_concurrency_pool = LlmConcurrencyPool::default();
     let caps = CapabilityProviders::new(CapabilityProviderConfig {
@@ -255,6 +369,7 @@ pub(super) async fn build_server_environment(
         one_shot_sensory_input_store,
         ambient_sensory_snapshot_store,
         utterance_event_store,
+        external_action_event_store,
         external_actions,
     })
 }
@@ -783,11 +898,15 @@ mod tests {
         collections::HashMap,
         fs,
         path::PathBuf,
-        sync::atomic::{AtomicU64, Ordering},
+        sync::{
+            atomic::{AtomicU64, Ordering},
+            mpsc,
+        },
     };
 
     use nuillu_blackboard::{ActivationRatio, Bpm, ModulePolicy, linear_ratio_fn};
-    use nuillu_types::{ModuleId, ReplicaCapRange, builtin};
+    use nuillu_types::{ModuleId, ModuleInstanceId, ReplicaCapRange, ReplicaIndex, builtin};
+    use nuillu_visualizer_protocol::{ExternalActionEventStatusView, VisualizerServerMessage};
 
     use super::*;
     use crate::config::{DEFAULT_MODULES, ServerBootConfig};
@@ -816,6 +935,40 @@ mod tests {
             use_responses_api: false,
             compaction_input_token_threshold: 16_000,
             max_concurrent_llm_calls: None,
+        }
+    }
+
+    #[derive(Debug, Clone)]
+    struct FixedClock(chrono::DateTime<chrono::Utc>);
+
+    #[async_trait::async_trait(?Send)]
+    impl Clock for FixedClock {
+        fn now(&self) -> chrono::DateTime<chrono::Utc> {
+            self.0
+        }
+
+        async fn sleep_until(&self, _deadline: chrono::DateTime<chrono::Utc>) {}
+    }
+
+    #[derive(Debug)]
+    struct TestEmbedder {
+        dimensions: usize,
+    }
+
+    impl TestEmbedder {
+        fn boxed(dimensions: usize) -> Box<dyn Embedder> {
+            Box::new(Self { dimensions })
+        }
+    }
+
+    #[async_trait::async_trait(?Send)]
+    impl Embedder for TestEmbedder {
+        fn dimensions(&self) -> usize {
+            self.dimensions
+        }
+
+        async fn embed(&self, _text: &str) -> Result<Vec<f32>, PortError> {
+            Ok(vec![0.0; self.dimensions])
         }
     }
 
@@ -932,6 +1085,119 @@ mod tests {
             1,
             "server should not clip speak solely because the default module set already has many active baseline roles"
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn external_action_executor_persists_pending_and_completion_events() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let db_path = test_state_dir().join("agent.db");
+                let agent_store = LibsqlAgentStore::connect(
+                    LibsqlAgentStoreConfig::local(db_path, 3, 3),
+                    TestEmbedder::boxed(3),
+                    TestEmbedder::boxed(3),
+                )
+                .await
+                .unwrap();
+                let store = agent_store.external_action_event_store();
+                let (events_tx, events_rx) = mpsc::channel();
+                let clock: Rc<dyn Clock> = Rc::new(FixedClock(
+                    chrono::DateTime::from_timestamp_millis(1_780_000_000_000).unwrap(),
+                ));
+                let state = Rc::new(ServerExternalActionState::new(
+                    "server-session".to_string(),
+                    VisualizerTabId::new("server"),
+                    crate::gui::VisualizerEventSink::new(events_tx),
+                    store.clone(),
+                    clock,
+                ));
+
+                let invoke_state = state.clone();
+                let invoke = tokio::task::spawn_local(async move {
+                    invoke_state
+                        .invoke(ExternalActionInvocation {
+                            invoked_by: ModuleInstanceId::new(
+                                ModuleId::new("action").unwrap(),
+                                ReplicaIndex::ZERO,
+                            ),
+                            action_id: "poet".to_string(),
+                            arguments: serde_json::json!({ "poem": "quiet rain" }),
+                        })
+                        .await
+                        .unwrap()
+                });
+                tokio::task::yield_now().await;
+
+                let appended = events_rx
+                    .recv_timeout(std::time::Duration::from_secs(1))
+                    .expect("pending event is emitted");
+                let request = events_rx
+                    .recv_timeout(std::time::Duration::from_secs(1))
+                    .expect("action request is emitted");
+
+                let (event_id, invocation_id) = match appended {
+                    VisualizerServerMessage::Event {
+                        event: VisualizerEvent::ExternalActionEventAppended { row, tab_id },
+                    } => {
+                        assert_eq!(tab_id.as_str(), "server");
+                        assert_eq!(row.status, ExternalActionEventStatusView::Pending);
+                        assert_eq!(row.action_id, "poet");
+                        assert_eq!(row.arguments, serde_json::json!({ "poem": "quiet rain" }));
+                        (row.id, row.invocation_id)
+                    }
+                    other => panic!("expected pending external action event, got {other:?}"),
+                };
+                match request {
+                    VisualizerServerMessage::Event {
+                        event: VisualizerEvent::AgentActionInvocationRequested { request, tab_id },
+                    } => {
+                        assert_eq!(tab_id.as_str(), "server");
+                        assert_eq!(request.invocation_id, invocation_id);
+                        assert_eq!(request.action_id, "poet");
+                    }
+                    other => panic!("expected external action request, got {other:?}"),
+                }
+
+                assert!(
+                    state
+                        .complete(AgentActionInvocationCompletion {
+                            invocation_id,
+                            accepted: true,
+                            message: "poem recorded".to_string(),
+                        })
+                        .await
+                );
+                let updated = events_rx
+                    .recv_timeout(std::time::Duration::from_secs(1))
+                    .expect("completion event is emitted");
+                match updated {
+                    VisualizerServerMessage::Event {
+                        event: VisualizerEvent::ExternalActionEventUpdated { row, tab_id },
+                    } => {
+                        assert_eq!(tab_id.as_str(), "server");
+                        assert_eq!(row.id, event_id);
+                        assert_eq!(row.accepted, Some(true));
+                        assert_eq!(row.message.as_deref(), Some("poem recorded"));
+                    }
+                    other => panic!("expected updated external action event, got {other:?}"),
+                }
+
+                let result = invoke.await.unwrap();
+                assert_eq!(
+                    result,
+                    ExternalActionInvocationResult {
+                        accepted: true,
+                        message: "poem recorded".to_string(),
+                    }
+                );
+                let stored = store.recent(10).await.unwrap();
+                assert_eq!(stored.len(), 1);
+                assert_eq!(stored[0].id, event_id);
+                assert_eq!(stored[0].accepted, Some(true));
+                assert_eq!(stored[0].message.as_deref(), Some("poem recorded"));
+            })
+            .await;
     }
 
     #[test]

@@ -222,6 +222,7 @@ scene-save = Save
 scene-activity-role-sensory = sensory
 scene-activity-role-ambient = ambient
 scene-activity-role-agent = agent
+scene-activity-role-action = action
 scene-atmosphere-aspect-light = light
 scene-atmosphere-aspect-smell = smell
 scene-atmosphere-aspect-temperature = temperature
