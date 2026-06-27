@@ -10,7 +10,7 @@ use crate::{
     SceneSoundRowView, SceneStateView, UtteranceDeltaView, UtteranceEventKindView,
     UtteranceEventRowView, UtteranceView, VisualizerClientMessage, VisualizerCommand,
     VisualizerTabId, derive_scene_ambient, i18n::EguiI18nExt as _, text::wrapped_label,
-    visualizer_selection_message_fill,
+    time::format_jst_datetime, visualizer_selection_message_fill,
 };
 
 const FIELD_HEIGHT: f32 = 24.0;
@@ -175,10 +175,14 @@ impl SceneUiState {
                 "one-shot {} from {} at {}",
                 modality.as_str(),
                 direction,
-                observed_at
+                format_jst_datetime(observed_at)
             )
         } else {
-            format!("one-shot {} at {}", modality.as_str(), observed_at)
+            format!(
+                "one-shot {} at {}",
+                modality.as_str(),
+                format_jst_datetime(observed_at)
+            )
         };
         let mut message = ActivityMessage::new(ActivityRole::User, content);
         message.source = Some(source);
@@ -264,7 +268,9 @@ impl SceneUiState {
         let mut message = ActivityMessage::new(ActivityRole::Assistant, utterance.text);
         message.source = Some(format!(
             "{} -> {} at {}",
-            utterance.sender, utterance.target, utterance.emitted_at
+            utterance.sender,
+            utterance.target,
+            format_jst_datetime(utterance.emitted_at)
         ));
         let index = self.activity.len();
         self.activity.push(message);
@@ -375,8 +381,10 @@ impl SceneUiState {
                             let mut message =
                                 ActivityMessage::new(ActivityRole::Environment, content);
                             message.id = Some(format!("ambient:{}", row.id));
-                            message.source =
-                                Some(format!("ambient snapshot at {}", row.observed_at));
+                            message.source = Some(format!(
+                                "ambient snapshot at {}",
+                                format_jst_datetime(row.observed_at)
+                            ));
                             self.activity.push(message);
                         }
                     }
@@ -399,7 +407,9 @@ impl SceneUiState {
                     message.id = Some(format!("external-action:{}", row.id));
                     message.source = Some(format!(
                         "{} invoked by {} at {}",
-                        row.action_id, row.invoked_by, row.requested_at
+                        row.action_id,
+                        row.invoked_by,
+                        format_jst_datetime(row.requested_at)
                     ));
                     self.activity.push(message);
                 }
@@ -550,7 +560,9 @@ fn apply_utterance_event_row(
             message.id = Some(format!("utterance:{}", row.id));
             message.source = Some(format!(
                 "{} -> {} at {}",
-                row.sender, row.target, row.occurred_at
+                row.sender,
+                row.target,
+                format_jst_datetime(row.occurred_at)
             ));
             let index = activity.len();
             activity.push(message);
@@ -581,10 +593,16 @@ fn one_shot_source(row: &OneShotSensoryInputRowView) -> String {
     if let Some(direction) = &row.direction {
         format!(
             "one-shot {} from {} at {}",
-            row.modality, direction, row.observed_at
+            row.modality,
+            direction,
+            format_jst_datetime(row.observed_at)
         )
     } else {
-        format!("one-shot {} at {}", row.modality, row.observed_at)
+        format!(
+            "one-shot {} at {}",
+            row.modality,
+            format_jst_datetime(row.observed_at)
+        )
     }
 }
 
@@ -1520,10 +1538,18 @@ mod tests {
         assert!(!state.activity[0].streaming);
         assert_eq!(state.activity[1].role, ActivityRole::Environment);
         assert!(state.activity[1].content.contains("updated vision"));
+        assert_eq!(
+            state.activity[1].source.as_deref(),
+            Some("ambient snapshot at 2026-06-13 15:18:02")
+        );
         assert_eq!(state.activity[2].content, "stay");
         assert!(!state.activity[2].streaming);
         assert_eq!(state.activity[3].role, ActivityRole::User);
         assert_eq!(state.activity[3].content, "Koro says, \"wait\"");
+        assert_eq!(
+            state.activity[3].source.as_deref(),
+            Some("one-shot audition from Koro at 2026-06-13 15:18:04")
+        );
         assert_eq!(state.activity[4].content, " close.");
         assert!(!state.activity[4].streaming);
     }
@@ -1594,6 +1620,10 @@ mod tests {
         assert_eq!(state.activity[0].role, ActivityRole::Assistant);
         assert_eq!(state.activity[1].role, ActivityRole::Action);
         assert!(state.activity[1].content.contains("status: pending"));
+        assert_eq!(
+            state.activity[1].source.as_deref(),
+            Some("poet invoked by action at 2026-06-13 15:18:02")
+        );
         assert_eq!(state.activity[2].role, ActivityRole::User);
 
         state.update_external_action_event_row(external_action_event(

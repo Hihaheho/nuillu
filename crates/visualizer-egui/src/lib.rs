@@ -9,6 +9,7 @@ pub mod module_filter;
 pub mod modules;
 pub mod resource_monitor;
 pub mod text;
+mod time;
 pub mod window;
 
 pub use eframe;

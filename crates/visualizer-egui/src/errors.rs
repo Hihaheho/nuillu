@@ -5,6 +5,7 @@ use nuillu_visualizer_protocol::VisualizerErrorView;
 use crate::{
     i18n::{EguiI18nExt as _, localized_module_name_with_id},
     text::wrapped_label,
+    time::format_jst_time,
 };
 
 pub fn ui(
@@ -60,7 +61,7 @@ fn error_row(ui: &mut egui::Ui, error: &VisualizerErrorView) {
             ui.horizontal_wrapped(|ui| {
                 ui.colored_label(ui.visuals().error_fg_color, &error.phase);
                 ui.label(localized_module_name_with_id(ui.ctx(), &error.source));
-                ui.label(error.at.format("%H:%M:%S%.3f").to_string());
+                ui.label(format_jst_time(error.at));
                 if let Some(owner) = &error.owner {
                     wrapped_label(ui, &localized_module_name_with_id(ui.ctx(), owner));
                 }

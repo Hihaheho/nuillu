@@ -1,5 +1,6 @@
 use crate::{
     CognitionEntryView, CognitionLogView, i18n::localized_module_name_with_id, text::wrapped_label,
+    time::format_jst_datetime,
 };
 
 pub fn ui(ui: &mut egui::Ui, logs: &[CognitionLogView]) {
@@ -19,7 +20,7 @@ pub fn ui(ui: &mut egui::Ui, logs: &[CognitionLogView]) {
                                 entry.source,
                                 &entry.entry.origin,
                             ));
-                            ui.label(entry.entry.at.to_rfc3339());
+                            ui.label(format_jst_datetime(entry.entry.at));
                         });
                         ui.add_space(4.0);
                         wrapped_label(ui, &entry.entry.text);

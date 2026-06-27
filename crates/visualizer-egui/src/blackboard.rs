@@ -2,6 +2,7 @@ use crate::{
     BlackboardSnapshot,
     i18n::{EguiI18nExt as _, I18nArg, localized_module_name_with_id},
     text::wrapped_label,
+    time::format_jst_datetime,
 };
 
 pub fn ui(ui: &mut egui::Ui, snapshot: &BlackboardSnapshot) {
@@ -86,7 +87,7 @@ pub fn ui(ui: &mut egui::Ui, snapshot: &BlackboardSnapshot) {
                         ui.label(
                             memory
                                 .occurred_at
-                                .map(|at| at.to_rfc3339())
+                                .map(format_jst_datetime)
                                 .unwrap_or_else(|| "-".to_string()),
                         );
                         ui.end_row();

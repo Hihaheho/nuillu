@@ -4,6 +4,7 @@ use crate::{
     module_filter,
     module_filter::ModuleFilterState,
     text::wrapped_label,
+    time::format_jst_datetime,
 };
 
 pub fn ui(
@@ -53,7 +54,7 @@ pub fn render_memo_card(ui: &mut egui::Ui, memo: &MemoView) {
                     ui.ctx()
                         .tr_args("memo-index", &[("index", memo.index.to_string().into())]),
                 );
-                ui.label(memo.written_at.to_rfc3339());
+                ui.label(format_jst_datetime(memo.written_at));
             });
             ui.add_space(4.0);
             wrapped_label(ui, &memo.content);

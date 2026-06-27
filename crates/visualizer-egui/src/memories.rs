@@ -7,6 +7,7 @@ use crate::{
     VisualizerCommand, VisualizerTabId,
     i18n::{EguiI18nExt as _, I18nArg},
     text::wrapped_label,
+    time::format_jst_datetime,
 };
 
 const MAIN_CHUNK_SIZE: usize = 50;
@@ -453,12 +454,12 @@ fn memory_record_card(
                 ui.label(
                     record
                         .occurred_at
-                        .map(|at| at.to_rfc3339())
+                        .map(format_jst_datetime)
                         .unwrap_or_else(|| "-".to_string()),
                 );
                 ui.label(ui.ctx().tr_args(
                     "memory-stored-at",
-                    &[("stored_at", record.stored_at.to_rfc3339().into())],
+                    &[("stored_at", format_jst_datetime(record.stored_at).into())],
                 ));
                 ui.label(ui.ctx().tr_args(
                     "memory-arousal",
