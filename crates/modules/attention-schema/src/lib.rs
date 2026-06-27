@@ -34,9 +34,11 @@ Use exactly one tool per activation:
 
 Do not use final assistant text as an output channel.
 
-The plaintext field is the exact cognitive attention-experience memo to write. Keep the whole text
-brief and at most 160 characters total. Any number of short sentences is acceptable within that
-limit. Do not use bullet, list, or code-block formatting.
+The plaintext field is the exact cognitive attention-experience memo to write. It must be a short
+text that captures the attention of this single moment, not a long passage. Do not write
+paragraphs, narration, or accumulated history. One short sentence is typical; a few short sentences
+are acceptable only when the current attention genuinely needs them. Do not use bullet, list, or
+code-block formatting.
 Write subjective experience: use "I" as the subject whenever possible, use an experiential verb, and
 describe the attention as an active first-person experience. Synthesize the attention experience; do
 not copy input notes or cognition entries verbatim. Preserve named attention targets and
@@ -55,7 +57,6 @@ const COMPACTED_ATTENTION_SCHEMA_SESSION_PREFIX: &str =
     "Compacted attention-schema session history:";
 const MEMO_CONTEXT_WINDOW: LlmContextWindow = LlmContextWindow::new(8, 1_200, 4_800);
 const COGNITION_CONTEXT_WINDOW: LlmContextWindow = LlmContextWindow::new(12, 600, 4_800);
-const ATTENTION_EXPERIENCE_MAX_CHARS: usize = 160;
 const TOOL_TURN_MAX_OUTPUT_TOKENS: u32 = 768;
 const SESSION_COMPACTION_FOCUS: &str = r#"Preserve memo-log facts, attention-state interpretations,
 prior written first-person attention experiences, rejected candidates, and cognition-log context
@@ -108,11 +109,6 @@ fn validate_attention_experience_plaintext(plaintext: &str) -> Result<String> {
         anyhow::bail!("attention experience plaintext must not contain blank lines");
     }
     let plaintext = lines.join("\n");
-    if plaintext.chars().count() > ATTENTION_EXPERIENCE_MAX_CHARS {
-        anyhow::bail!(
-            "attention experience plaintext exceeds {ATTENTION_EXPERIENCE_MAX_CHARS} chars"
-        );
-    }
     if lines.iter().any(|line| starts_with_list_marker(line)) {
         anyhow::bail!("attention experience plaintext must not be a list item");
     }
@@ -146,8 +142,8 @@ fn starts_with_list_marker(text: &str) -> bool {
 )]
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct AppendAttentionExperienceArgs {
-    /// Synthesized first-person attention sentences, at most 160 chars total. Not a bullet, list,
-    /// code block, label, or copied note text.
+    /// Synthesized first-person attention sentences capturing the present moment; keep it short,
+    /// not a long passage. Not a bullet, list, code block, label, or copied note text.
     pub plaintext: String,
 }
 
@@ -630,9 +626,21 @@ mod tests {
     }
 
     #[test]
-    fn attention_experience_validation_rejects_empty_long_blank_line_and_list_text() {
+    fn attention_experience_validation_accepts_long_single_line_sentence() {
+        let long_sentence = format!(
+            "I attend to {} as it lingers.",
+            "the slow drifting glow ".repeat(20)
+        );
+        assert!(long_sentence.chars().count() > 160);
+        assert_eq!(
+            validate_attention_experience_plaintext(&long_sentence).unwrap(),
+            long_sentence
+        );
+    }
+
+    #[test]
+    fn attention_experience_validation_rejects_empty_blank_line_and_list_text() {
         assert!(validate_attention_experience_plaintext("   ").is_err());
-        assert!(validate_attention_experience_plaintext(&"x".repeat(161)).is_err());
         assert!(
             validate_attention_experience_plaintext("I attend to Koro.\n\nI stay alert.").is_err()
         );
@@ -648,10 +656,9 @@ mod tests {
     async fn invalid_tool_plaintext_writes_no_memo() {
         let now = Utc.with_ymd_and_hms(2026, 5, 7, 12, 0, 0).unwrap();
         let blackboard = Blackboard::default();
-        let capture = CapturingAdapter::new(
-            MockLlmAdapter::new()
-                .with_text_scenario(append_attention_experience_scenario(&"x".repeat(161))),
-        );
+        let capture = CapturingAdapter::new(MockLlmAdapter::new().with_text_scenario(
+            append_attention_experience_scenario("I attend to Koro.\n\nI stay alert."),
+        ));
         let (caps, lutum) = test_caps(blackboard.clone(), Arc::new(capture));
         let mut module = build_attention_schema_module(&caps).await;
         let sensory = ModuleInstanceId::new(builtin::sensory(), ReplicaIndex::ZERO);
@@ -671,7 +678,7 @@ mod tests {
             .expect_err("invalid plaintext should fail activation");
 
         assert!(
-            format!("{error:#}").contains("exceeds 160 chars"),
+            format!("{error:#}").contains("must not contain blank lines"),
             "unexpected error: {error:#}"
         );
         assert!(attention_schema_memos(&blackboard).await.is_empty());
