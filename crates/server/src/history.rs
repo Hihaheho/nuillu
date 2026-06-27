@@ -30,6 +30,7 @@ pub struct ConversationHistorySession {
 pub enum ConversationHistoryEntryRole {
     User,
     Agent,
+    ExternalAction,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -105,7 +106,7 @@ pub fn render_conversation_history_markdown(export: &ConversationHistoryExport) 
                 "- セッション: {}\n\n",
                 render_session_label(session)
             ));
-            append_markdown_table(&mut out, &session.entries);
+            append_markdown_list(&mut out, &session.entries);
         }
         sessions => {
             out.push('\n');
@@ -117,7 +118,7 @@ pub fn render_conversation_history_markdown(export: &ConversationHistoryExport) 
                     "## セッション: {}\n\n",
                     render_session_label(session)
                 ));
-                append_markdown_table(&mut out, &session.entries);
+                append_markdown_list(&mut out, &session.entries);
             }
         }
     }
@@ -143,6 +144,11 @@ fn conversation_history_entry(
         ConversationHistoryRole::Agent => (
             ConversationHistoryEntryRole::Agent,
             agent_name.to_string(),
+            record.target,
+        ),
+        ConversationHistoryRole::ExternalAction => (
+            ConversationHistoryEntryRole::ExternalAction,
+            record.speaker,
             record.target,
         ),
     };
@@ -186,40 +192,69 @@ fn render_session_label(session: &ConversationHistorySession) -> String {
     }
 }
 
-fn append_markdown_table(out: &mut String, entries: &[ConversationHistoryEntry]) {
-    out.push_str("| 時刻 (UTC) | 話者 | 発話 |\n");
-    out.push_str("|---|---|---|\n");
+fn append_markdown_list(out: &mut String, entries: &[ConversationHistoryEntry]) {
     for entry in entries {
-        out.push_str(&format!(
-            "| {} | {} | {} |\n",
-            entry.timestamp.format("%Y-%m-%d %H:%M:%S"),
-            markdown_speaker(entry),
-            markdown_table_cell(&entry.text)
-        ));
+        append_markdown_entry(out, entry);
     }
 }
 
 fn markdown_speaker(entry: &ConversationHistoryEntry) -> String {
     match entry.role {
         ConversationHistoryEntryRole::User => {
-            format!("**{}**", markdown_table_cell(&entry.speaker))
+            format!("**{}**", markdown_inline_text(&entry.speaker))
         }
         ConversationHistoryEntryRole::Agent => match &entry.target {
             Some(target) if !target.trim().is_empty() => format!(
                 "{} → {}",
-                markdown_table_cell(&entry.speaker),
-                markdown_table_cell(target)
+                markdown_inline_text(&entry.speaker),
+                markdown_inline_text(target)
             ),
-            _ => markdown_table_cell(&entry.speaker),
+            _ => markdown_inline_text(&entry.speaker),
+        },
+        ConversationHistoryEntryRole::ExternalAction => match &entry.target {
+            Some(target) if !target.trim().is_empty() => format!(
+                "{} → {}",
+                markdown_inline_text(&entry.speaker),
+                markdown_inline_text(target)
+            ),
+            _ => markdown_inline_text(&entry.speaker),
         },
     }
 }
 
-fn markdown_table_cell(value: &str) -> String {
-    value
-        .replace('\r', "")
-        .replace('\n', "<br>")
-        .replace('|', "\\|")
+fn append_markdown_entry(out: &mut String, entry: &ConversationHistoryEntry) {
+    let text = entry.text.replace('\r', "");
+    let mut lines = text.split('\n');
+    let first_line = lines.next().unwrap_or_default();
+
+    out.push_str("- ");
+    if entry.role != ConversationHistoryEntryRole::User {
+        out.push_str(&markdown_speaker(entry));
+        out.push_str(": ");
+    }
+    out.push_str(first_line);
+    out.push('\n');
+
+    for line in lines {
+        out.push_str("  ");
+        out.push_str(line);
+        out.push('\n');
+    }
+}
+
+fn markdown_inline_text(value: &str) -> String {
+    let value = value.replace('\r', "").replace('\n', " ");
+    let mut escaped = String::with_capacity(value.len());
+    for ch in value.chars() {
+        match ch {
+            '\\' | '`' | '*' | '_' | '[' | ']' => {
+                escaped.push('\\');
+                escaped.push(ch);
+            }
+            _ => escaped.push(ch),
+        }
+    }
+    escaped
 }
 
 #[cfg(test)]
@@ -242,6 +277,7 @@ mod tests {
             source_table: match role {
                 ConversationHistoryRole::User => "one_shot_sensory_inputs",
                 ConversationHistoryRole::Agent => "utterance_events",
+                ConversationHistoryRole::ExternalAction => "external_action_events",
             }
             .to_string(),
             source_id,
@@ -270,6 +306,18 @@ mod tests {
                     "Ryo",
                     None,
                     "Ryo says, \"こんにちは\"",
+                    None,
+                ),
+                record(
+                    3,
+                    "server-20260622T023702Z-uuid",
+                    Utc.with_ymd_and_hms(2026, 6, 22, 2, 38, 8)
+                        .unwrap()
+                        .timestamp_millis(),
+                    ConversationHistoryRole::ExternalAction,
+                    "action",
+                    Some("poet"),
+                    "action: poet\narguments: {\"poem\":\"quiet rain\"}\nstatus: accepted: poem recorded",
                     None,
                 ),
                 record(
@@ -306,6 +354,17 @@ mod tests {
                             text: "Ryo says, \"こんにちは\"".to_string(),
                             source_table: "one_shot_sensory_inputs".to_string(),
                             source_id: 1,
+                            generation_id: None,
+                        },
+                        ConversationHistoryEntry {
+                            timestamp: Utc.with_ymd_and_hms(2026, 6, 22, 2, 38, 8).unwrap(),
+                            role: ConversationHistoryEntryRole::ExternalAction,
+                            speaker: "action".to_string(),
+                            target: Some("poet".to_string()),
+                            text: "action: poet\narguments: {\"poem\":\"quiet rain\"}\nstatus: accepted: poem recorded"
+                                .to_string(),
+                            source_table: "external_action_events".to_string(),
+                            source_id: 3,
                             generation_id: None,
                         },
                         ConversationHistoryEntry {
@@ -353,37 +412,67 @@ mod tests {
                         source_id: 2,
                         generation_id: Some(7),
                     },
+                    ConversationHistoryEntry {
+                        timestamp: Utc.with_ymd_and_hms(2026, 6, 22, 2, 38, 8).unwrap(),
+                        role: ConversationHistoryEntryRole::ExternalAction,
+                        speaker: "action".to_string(),
+                        target: Some("poet".to_string()),
+                        text: "action: poet\narguments: {\"poem\":\"quiet rain\"}\nstatus: accepted: poem recorded"
+                            .to_string(),
+                        source_table: "external_action_events".to_string(),
+                        source_id: 3,
+                        generation_id: None,
+                    },
                 ],
             }],
         };
 
         assert_eq!(
             render_conversation_history_markdown(&export),
-            "# 会話履歴\n\n\
-- 出典: `.tmp/exhibition/agent.db`\n\
-- セッション: server-20260622T023702Z（2026-06-22 UTC）\n\n\
-| 時刻 (UTC) | 話者 | 発話 |\n\
-|---|---|---|\n\
-| 2026-06-22 02:37:06 | **Ryo** | Ryo says, \"こんにちは\" |\n\
-| 2026-06-22 02:38:07 | Nui → Ryo | こんにちは。元気だよ |\n"
+            concat!(
+                "# 会話履歴\n\n",
+                "- 出典: `.tmp/exhibition/agent.db`\n",
+                "- セッション: server-20260622T023702Z（2026-06-22 UTC）\n\n",
+                "- Ryo says, \"こんにちは\"\n",
+                "- Nui → Ryo: こんにちは。元気だよ\n",
+                "- action → poet: action: poet\n",
+                "  arguments: {\"poem\":\"quiet rain\"}\n",
+                "  status: accepted: poem recorded\n",
+            )
         );
     }
 
     #[test]
-    fn render_markdown_escapes_table_cells() {
-        let entry = ConversationHistoryEntry {
-            timestamp: Utc.with_ymd_and_hms(2026, 6, 22, 2, 37, 6).unwrap(),
-            role: ConversationHistoryEntryRole::User,
-            speaker: "Ry|o".to_string(),
-            target: None,
-            text: "line|one\nline two".to_string(),
-            source_table: "one_shot_sensory_inputs".to_string(),
-            source_id: 1,
-            generation_id: None,
+    fn render_markdown_preserves_multiline_entry_text_as_list_body() {
+        let export = ConversationHistoryExport {
+            source: "agent.db".to_string(),
+            sessions: vec![ConversationHistorySession {
+                id: "session".to_string(),
+                label: "session".to_string(),
+                started_at: None,
+                entries: vec![ConversationHistoryEntry {
+                    timestamp: Utc.with_ymd_and_hms(2026, 6, 22, 2, 37, 6).unwrap(),
+                    role: ConversationHistoryEntryRole::User,
+                    speaker: "Ry|o".to_string(),
+                    target: None,
+                    text: "line|one\nline two".to_string(),
+                    source_table: "one_shot_sensory_inputs".to_string(),
+                    source_id: 1,
+                    generation_id: None,
+                }],
+            }],
         };
 
-        assert_eq!(markdown_speaker(&entry), "**Ry\\|o**");
-        assert_eq!(markdown_table_cell(&entry.text), "line\\|one<br>line two");
+        assert_eq!(
+            render_conversation_history_markdown(&export),
+            concat!(
+                "# 会話履歴\n\n",
+                "- 出典: `agent.db`\n",
+                "- セッション: session\n\n",
+                "- line|one\n",
+                "  line two\n",
+            )
+        );
     }
 
     #[test]
@@ -394,16 +483,28 @@ mod tests {
                 id: "session".to_string(),
                 label: "session".to_string(),
                 started_at: None,
-                entries: vec![ConversationHistoryEntry {
-                    timestamp: Utc.with_ymd_and_hms(2026, 6, 22, 2, 37, 6).unwrap(),
-                    role: ConversationHistoryEntryRole::Agent,
-                    speaker: "Nui".to_string(),
-                    target: Some("Ryo".to_string()),
-                    text: "hello".to_string(),
-                    source_table: "utterance_events".to_string(),
-                    source_id: 2,
-                    generation_id: Some(7),
-                }],
+                entries: vec![
+                    ConversationHistoryEntry {
+                        timestamp: Utc.with_ymd_and_hms(2026, 6, 22, 2, 37, 6).unwrap(),
+                        role: ConversationHistoryEntryRole::Agent,
+                        speaker: "Nui".to_string(),
+                        target: Some("Ryo".to_string()),
+                        text: "hello".to_string(),
+                        source_table: "utterance_events".to_string(),
+                        source_id: 2,
+                        generation_id: Some(7),
+                    },
+                    ConversationHistoryEntry {
+                        timestamp: Utc.with_ymd_and_hms(2026, 6, 22, 2, 37, 8).unwrap(),
+                        role: ConversationHistoryEntryRole::ExternalAction,
+                        speaker: "action".to_string(),
+                        target: Some("poet".to_string()),
+                        text: "action: poet\narguments: {}\nstatus: pending".to_string(),
+                        source_table: "external_action_events".to_string(),
+                        source_id: 3,
+                        generation_id: None,
+                    },
+                ],
             }],
         };
 
@@ -423,6 +524,14 @@ mod tests {
                         "source_table": "utterance_events",
                         "source_id": 2,
                         "generation_id": 7
+                    }, {
+                        "timestamp": "2026-06-22T02:37:08Z",
+                        "role": "external_action",
+                        "speaker": "action",
+                        "target": "poet",
+                        "text": "action: poet\narguments: {}\nstatus: pending",
+                        "source_table": "external_action_events",
+                        "source_id": 3
                     }]
                 }]
             })

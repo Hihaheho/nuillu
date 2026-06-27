@@ -359,6 +359,7 @@ pub struct ExternalActionEventRecord {
 pub enum ConversationHistoryRole {
     User,
     Agent,
+    ExternalAction,
 }
 
 impl ConversationHistoryRole {
@@ -366,6 +367,7 @@ impl ConversationHistoryRole {
         match self {
             Self::User => "user",
             Self::Agent => "agent",
+            Self::ExternalAction => "external_action",
         }
     }
 }
@@ -540,9 +542,32 @@ impl LibsqlConversationHistoryStore {
                            target,
                            content,
                            generation_id,
-                           1 AS source_order
+                           2 AS source_order
                       FROM utterance_events
                      WHERE event_kind = 'completed'
+                    UNION ALL
+                    SELECT 'external_action' AS role,
+                           'external_action_events' AS source_table,
+                           id AS source_id,
+                           server_session_id,
+                           requested_at_ms AS occurred_at_ms,
+                           CASE
+                             WHEN invoked_by_replica = 0 THEN invoked_by_module
+                             ELSE invoked_by_module || '[' || invoked_by_replica || ']'
+                           END AS speaker,
+                           action_id AS target,
+                           'action: ' || action_id
+                             || char(10) || 'arguments: ' || arguments_json
+                             || char(10) || 'status: ' ||
+                             CASE
+                               WHEN status = 'pending' THEN 'pending'
+                               WHEN COALESCE(accepted, 0) != 0
+                                 THEN 'accepted: ' || COALESCE(message, '')
+                               ELSE 'rejected: ' || COALESCE(message, '')
+                             END AS content,
+                           NULL AS generation_id,
+                           3 AS source_order
+                      FROM external_action_events
                   )
                  ORDER BY server_session_id ASC,
                           occurred_at_ms ASC,
@@ -574,7 +599,11 @@ impl LibsqlConversationHistoryStore {
                 "SELECT name
                    FROM sqlite_master
                   WHERE type = 'table'
-                    AND name IN ('one_shot_sensory_inputs', 'utterance_events')",
+                    AND name IN (
+                        'one_shot_sensory_inputs',
+                        'utterance_events',
+                        'external_action_events'
+                    )",
                 (),
             )
             .await
@@ -584,10 +613,14 @@ impl LibsqlConversationHistoryStore {
             let name: String = row.get(0).map_err(map_libsql_error)?;
             found.push(name);
         }
-        let missing = ["one_shot_sensory_inputs", "utterance_events"]
-            .into_iter()
-            .filter(|table| !found.iter().any(|name| name == table))
-            .collect::<Vec<_>>();
+        let missing = [
+            "one_shot_sensory_inputs",
+            "utterance_events",
+            "external_action_events",
+        ]
+        .into_iter()
+        .filter(|table| !found.iter().any(|name| name == table))
+        .collect::<Vec<_>>();
         if missing.is_empty() {
             Ok(())
         } else {
@@ -3687,6 +3720,7 @@ fn conversation_history_role_from_str(value: &str) -> Result<ConversationHistory
     match value {
         "user" => Ok(ConversationHistoryRole::User),
         "agent" => Ok(ConversationHistoryRole::Agent),
+        "external_action" => Ok(ConversationHistoryRole::ExternalAction),
         _ => Err(PortError::InvalidData(format!(
             "unknown conversation history role: {value}"
         ))),
@@ -4445,10 +4479,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn conversation_history_entries_merge_user_inputs_and_completed_utterances() {
+    async fn conversation_history_entries_merge_user_inputs_utterances_and_external_actions() {
         let path = test_db_path();
         let sender = ModuleInstanceId::new(ModuleId::new("speak").unwrap(), ReplicaIndex::ZERO);
-        let (input_a, input_b, completed_a) = {
+        let action_invoker =
+            ModuleInstanceId::new(ModuleId::new("action").unwrap(), ReplicaIndex::ZERO);
+        let (input_a, input_b, action_a, completed_a) = {
             let agent = LibsqlAgentStore::connect(
                 LibsqlAgentStoreConfig::local(path.clone(), 3, 3),
                 TestEmbedder::boxed(3),
@@ -4458,6 +4494,7 @@ mod tests {
             .unwrap();
             let one_shot = agent.one_shot_sensory_input_store();
             let utterance = agent.utterance_event_store();
+            let external_action = agent.external_action_event_store();
             let input_a = one_shot
                 .append(NewOneShotSensoryInput {
                     server_session_id: "session-a".to_string(),
@@ -4486,6 +4523,21 @@ mod tests {
                     content: "An unnamed sound.".to_string(),
                     observed_at_ms: 22,
                 })
+                .await
+                .unwrap();
+            let action_a = external_action
+                .append_pending(NewExternalActionEvent {
+                    server_session_id: "session-a".to_string(),
+                    invocation_id: "agent-action-1".to_string(),
+                    invoked_by: action_invoker,
+                    action_id: "poet".to_string(),
+                    arguments: serde_json::json!({ "poem": "quiet rain" }),
+                    requested_at_ms: 22,
+                })
+                .await
+                .unwrap();
+            let action_a = external_action
+                .complete(action_a.id, true, "poem recorded".to_string(), 25)
                 .await
                 .unwrap();
             utterance
@@ -4526,7 +4578,7 @@ mod tests {
                 })
                 .await
                 .unwrap();
-            (input_a, input_b, completed_a)
+            (input_a, input_b, action_a, completed_a)
         };
 
         let store = LibsqlConversationHistoryStore::open(&path).await.unwrap();
@@ -4543,6 +4595,18 @@ mod tests {
                     speaker: "Ryo".to_string(),
                     target: None,
                     content: "Ryo says, \"hello\"".to_string(),
+                    generation_id: None,
+                },
+                ConversationHistoryEntryRecord {
+                    source_table: "external_action_events".to_string(),
+                    source_id: action_a.id,
+                    server_session_id: "session-a".to_string(),
+                    occurred_at_ms: 22,
+                    role: ConversationHistoryRole::ExternalAction,
+                    speaker: "action".to_string(),
+                    target: Some("poet".to_string()),
+                    content: "action: poet\narguments: {\"poem\":\"quiet rain\"}\nstatus: accepted: poem recorded"
+                        .to_string(),
                     generation_id: None,
                 },
                 ConversationHistoryEntryRecord {
