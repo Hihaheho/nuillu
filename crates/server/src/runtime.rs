@@ -259,7 +259,7 @@ pub(crate) fn set_runtime_running(
 mod tests {
     use std::sync::mpsc;
 
-    use nuillu_visualizer_protocol::VisualizerClientMessage;
+    use nuillu_visualizer_protocol::{VisualizerActionKind, VisualizerClientMessage};
 
     use super::*;
 
@@ -274,14 +274,16 @@ mod tests {
         set_runtime_running(&visualizer, &tab_id, &controller, false);
         assert!(!controller.is_running());
         let messages = event_rx.try_iter().collect::<Vec<_>>();
+        assert_eq!(messages.len(), 3);
         assert!(matches!(
             &messages[0],
             VisualizerServerMessage::Event {
                 event: VisualizerEvent::SetTabStatus {
+                    tab_id: actual_tab_id,
                     status: TabStatus::Stopped,
                     ..
                 }
-            }
+            } if actual_tab_id == &tab_id
         ));
         assert!(matches!(
             &messages[1],
@@ -292,19 +294,22 @@ mod tests {
             &messages[2],
             VisualizerServerMessage::OfferAction { action }
                 if action.id == run_runtime_action_id(&tab_id)
+                    && action.kind == VisualizerActionKind::RunRuntime
         ));
 
         set_runtime_running(&visualizer, &tab_id, &controller, true);
         assert!(controller.is_running());
         let messages = event_rx.try_iter().collect::<Vec<_>>();
+        assert_eq!(messages.len(), 3);
         assert!(matches!(
             &messages[0],
             VisualizerServerMessage::Event {
                 event: VisualizerEvent::SetTabStatus {
+                    tab_id: actual_tab_id,
                     status: TabStatus::Running,
                     ..
                 }
-            }
+            } if actual_tab_id == &tab_id
         ));
         assert!(matches!(
             &messages[1],
@@ -315,6 +320,7 @@ mod tests {
             &messages[2],
             VisualizerServerMessage::OfferAction { action }
                 if action.id == stop_runtime_action_id(&tab_id)
+                    && action.kind == VisualizerActionKind::StopRuntime
         ));
     }
 }

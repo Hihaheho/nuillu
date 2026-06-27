@@ -633,11 +633,18 @@ impl eframe::App for VisualizerApp {
                     }
                     for action in self.state.visible_actions() {
                         if ui.button(&action.label).clicked() {
-                            let _ =
+                            if let Err(error) =
                                 self.client_messages
                                     .send(VisualizerClientMessage::InvokeAction {
-                                        action_id: action.id,
-                                    });
+                                        action_id: action.id.clone(),
+                                    })
+                            {
+                                self.state.record_action_send_failed(
+                                    &action,
+                                    error.to_string(),
+                                    self.remote,
+                                );
+                            }
                         }
                     }
                     if self.remote && self.state.disconnected {
@@ -849,6 +856,29 @@ impl VisualizerState {
         self.actions.clear();
         for tab in self.tabs.values_mut() {
             tab.push_log("eval process disconnected".to_string());
+        }
+    }
+
+    fn record_action_send_failed(
+        &mut self,
+        action: &VisualizerAction,
+        error: String,
+        remote: bool,
+    ) {
+        if remote {
+            self.disconnected = true;
+        }
+        self.actions.clear();
+        let message = format!(
+            "failed to send visualizer action {} ({}): {error}",
+            action.label, action.id
+        );
+        if let Some(tab_id) = self
+            .selected
+            .clone()
+            .or_else(|| self.tabs.keys().next().cloned())
+        {
+            self.tab_mut(tab_id).push_log(message);
         }
     }
 
@@ -2314,6 +2344,36 @@ mod tests {
             actions
                 .iter()
                 .any(|action| action.id == stop_runtime_action_id(&tab_id))
+        );
+    }
+
+    #[test]
+    fn action_send_failure_clears_actions_and_logs_on_selected_tab() {
+        let mut state = VisualizerState::default();
+        let tab_id = VisualizerTabId::new("server");
+        state.apply(VisualizerEvent::OpenTab {
+            tab_id: tab_id.clone(),
+            title: "Server".to_string(),
+        });
+        state.apply_server_message(VisualizerServerMessage::OfferAction {
+            action: VisualizerAction::stop_runtime(tab_id.clone()),
+        });
+        let action = state
+            .visible_actions()
+            .into_iter()
+            .find(|action| action.id == stop_runtime_action_id(&tab_id))
+            .expect("stop action is visible");
+
+        state.record_action_send_failed(&action, "sending on a closed channel".to_string(), true);
+
+        assert!(state.visible_actions().is_empty());
+        assert!(state.disconnected);
+        let tab = state.tabs().get(&tab_id).expect("tab exists");
+        assert_eq!(
+            tab.logs.back().map(String::as_str),
+            Some(
+                "failed to send visualizer action Stop (tab:server:stop-runtime): sending on a closed channel"
+            )
         );
     }
 

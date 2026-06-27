@@ -97,6 +97,8 @@ async fn handle_server_visualizer_message(
                 resume_runtime(visualizer, tab_id, scene, sensory, env, run_controller).await;
             } else if action_id == stop_runtime_action_id(tab_id) {
                 set_runtime_running(visualizer, tab_id, run_controller, false);
+            } else {
+                emit_unknown_visualizer_action(visualizer, tab_id, &action_id);
             }
             return false;
         }
@@ -732,6 +734,17 @@ async fn resume_runtime(
     publish_scene_snapshot(scene, sensory, visualizer, tab_id, env).await;
 }
 
+fn emit_unknown_visualizer_action(
+    visualizer: &VisualizerHook,
+    tab_id: &VisualizerTabId,
+    action_id: &str,
+) {
+    visualizer.send_event(VisualizerEvent::Log {
+        tab_id: tab_id.clone(),
+        message: format!("ignored unknown visualizer action: {action_id}"),
+    });
+}
+
 pub(super) fn emit_scene_state(
     scene: &SceneState,
     visualizer: &VisualizerHook,
@@ -1115,7 +1128,7 @@ async fn build_module_policy_update(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::Path;
+    use std::{path::Path, sync::mpsc};
 
     use crate::config::parse_server_boot_config_content;
 
@@ -1168,6 +1181,29 @@ mod tests {
         base.retain(|affordance| affordance.id != "poet");
         let merged = boot_config.overlay_action_affordances(base);
         assert_eq!(merged, vec![action_affordance("poet", "Config poet.")]);
+    }
+
+    #[test]
+    fn unknown_visualizer_action_logs_instead_of_disappearing() {
+        let (event_tx, event_rx) = mpsc::channel();
+        let (_command_tx, command_rx) = mpsc::channel::<VisualizerClientMessage>();
+        let visualizer = VisualizerHook::new(event_tx, command_rx);
+        let tab_id = VisualizerTabId::new("server");
+
+        emit_unknown_visualizer_action(&visualizer, &tab_id, "tab:server:unknown");
+
+        let messages = event_rx.try_iter().collect::<Vec<_>>();
+        assert_eq!(messages.len(), 1);
+        assert!(matches!(
+            &messages[0],
+            nuillu_visualizer_protocol::VisualizerServerMessage::Event {
+                event: VisualizerEvent::Log {
+                    tab_id: actual_tab_id,
+                    message,
+                }
+            } if actual_tab_id == &tab_id
+                && message == "ignored unknown visualizer action: tab:server:unknown"
+        ));
     }
 
     fn action_affordance(id: &str, description: &str) -> ActionAffordance {
