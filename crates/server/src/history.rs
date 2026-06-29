@@ -8,8 +8,6 @@ use lutum_libsql_adapter::{
 };
 use serde::Serialize;
 
-const AGENT_DB_FILE: &str = "agent.db";
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ConversationHistoryExport {
     pub source: String,
@@ -48,19 +46,18 @@ pub struct ConversationHistoryEntry {
 }
 
 pub async fn export_conversation_history(
-    state_dir: &Path,
+    agent_db_path: &Path,
     session_ids: &[String],
     agent_name: &str,
 ) -> anyhow::Result<ConversationHistoryExport> {
-    let db_path = state_dir.join(AGENT_DB_FILE);
-    let store = LibsqlConversationHistoryStore::open(&db_path)
+    let store = LibsqlConversationHistoryStore::open(agent_db_path)
         .await
-        .with_context(|| format!("open conversation history db {}", db_path.display()))?;
+        .with_context(|| format!("open conversation history db {}", agent_db_path.display()))?;
     let entries = store
         .entries(session_ids)
         .await
-        .with_context(|| format!("load conversation history from {}", db_path.display()))?;
-    build_conversation_history_export(db_path.display().to_string(), entries, agent_name)
+        .with_context(|| format!("load conversation history from {}", agent_db_path.display()))?;
+    build_conversation_history_export(agent_db_path.display().to_string(), entries, agent_name)
 }
 
 pub fn build_conversation_history_export(

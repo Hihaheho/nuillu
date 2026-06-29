@@ -11,6 +11,7 @@ use nuillu_server::{
 };
 
 const DEFAULT_OPENAI_EMBEDDING_ENDPOINT: &str = "https://api.openai.com/v1";
+const AGENT_DB_FILE: &str = "agent.db";
 const STATE_MODEL_SET_FILE: &str = "model-set.eure";
 
 #[derive(Debug, Parser)]
@@ -67,8 +68,12 @@ struct RunArgs {
     participants: Vec<String>,
 
     /// Back up existing agent.db under --state before connecting, then start with a fresh DB.
-    #[arg(long)]
+    #[arg(long, conflicts_with = "agent_db")]
     fresh_agent_db: bool,
+
+    /// Override the persistent agent DB path. Defaults to <state>/agent.db.
+    #[arg(long, value_name = "PATH", conflicts_with = "fresh_agent_db")]
+    agent_db: Option<PathBuf>,
 
     /// Path to an existing visualizer GUI binary.
     ///
@@ -82,6 +87,10 @@ struct HistoryArgs {
     /// Persistent server runtime state directory. Defaults to the top-level --state.
     #[arg(long)]
     state: Option<PathBuf>,
+
+    /// Override the persistent agent DB path.
+    #[arg(long, value_name = "PATH")]
+    agent_db: Option<PathBuf>,
 
     /// Output format.
     #[arg(long, value_enum, default_value_t = HistoryOutputFormat::Json)]
@@ -104,16 +113,19 @@ enum HistoryOutputFormat {
 
 fn main() -> anyhow::Result<()> {
     install_lutum_trace_subscriber()?;
-    let args = Args::parse();
-    match args.command {
+    let Args { run, command } = Args::parse();
+    match command {
         Some(Command::Run(run_args)) => run_server(run_args),
-        Some(Command::History(history_args)) => export_history(history_args, args.run.state),
-        None => run_server(args.run),
+        Some(Command::History(history_args)) => {
+            export_history(history_args, run.state, run.agent_db)
+        }
+        None => run_server(run),
     }
 }
 
 fn run_server(args: RunArgs) -> anyhow::Result<()> {
     let model_set_path = resolve_model_set_path(&args.state, args.model_set);
+    let agent_db_path = resolve_agent_db_path(&args.state, args.agent_db);
     let model_set = parse_model_set_file(&model_set_path)?;
     let backends = resolve_llm_backends(&model_set)?;
     let cheap_backend = backends.cheap;
@@ -125,6 +137,7 @@ fn run_server(args: RunArgs) -> anyhow::Result<()> {
 
     run_server_with_visualizer(ServerConfig {
         state_dir: args.state,
+        agent_db_path,
         session_id,
         llm_log_root: args.llm_log_root,
         cheap_backend,
@@ -140,14 +153,23 @@ fn run_server(args: RunArgs) -> anyhow::Result<()> {
     .context("run nuillu server")
 }
 
-fn export_history(args: HistoryArgs, default_state: PathBuf) -> anyhow::Result<()> {
-    let state = args.state.unwrap_or(default_state);
+fn export_history(
+    args: HistoryArgs,
+    default_state: PathBuf,
+    default_agent_db: Option<PathBuf>,
+) -> anyhow::Result<()> {
+    let agent_db_path = resolve_history_agent_db_path(
+        args.state.as_deref(),
+        args.agent_db.as_deref(),
+        &default_state,
+        default_agent_db.as_deref(),
+    );
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .context("build history export runtime")?;
     let export = runtime.block_on(export_conversation_history(
-        &state,
+        &agent_db_path,
         &args.session_ids,
         &args.agent_name,
     ))?;
@@ -173,6 +195,22 @@ fn resolve_session_id(session_id: Option<String>, run_id_alias: Option<String>) 
 
 fn resolve_model_set_path(state_dir: &Path, model_set: Option<PathBuf>) -> PathBuf {
     model_set.unwrap_or_else(|| state_dir.join(STATE_MODEL_SET_FILE))
+}
+
+fn resolve_agent_db_path(state_dir: &Path, agent_db: Option<PathBuf>) -> PathBuf {
+    agent_db.unwrap_or_else(|| state_dir.join(AGENT_DB_FILE))
+}
+
+fn resolve_history_agent_db_path(
+    history_state: Option<&Path>,
+    history_agent_db: Option<&Path>,
+    default_state: &Path,
+    default_agent_db: Option<&Path>,
+) -> PathBuf {
+    history_agent_db
+        .or(default_agent_db)
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| history_state.unwrap_or(default_state).join(AGENT_DB_FILE))
 }
 
 fn resolve_embedding(role: &EmbeddingRole) -> anyhow::Result<EmbeddingBackendConfig> {
@@ -241,6 +279,63 @@ mod tests {
     }
 
     #[test]
+    fn resolve_agent_db_path_defaults_under_state_dir() {
+        assert_eq!(
+            resolve_agent_db_path(Path::new(".tmp/custom-server"), None),
+            PathBuf::from(".tmp/custom-server/agent.db")
+        );
+    }
+
+    #[test]
+    fn resolve_agent_db_path_prefers_explicit_path() {
+        let explicit = PathBuf::from(".tmp/custom-agent.db");
+
+        assert_eq!(
+            resolve_agent_db_path(Path::new(".tmp/server"), Some(explicit.clone())),
+            explicit
+        );
+    }
+
+    #[test]
+    fn resolve_history_agent_db_path_prefers_history_agent_db() {
+        assert_eq!(
+            resolve_history_agent_db_path(
+                Some(Path::new(".tmp/history-state")),
+                Some(Path::new(".tmp/history-agent.db")),
+                Path::new(".tmp/top-state"),
+                Some(Path::new(".tmp/top-agent.db")),
+            ),
+            PathBuf::from(".tmp/history-agent.db")
+        );
+    }
+
+    #[test]
+    fn resolve_history_agent_db_path_uses_top_level_agent_db() {
+        assert_eq!(
+            resolve_history_agent_db_path(
+                Some(Path::new(".tmp/history-state")),
+                None,
+                Path::new(".tmp/top-state"),
+                Some(Path::new(".tmp/top-agent.db")),
+            ),
+            PathBuf::from(".tmp/top-agent.db")
+        );
+    }
+
+    #[test]
+    fn resolve_history_agent_db_path_defaults_under_resolved_state() {
+        assert_eq!(
+            resolve_history_agent_db_path(
+                Some(Path::new(".tmp/history-state")),
+                None,
+                Path::new(".tmp/top-state"),
+                None,
+            ),
+            PathBuf::from(".tmp/history-state/agent.db")
+        );
+    }
+
+    #[test]
     fn args_parse_fresh_agent_db_flag() {
         let args = Args::parse_from(["nuillu-server", "--fresh-agent-db"]);
 
@@ -249,10 +344,22 @@ mod tests {
     }
 
     #[test]
+    fn args_parse_top_level_agent_db_path() {
+        let args = Args::parse_from(["nuillu-server", "--agent-db", ".tmp/custom-agent.db"]);
+
+        assert_eq!(
+            args.run.agent_db,
+            Some(PathBuf::from(".tmp/custom-agent.db"))
+        );
+        assert!(args.command.is_none());
+    }
+
+    #[test]
     fn args_default_to_reusing_agent_db() {
         let args = Args::parse_from(["nuillu-server"]);
 
         assert!(!args.run.fresh_agent_db);
+        assert_eq!(args.run.agent_db, None);
         assert!(args.command.is_none());
     }
 
@@ -291,6 +398,37 @@ mod tests {
     }
 
     #[test]
+    fn args_parse_explicit_run_agent_db_path() {
+        let args = Args::parse_from([
+            "nuillu-server",
+            "run",
+            "--state",
+            ".tmp/exhibition",
+            "--agent-db",
+            ".tmp/custom-agent.db",
+        ]);
+
+        let Some(Command::Run(run)) = args.command else {
+            panic!("expected run subcommand");
+        };
+        assert_eq!(run.state, PathBuf::from(".tmp/exhibition"));
+        assert_eq!(run.agent_db, Some(PathBuf::from(".tmp/custom-agent.db")));
+    }
+
+    #[test]
+    fn args_reject_agent_db_with_fresh_agent_db() {
+        assert!(
+            Args::try_parse_from([
+                "nuillu-server",
+                "--agent-db",
+                ".tmp/custom-agent.db",
+                "--fresh-agent-db",
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
     fn args_parse_history_subcommand() {
         let args = Args::parse_from([
             "nuillu-server",
@@ -311,9 +449,28 @@ mod tests {
             panic!("expected history subcommand");
         };
         assert_eq!(history.state, Some(PathBuf::from(".tmp/exhibition")));
+        assert_eq!(history.agent_db, None);
         assert_eq!(history.output, HistoryOutputFormat::Markdown);
         assert_eq!(history.session_ids, vec!["server-a", "server-b"]);
         assert_eq!(history.agent_name, "Nui");
+    }
+
+    #[test]
+    fn args_parse_history_agent_db_path() {
+        let args = Args::parse_from([
+            "nuillu-server",
+            "history",
+            "--agent-db",
+            ".tmp/history-agent.db",
+        ]);
+
+        let Some(Command::History(history)) = args.command else {
+            panic!("expected history subcommand");
+        };
+        assert_eq!(
+            history.agent_db,
+            Some(PathBuf::from(".tmp/history-agent.db"))
+        );
     }
 
     #[test]
@@ -325,5 +482,53 @@ mod tests {
             panic!("expected history subcommand");
         };
         assert_eq!(history.state, None);
+    }
+
+    #[test]
+    fn args_history_uses_top_level_agent_db_default() {
+        let args = Args::parse_from([
+            "nuillu-server",
+            "--agent-db",
+            ".tmp/top-agent.db",
+            "history",
+        ]);
+
+        let Some(Command::History(history)) = &args.command else {
+            panic!("expected history subcommand");
+        };
+        assert_eq!(
+            resolve_history_agent_db_path(
+                history.state.as_deref(),
+                history.agent_db.as_deref(),
+                &args.run.state,
+                args.run.agent_db.as_deref(),
+            ),
+            PathBuf::from(".tmp/top-agent.db")
+        );
+    }
+
+    #[test]
+    fn args_history_agent_db_overrides_top_level_agent_db() {
+        let args = Args::parse_from([
+            "nuillu-server",
+            "--agent-db",
+            ".tmp/top-agent.db",
+            "history",
+            "--agent-db",
+            ".tmp/history-agent.db",
+        ]);
+
+        let Some(Command::History(history)) = &args.command else {
+            panic!("expected history subcommand");
+        };
+        assert_eq!(
+            resolve_history_agent_db_path(
+                history.state.as_deref(),
+                history.agent_db.as_deref(),
+                &args.run.state,
+                args.run.agent_db.as_deref(),
+            ),
+            PathBuf::from(".tmp/history-agent.db")
+        );
     }
 }

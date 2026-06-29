@@ -414,7 +414,7 @@ async fn connect_agent_store(config: &ServerConfig) -> anyhow::Result<LibsqlAgen
     }
     LibsqlAgentStore::connect(
         LibsqlAgentStoreConfig::local(
-            config.state_dir.join(AGENT_DB_FILE),
+            config.agent_db_path.clone(),
             memory_dimensions,
             policy_dimensions,
         )
@@ -976,6 +976,7 @@ mod tests {
     fn server_llm_log_context_uses_session_id_namespace() {
         let config = ServerConfig {
             state_dir: PathBuf::from(".tmp/server"),
+            agent_db_path: PathBuf::from(".tmp/server/agent.db"),
             session_id: "session-1".to_string(),
             llm_log_root: PathBuf::from("llm-logs"),
             cheap_backend: test_backend_config(),

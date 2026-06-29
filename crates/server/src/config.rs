@@ -22,6 +22,7 @@ use crate::model_set::ReasoningEffort;
 #[derive(Debug, Clone)]
 pub struct ServerConfig {
     pub state_dir: PathBuf,
+    pub agent_db_path: PathBuf,
     pub session_id: String,
     pub llm_log_root: PathBuf,
     pub cheap_backend: LlmBackendConfig,
