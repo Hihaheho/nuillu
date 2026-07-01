@@ -10,7 +10,9 @@ use lutum::{
     ErasedTextTurnEvent, LutumHooksSet, LutumStreamEvent, ModelInputHookContext, OnModelInput,
     OnStreamEvent, OperationKind, RequestExtensions, StreamEventHookContext, Usage,
 };
-use lutum_libsql_adapter::{LibsqlLlmTranscriptStore, NewLlmTranscriptTurn};
+use lutum_libsql_adapter::{
+    LibsqlLlmTranscriptStore, LlmTranscriptTurnRecord, NewLlmTranscriptTurn,
+};
 use nuillu_module::{LlmRequestMetadata, ModuleSessionMetadata};
 use nuillu_types::ModuleInstanceId;
 use nuillu_visualizer_protocol::{
@@ -24,7 +26,7 @@ use crate::llm_observer::{
     model_input_views, observation_source, operation_kind_label, usage_view,
 };
 
-const LLM_TRANSCRIPT_RETAINED_TURNS: usize = 200;
+const LLM_TRANSCRIPT_BOOTSTRAP_TURNS: usize = 200;
 const SUPERSEDED_TRACE_MESSAGE: &str =
     "superseded by a new LLM model input before terminal stream event";
 
@@ -272,14 +274,6 @@ impl DbLlmTraceSink {
             tracing::warn!(?error, "failed to persist completed LLM trace");
             return;
         }
-        if let Err(error) = self
-            .inner
-            .store
-            .prune_completed_turns(LLM_TRANSCRIPT_RETAINED_TURNS)
-            .await
-        {
-            tracing::warn!(?error, "failed to prune completed LLM traces");
-        }
     }
 
     pub async fn mark_activation_attempt_failed(
@@ -365,7 +359,7 @@ pub async fn emit_persisted_llm_transcripts(
     visualizer: &VisualizerEventSink,
 ) {
     let records = match store
-        .recent_completed_turns(LLM_TRANSCRIPT_RETAINED_TURNS)
+        .recent_completed_turns(LLM_TRANSCRIPT_BOOTSTRAP_TURNS)
         .await
     {
         Ok(records) => records,
@@ -377,15 +371,28 @@ pub async fn emit_persisted_llm_transcripts(
     let tab_id = VisualizerTabId::new(tab_id.to_string());
     let mut turns = Vec::new();
     for record in records {
-        let Ok(trace) = serde_json::from_value::<CompletedTurnTrace>(record.trace_json) else {
-            tracing::warn!(id = record.id, "failed to parse persisted LLM transcript");
+        let Some(turn) = transcript_turn_view_from_record(record) else {
             continue;
         };
-        turns.push(trace.to_transcript_turn_view(format!("server-persisted-{}", record.id)));
+        turns.push(turn);
     }
     if !turns.is_empty() {
         visualizer.send(VisualizerEvent::LlmTranscriptSnapshot { tab_id, turns });
     }
+}
+
+pub(crate) fn transcript_turn_view_from_record(
+    record: LlmTranscriptTurnRecord,
+) -> Option<LlmTranscriptTurnView> {
+    let id = record.id;
+    let trace = match serde_json::from_value::<CompletedTurnTrace>(record.trace_json) {
+        Ok(trace) => trace,
+        Err(error) => {
+            tracing::warn!(id, ?error, "failed to parse persisted LLM transcript");
+            return None;
+        }
+    };
+    Some(trace.to_transcript_turn_view(format!("server-persisted-{id}")))
 }
 
 impl CompletedTurnTrace {

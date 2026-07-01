@@ -19,6 +19,8 @@ const MEDIUM_FIELD_WIDTH: f32 = 150.0;
 const LONG_FIELD_WIDTH: f32 = 260.0;
 const PREVIEW_MODALITY_WIDTH: f32 = 96.0;
 const PREVIEW_CONTENT_WIDTH: f32 = 560.0;
+const ACTIVITY_ROW_RETAINED: usize = 512;
+const ACTIVITY_HISTORY_PAGE_SIZE: usize = 200;
 
 const ATMOSPHERE_ASPECTS: [&str; 6] = [
     "light",
@@ -102,8 +104,24 @@ pub struct SceneUiState {
     ambient_sensory_rows: BTreeMap<i64, AmbientSensorySnapshotRowView>,
     utterance_event_rows: BTreeMap<i64, UtteranceEventRowView>,
     external_action_event_rows: BTreeMap<i64, ExternalActionEventRowView>,
+    activity_rows_omitted: bool,
+    full_history: ActivityHistoryState,
     selected_person_message_row_id: Option<String>,
     person_message_draft: String,
+}
+
+#[derive(Debug, Default)]
+struct ActivityHistoryState {
+    open: bool,
+    requested_initial_load: bool,
+    loading: bool,
+    has_more: bool,
+    next_offset: usize,
+    activity: Vec<ActivityMessage>,
+    one_shot_sensory_rows: BTreeMap<i64, OneShotSensoryInputRowView>,
+    ambient_sensory_rows: BTreeMap<i64, AmbientSensorySnapshotRowView>,
+    utterance_event_rows: BTreeMap<i64, UtteranceEventRowView>,
+    external_action_event_rows: BTreeMap<i64, ExternalActionEventRowView>,
 }
 
 impl SceneUiState {
@@ -281,11 +299,15 @@ impl SceneUiState {
 
     pub fn apply_one_shot_sensory_input_rows(&mut self, rows: Vec<OneShotSensoryInputRowView>) {
         self.one_shot_sensory_rows = rows.into_iter().map(|row| (row.id, row)).collect();
+        self.activity_rows_omitted |=
+            prune_recent_rows(&mut self.one_shot_sensory_rows, ACTIVITY_ROW_RETAINED);
         self.rebuild_activity_from_raw_rows();
     }
 
     pub fn append_one_shot_sensory_input_row(&mut self, row: OneShotSensoryInputRowView) {
         self.one_shot_sensory_rows.insert(row.id, row);
+        self.activity_rows_omitted |=
+            prune_recent_rows(&mut self.one_shot_sensory_rows, ACTIVITY_ROW_RETAINED);
         self.rebuild_activity_from_raw_rows();
     }
 
@@ -294,37 +316,89 @@ impl SceneUiState {
         rows: Vec<AmbientSensorySnapshotRowView>,
     ) {
         self.ambient_sensory_rows = rows.into_iter().map(|row| (row.id, row)).collect();
+        self.activity_rows_omitted |=
+            prune_recent_rows(&mut self.ambient_sensory_rows, ACTIVITY_ROW_RETAINED);
         self.rebuild_activity_from_raw_rows();
     }
 
     pub fn append_ambient_sensory_snapshot_row(&mut self, row: AmbientSensorySnapshotRowView) {
         self.ambient_sensory_rows.insert(row.id, row);
+        self.activity_rows_omitted |=
+            prune_recent_rows(&mut self.ambient_sensory_rows, ACTIVITY_ROW_RETAINED);
         self.rebuild_activity_from_raw_rows();
     }
 
     pub fn apply_utterance_event_rows(&mut self, rows: Vec<UtteranceEventRowView>) {
         self.utterance_event_rows = rows.into_iter().map(|row| (row.id, row)).collect();
+        self.activity_rows_omitted |=
+            prune_recent_rows(&mut self.utterance_event_rows, ACTIVITY_ROW_RETAINED);
         self.rebuild_activity_from_raw_rows();
     }
 
     pub fn append_utterance_event_row(&mut self, row: UtteranceEventRowView) {
         self.utterance_event_rows.insert(row.id, row);
+        self.activity_rows_omitted |=
+            prune_recent_rows(&mut self.utterance_event_rows, ACTIVITY_ROW_RETAINED);
         self.rebuild_activity_from_raw_rows();
     }
 
     pub fn apply_external_action_event_rows(&mut self, rows: Vec<ExternalActionEventRowView>) {
         self.external_action_event_rows = rows.into_iter().map(|row| (row.id, row)).collect();
+        self.activity_rows_omitted |=
+            prune_recent_rows(&mut self.external_action_event_rows, ACTIVITY_ROW_RETAINED);
         self.rebuild_activity_from_raw_rows();
     }
 
     pub fn append_external_action_event_row(&mut self, row: ExternalActionEventRowView) {
         self.external_action_event_rows.insert(row.id, row);
+        self.activity_rows_omitted |=
+            prune_recent_rows(&mut self.external_action_event_rows, ACTIVITY_ROW_RETAINED);
         self.rebuild_activity_from_raw_rows();
     }
 
     pub fn update_external_action_event_row(&mut self, row: ExternalActionEventRowView) {
         self.external_action_event_rows.insert(row.id, row);
+        self.activity_rows_omitted |=
+            prune_recent_rows(&mut self.external_action_event_rows, ACTIVITY_ROW_RETAINED);
         self.rebuild_activity_from_raw_rows();
+    }
+
+    pub fn apply_activity_rows_loaded(
+        &mut self,
+        offset: usize,
+        one_shot_rows: Vec<OneShotSensoryInputRowView>,
+        ambient_rows: Vec<AmbientSensorySnapshotRowView>,
+        utterance_rows: Vec<UtteranceEventRowView>,
+        external_action_rows: Vec<ExternalActionEventRowView>,
+        has_more: bool,
+    ) {
+        if !self.full_history.open {
+            return;
+        }
+        self.full_history.loading = false;
+        if offset == 0 {
+            self.full_history.one_shot_sensory_rows.clear();
+            self.full_history.ambient_sensory_rows.clear();
+            self.full_history.utterance_event_rows.clear();
+            self.full_history.external_action_event_rows.clear();
+        } else if offset != self.full_history.next_offset {
+            return;
+        }
+        self.full_history
+            .one_shot_sensory_rows
+            .extend(one_shot_rows.into_iter().map(|row| (row.id, row)));
+        self.full_history
+            .ambient_sensory_rows
+            .extend(ambient_rows.into_iter().map(|row| (row.id, row)));
+        self.full_history
+            .utterance_event_rows
+            .extend(utterance_rows.into_iter().map(|row| (row.id, row)));
+        self.full_history
+            .external_action_event_rows
+            .extend(external_action_rows.into_iter().map(|row| (row.id, row)));
+        self.full_history.has_more = has_more;
+        self.full_history.next_offset = offset.saturating_add(ACTIVITY_HISTORY_PAGE_SIZE);
+        self.rebuild_full_history_activity();
     }
 
     fn rebuild_activity_from_raw_rows(&mut self) {
@@ -332,91 +406,154 @@ impl SceneUiState {
         self.activity.clear();
         self.streaming_utterances.clear();
         self.completed_utterances.clear();
+        rebuild_activity_messages(
+            &mut self.activity,
+            &mut self.streaming_utterances,
+            &mut self.completed_utterances,
+            &self.one_shot_sensory_rows,
+            &self.ambient_sensory_rows,
+            &self.utterance_event_rows,
+            &self.external_action_event_rows,
+        );
+    }
 
-        let mut utterance_messages = BTreeMap::<UtteranceKey, Vec<usize>>::new();
-        let mut ambient_baseline: Option<BTreeMap<String, AmbientSensoryEntry>> = None;
-        let mut rows = Vec::new();
-        rows.extend(
-            self.one_shot_sensory_rows
-                .values()
-                .map(ActivitySourceRow::OneShot),
+    fn rebuild_full_history_activity(&mut self) {
+        let mut streaming_utterances = BTreeMap::new();
+        let mut completed_utterances = BTreeMap::new();
+        self.full_history.activity.clear();
+        rebuild_activity_messages(
+            &mut self.full_history.activity,
+            &mut streaming_utterances,
+            &mut completed_utterances,
+            &self.full_history.one_shot_sensory_rows,
+            &self.full_history.ambient_sensory_rows,
+            &self.full_history.utterance_event_rows,
+            &self.full_history.external_action_event_rows,
         );
-        rows.extend(
-            self.ambient_sensory_rows
-                .values()
-                .map(ActivitySourceRow::Ambient),
-        );
-        rows.extend(
-            self.utterance_event_rows
-                .values()
-                .map(ActivitySourceRow::Utterance),
-        );
-        rows.extend(
-            self.external_action_event_rows
-                .values()
-                .map(ActivitySourceRow::ExternalAction),
-        );
-        rows.sort_by_key(ActivitySourceRow::sort_key);
+    }
 
-        for row in rows {
-            match row {
-                ActivitySourceRow::OneShot(row) => {
-                    interrupt_streaming_messages(
-                        &mut self.activity,
-                        &mut self.streaming_utterances,
-                    );
-                    let mut message = ActivityMessage::new(ActivityRole::User, row.content.clone());
-                    message.id = Some(format!("one-shot:{}", row.id));
-                    message.source = Some(one_shot_source(row));
-                    self.activity.push(message);
-                }
-                ActivitySourceRow::Ambient(row) => {
-                    let current = ambient_entry_map(&row.entries);
-                    if let Some(previous) = &ambient_baseline {
-                        if let Some(content) = ambient_diff_content(previous, &current) {
-                            interrupt_streaming_messages(
-                                &mut self.activity,
-                                &mut self.streaming_utterances,
-                            );
-                            let mut message =
-                                ActivityMessage::new(ActivityRole::Environment, content);
-                            message.id = Some(format!("ambient:{}", row.id));
-                            message.source = Some(format!(
-                                "ambient snapshot at {}",
-                                format_jst_datetime(row.observed_at)
-                            ));
-                            self.activity.push(message);
-                        }
+    fn request_full_history_page(
+        &mut self,
+        tab_id: &VisualizerTabId,
+        commands: &Sender<VisualizerClientMessage>,
+    ) {
+        if self.full_history.loading {
+            return;
+        }
+        self.full_history.open = true;
+        self.full_history.requested_initial_load = true;
+        self.full_history.loading = true;
+        let _ = commands.send(VisualizerClientMessage::Command {
+            command: VisualizerCommand::LoadActivityRows {
+                tab_id: tab_id.clone(),
+                offset: self.full_history.next_offset,
+                limit: ACTIVITY_HISTORY_PAGE_SIZE,
+            },
+        });
+    }
+
+    fn close_full_history(&mut self) {
+        self.full_history = ActivityHistoryState::default();
+    }
+
+    fn open_full_history(
+        &mut self,
+        tab_id: &VisualizerTabId,
+        commands: &Sender<VisualizerClientMessage>,
+    ) {
+        if !self.full_history.open {
+            self.full_history.open = true;
+            self.full_history.next_offset = 0;
+            self.full_history.has_more = true;
+            self.request_full_history_page(tab_id, commands);
+        }
+    }
+}
+
+fn rebuild_activity_messages(
+    activity: &mut Vec<ActivityMessage>,
+    streaming_utterances: &mut BTreeMap<UtteranceKey, usize>,
+    completed_utterances: &mut BTreeMap<UtteranceKey, usize>,
+    one_shot_sensory_rows: &BTreeMap<i64, OneShotSensoryInputRowView>,
+    ambient_sensory_rows: &BTreeMap<i64, AmbientSensorySnapshotRowView>,
+    utterance_event_rows: &BTreeMap<i64, UtteranceEventRowView>,
+    external_action_event_rows: &BTreeMap<i64, ExternalActionEventRowView>,
+) {
+    let mut utterance_messages = BTreeMap::<UtteranceKey, Vec<usize>>::new();
+    let mut ambient_baseline: Option<BTreeMap<String, AmbientSensoryEntry>> = None;
+    let mut rows = Vec::new();
+    rows.extend(
+        one_shot_sensory_rows
+            .values()
+            .map(ActivitySourceRow::OneShot),
+    );
+    rows.extend(
+        ambient_sensory_rows
+            .values()
+            .map(ActivitySourceRow::Ambient),
+    );
+    rows.extend(
+        utterance_event_rows
+            .values()
+            .map(ActivitySourceRow::Utterance),
+    );
+    rows.extend(
+        external_action_event_rows
+            .values()
+            .map(ActivitySourceRow::ExternalAction),
+    );
+    rows.sort_by_key(ActivitySourceRow::sort_key);
+
+    for row in rows {
+        match row {
+            ActivitySourceRow::OneShot(row) => {
+                interrupt_streaming_messages(activity, streaming_utterances);
+                let mut message = ActivityMessage::new(ActivityRole::User, row.content.clone());
+                message.id = Some(format!("one-shot:{}", row.id));
+                message.source = Some(one_shot_source(row));
+                activity.push(message);
+            }
+            ActivitySourceRow::Ambient(row) => {
+                let current = ambient_entry_map(&row.entries);
+                if let Some(previous) = &ambient_baseline {
+                    if let Some(content) = ambient_diff_content(previous, &current) {
+                        interrupt_streaming_messages(activity, streaming_utterances);
+                        let mut message = ActivityMessage::new(ActivityRole::Environment, content);
+                        message.id = Some(format!("ambient:{}", row.id));
+                        message.source = Some(format!(
+                            "ambient snapshot at {}",
+                            format_jst_datetime(row.observed_at)
+                        ));
+                        activity.push(message);
                     }
-                    ambient_baseline = Some(current);
                 }
-                ActivitySourceRow::Utterance(row) => apply_utterance_event_row(
-                    &mut self.activity,
-                    &mut self.streaming_utterances,
-                    &mut self.completed_utterances,
-                    &mut utterance_messages,
-                    row,
-                ),
-                ActivitySourceRow::ExternalAction(row) => {
-                    interrupt_streaming_messages(
-                        &mut self.activity,
-                        &mut self.streaming_utterances,
-                    );
-                    let mut message =
-                        ActivityMessage::new(ActivityRole::Action, external_action_content(row));
-                    message.id = Some(format!("external-action:{}", row.id));
-                    message.source = Some(format!(
-                        "{} invoked by {} at {}",
-                        row.action_id,
-                        row.invoked_by,
-                        format_jst_datetime(row.requested_at)
-                    ));
-                    self.activity.push(message);
-                }
+                ambient_baseline = Some(current);
+            }
+            ActivitySourceRow::Utterance(row) => apply_utterance_event_row(
+                activity,
+                streaming_utterances,
+                completed_utterances,
+                &mut utterance_messages,
+                row,
+            ),
+            ActivitySourceRow::ExternalAction(row) => {
+                interrupt_streaming_messages(activity, streaming_utterances);
+                let mut message =
+                    ActivityMessage::new(ActivityRole::Action, external_action_content(row));
+                message.id = Some(format!("external-action:{}", row.id));
+                message.source = Some(format!(
+                    "{} invoked by {} at {}",
+                    row.action_id,
+                    row.invoked_by,
+                    format_jst_datetime(row.requested_at)
+                ));
+                activity.push(message);
             }
         }
     }
+}
 
+impl SceneUiState {
     fn send_person_message_commands(
         &mut self,
         tab_id: &VisualizerTabId,
@@ -449,6 +586,18 @@ impl SceneUiState {
         }
         self.selected_person_message_row_id = next_selection;
     }
+}
+
+fn prune_recent_rows<T>(rows: &mut BTreeMap<i64, T>, retain: usize) -> bool {
+    let mut pruned = false;
+    while rows.len() > retain {
+        let Some(id) = rows.keys().next().copied() else {
+            break;
+        };
+        rows.remove(&id);
+        pruned = true;
+    }
+    pruned
 }
 
 fn selected_person_message_row_id(
@@ -704,7 +853,7 @@ pub fn ui(
     ui.allocate_ui_with_layout(
         egui::vec2(width, activity_height),
         egui::Layout::top_down(egui::Align::Min),
-        |ui| activity_ui(ui, &state.activity),
+        |ui| activity_ui(ui, tab_id, state, commands),
     );
     ui.add_space(SCENE_ROW_GAP);
     ui.allocate_ui_with_layout(
@@ -999,8 +1148,55 @@ fn derived_ambient_ui(ui: &mut egui::Ui, rows: &[DerivedAmbientSensoryRowView]) 
     });
 }
 
-fn activity_ui(ui: &mut egui::Ui, activity: &[ActivityMessage]) {
-    ui.strong(ui.ctx().tr("scene-recent-activity"));
+fn activity_ui(
+    ui: &mut egui::Ui,
+    tab_id: &VisualizerTabId,
+    state: &mut SceneUiState,
+    commands: &Sender<VisualizerClientMessage>,
+) {
+    if state.full_history.open
+        && !state.full_history.requested_initial_load
+        && !state.full_history.loading
+    {
+        state.request_full_history_page(tab_id, commands);
+    }
+
+    let full_history_open = state.full_history.open;
+    ui.horizontal_wrapped(|ui| {
+        ui.strong(if full_history_open {
+            ui.ctx().tr("scene-activity-history")
+        } else {
+            ui.ctx().tr("scene-recent-activity")
+        });
+        if full_history_open {
+            if ui.button(ui.ctx().tr("scene-recent-activity")).clicked() {
+                state.close_full_history();
+            }
+            if state.full_history.has_more
+                && ui
+                    .add_enabled(
+                        !state.full_history.loading,
+                        egui::Button::new(ui.ctx().tr("scene-load-more-activity")),
+                    )
+                    .clicked()
+            {
+                state.request_full_history_page(tab_id, commands);
+            }
+            if state.full_history.loading {
+                ui.label(ui.ctx().tr("memory-loading"));
+            }
+        } else if state.activity_rows_omitted {
+            ui.label(ui.ctx().tr("scene-activity-omitted"));
+            if ui.button(ui.ctx().tr("scene-show-all-activity")).clicked() {
+                state.open_full_history(tab_id, commands);
+            }
+        }
+    });
+    let activity = if full_history_open {
+        &state.full_history.activity
+    } else {
+        &state.activity
+    };
     egui::ScrollArea::vertical()
         .id_salt("scene-activity")
         .stick_to_bottom(true)
@@ -1737,6 +1933,48 @@ mod tests {
             state.activity[2].content,
             "The poet action recorded a poem."
         );
+    }
+
+    #[test]
+    fn recent_activity_rows_are_pruned_and_mark_omitted() {
+        let mut state = SceneUiState::default();
+        for id in 0..(ACTIVITY_ROW_RETAINED + 1) {
+            state.append_one_shot_sensory_input_row(one_shot_row(
+                id as i64,
+                (id % 60) as u32,
+                &format!("message {id}"),
+            ));
+        }
+
+        assert_eq!(state.one_shot_sensory_rows.len(), ACTIVITY_ROW_RETAINED);
+        assert!(state.activity_rows_omitted);
+        assert!(!state.one_shot_sensory_rows.contains_key(&0));
+        assert!(
+            state
+                .one_shot_sensory_rows
+                .contains_key(&(ACTIVITY_ROW_RETAINED as i64))
+        );
+    }
+
+    #[test]
+    fn full_activity_page_does_not_grow_recent_activity_state() {
+        let mut state = SceneUiState::default();
+        state.append_one_shot_sensory_input_row(one_shot_row(1, 1, "recent"));
+        state.full_history.open = true;
+
+        state.apply_activity_rows_loaded(
+            0,
+            vec![one_shot_row(2, 2, "history")],
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            false,
+        );
+
+        assert_eq!(state.one_shot_sensory_rows.len(), 1);
+        assert_eq!(state.activity.len(), 1);
+        assert_eq!(state.full_history.one_shot_sensory_rows.len(), 1);
+        assert_eq!(state.full_history.activity.len(), 1);
     }
 
     fn scene_with_two_people() -> SceneUiState {

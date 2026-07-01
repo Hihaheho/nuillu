@@ -1,8 +1,8 @@
 use std::time::Duration;
 
 use nuillu_blackboard::{
-    Blackboard, BlackboardInner, InteroceptiveMode, InteroceptiveState, ResourceAllocation,
-    ZeroReplicaWindowPolicy,
+    Blackboard, BlackboardInner, InteroceptiveMode, InteroceptiveState, MemoryMetadata,
+    ResourceAllocation, ZeroReplicaWindowPolicy,
 };
 use nuillu_memory::{LinkedMemoryRecord, MemoryRecord};
 use nuillu_types::MemoryRank;
@@ -14,6 +14,8 @@ use nuillu_visualizer_protocol::{
 };
 
 use super::gui::VisualizerHook;
+
+const VISUALIZER_MEMORY_METADATA_LIMIT: usize = 512;
 
 pub(crate) async fn emit_visualizer_blackboard_snapshot(
     tab_id: &str,
@@ -215,9 +217,14 @@ pub fn zero_replica_window_view(policy: ZeroReplicaWindowPolicy) -> ZeroReplicaW
 }
 
 pub fn memory_metadata_views(bb: &BlackboardInner) -> Vec<MemoryMetadataView> {
-    let mut memory_metadata = bb
-        .memory_metadata()
-        .iter()
+    let mut memory_metadata = bb.memory_metadata().iter().collect::<Vec<_>>();
+    memory_metadata.sort_by(|(left_index, left), (right_index, right)| {
+        memory_metadata_activity_order(left_index.as_str(), left, right_index.as_str(), right)
+    });
+    memory_metadata.truncate(VISUALIZER_MEMORY_METADATA_LIMIT);
+
+    let mut memory_metadata = memory_metadata
+        .into_iter()
         .map(|(index, metadata)| MemoryMetadataView {
             index: index.as_str().to_owned(),
             rank: memory_rank_name(metadata.rank).to_owned(),
@@ -230,6 +237,24 @@ pub fn memory_metadata_views(bb: &BlackboardInner) -> Vec<MemoryMetadataView> {
         .collect::<Vec<_>>();
     memory_metadata.sort_by(|left, right| left.index.cmp(&right.index));
     memory_metadata
+}
+
+fn memory_metadata_activity_order(
+    left_index: &str,
+    left: &MemoryMetadata,
+    right_index: &str,
+    right: &MemoryMetadata,
+) -> std::cmp::Ordering {
+    right
+        .last_reinforced_at
+        .cmp(&left.last_reinforced_at)
+        .then_with(|| right.last_used.cmp(&left.last_used))
+        .then_with(|| right.last_accessed.cmp(&left.last_accessed))
+        .then_with(|| right.occurred_at.cmp(&left.occurred_at))
+        .then_with(|| right.reinforcement_count.cmp(&left.reinforcement_count))
+        .then_with(|| right.use_count.cmp(&left.use_count))
+        .then_with(|| right.access_count.cmp(&left.access_count))
+        .then_with(|| left_index.cmp(right_index))
 }
 
 pub fn memory_rank_name(rank: MemoryRank) -> &'static str {
@@ -249,7 +274,8 @@ pub fn duration_millis_u64(duration: Duration) -> u64 {
 #[cfg(test)]
 mod tests {
     use chrono::{DateTime, Utc};
-    use nuillu_blackboard::{BlackboardCommand, InteroceptivePatch};
+    use nuillu_blackboard::{BlackboardCommand, InteroceptivePatch, MemoryMetaPatch};
+    use nuillu_types::MemoryIndex;
 
     use super::*;
 
@@ -286,6 +312,44 @@ mod tests {
                 emotion: "drowsy".to_string(),
                 last_updated: now,
             }
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn visualizer_snapshot_caps_memory_metadata_to_recent_activity() {
+        let blackboard = Blackboard::new();
+        let base = DateTime::<Utc>::from_timestamp(100, 0).unwrap();
+        let total = VISUALIZER_MEMORY_METADATA_LIMIT + 2;
+        for index in 0..total {
+            blackboard
+                .apply(BlackboardCommand::UpsertMemoryMetadata {
+                    index: MemoryIndex::new(format!("memory-{index:04}")),
+                    rank_if_new: MemoryRank::ShortTerm,
+                    occurred_at_if_new: Some(base + chrono::Duration::seconds(index as i64)),
+                    decay_if_new_secs: 0,
+                    now: base + chrono::Duration::seconds(index as i64),
+                    patch: MemoryMetaPatch::default(),
+                })
+                .await;
+        }
+
+        let snapshot = blackboard.read(visualizer_blackboard_snapshot).await;
+
+        assert_eq!(
+            snapshot.memory_metadata.len(),
+            VISUALIZER_MEMORY_METADATA_LIMIT
+        );
+        assert!(
+            snapshot
+                .memory_metadata
+                .iter()
+                .all(|memory| memory.index != "memory-0000" && memory.index != "memory-0001")
+        );
+        assert!(
+            snapshot
+                .memory_metadata
+                .iter()
+                .any(|memory| memory.index == format!("memory-{:04}", total - 1))
         );
     }
 }

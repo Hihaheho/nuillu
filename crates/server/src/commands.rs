@@ -26,6 +26,7 @@ use crate::SERVER_TAB_ID;
 use crate::config::ServerBootConfig;
 use crate::environment::ServerEnvironment;
 use crate::gui::VisualizerHook;
+use crate::llm_db_trace::transcript_turn_view_from_record;
 use crate::runtime::set_runtime_running;
 use crate::snapshot::{
     emit_visualizer_blackboard_snapshot, linked_memory_record_view, memory_record_view,
@@ -412,6 +413,61 @@ async fn handle_server_visualizer_message(
             }
             false
         }
+        VisualizerCommand::LoadActivityRows {
+            tab_id: command_tab,
+            offset,
+            limit,
+        } if command_tab == *tab_id => {
+            match load_activity_rows(env, offset, limit).await {
+                Ok((
+                    one_shot_rows,
+                    ambient_rows,
+                    utterance_rows,
+                    external_action_rows,
+                    has_more,
+                )) => {
+                    visualizer.send_event(VisualizerEvent::ActivityRowsLoaded {
+                        tab_id: tab_id.clone(),
+                        offset,
+                        one_shot_rows,
+                        ambient_rows,
+                        utterance_rows,
+                        external_action_rows,
+                        has_more,
+                    });
+                }
+                Err(error) => {
+                    visualizer.send_event(VisualizerEvent::Log {
+                        tab_id: tab_id.clone(),
+                        message: format!("failed to load activity rows: {error}"),
+                    });
+                }
+            }
+            false
+        }
+        VisualizerCommand::LoadLlmTranscriptTurns {
+            tab_id: command_tab,
+            offset,
+            limit,
+        } if command_tab == *tab_id => {
+            match load_llm_transcript_turns(env, offset, limit).await {
+                Ok((turns, has_more)) => {
+                    visualizer.send_event(VisualizerEvent::LlmTranscriptTurnsLoaded {
+                        tab_id: tab_id.clone(),
+                        offset,
+                        turns,
+                        has_more,
+                    });
+                }
+                Err(error) => {
+                    visualizer.send_event(VisualizerEvent::Log {
+                        tab_id: tab_id.clone(),
+                        message: format!("failed to load LLM transcript turns: {error}"),
+                    });
+                }
+            }
+            false
+        }
         VisualizerCommand::LoadMemoryRecords {
             tab_id: command_tab,
             scope,
@@ -598,6 +654,87 @@ async fn load_memory_records(
         records.into_iter().map(memory_record_view).collect(),
         has_more,
     ))
+}
+
+async fn load_activity_rows(
+    env: &ServerEnvironment,
+    offset: usize,
+    limit: usize,
+) -> anyhow::Result<(
+    Vec<OneShotSensoryInputRowView>,
+    Vec<AmbientSensorySnapshotRowView>,
+    Vec<UtteranceEventRowView>,
+    Vec<ExternalActionEventRowView>,
+    bool,
+)> {
+    if limit == 0 {
+        return Ok((Vec::new(), Vec::new(), Vec::new(), Vec::new(), false));
+    }
+    let fetch_limit = limit.saturating_add(1);
+    let (one_shot_rows, one_shot_more) = trim_chunk(
+        env.one_shot_sensory_input_store
+            .recent_page(offset, fetch_limit)
+            .await?,
+        limit,
+    );
+    let (ambient_rows, ambient_more) = trim_chunk(
+        env.ambient_sensory_snapshot_store
+            .recent_page(offset, fetch_limit)
+            .await?,
+        limit,
+    );
+    let (utterance_rows, utterance_more) = trim_chunk(
+        env.utterance_event_store
+            .recent_page(offset, fetch_limit)
+            .await?,
+        limit,
+    );
+    let (external_action_rows, external_action_more) = trim_chunk(
+        env.external_action_event_store
+            .recent_page(offset, fetch_limit)
+            .await?,
+        limit,
+    );
+    Ok((
+        one_shot_rows
+            .into_iter()
+            .map(one_shot_sensory_input_row_view)
+            .collect(),
+        ambient_rows
+            .into_iter()
+            .map(ambient_sensory_snapshot_row_view)
+            .collect(),
+        utterance_rows
+            .into_iter()
+            .map(utterance_event_row_view)
+            .collect(),
+        external_action_rows
+            .into_iter()
+            .map(external_action_event_row_view)
+            .collect(),
+        one_shot_more || ambient_more || utterance_more || external_action_more,
+    ))
+}
+
+async fn load_llm_transcript_turns(
+    env: &ServerEnvironment,
+    offset: usize,
+    limit: usize,
+) -> anyhow::Result<(Vec<nuillu_visualizer_protocol::LlmTranscriptTurnView>, bool)> {
+    if limit == 0 {
+        return Ok((Vec::new(), false));
+    }
+    let fetch_limit = limit.saturating_add(1);
+    let records = env
+        .llm_transcript_store
+        .completed_turns_page(offset, fetch_limit)
+        .await?;
+    let (records, has_more) = trim_chunk(records, limit);
+    let turns = records
+        .into_iter()
+        .filter_map(transcript_turn_view_from_record)
+        .collect();
+    Ok((turns, has_more))
 }
 
 async fn load_linked_memory_records(

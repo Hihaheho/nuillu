@@ -42,6 +42,7 @@ const MAX_ZOOM_FACTOR: f32 = 2.0;
 const ZOOM_BUTTON_STEP_PERCENT: f32 = 1.0;
 const ZOOM_BUTTON_DOUBLE_CLICK_TOTAL_PERCENT: f32 = 10.0;
 const ZOOM_SYNC_EPSILON: f32 = 0.000_1;
+const SERVER_MESSAGES_PER_FRAME: usize = 256;
 
 pub struct VisualizerChannels {
     pub server_messages: Receiver<VisualizerServerMessage>,
@@ -91,12 +92,18 @@ impl VisualizerApp {
         ctx.install_i18n(self.i18n_catalog.for_locale(locale));
     }
 
-    fn drain_server_messages(&mut self) {
+    fn drain_server_messages(&mut self, ctx: &egui::Context) {
+        let mut drained = 0;
         loop {
+            if drained >= SERVER_MESSAGES_PER_FRAME {
+                ctx.request_repaint();
+                break;
+            }
             match self.server_messages.try_recv() {
                 Ok(message) => {
                     dispatch_agent_action_event(&message, &self.client_messages);
                     self.state.apply_server_message(message);
+                    drained += 1;
                 }
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => {
@@ -584,7 +591,7 @@ impl eframe::App for VisualizerApp {
         if !self.zoom_percent_input_focused && !self.zoom_percent_input_dirty {
             self.zoom_percent_input = format_zoom_percent(zoom_factor);
         }
-        self.drain_server_messages();
+        self.drain_server_messages(ui.ctx());
         ui.ctx()
             .request_repaint_after(std::time::Duration::from_millis(100));
 
@@ -951,6 +958,34 @@ impl VisualizerState {
                     .scene
                     .update_external_action_event_row(row);
             }
+            VisualizerEvent::ActivityRowsLoaded {
+                tab_id,
+                offset,
+                one_shot_rows,
+                ambient_rows,
+                utterance_rows,
+                external_action_rows,
+                has_more,
+            } => {
+                self.tab_mut(tab_id).scene.apply_activity_rows_loaded(
+                    offset,
+                    one_shot_rows,
+                    ambient_rows,
+                    utterance_rows,
+                    external_action_rows,
+                    has_more,
+                );
+            }
+            VisualizerEvent::LlmTranscriptTurnsLoaded {
+                tab_id,
+                offset,
+                turns,
+                has_more,
+            } => {
+                self.tab_mut(tab_id)
+                    .llm_transcript_history
+                    .apply_page(offset, turns, has_more);
+            }
             VisualizerEvent::RuntimeEvent { tab_id, event } => {
                 let tab = self.tab_mut(tab_id);
                 let now_secs = tab.resource_monitor_elapsed_secs();
@@ -1073,6 +1108,7 @@ pub struct RuntimeTab {
     blackboard: BlackboardSnapshot,
     memories: memories::MemoriesState,
     modules: modules::ModulesState,
+    llm_transcript_history: modules::LlmTranscriptHistoryState,
     resource_monitor: resource_monitor::ResourceMonitorState,
     runtime_events: VecDeque<RuntimeEvent>,
     errors: VecDeque<VisualizerErrorView>,
@@ -1131,6 +1167,7 @@ impl RuntimeTab {
             blackboard: BlackboardSnapshot::default(),
             memories: memories::MemoriesState::default(),
             modules: modules::ModulesState::default(),
+            llm_transcript_history: modules::LlmTranscriptHistoryState::default(),
             resource_monitor: resource_monitor::ResourceMonitorState::default(),
             runtime_events: VecDeque::new(),
             errors: VecDeque::new(),
@@ -1659,9 +1696,12 @@ impl RuntimeTab {
             .show(ui, |ui| {
                 modules::render_llm_turns(
                     ui,
+                    &self.id,
                     &self.modules,
+                    &mut self.llm_transcript_history,
                     &mut self.llm_turns_module_filter,
                     &llm_turns_filter_modules,
+                    commands,
                 )
             });
         self.record_window_open(llm_turns_id, open);

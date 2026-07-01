@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeMap,
     io::{self, BufRead, BufReader, BufWriter, ErrorKind, Write},
     net::{TcpListener, TcpStream, ToSocketAddrs},
     sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, TryRecvError},
@@ -252,6 +253,21 @@ pub enum VisualizerEvent {
         tab_id: VisualizerTabId,
         row: ExternalActionEventRowView,
     },
+    ActivityRowsLoaded {
+        tab_id: VisualizerTabId,
+        offset: usize,
+        one_shot_rows: Vec<OneShotSensoryInputRowView>,
+        ambient_rows: Vec<AmbientSensorySnapshotRowView>,
+        utterance_rows: Vec<UtteranceEventRowView>,
+        external_action_rows: Vec<ExternalActionEventRowView>,
+        has_more: bool,
+    },
+    LlmTranscriptTurnsLoaded {
+        tab_id: VisualizerTabId,
+        offset: usize,
+        turns: Vec<LlmTranscriptTurnView>,
+        has_more: bool,
+    },
     SceneState {
         tab_id: VisualizerTabId,
         state: SceneStateView,
@@ -336,6 +352,16 @@ pub enum VisualizerCommand {
     ResetModuleSessionHistory {
         tab_id: VisualizerTabId,
         owner: String,
+    },
+    LoadActivityRows {
+        tab_id: VisualizerTabId,
+        offset: usize,
+        limit: usize,
+    },
+    LoadLlmTranscriptTurns {
+        tab_id: VisualizerTabId,
+        offset: usize,
+        limit: usize,
     },
     LoadMemoryRecords {
         tab_id: VisualizerTabId,
@@ -1103,8 +1129,7 @@ impl VisualizerServerPort {
 
     pub fn from_stream(stream: TcpStream) -> Result<Self, VisualizerProtocolError> {
         stream.set_nonblocking(false)?;
-        let (incoming, outgoing) =
-            spawn_connection_threads::<VisualizerClientMessage, VisualizerServerMessage>(stream)?;
+        let (incoming, outgoing) = spawn_visualizer_server_connection_threads(stream)?;
         Ok(Self { incoming, outgoing })
     }
 
@@ -1198,6 +1223,58 @@ where
     let (incoming_tx, incoming_rx) = mpsc::channel();
     let (outgoing_tx, outgoing_rx) = mpsc::channel();
 
+    spawn_read_thread(read_stream, incoming_tx);
+
+    thread::spawn(move || {
+        let mut writer = BufWriter::new(write_stream);
+        while let Ok(message) = outgoing_rx.recv() {
+            if write_json_line(&mut writer, &message).is_err() {
+                eprintln!("visualizer protocol write loop ended: write failed");
+                break;
+            }
+        }
+        eprintln!("visualizer protocol write loop ended: sender dropped");
+    });
+
+    Ok((incoming_rx, outgoing_tx))
+}
+
+fn spawn_visualizer_server_connection_threads(
+    stream: TcpStream,
+) -> Result<
+    (
+        Receiver<VisualizerClientMessage>,
+        Sender<VisualizerServerMessage>,
+    ),
+    VisualizerProtocolError,
+> {
+    let read_stream = stream.try_clone()?;
+    let write_stream = stream;
+    let (incoming_tx, incoming_rx) = mpsc::channel();
+    let (outgoing_tx, outgoing_rx) = mpsc::channel();
+
+    spawn_read_thread(read_stream, incoming_tx);
+
+    thread::spawn(move || {
+        let mut writer = BufWriter::new(write_stream);
+        while let Ok(first_message) = outgoing_rx.recv() {
+            for message in coalesced_visualizer_server_messages(first_message, &outgoing_rx) {
+                if write_json_line(&mut writer, &message).is_err() {
+                    eprintln!("visualizer protocol write loop ended: write failed");
+                    return;
+                }
+            }
+        }
+        eprintln!("visualizer protocol write loop ended: sender dropped");
+    });
+
+    Ok((incoming_rx, outgoing_tx))
+}
+
+fn spawn_read_thread<Incoming>(read_stream: TcpStream, incoming_tx: Sender<Incoming>)
+where
+    Incoming: DeserializeOwned + Send + 'static,
+{
     thread::spawn(move || {
         let mut reader = BufReader::new(read_stream);
         loop {
@@ -1231,19 +1308,51 @@ where
             }
         }
     });
+}
 
-    thread::spawn(move || {
-        let mut writer = BufWriter::new(write_stream);
-        while let Ok(message) = outgoing_rx.recv() {
-            if write_json_line(&mut writer, &message).is_err() {
-                eprintln!("visualizer protocol write loop ended: write failed");
-                break;
-            }
+fn coalesced_visualizer_server_messages(
+    first_message: VisualizerServerMessage,
+    outgoing_rx: &Receiver<VisualizerServerMessage>,
+) -> Vec<VisualizerServerMessage> {
+    let mut messages = vec![first_message];
+    while let Ok(message) = outgoing_rx.try_recv() {
+        messages.push(message);
+    }
+
+    latest_blackboard_snapshots(messages)
+}
+
+fn latest_blackboard_snapshots(
+    messages: Vec<VisualizerServerMessage>,
+) -> Vec<VisualizerServerMessage> {
+    let mut latest_snapshot_indexes = BTreeMap::new();
+    for (index, message) in messages.iter().enumerate() {
+        if let Some(tab_id) = blackboard_snapshot_tab_id(message) {
+            latest_snapshot_indexes.insert(tab_id.clone(), index);
         }
-        eprintln!("visualizer protocol write loop ended: sender dropped");
-    });
+    }
 
-    Ok((incoming_rx, outgoing_tx))
+    messages
+        .into_iter()
+        .enumerate()
+        .filter_map(|(index, message)| {
+            if let Some(tab_id) = blackboard_snapshot_tab_id(&message)
+                && latest_snapshot_indexes.get(tab_id) != Some(&index)
+            {
+                return None;
+            }
+            Some(message)
+        })
+        .collect()
+}
+
+fn blackboard_snapshot_tab_id(message: &VisualizerServerMessage) -> Option<&VisualizerTabId> {
+    match message {
+        VisualizerServerMessage::Event {
+            event: VisualizerEvent::BlackboardSnapshot { tab_id, .. },
+        } => Some(tab_id),
+        _ => None,
+    }
 }
 
 fn write_json_line(
@@ -1687,6 +1796,92 @@ mod tests {
     }
 
     #[test]
+    fn history_page_commands_and_events_round_trip_through_json() {
+        let tab_id = VisualizerTabId::new("live");
+        let activity_command = VisualizerClientMessage::Command {
+            command: VisualizerCommand::LoadActivityRows {
+                tab_id: tab_id.clone(),
+                offset: 200,
+                limit: 50,
+            },
+        };
+        let transcript_command = VisualizerClientMessage::Command {
+            command: VisualizerCommand::LoadLlmTranscriptTurns {
+                tab_id: tab_id.clone(),
+                offset: 400,
+                limit: 25,
+            },
+        };
+
+        let actual: VisualizerClientMessage =
+            serde_json::from_str(&serde_json::to_string(&activity_command).unwrap()).unwrap();
+        assert!(matches!(
+            actual,
+            VisualizerClientMessage::Command {
+                command: VisualizerCommand::LoadActivityRows {
+                    offset: 200,
+                    limit: 50,
+                    ..
+                },
+            }
+        ));
+        let actual: VisualizerClientMessage =
+            serde_json::from_str(&serde_json::to_string(&transcript_command).unwrap()).unwrap();
+        assert!(matches!(
+            actual,
+            VisualizerClientMessage::Command {
+                command: VisualizerCommand::LoadLlmTranscriptTurns {
+                    offset: 400,
+                    limit: 25,
+                    ..
+                },
+            }
+        ));
+
+        let activity_event = VisualizerServerMessage::event(VisualizerEvent::ActivityRowsLoaded {
+            tab_id: tab_id.clone(),
+            offset: 200,
+            one_shot_rows: Vec::new(),
+            ambient_rows: Vec::new(),
+            utterance_rows: Vec::new(),
+            external_action_rows: Vec::new(),
+            has_more: true,
+        });
+        let transcript_event =
+            VisualizerServerMessage::event(VisualizerEvent::LlmTranscriptTurnsLoaded {
+                tab_id,
+                offset: 400,
+                turns: Vec::new(),
+                has_more: false,
+            });
+
+        let actual: VisualizerServerMessage =
+            serde_json::from_str(&serde_json::to_string(&activity_event).unwrap()).unwrap();
+        assert!(matches!(
+            actual,
+            VisualizerServerMessage::Event {
+                event: VisualizerEvent::ActivityRowsLoaded {
+                    offset: 200,
+                    has_more: true,
+                    ..
+                },
+            }
+        ));
+        let actual: VisualizerServerMessage =
+            serde_json::from_str(&serde_json::to_string(&transcript_event).unwrap()).unwrap();
+        assert!(matches!(
+            actual,
+            VisualizerServerMessage::Event {
+                event: VisualizerEvent::LlmTranscriptTurnsLoaded {
+                    offset: 400,
+                    has_more: false,
+                    ..
+                },
+            }
+        ));
+    }
+
+    #[test]
     fn blackboard_snapshot_defaults_missing_interoception() {
         let json = r#"{
             "module_statuses": [],
@@ -1700,6 +1895,54 @@ mod tests {
         let actual: BlackboardSnapshot = serde_json::from_str(json).unwrap();
 
         assert_eq!(actual.interoception, InteroceptionView::default());
+    }
+
+    #[test]
+    fn server_writer_coalesces_stale_blackboard_snapshots() {
+        let tab_id = VisualizerTabId::new("server");
+        let messages = latest_blackboard_snapshots(vec![
+            blackboard_snapshot_message(&tab_id, "stale"),
+            VisualizerServerMessage::event(VisualizerEvent::Log {
+                tab_id: tab_id.clone(),
+                message: "runtime stopped".to_string(),
+            }),
+            VisualizerServerMessage::RevokeAction {
+                action_id: stop_runtime_action_id(&tab_id),
+            },
+            blackboard_snapshot_message(&tab_id, "latest"),
+        ]);
+
+        assert_eq!(messages.len(), 3);
+        assert!(matches!(
+            &messages[0],
+            VisualizerServerMessage::Event {
+                event: VisualizerEvent::Log { message, .. },
+            } if message == "runtime stopped"
+        ));
+        assert!(matches!(
+            &messages[1],
+            VisualizerServerMessage::RevokeAction { action_id }
+                if action_id == &stop_runtime_action_id(&tab_id)
+        ));
+        assert!(matches!(
+            &messages[2],
+            VisualizerServerMessage::Event {
+                event: VisualizerEvent::BlackboardSnapshot { snapshot, .. },
+            } if snapshot.forced_disabled_modules == vec!["latest".to_string()]
+        ));
+    }
+
+    fn blackboard_snapshot_message(
+        tab_id: &VisualizerTabId,
+        marker: &str,
+    ) -> VisualizerServerMessage {
+        VisualizerServerMessage::event(VisualizerEvent::BlackboardSnapshot {
+            tab_id: tab_id.clone(),
+            snapshot: BlackboardSnapshot {
+                forced_disabled_modules: vec![marker.to_string()],
+                ..BlackboardSnapshot::default()
+            },
+        })
     }
 
     #[test]

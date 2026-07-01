@@ -1045,6 +1045,17 @@ impl LibsqlLlmTranscriptStore {
         &self,
         limit: usize,
     ) -> Result<Vec<LlmTranscriptTurnRecord>, PortError> {
+        self.completed_turns_page(0, limit).await
+    }
+
+    pub async fn completed_turns_page(
+        &self,
+        offset: usize,
+        limit: usize,
+    ) -> Result<Vec<LlmTranscriptTurnRecord>, PortError> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
         let mut rows = self
             .conn
             .query(
@@ -1062,10 +1073,11 @@ impl LibsqlLlmTranscriptStore {
                     started_at_ms,
                     completed_at_ms,
                     trace_json
-                   FROM llm_transcript_turns
+                  FROM llm_transcript_turns
                   ORDER BY id DESC
-                  LIMIT ?1",
-                params![limit_to_i64(limit)],
+                  LIMIT ?1
+                  OFFSET ?2",
+                params![limit_to_i64(limit), limit_to_i64(offset)],
             )
             .await
             .map_err(map_libsql_error)?;
@@ -1159,6 +1171,17 @@ impl LibsqlOneShotSensoryInputStore {
     }
 
     pub async fn recent(&self, limit: usize) -> Result<Vec<OneShotSensoryInputRecord>, PortError> {
+        self.recent_page(0, limit).await
+    }
+
+    pub async fn recent_page(
+        &self,
+        offset: usize,
+        limit: usize,
+    ) -> Result<Vec<OneShotSensoryInputRecord>, PortError> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
         let mut rows = self
             .conn
             .query(
@@ -1172,8 +1195,9 @@ impl LibsqlOneShotSensoryInputStore {
                     created_at_ms
                    FROM one_shot_sensory_inputs
                   ORDER BY id DESC
-                  LIMIT ?1",
-                params![limit_to_i64(limit)],
+                  LIMIT ?1
+                  OFFSET ?2",
+                params![limit_to_i64(limit), limit_to_i64(offset)],
             )
             .await
             .map_err(map_libsql_error)?;
@@ -1233,6 +1257,17 @@ impl LibsqlAmbientSensorySnapshotStore {
         &self,
         limit: usize,
     ) -> Result<Vec<AmbientSensorySnapshotRecord>, PortError> {
+        self.recent_page(0, limit).await
+    }
+
+    pub async fn recent_page(
+        &self,
+        offset: usize,
+        limit: usize,
+    ) -> Result<Vec<AmbientSensorySnapshotRecord>, PortError> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
         let mut rows = self
             .conn
             .query(
@@ -1244,8 +1279,9 @@ impl LibsqlAmbientSensorySnapshotStore {
                     created_at_ms
                    FROM ambient_sensory_snapshots
                   ORDER BY id DESC
-                  LIMIT ?1",
-                params![limit_to_i64(limit)],
+                  LIMIT ?1
+                  OFFSET ?2",
+                params![limit_to_i64(limit), limit_to_i64(offset)],
             )
             .await
             .map_err(map_libsql_error)?;
@@ -1321,6 +1357,17 @@ impl LibsqlUtteranceEventStore {
     }
 
     pub async fn recent(&self, limit: usize) -> Result<Vec<UtteranceEventRecord>, PortError> {
+        self.recent_page(0, limit).await
+    }
+
+    pub async fn recent_page(
+        &self,
+        offset: usize,
+        limit: usize,
+    ) -> Result<Vec<UtteranceEventRecord>, PortError> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
         let mut rows = self
             .conn
             .query(
@@ -1339,8 +1386,9 @@ impl LibsqlUtteranceEventStore {
                     created_at_ms
                    FROM utterance_events
                   ORDER BY id DESC
-                  LIMIT ?1",
-                params![limit_to_i64(limit)],
+                  LIMIT ?1
+                  OFFSET ?2",
+                params![limit_to_i64(limit), limit_to_i64(offset)],
             )
             .await
             .map_err(map_libsql_error)?;
@@ -1470,6 +1518,17 @@ impl LibsqlExternalActionEventStore {
     }
 
     pub async fn recent(&self, limit: usize) -> Result<Vec<ExternalActionEventRecord>, PortError> {
+        self.recent_page(0, limit).await
+    }
+
+    pub async fn recent_page(
+        &self,
+        offset: usize,
+        limit: usize,
+    ) -> Result<Vec<ExternalActionEventRecord>, PortError> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
         let mut rows = self
             .conn
             .query(
@@ -1490,8 +1549,9 @@ impl LibsqlExternalActionEventStore {
                     updated_at_ms
                    FROM external_action_events
                   ORDER BY id DESC
-                  LIMIT ?1",
-                params![limit_to_i64(limit)],
+                  LIMIT ?1
+                  OFFSET ?2",
+                params![limit_to_i64(limit), limit_to_i64(offset)],
             )
             .await
             .map_err(map_libsql_error)?;
@@ -4329,6 +4389,51 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn llm_transcript_store_pages_completed_turns_without_implicit_prune() {
+        let agent = LibsqlAgentStore::connect(
+            LibsqlAgentStoreConfig::local(test_db_path(), 3, 3),
+            TestEmbedder::boxed(3),
+            TestEmbedder::boxed(3),
+        )
+        .await
+        .unwrap();
+        let store = agent.llm_transcript_store();
+        for index in 0..205 {
+            store
+                .insert_completed_turn(NewLlmTranscriptTurn {
+                    server_session_id: "server-session".to_owned(),
+                    turn_id: format!("turn-{index:03}"),
+                    owner: "memory#0".to_owned(),
+                    owner_module: "memory".to_owned(),
+                    owner_replica: 0,
+                    tier: "cheap".to_owned(),
+                    source: "faculty".to_owned(),
+                    session_key: Some("main".to_owned()),
+                    operation: "text-turn".to_owned(),
+                    started_at_ms: index * 10,
+                    completed_at_ms: index * 10 + 1,
+                    trace_json: serde_json::json!({ "index": index }),
+                })
+                .await
+                .unwrap();
+        }
+
+        let first_page = store.completed_turns_page(0, 200).await.unwrap();
+        let second_page = store.completed_turns_page(200, 10).await.unwrap();
+
+        assert_eq!(first_page.len(), 200);
+        assert_eq!(first_page.first().unwrap().turn_id, "turn-005");
+        assert_eq!(first_page.last().unwrap().turn_id, "turn-204");
+        assert_eq!(
+            second_page
+                .iter()
+                .map(|record| record.turn_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["turn-000", "turn-001", "turn-002", "turn-003", "turn-004"]
+        );
+    }
+
+    #[tokio::test]
     async fn llm_transcript_store_replaces_existing_turn_id() {
         let agent = LibsqlAgentStore::connect(
             LibsqlAgentStoreConfig::local(test_db_path(), 3, 3),
@@ -4423,6 +4528,38 @@ mod tests {
         assert_eq!(one_shot.recent(10).await.unwrap(), vec![one_shot_record]);
         assert_eq!(ambient.recent(10).await.unwrap(), vec![ambient_record]);
         assert_eq!(utterance.recent(10).await.unwrap(), vec![utterance_record]);
+    }
+
+    #[tokio::test]
+    async fn sensory_trace_store_recent_page_honors_offset() {
+        let agent = LibsqlAgentStore::connect(
+            LibsqlAgentStoreConfig::local(test_db_path(), 3, 3),
+            TestEmbedder::boxed(3),
+            TestEmbedder::boxed(3),
+        )
+        .await
+        .unwrap();
+        let one_shot = agent.one_shot_sensory_input_store();
+        for index in 0..4 {
+            one_shot
+                .append(NewOneShotSensoryInput {
+                    server_session_id: "server-session".to_string(),
+                    modality: "audition".to_string(),
+                    direction: Some("Ryo".to_string()),
+                    content: format!("message {index}"),
+                    observed_at_ms: index,
+                })
+                .await
+                .unwrap();
+        }
+
+        let page = one_shot.recent_page(1, 2).await.unwrap();
+        assert_eq!(
+            page.iter()
+                .map(|record| record.content.as_str())
+                .collect::<Vec<_>>(),
+            vec!["message 1", "message 2"]
+        );
     }
 
     #[tokio::test]

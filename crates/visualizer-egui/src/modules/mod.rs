@@ -10,8 +10,9 @@ pub mod sensory;
 pub mod speak;
 pub mod surprise;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::hash::Hash;
+use std::sync::mpsc::Sender;
 use std::time::Duration;
 
 use egui_hooks::UseHookExt as _;
@@ -20,7 +21,8 @@ use nuillu_module::RuntimeEvent;
 use crate::{
     AllocationView, BlackboardSnapshot, LlmInputItemView, LlmObservationEvent,
     LlmObservationSource, LlmTranscriptTurnStatus, LlmTranscriptTurnView, LlmUsageView, MemoView,
-    ModulePolicyView, ModuleSettingsView, ModuleStatusView, ZeroReplicaWindowView,
+    ModulePolicyView, ModuleSettingsView, ModuleStatusView, VisualizerClientMessage,
+    VisualizerCommand, VisualizerTabId, ZeroReplicaWindowView,
     i18n::{EguiI18nExt as _, I18nArg, localized_module_name, localized_module_name_with_id},
     memos, module_filter,
     module_filter::ModuleFilterState,
@@ -29,12 +31,16 @@ use crate::{
     visualizer_selection_card_fill, visualizer_selection_cell_fill, visualizer_selection_row_fill,
 };
 
+const MODULE_HISTORY_RETAINED_COMPLETED_ACTIVATIONS: usize = 200;
+const LLM_TRANSCRIPT_HISTORY_PAGE_SIZE: usize = 200;
+
 #[derive(Debug)]
 pub struct ModulesState {
     modules: BTreeMap<String, ModuleState>,
     activation_to_owner: BTreeMap<u64, String>,
     activation_order: Vec<u64>,
     turn_to_owner: BTreeMap<String, String>,
+    history_omitted: bool,
 }
 
 impl Default for ModulesState {
@@ -44,6 +50,7 @@ impl Default for ModulesState {
             activation_to_owner: BTreeMap::new(),
             activation_order: Vec::new(),
             turn_to_owner: BTreeMap::new(),
+            history_omitted: false,
         }
     }
 }
@@ -71,6 +78,81 @@ impl ModulesState {
             .values()
             .map(|module| llm_turn_counts(module).total)
             .fold(0_u32, u32::saturating_add)
+    }
+
+    pub fn history_omitted(&self) -> bool {
+        self.history_omitted
+    }
+}
+
+#[derive(Debug)]
+pub struct LlmTranscriptHistoryState {
+    open: bool,
+    requested_initial_load: bool,
+    loading: bool,
+    has_more: bool,
+    next_offset: usize,
+    modules: ModulesState,
+}
+
+impl Default for LlmTranscriptHistoryState {
+    fn default() -> Self {
+        Self {
+            open: false,
+            requested_initial_load: false,
+            loading: false,
+            has_more: true,
+            next_offset: 0,
+            modules: ModulesState::default(),
+        }
+    }
+}
+
+impl LlmTranscriptHistoryState {
+    pub fn apply_page(&mut self, offset: usize, turns: Vec<LlmTranscriptTurnView>, has_more: bool) {
+        if !self.open {
+            return;
+        }
+        self.loading = false;
+        if offset == 0 {
+            self.modules = ModulesState::default();
+        } else if offset != self.next_offset {
+            return;
+        }
+        apply_llm_transcript_turns_unbounded(&mut self.modules, turns);
+        self.has_more = has_more;
+        self.next_offset = offset.saturating_add(LLM_TRANSCRIPT_HISTORY_PAGE_SIZE);
+    }
+
+    fn close(&mut self) {
+        *self = Self::default();
+    }
+
+    fn request_page(
+        &mut self,
+        tab_id: &VisualizerTabId,
+        commands: &Sender<VisualizerClientMessage>,
+    ) {
+        if self.loading {
+            return;
+        }
+        self.open = true;
+        self.requested_initial_load = true;
+        self.loading = true;
+        let _ = commands.send(VisualizerClientMessage::Command {
+            command: VisualizerCommand::LoadLlmTranscriptTurns {
+                tab_id: tab_id.clone(),
+                offset: self.next_offset,
+                limit: LLM_TRANSCRIPT_HISTORY_PAGE_SIZE,
+            },
+        });
+    }
+
+    fn open(&mut self, tab_id: &VisualizerTabId, commands: &Sender<VisualizerClientMessage>) {
+        if !self.open {
+            self.open = true;
+            self.request_page(tab_id, commands);
+        }
     }
 }
 
@@ -412,6 +494,7 @@ pub fn apply_runtime_event_at(state: &mut ModulesState, event: &RuntimeEvent, no
             module.runtime_status = Some(format!("Compaction failed {session_key}: {message}"));
         }
     }
+    prune_all_module_history(state);
 }
 
 pub fn apply_llm_observation(state: &mut ModulesState, event: LlmObservationEvent) {
@@ -569,9 +652,20 @@ pub fn apply_llm_observation(state: &mut ModulesState, event: LlmObservationEven
             }
         }
     }
+    prune_all_module_history(state);
 }
 
 pub fn apply_llm_transcript_snapshot(state: &mut ModulesState, turns: Vec<LlmTranscriptTurnView>) {
+    for turn in turns {
+        apply_llm_transcript_turn(state, turn);
+    }
+    prune_all_module_history(state);
+}
+
+fn apply_llm_transcript_turns_unbounded(
+    state: &mut ModulesState,
+    turns: Vec<LlmTranscriptTurnView>,
+) {
     for turn in turns {
         apply_llm_transcript_turn(state, turn);
     }
@@ -603,12 +697,17 @@ fn apply_llm_transcript_turn(state: &mut ModulesState, turn: LlmTranscriptTurnVi
     record_turn_owner(state, &turn_id, &owner);
     record_activation_owner(state, activation_id, &owner);
     let module_state = module_mut_with_metadata(state, owner, module, replica);
+    let restored_status = match status {
+        LlmTranscriptTurnStatus::Completed => ModuleSessionStatus::Completed,
+        LlmTranscriptTurnStatus::Failed => ModuleSessionStatus::Failed,
+    };
     let activation = ensure_activation(
         module_state,
         activation_id,
         Some(activation_attempt),
         Some(module_batch_debug_state(batch)),
     );
+    activation.status = restored_status;
     push_activation_turn(activation, &turn_id);
     let turn_state = ensure_turn(module_state, turn_id, operation, source, session_key, tier);
     turn_state.input = input;
@@ -626,10 +725,7 @@ fn apply_llm_transcript_turn(state: &mut ModulesState, turn: LlmTranscriptTurnVi
     turn_state.finish_reason = finish_reason;
     turn_state.usage = usage;
     turn_state.error_message = error_message;
-    turn_state.status = match status {
-        LlmTranscriptTurnStatus::Completed => ModuleSessionStatus::Completed,
-        LlmTranscriptTurnStatus::Failed => ModuleSessionStatus::Failed,
-    };
+    turn_state.status = restored_status;
 }
 
 pub fn overview_rows(
@@ -833,6 +929,63 @@ pub fn render_module(
 }
 
 pub fn render_llm_turns(
+    ui: &mut egui::Ui,
+    tab_id: &VisualizerTabId,
+    state: &ModulesState,
+    history: &mut LlmTranscriptHistoryState,
+    filter: &mut ModuleFilterState,
+    modules: &[String],
+    commands: &Sender<VisualizerClientMessage>,
+) {
+    ui.horizontal_wrapped(|ui| {
+        if history.open {
+            ui.strong(ui.ctx().tr("module-llm-turn-history"));
+            if ui.button(ui.ctx().tr("module-recent-llm-turns")).clicked() {
+                history.close();
+            }
+            if history.has_more
+                && ui
+                    .add_enabled(
+                        !history.loading,
+                        egui::Button::new(ui.ctx().tr("module-load-more-llm-turns")),
+                    )
+                    .clicked()
+            {
+                history.request_page(tab_id, commands);
+            }
+            if history.loading {
+                ui.label(ui.ctx().tr("memory-loading"));
+            }
+        } else {
+            ui.strong(ui.ctx().tr("module-recent-llm-turns"));
+            if state.history_omitted() {
+                ui.label(ui.ctx().tr("module-llm-turns-omitted"));
+                if ui
+                    .button(ui.ctx().tr("module-show-all-llm-turns"))
+                    .clicked()
+                {
+                    history.open(tab_id, commands);
+                }
+            }
+        }
+    });
+    if history.open && !history.requested_initial_load && !history.loading {
+        history.request_page(tab_id, commands);
+    }
+    let active_state = if history.open {
+        &history.modules
+    } else {
+        state
+    };
+    let active_modules = if history.open {
+        history.modules.module_names()
+    } else {
+        modules.to_vec()
+    };
+    render_llm_turns_body(ui, active_state, filter, &active_modules);
+}
+
+fn render_llm_turns_body(
     ui: &mut egui::Ui,
     state: &ModulesState,
     filter: &mut ModuleFilterState,
@@ -2748,6 +2901,96 @@ fn record_turn_owner(state: &mut ModulesState, turn_id: &str, owner: &str) -> bo
         .turn_to_owner
         .insert(turn_id.to_string(), owner.to_string());
     new_turn
+}
+
+fn prune_all_module_history(state: &mut ModulesState) {
+    let owners = state.modules.keys().cloned().collect::<Vec<_>>();
+    for owner in owners {
+        prune_module_history(state, &owner);
+    }
+}
+
+fn prune_module_history(state: &mut ModulesState, owner: &str) {
+    let mut removed_activation_ids = BTreeSet::new();
+    let mut removed_turn_ids = BTreeSet::new();
+    {
+        let Some(module) = state.modules.get_mut(owner) else {
+            return;
+        };
+        let completed_activation_indexes = module
+            .activations
+            .iter()
+            .enumerate()
+            .filter_map(|(index, activation)| {
+                activation_prunable(module, activation).then_some(index)
+            })
+            .collect::<Vec<_>>();
+        let remove_count = completed_activation_indexes
+            .len()
+            .saturating_sub(MODULE_HISTORY_RETAINED_COMPLETED_ACTIVATIONS);
+        if remove_count > 0 {
+            for index in completed_activation_indexes.into_iter().take(remove_count) {
+                let activation = &module.activations[index];
+                removed_activation_ids.insert(activation.activation_id);
+                removed_turn_ids.extend(activation.turn_ids.iter().cloned());
+            }
+            module
+                .activations
+                .retain(|activation| !removed_activation_ids.contains(&activation.activation_id));
+            module
+                .turns
+                .retain(|turn| !removed_turn_ids.contains(&turn.turn_id));
+        }
+
+        let completed_turn_ids = module
+            .turns
+            .iter()
+            .filter(|turn| turn_prunable(turn))
+            .map(|turn| turn.turn_id.clone())
+            .collect::<Vec<_>>();
+        let remove_turn_count = completed_turn_ids
+            .len()
+            .saturating_sub(MODULE_HISTORY_RETAINED_COMPLETED_ACTIVATIONS);
+        if remove_turn_count > 0 {
+            removed_turn_ids.extend(completed_turn_ids.into_iter().take(remove_turn_count));
+            module
+                .turns
+                .retain(|turn| !removed_turn_ids.contains(&turn.turn_id));
+            for activation in &mut module.activations {
+                activation
+                    .turn_ids
+                    .retain(|turn_id| !removed_turn_ids.contains(turn_id));
+            }
+        }
+    }
+
+    if removed_activation_ids.is_empty() && removed_turn_ids.is_empty() {
+        return;
+    }
+    state.history_omitted = true;
+    state
+        .activation_to_owner
+        .retain(|activation_id, _| !removed_activation_ids.contains(activation_id));
+    state
+        .activation_order
+        .retain(|activation_id| !removed_activation_ids.contains(activation_id));
+    state
+        .turn_to_owner
+        .retain(|turn_id, _| !removed_turn_ids.contains(turn_id));
+}
+
+fn activation_prunable(module: &ModuleState, activation: &ActivationState) -> bool {
+    matches!(
+        activation.status,
+        ModuleSessionStatus::Completed | ModuleSessionStatus::Failed | ModuleSessionStatus::Idle
+    ) && !activation_llm_in_flight(module, activation)
+}
+
+fn turn_prunable(turn: &LlmTurnState) -> bool {
+    matches!(
+        turn.status,
+        ModuleSessionStatus::Completed | ModuleSessionStatus::Failed | ModuleSessionStatus::Idle
+    ) && !turn_is_streaming(turn)
 }
 
 fn module_turn_label_module(module: &ModuleState) -> String {
@@ -4968,6 +5211,122 @@ mod tests {
     }
 
     #[test]
+    fn completed_llm_history_is_pruned_per_owner() {
+        let mut state = ModulesState::default();
+        let turns = (0..=MODULE_HISTORY_RETAINED_COMPLETED_ACTIVATIONS)
+            .map(|index| {
+                transcript_turn_view(
+                    &format!("turn-{index:03}"),
+                    index as u64,
+                    LlmTranscriptTurnStatus::Completed,
+                )
+            })
+            .collect::<Vec<_>>();
+
+        apply_llm_transcript_snapshot(&mut state, turns);
+
+        let module = state.modules.get("predict").expect("module exists");
+        assert_eq!(
+            module.activations.len(),
+            MODULE_HISTORY_RETAINED_COMPLETED_ACTIVATIONS
+        );
+        assert_eq!(
+            module.turns.len(),
+            MODULE_HISTORY_RETAINED_COMPLETED_ACTIVATIONS
+        );
+        assert!(state.history_omitted());
+        assert!(!state.turn_to_owner.contains_key("turn-000"));
+        assert!(!state.activation_to_owner.contains_key(&0));
+    }
+
+    #[test]
+    fn streaming_llm_turn_is_retained_when_completed_history_is_pruned() {
+        let mut state = ModulesState::default();
+        apply_llm_observation(
+            &mut state,
+            LlmObservationEvent::ModelInput {
+                turn_id: "streaming-turn".to_string(),
+                owner: "predict".to_string(),
+                module: "predict".to_string(),
+                replica: 0,
+                tier: "Default".to_string(),
+                source: LlmObservationSource::ModuleTurn,
+                session_key: Some("session".to_string()),
+                operation: "text_turn".to_string(),
+                activation_id: 9_999,
+                activation_attempt: 1,
+                batch: test_batch_view(),
+                items: Vec::new(),
+            },
+        );
+        let turns = (0..=MODULE_HISTORY_RETAINED_COMPLETED_ACTIVATIONS)
+            .map(|index| {
+                transcript_turn_view(
+                    &format!("turn-{index:03}"),
+                    index as u64,
+                    LlmTranscriptTurnStatus::Completed,
+                )
+            })
+            .collect::<Vec<_>>();
+
+        apply_llm_transcript_snapshot(&mut state, turns);
+
+        let module = state.modules.get("predict").expect("module exists");
+        assert!(
+            module
+                .turns
+                .iter()
+                .any(|turn| turn.turn_id == "streaming-turn")
+        );
+        assert!(
+            module
+                .activations
+                .iter()
+                .any(|activation| activation.activation_id == 9_999)
+        );
+    }
+
+    fn transcript_turn_view(
+        turn_id: &str,
+        activation_id: u64,
+        status: LlmTranscriptTurnStatus,
+    ) -> LlmTranscriptTurnView {
+        LlmTranscriptTurnView {
+            turn_id: turn_id.to_string(),
+            owner: "predict".to_string(),
+            module: "predict".to_string(),
+            replica: 0,
+            tier: "Default".to_string(),
+            source: LlmObservationSource::ModuleTurn,
+            session_key: Some("session".to_string()),
+            operation: "text_turn".to_string(),
+            activation_id,
+            activation_attempt: 1,
+            batch: test_batch_view(),
+            input: Vec::new(),
+            output: vec![LlmOutputItemView {
+                kind: "text".to_string(),
+                content: "partial output".to_string(),
+                source: None,
+            }],
+            request_id: Some("req-1".to_string()),
+            model: Some("model-a".to_string()),
+            finish_reason: Some("Stop".to_string()),
+            usage: Some(LlmUsageView {
+                input_tokens: 3,
+                output_tokens: 5,
+                total_tokens: 8,
+                cost_micros_usd: 0,
+                cache_creation_tokens: 0,
+                cache_read_tokens: 0,
+            }),
+            status,
+            error_message: (status == LlmTranscriptTurnStatus::Failed)
+                .then(|| "request timed out".to_string()),
+        }
+    }
+
+    #[test]
     fn failed_turn_error_banner_does_not_grow_llm_turns_window_each_frame() {
         let mut state = ModulesState::default();
         apply_llm_observation(
@@ -4998,6 +5357,9 @@ mod tests {
         let ctx = test_i18n_context(Locale::EnUs);
         let mut filter = ModuleFilterState::default();
         let modules = state.module_names();
+        let tab_id = VisualizerTabId::new("test");
+        let (commands, _received_commands) = std::sync::mpsc::channel();
+        let mut history = LlmTranscriptHistoryState::default();
         let mut widths = Vec::new();
 
         for frame in 0..6 {
@@ -5014,7 +5376,15 @@ mod tests {
                     .id(egui::Id::new("failed-turn-growth-test"))
                     .default_size(egui::vec2(760.0, 520.0))
                     .show(ui.ctx(), |ui| {
-                        render_llm_turns(ui, &state, &mut filter, &modules);
+                        render_llm_turns(
+                            ui,
+                            &tab_id,
+                            &state,
+                            &mut history,
+                            &mut filter,
+                            &modules,
+                            &commands,
+                        );
                     })
                     .expect("window is open");
                 widths.push(response.response.rect.width());
@@ -5077,6 +5447,9 @@ mod tests {
             let ctx = test_i18n_context(Locale::EnUs);
             let mut filter = ModuleFilterState::default();
             let modules = state.module_names();
+            let tab_id = VisualizerTabId::new("test");
+            let (commands, _received_commands) = std::sync::mpsc::channel();
+            let mut history = LlmTranscriptHistoryState::default();
             let mut width = 0.0;
             let input = egui::RawInput {
                 screen_rect: Some(egui::Rect::from_min_size(
@@ -5091,7 +5464,15 @@ mod tests {
                     .id(egui::Id::new(id))
                     .default_size(egui::vec2(760.0, 520.0))
                     .show(ui.ctx(), |ui| {
-                        render_llm_turns(ui, state, &mut filter, &modules);
+                        render_llm_turns(
+                            ui,
+                            &tab_id,
+                            state,
+                            &mut history,
+                            &mut filter,
+                            &modules,
+                            &commands,
+                        );
                     })
                     .expect("window is open");
                 width = response.response.rect.width();
