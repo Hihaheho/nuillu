@@ -1,19 +1,26 @@
-use std::sync::mpsc;
+use std::path::PathBuf;
 
+use clap::{Args as ClapArgs, Parser};
+use nuillu_server::{
+    RuntimeModule, ServerRunOptions, install_lutum_trace_subscriber,
+    load_server_config_from_options, spawn_server_runtime,
+};
 use nuillu_visualizer_egui::{VisualizerApp, VisualizerChannels};
 use nuillu_visualizer_protocol::{VisualizerClientMessage, VisualizerClientPort};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let args = Args::parse(std::env::args().skip(1))?;
-    let remote = args.host.is_some();
-    let (server_messages, client_messages) = if let Some(host) = args.host {
+    install_lutum_trace_subscriber()?;
+    let args = Args::parse();
+    let (server_messages, client_messages, embedded_runtime) = if let Some(host) = args.host {
         let port = VisualizerClientPort::connect(host.as_str())?;
         port.send(VisualizerClientMessage::hello())?;
-        port.into_channels()
+        let (server_messages, client_messages) = port.into_channels();
+        (server_messages, client_messages, None)
     } else {
-        let (_server_tx, server_rx) = mpsc::channel();
-        let (client_tx, _client_rx) = mpsc::channel();
-        (server_rx, client_tx)
+        let config = load_server_config_from_options(args.server.into_options())?;
+        let runtime = spawn_server_runtime(config)?;
+        let (server_messages, client_messages) = runtime.visualizer_channels();
+        (server_messages, client_messages, Some(runtime))
     };
     let native_options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
@@ -21,7 +28,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .with_visible(true),
         ..eframe::NativeOptions::default()
     };
-    eframe::run_native(
+    let result = eframe::run_native(
         "Nuillu Visualizer",
         native_options,
         Box::new(|cc| {
@@ -30,46 +37,83 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 VisualizerChannels {
                     server_messages,
                     client_messages,
-                    remote,
+                    remote: true,
                 },
             )))
         }),
-    )?;
+    );
+    if let Some(runtime) = embedded_runtime {
+        let _ = runtime.shutdown();
+        let _ = runtime.join();
+    }
+    result?;
     Ok(())
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Parser)]
+#[command(name = "nuillu-visualizer-egui", about = "Run the Nuillu visualizer")]
 struct Args {
+    /// Connect to an already-running visualizer protocol server.
+    #[arg(long)]
     host: Option<String>,
+
+    #[command(flatten)]
+    server: ServerArgs,
 }
 
-impl Args {
-    fn parse(args: impl IntoIterator<Item = String>) -> Result<Self, std::io::Error> {
-        let mut parsed = Self::default();
-        let mut args = args.into_iter();
-        while let Some(arg) = args.next() {
-            match arg.as_str() {
-                "--host" => {
-                    let Some(host) = args.next() else {
-                        return Err(std::io::Error::new(
-                            std::io::ErrorKind::InvalidInput,
-                            "--host requires an address",
-                        ));
-                    };
-                    parsed.host = Some(host);
-                }
-                "-h" | "--help" => {
-                    println!("Usage: nuillu-visualizer-egui [--host HOST:PORT]");
-                    std::process::exit(0);
-                }
-                other => {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::InvalidInput,
-                        format!("unknown argument: {other}"),
-                    ));
-                }
-            }
+#[derive(Debug, Clone, ClapArgs)]
+struct ServerArgs {
+    /// Persistent server runtime state directory.
+    #[arg(long, default_value = ".tmp/server")]
+    state: PathBuf,
+
+    /// Deprecated alias for --session-id.
+    #[arg(long, hide = true)]
+    run_id: Option<String>,
+
+    /// Session id used as the LLM trace namespace.
+    #[arg(long)]
+    session_id: Option<String>,
+
+    /// Root directory for per-turn LLM trace files.
+    #[arg(long, default_value = "llm-logs")]
+    llm_log_root: PathBuf,
+
+    /// Model set Eure file with per-role backend config.
+    ///
+    /// Defaults to <state>/model-set.eure.
+    #[arg(long)]
+    model_set: Option<PathBuf>,
+
+    /// Modules to force-disable at startup.
+    #[arg(long = "disable-module", value_enum, value_name = "MODULE")]
+    disable_module: Vec<RuntimeModule>,
+
+    /// Participants currently available to the speak module as targets.
+    #[arg(long = "participant", value_name = "NAME")]
+    participants: Vec<String>,
+
+    /// Back up existing agent.db under --state before connecting, then start with a fresh DB.
+    #[arg(long, conflicts_with = "agent_db")]
+    fresh_agent_db: bool,
+
+    /// Override the persistent agent DB path. Defaults to <state>/agent.db.
+    #[arg(long, value_name = "PATH", conflicts_with = "fresh_agent_db")]
+    agent_db: Option<PathBuf>,
+}
+
+impl ServerArgs {
+    fn into_options(self) -> ServerRunOptions {
+        ServerRunOptions {
+            state_dir: self.state,
+            run_id: self.run_id,
+            session_id: self.session_id,
+            llm_log_root: self.llm_log_root,
+            model_set: self.model_set,
+            disabled_modules: self.disable_module,
+            participants: self.participants,
+            fresh_agent_db: self.fresh_agent_db,
+            agent_db: self.agent_db,
         }
-        Ok(parsed)
     }
 }

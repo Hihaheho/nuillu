@@ -17,7 +17,14 @@ use nuillu_types::{ModelTier, ModuleId, ReplicaCapRange, builtin};
 use tracing_subscriber::layer::SubscriberExt as _;
 use uuid::Uuid;
 
-use crate::model_set::ReasoningEffort;
+use crate::model_set::{
+    EmbeddingRole, ReasoningEffort, parse_model_set_file, resolve_llm_backends,
+    resolve_token_fields,
+};
+
+const DEFAULT_OPENAI_EMBEDDING_ENDPOINT: &str = "https://api.openai.com/v1";
+const AGENT_DB_FILE: &str = "agent.db";
+const STATE_MODEL_SET_FILE: &str = "model-set.eure";
 
 #[derive(Debug, Clone)]
 pub struct ServerConfig {
@@ -33,7 +40,19 @@ pub struct ServerConfig {
     pub disabled_modules: Vec<RuntimeModule>,
     pub participants: Vec<String>,
     pub fresh_agent_db: bool,
-    pub visualizer_bin: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ServerRunOptions {
+    pub state_dir: PathBuf,
+    pub run_id: Option<String>,
+    pub session_id: Option<String>,
+    pub llm_log_root: PathBuf,
+    pub model_set: Option<PathBuf>,
+    pub disabled_modules: Vec<RuntimeModule>,
+    pub participants: Vec<String>,
+    pub fresh_agent_db: bool,
+    pub agent_db: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone)]
@@ -810,6 +829,67 @@ pub fn default_run_id() -> String {
 
 pub fn default_server_session_id() -> String {
     format!("server-{}-{}", default_run_id(), Uuid::now_v7())
+}
+
+pub fn load_server_config_from_options(options: ServerRunOptions) -> anyhow::Result<ServerConfig> {
+    let model_set_path = resolve_model_set_path(&options.state_dir, options.model_set);
+    let agent_db_path = resolve_agent_db_path(&options.state_dir, options.agent_db);
+    let model_set = parse_model_set_file(&model_set_path)?;
+    let backends = resolve_llm_backends(&model_set)?;
+    let cheap_backend = backends.cheap;
+    let default_backend = backends.default;
+    let premium_backend = backends.premium;
+    let embedding_backend = resolve_embedding(&model_set.embedding)?;
+    let session_id = resolve_session_id(options.session_id, options.run_id);
+    let boot_config = load_server_boot_config(&options.state_dir)?;
+
+    Ok(ServerConfig {
+        state_dir: options.state_dir,
+        agent_db_path,
+        session_id,
+        llm_log_root: options.llm_log_root,
+        cheap_backend,
+        default_backend,
+        premium_backend,
+        embedding_backend,
+        boot_config,
+        disabled_modules: options.disabled_modules,
+        participants: options.participants,
+        fresh_agent_db: options.fresh_agent_db,
+    })
+}
+
+pub fn resolve_session_id(session_id: Option<String>, run_id_alias: Option<String>) -> String {
+    session_id
+        .or(run_id_alias)
+        .unwrap_or_else(default_server_session_id)
+}
+
+pub fn resolve_model_set_path(state_dir: &Path, model_set: Option<PathBuf>) -> PathBuf {
+    model_set.unwrap_or_else(|| state_dir.join(STATE_MODEL_SET_FILE))
+}
+
+pub fn resolve_agent_db_path(state_dir: &Path, agent_db: Option<PathBuf>) -> PathBuf {
+    agent_db.unwrap_or_else(|| state_dir.join(AGENT_DB_FILE))
+}
+
+pub fn resolve_embedding(role: &EmbeddingRole) -> anyhow::Result<EmbeddingBackendConfig> {
+    let endpoint = role
+        .endpoint()
+        .unwrap_or(DEFAULT_OPENAI_EMBEDDING_ENDPOINT)
+        .to_string();
+    let token = resolve_token_fields(
+        "embedding",
+        role.token_env.as_deref(),
+        role.token.as_deref(),
+        None,
+    )?;
+    Ok(EmbeddingBackendConfig {
+        endpoint,
+        token,
+        model: role.model.clone(),
+        dimensions: role.dimensions as usize,
+    })
 }
 
 pub fn install_lutum_trace_subscriber() -> anyhow::Result<()> {

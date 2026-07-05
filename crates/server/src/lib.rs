@@ -18,16 +18,13 @@ pub const SERVER_TAB_ID: &str = "server";
 pub use config::{
     DEFAULT_MODULES, EmbeddingBackendConfig, LlmBackendConfig, LlmGenerationConfig, RuntimeModule,
     ServerBootConfig, ServerConfig, ServerModuleGroup, ServerModuleSessionSpec, ServerModuleSpec,
-    ServerSessionTier, default_run_id, default_server_session_id, install_lutum_trace_subscriber,
-    load_server_boot_config,
+    ServerRunOptions, ServerSessionTier, default_run_id, default_server_session_id,
+    install_lutum_trace_subscriber, load_server_boot_config, load_server_config_from_options,
 };
 pub use environment::{
     build_embedder, build_lutum, build_model_handle, build_tiers, server_llm_log_context,
 };
-pub use gui::{
-    VisualizerEventSink, VisualizerHook, accept_visualizer_connection, drain_child_stdio,
-    spawn_visualizer_gui, wait_for_visualizer_exit_with_context,
-};
+pub use gui::{VisualizerEventSink, VisualizerHook};
 pub use llm_observer::VisualizerLlmObserver;
 pub use model_set::{
     EmbeddingRole, ModelDefinition, ModelSet, ModelSetError, ModelSetFile, ReasoningEffort,
@@ -35,7 +32,12 @@ pub use model_set::{
     resolve_llm_backends, resolve_token_fields,
 };
 pub use nuillu_llm_trace_file::{FileLlmTraceSink, LlmLogContext};
-pub use runtime::run_server_with_visualizer;
+pub use runtime::{
+    ServerAmbientSensorySnapshotRecord, ServerEvent, ServerExternalActionEventRecord,
+    ServerExternalActionEventStatus, ServerOneShotSensoryInputRecord, ServerRuntimeHandle,
+    ServerRuntimeStatus, ServerUtteranceEventKind, ServerUtteranceEventRecord,
+    run_server_with_visualizer, spawn_server_runtime,
+};
 pub use snapshot::{
     duration_millis_u64, linked_memory_record_view, memory_metadata_views, memory_rank_name,
     memory_record_view, module_policy_views, zero_replica_window_view,

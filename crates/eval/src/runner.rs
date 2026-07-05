@@ -251,7 +251,8 @@ impl VisualizerHook {
                         has_more,
                     });
                 }
-                VisualizerCommand::SendOneShotSensoryInput { tab_id, .. } => {
+                VisualizerCommand::PublishSensoryInput { tab_id, .. }
+                | VisualizerCommand::SendOneShotSensoryInput { tab_id, .. } => {
                     self.send_event(VisualizerEvent::Log {
                         tab_id,
                         message: "eval case is no longer running".to_string(),
@@ -273,7 +274,9 @@ impl VisualizerHook {
                 | VisualizerCommand::UpsertAgentActionAffordance { tab_id, .. }
                 | VisualizerCommand::RemoveAgentActionAffordance { tab_id, .. }
                 | VisualizerCommand::CompleteAgentActionInvocation { tab_id, .. }
-                | VisualizerCommand::ResetModuleSessionHistory { tab_id, .. } => {
+                | VisualizerCommand::ResetModuleSessionHistory { tab_id, .. }
+                | VisualizerCommand::LoadActivityRows { tab_id, .. }
+                | VisualizerCommand::LoadLlmTranscriptTurns { tab_id, .. } => {
                     self.send_event(VisualizerEvent::Log {
                         tab_id,
                         message: "eval case is no longer running".to_string(),
@@ -4055,6 +4058,19 @@ async fn handle_visualizer_commands(
             VisualizerCommand::Shutdown => {
                 visualizer.request_shutdown();
                 outcome.shutdown = true;
+            }
+            VisualizerCommand::PublishSensoryInput { tab_id, input }
+                if tab_id.as_str() == case_id =>
+            {
+                let Some(sensory) = sensory else {
+                    visualizer.send_event(VisualizerEvent::Log {
+                        tab_id,
+                        message: "this runtime does not accept sensory input".to_string(),
+                    });
+                    continue;
+                };
+                let _ = sensory.publish(input.clone()).await;
+                visualizer.send_event(VisualizerEvent::SensoryInput { tab_id, input });
             }
             VisualizerCommand::SendOneShotSensoryInput { tab_id, input }
                 if tab_id.as_str() == case_id =>

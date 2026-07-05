@@ -284,6 +284,10 @@ pub enum VisualizerEvent {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum VisualizerCommand {
+    PublishSensoryInput {
+        tab_id: VisualizerTabId,
+        input: SensoryInput,
+    },
     SendOneShotSensoryInput {
         tab_id: VisualizerTabId,
         input: OneShotSensoryInput,

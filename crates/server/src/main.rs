@@ -4,21 +4,15 @@ use std::path::{Path, PathBuf};
 use anyhow::Context as _;
 use clap::{Args as ClapArgs, Parser, Subcommand, ValueEnum};
 use nuillu_server::{
-    EmbeddingBackendConfig, EmbeddingRole, RuntimeModule, ServerConfig, default_server_session_id,
+    RuntimeModule, ServerRunOptions,
     history::{export_conversation_history, render_conversation_history_markdown},
-    install_lutum_trace_subscriber, load_server_boot_config, parse_model_set_file,
-    resolve_llm_backends, resolve_token_fields, run_server_with_visualizer,
+    install_lutum_trace_subscriber, load_server_config_from_options, run_server_with_visualizer,
 };
 
-const DEFAULT_OPENAI_EMBEDDING_ENDPOINT: &str = "https://api.openai.com/v1";
 const AGENT_DB_FILE: &str = "agent.db";
-const STATE_MODEL_SET_FILE: &str = "model-set.eure";
 
 #[derive(Debug, Parser)]
-#[command(
-    name = "nuillu-server",
-    about = "Run a nuillu server with the visualizer GUI"
-)]
+#[command(name = "nuillu-server", about = "Run a nuillu server runtime")]
 struct Args {
     #[command(flatten)]
     run: RunArgs,
@@ -29,7 +23,7 @@ struct Args {
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    /// Run a nuillu server with the visualizer GUI.
+    /// Run a nuillu server and wait for a visualizer connection.
     Run(RunArgs),
     /// Export user/agent conversation history from the server agent DB.
     History(HistoryArgs),
@@ -74,12 +68,6 @@ struct RunArgs {
     /// Override the persistent agent DB path. Defaults to <state>/agent.db.
     #[arg(long, value_name = "PATH", conflicts_with = "fresh_agent_db")]
     agent_db: Option<PathBuf>,
-
-    /// Path to an existing visualizer GUI binary.
-    ///
-    /// Defaults to building the visualizer bin target.
-    #[arg(long = "visualizer-bin", value_name = "PATH")]
-    visualizer_bin: Option<PathBuf>,
 }
 
 #[derive(Debug, ClapArgs)]
@@ -124,32 +112,17 @@ fn main() -> anyhow::Result<()> {
 }
 
 fn run_server(args: RunArgs) -> anyhow::Result<()> {
-    let model_set_path = resolve_model_set_path(&args.state, args.model_set);
-    let agent_db_path = resolve_agent_db_path(&args.state, args.agent_db);
-    let model_set = parse_model_set_file(&model_set_path)?;
-    let backends = resolve_llm_backends(&model_set)?;
-    let cheap_backend = backends.cheap;
-    let default_backend = backends.default;
-    let premium_backend = backends.premium;
-    let embedding_backend = resolve_embedding(&model_set.embedding)?;
-    let session_id = resolve_session_id(args.session_id, args.run_id);
-    let boot_config = load_server_boot_config(&args.state)?;
-
-    run_server_with_visualizer(ServerConfig {
+    run_server_with_visualizer(load_server_config_from_options(ServerRunOptions {
         state_dir: args.state,
-        agent_db_path,
-        session_id,
+        run_id: args.run_id,
+        session_id: args.session_id,
         llm_log_root: args.llm_log_root,
-        cheap_backend,
-        default_backend,
-        premium_backend,
-        embedding_backend,
-        boot_config,
+        model_set: args.model_set,
         disabled_modules: args.disable_module,
         participants: args.participants,
         fresh_agent_db: args.fresh_agent_db,
-        visualizer_bin: args.visualizer_bin,
-    })
+        agent_db: args.agent_db,
+    })?)
     .context("run nuillu server")
 }
 
@@ -187,20 +160,6 @@ fn export_history(
     Ok(())
 }
 
-fn resolve_session_id(session_id: Option<String>, run_id_alias: Option<String>) -> String {
-    session_id
-        .or(run_id_alias)
-        .unwrap_or_else(default_server_session_id)
-}
-
-fn resolve_model_set_path(state_dir: &Path, model_set: Option<PathBuf>) -> PathBuf {
-    model_set.unwrap_or_else(|| state_dir.join(STATE_MODEL_SET_FILE))
-}
-
-fn resolve_agent_db_path(state_dir: &Path, agent_db: Option<PathBuf>) -> PathBuf {
-    agent_db.unwrap_or_else(|| state_dir.join(AGENT_DB_FILE))
-}
-
 fn resolve_history_agent_db_path(
     history_state: Option<&Path>,
     history_agent_db: Option<&Path>,
@@ -213,28 +172,12 @@ fn resolve_history_agent_db_path(
         .unwrap_or_else(|| history_state.unwrap_or(default_state).join(AGENT_DB_FILE))
 }
 
-fn resolve_embedding(role: &EmbeddingRole) -> anyhow::Result<EmbeddingBackendConfig> {
-    let endpoint = role
-        .endpoint()
-        .unwrap_or(DEFAULT_OPENAI_EMBEDDING_ENDPOINT)
-        .to_string();
-    let token = resolve_token_fields(
-        "embedding",
-        role.token_env.as_deref(),
-        role.token.as_deref(),
-        None,
-    )?;
-    Ok(EmbeddingBackendConfig {
-        endpoint,
-        token,
-        model: role.model.clone(),
-        dimensions: role.dimensions as usize,
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use nuillu_server::config::{
+        resolve_agent_db_path, resolve_model_set_path, resolve_session_id,
+    };
 
     #[test]
     fn resolve_session_id_prefers_explicit_session_id() {
@@ -364,17 +307,6 @@ mod tests {
     }
 
     #[test]
-    fn args_parse_visualizer_bin_path() {
-        let args = Args::parse_from(["nuillu-server", "--visualizer-bin", "/custom/visualizer"]);
-
-        assert_eq!(
-            args.run.visualizer_bin,
-            Some(PathBuf::from("/custom/visualizer"))
-        );
-        assert!(args.command.is_none());
-    }
-
-    #[test]
     fn args_parse_explicit_run_subcommand() {
         let args = Args::parse_from([
             "nuillu-server",
@@ -382,8 +314,6 @@ mod tests {
             "--state",
             ".tmp/exhibition",
             "--fresh-agent-db",
-            "--visualizer-bin",
-            "/custom/visualizer",
         ]);
 
         let Some(Command::Run(run)) = args.command else {
@@ -391,10 +321,6 @@ mod tests {
         };
         assert_eq!(run.state, PathBuf::from(".tmp/exhibition"));
         assert!(run.fresh_agent_db);
-        assert_eq!(
-            run.visualizer_bin,
-            Some(PathBuf::from("/custom/visualizer"))
-        );
     }
 
     #[test]

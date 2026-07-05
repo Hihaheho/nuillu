@@ -1,11 +1,28 @@
-use std::{fs, net::TcpListener, time::Duration};
+use std::{
+    collections::VecDeque,
+    fs,
+    net::TcpListener,
+    sync::{
+        Arc, Mutex,
+        mpsc::{self, Receiver, Sender},
+    },
+    thread,
+    time::Duration,
+};
 
 use anyhow::Context as _;
+use chrono::{DateTime, Utc};
 use nuillu_agent::{AgentEventLoopConfig, AgentRunController, run_controlled as run_agent};
 use nuillu_blackboard::BlackboardCommand;
+use nuillu_module::{
+    ActionAffordance, AmbientSensoryEntry, Participant, RuntimeEvent, SensoryInput,
+};
 use nuillu_visualizer_protocol::{
-    TabStatus, VisualizerAction, VisualizerEvent, VisualizerServerMessage, VisualizerServerPort,
-    VisualizerTabId, run_runtime_action_id, stop_runtime_action_id,
+    AgentActionInvocationCompletion, EditableSceneStateView, ExternalActionEventRowView,
+    ExternalActionEventStatusView, OneShotSensoryInput, TabStatus, UtteranceEventKindView,
+    UtteranceEventRowView, VisualizerAction, VisualizerClientMessage, VisualizerCommand,
+    VisualizerEvent, VisualizerServerMessage, VisualizerServerPort, VisualizerTabId,
+    run_runtime_action_id, stop_runtime_action_id,
 };
 use tokio::{runtime::Builder, task::LocalSet};
 
@@ -16,16 +33,275 @@ use crate::commands::{
 };
 use crate::config::ServerConfig;
 use crate::environment::build_server_environment;
-use crate::gui::{
-    VisualizerHook, accept_visualizer_connection, spawn_visualizer_gui,
-    wait_for_visualizer_exit_with_context,
-};
+use crate::gui::VisualizerHook;
 use crate::llm_db_trace::emit_persisted_llm_transcripts;
 use crate::registry::{full_agent_allocation, server_registry};
 use crate::snapshot::emit_visualizer_blackboard_snapshot;
 use crate::state::{ActionAffordanceState, ModuleSettingsState, SceneState};
 
 const SERVER_TITLE: &str = "nuillu-server";
+const EVENT_BACKLOG_LIMIT: usize = 512;
+
+#[derive(Clone)]
+pub struct ServerRuntimeHandle {
+    commands: Sender<VisualizerClientMessage>,
+    events: Broadcast<ServerEvent>,
+    visualizer_messages: Broadcast<VisualizerServerMessage>,
+    join: Arc<Mutex<Option<thread::JoinHandle<anyhow::Result<()>>>>>,
+}
+
+impl ServerRuntimeHandle {
+    pub fn send_one_shot(
+        &self,
+        modality: impl Into<String>,
+        direction: Option<String>,
+        content: impl Into<String>,
+    ) -> anyhow::Result<()> {
+        self.send_command(VisualizerCommand::SendOneShotSensoryInput {
+            tab_id: server_tab_id(),
+            input: OneShotSensoryInput {
+                modality: modality.into(),
+                direction,
+                content: content.into(),
+            },
+        })
+    }
+
+    pub fn publish_sensory_input(&self, input: SensoryInput) -> anyhow::Result<()> {
+        self.send_command(VisualizerCommand::PublishSensoryInput {
+            tab_id: server_tab_id(),
+            input,
+        })
+    }
+
+    pub fn set_participants(
+        &self,
+        participants: impl IntoIterator<Item = Participant>,
+    ) -> anyhow::Result<()> {
+        let people = participants
+            .into_iter()
+            .enumerate()
+            .map(
+                |(index, participant)| nuillu_visualizer_protocol::ScenePersonRowView {
+                    id: format!("participant-{}", index + 1),
+                    name: participant.name,
+                    direction: String::new(),
+                    distance: String::new(),
+                    state: String::new(),
+                },
+            )
+            .collect();
+        self.send_command(VisualizerCommand::SaveSceneState {
+            tab_id: server_tab_id(),
+            state: EditableSceneStateView {
+                people,
+                ..EditableSceneStateView::default()
+            },
+        })
+    }
+
+    pub fn set_action_affordances(&self, affordances: Vec<ActionAffordance>) -> anyhow::Result<()> {
+        self.send_command(VisualizerCommand::SetAgentActionAffordances {
+            tab_id: server_tab_id(),
+            affordances,
+        })
+    }
+
+    pub fn complete_external_action(
+        &self,
+        invocation_id: impl Into<String>,
+        accepted: bool,
+        message: impl Into<String>,
+    ) -> anyhow::Result<()> {
+        self.send_command(VisualizerCommand::CompleteAgentActionInvocation {
+            tab_id: server_tab_id(),
+            completion: AgentActionInvocationCompletion {
+                invocation_id: invocation_id.into(),
+                accepted,
+                message: message.into(),
+            },
+        })
+    }
+
+    pub fn pause(&self) -> anyhow::Result<()> {
+        self.commands
+            .send(VisualizerClientMessage::InvokeAction {
+                action_id: stop_runtime_action_id(&server_tab_id()),
+            })
+            .context("send server pause command")
+    }
+
+    pub fn resume(&self) -> anyhow::Result<()> {
+        self.commands
+            .send(VisualizerClientMessage::InvokeAction {
+                action_id: run_runtime_action_id(&server_tab_id()),
+            })
+            .context("send server resume command")
+    }
+
+    pub fn shutdown(&self) -> anyhow::Result<()> {
+        self.send_command(VisualizerCommand::Shutdown)
+    }
+
+    pub fn subscribe_events(&self) -> Receiver<ServerEvent> {
+        self.events.subscribe()
+    }
+
+    pub fn visualizer_channels(
+        &self,
+    ) -> (
+        Receiver<VisualizerServerMessage>,
+        Sender<VisualizerClientMessage>,
+    ) {
+        (self.visualizer_messages.subscribe(), self.commands.clone())
+    }
+
+    pub fn join(self) -> anyhow::Result<()> {
+        let Some(join) = self
+            .join
+            .lock()
+            .expect("server runtime join lock poisoned")
+            .take()
+        else {
+            return Ok(());
+        };
+        join.join()
+            .map_err(|panic| anyhow::anyhow!("server runtime thread panicked: {panic:?}"))?
+    }
+
+    fn send_command(&self, command: VisualizerCommand) -> anyhow::Result<()> {
+        self.commands
+            .send(VisualizerClientMessage::Command { command })
+            .context("send server runtime command")
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum ServerEvent {
+    Log {
+        message: String,
+    },
+    StatusChanged {
+        status: ServerRuntimeStatus,
+    },
+    RuntimeEvent {
+        event: RuntimeEvent,
+    },
+    SensoryInput {
+        input: SensoryInput,
+    },
+    OneShotSensoryInputAppended {
+        record: ServerOneShotSensoryInputRecord,
+    },
+    AmbientSensorySnapshotAppended {
+        record: ServerAmbientSensorySnapshotRecord,
+    },
+    UtteranceDelta {
+        sender: String,
+        target: String,
+        generation_id: u64,
+        sequence: u32,
+        delta: String,
+    },
+    UtteranceCompleted {
+        sender: String,
+        target: String,
+        generation_id: Option<u64>,
+        text: String,
+        emitted_at: DateTime<Utc>,
+    },
+    UtteranceEventAppended {
+        record: ServerUtteranceEventRecord,
+    },
+    ExternalActionRequested {
+        invocation_id: String,
+        action_id: String,
+        arguments: serde_json::Value,
+    },
+    ExternalActionEventAppended {
+        record: ServerExternalActionEventRecord,
+    },
+    ExternalActionEventUpdated {
+        record: ServerExternalActionEventRecord,
+    },
+    ActionAffordancesChanged {
+        affordances: Vec<ActionAffordance>,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ServerRuntimeStatus {
+    Running,
+    Passed,
+    Failed,
+    Stopped,
+    Invalid,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServerOneShotSensoryInputRecord {
+    pub id: i64,
+    pub server_session_id: String,
+    pub modality: String,
+    pub direction: Option<String>,
+    pub content: String,
+    pub observed_at: DateTime<Utc>,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServerAmbientSensorySnapshotRecord {
+    pub id: i64,
+    pub server_session_id: String,
+    pub entries: Vec<AmbientSensoryEntry>,
+    pub observed_at: DateTime<Utc>,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ServerUtteranceEventKind {
+    Delta,
+    Completed,
+    Aborted,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServerUtteranceEventRecord {
+    pub id: i64,
+    pub server_session_id: String,
+    pub event_kind: ServerUtteranceEventKind,
+    pub sender: String,
+    pub target: String,
+    pub generation_id: u64,
+    pub sequence: u32,
+    pub content: String,
+    pub reason: Option<String>,
+    pub occurred_at: DateTime<Utc>,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ServerExternalActionEventStatus {
+    Pending,
+    Completed,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ServerExternalActionEventRecord {
+    pub id: i64,
+    pub server_session_id: String,
+    pub invocation_id: String,
+    pub invoked_by: String,
+    pub action_id: String,
+    pub arguments: serde_json::Value,
+    pub status: ServerExternalActionEventStatus,
+    pub accepted: Option<bool>,
+    pub message: Option<String>,
+    pub requested_at: DateTime<Utc>,
+    pub completed_at: Option<DateTime<Utc>>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
 
 pub fn run_server_with_visualizer(config: ServerConfig) -> anyhow::Result<()> {
     fs::create_dir_all(&config.state_dir)
@@ -34,34 +310,45 @@ pub fn run_server_with_visualizer(config: ServerConfig) -> anyhow::Result<()> {
     let addr = listener
         .local_addr()
         .context("read visualizer RPC listener address")?;
-    eprintln!("visualizer RPC listening on {addr}");
-    listener
-        .set_nonblocking(true)
-        .context("set visualizer RPC listener nonblocking")?;
-    let mut child = spawn_visualizer_gui(&addr.to_string(), config.visualizer_bin.as_deref())?;
-    eprintln!("visualizer process started pid={}", child.id());
-    let stream = accept_visualizer_connection(&listener, &mut child)?;
+    eprintln!("nuillu-server visualizer RPC listening on {addr}");
+    let (stream, _) = listener
+        .accept()
+        .context("accept visualizer RPC connection")?;
     eprintln!("visualizer RPC connected");
     let port = VisualizerServerPort::from_stream(stream).context("open visualizer RPC port")?;
     port.send(VisualizerServerMessage::hello())
         .context("send visualizer protocol hello")?;
     let _ = port.recv();
 
-    let tab_id = VisualizerTabId::new(SERVER_TAB_ID.to_string());
-    port.send(VisualizerServerMessage::event(VisualizerEvent::OpenTab {
-        tab_id: tab_id.clone(),
-        title: SERVER_TITLE.to_string(),
-    }))
-    .context("open server tab")?;
-    port.send(VisualizerServerMessage::event(
-        VisualizerEvent::SetTabStatus {
-            tab_id,
-            status: TabStatus::Running,
-        },
-    ))
-    .context("set server tab status")?;
-
     let (command_rx, event_tx) = port.into_channels();
+    send_visualizer_startup(&event_tx);
+    run_server_on_current_thread(config, event_tx, command_rx)
+}
+
+pub fn spawn_server_runtime(config: ServerConfig) -> anyhow::Result<ServerRuntimeHandle> {
+    let (command_tx, command_rx) = mpsc::channel();
+    let (visualizer_tx, visualizer_rx) = mpsc::channel();
+    let events = Broadcast::new(EVENT_BACKLOG_LIMIT);
+    let visualizer_messages = Broadcast::new(EVENT_BACKLOG_LIMIT);
+    spawn_visualizer_message_pump(visualizer_rx, visualizer_messages.clone(), events.clone());
+    let join = thread::spawn(move || {
+        send_visualizer_startup(&visualizer_tx);
+        run_server_on_current_thread(config, visualizer_tx, command_rx)
+    });
+
+    Ok(ServerRuntimeHandle {
+        commands: command_tx,
+        events,
+        visualizer_messages,
+        join: Arc::new(Mutex::new(Some(join))),
+    })
+}
+
+fn run_server_on_current_thread(
+    config: ServerConfig,
+    event_tx: Sender<VisualizerServerMessage>,
+    command_rx: Receiver<VisualizerClientMessage>,
+) -> anyhow::Result<()> {
     let runtime = Builder::new_current_thread()
         .enable_all()
         .build()
@@ -81,15 +368,226 @@ pub fn run_server_with_visualizer(config: ServerConfig) -> anyhow::Result<()> {
             status: TabStatus::Invalid,
         });
     }
-    wait_for_visualizer_exit_with_context(
-        child,
-        if result.is_ok() {
-            "nuillu-server runtime stopped"
-        } else {
-            "nuillu-server runtime failed"
-        },
-    );
     result
+}
+
+fn send_visualizer_startup(events: &Sender<VisualizerServerMessage>) {
+    let tab_id = server_tab_id();
+    let _ = events.send(VisualizerServerMessage::hello());
+    let _ = events.send(VisualizerServerMessage::event(VisualizerEvent::OpenTab {
+        tab_id: tab_id.clone(),
+        title: SERVER_TITLE.to_string(),
+    }));
+    let _ = events.send(VisualizerServerMessage::event(
+        VisualizerEvent::SetTabStatus {
+            tab_id,
+            status: TabStatus::Running,
+        },
+    ));
+}
+
+fn server_tab_id() -> VisualizerTabId {
+    VisualizerTabId::new(SERVER_TAB_ID.to_string())
+}
+
+#[derive(Clone)]
+struct Broadcast<T: Clone> {
+    inner: Arc<Mutex<BroadcastState<T>>>,
+}
+
+struct BroadcastState<T: Clone> {
+    subscribers: Vec<Sender<T>>,
+    backlog: VecDeque<T>,
+    max_backlog: usize,
+}
+
+impl<T: Clone> Broadcast<T> {
+    fn new(max_backlog: usize) -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(BroadcastState {
+                subscribers: Vec::new(),
+                backlog: VecDeque::new(),
+                max_backlog,
+            })),
+        }
+    }
+
+    fn subscribe(&self) -> Receiver<T> {
+        let (tx, rx) = mpsc::channel();
+        let mut inner = self.inner.lock().expect("broadcast lock poisoned");
+        for item in &inner.backlog {
+            if tx.send(item.clone()).is_err() {
+                return rx;
+            }
+        }
+        inner.subscribers.push(tx);
+        rx
+    }
+
+    fn publish(&self, item: T) {
+        let mut inner = self.inner.lock().expect("broadcast lock poisoned");
+        if inner.max_backlog > 0 {
+            inner.backlog.push_back(item.clone());
+            while inner.backlog.len() > inner.max_backlog {
+                inner.backlog.pop_front();
+            }
+        }
+        inner
+            .subscribers
+            .retain(|subscriber| subscriber.send(item.clone()).is_ok());
+    }
+}
+
+fn spawn_visualizer_message_pump(
+    rx: Receiver<VisualizerServerMessage>,
+    raw_messages: Broadcast<VisualizerServerMessage>,
+    events: Broadcast<ServerEvent>,
+) {
+    thread::spawn(move || {
+        while let Ok(message) = rx.recv() {
+            if let Some(event) = server_event_from_visualizer_message(&message) {
+                events.publish(event);
+            }
+            raw_messages.publish(message);
+        }
+    });
+}
+
+fn server_event_from_visualizer_message(message: &VisualizerServerMessage) -> Option<ServerEvent> {
+    let VisualizerServerMessage::Event { event } = message else {
+        return None;
+    };
+    match event {
+        VisualizerEvent::SetTabStatus { status, .. } => Some(ServerEvent::StatusChanged {
+            status: match status {
+                TabStatus::Running => ServerRuntimeStatus::Running,
+                TabStatus::Passed => ServerRuntimeStatus::Passed,
+                TabStatus::Failed => ServerRuntimeStatus::Failed,
+                TabStatus::Stopped => ServerRuntimeStatus::Stopped,
+                TabStatus::Invalid => ServerRuntimeStatus::Invalid,
+            },
+        }),
+        VisualizerEvent::Log { message, .. } => Some(ServerEvent::Log {
+            message: message.clone(),
+        }),
+        VisualizerEvent::RuntimeEvent { event, .. } => Some(ServerEvent::RuntimeEvent {
+            event: event.clone(),
+        }),
+        VisualizerEvent::SensoryInput { input, .. } => Some(ServerEvent::SensoryInput {
+            input: input.clone(),
+        }),
+        VisualizerEvent::OneShotSensoryInputAppended { row, .. } => {
+            Some(ServerEvent::OneShotSensoryInputAppended {
+                record: ServerOneShotSensoryInputRecord {
+                    id: row.id,
+                    server_session_id: row.server_session_id.clone(),
+                    modality: row.modality.clone(),
+                    direction: row.direction.clone(),
+                    content: row.content.clone(),
+                    observed_at: row.observed_at,
+                    created_at: row.created_at,
+                },
+            })
+        }
+        VisualizerEvent::AmbientSensorySnapshotAppended { row, .. } => {
+            Some(ServerEvent::AmbientSensorySnapshotAppended {
+                record: ServerAmbientSensorySnapshotRecord {
+                    id: row.id,
+                    server_session_id: row.server_session_id.clone(),
+                    entries: row.entries.clone(),
+                    observed_at: row.observed_at,
+                    created_at: row.created_at,
+                },
+            })
+        }
+        VisualizerEvent::UtteranceDelta { utterance, .. } => Some(ServerEvent::UtteranceDelta {
+            sender: utterance.sender.clone(),
+            target: utterance.target.clone(),
+            generation_id: utterance.generation_id,
+            sequence: utterance.sequence,
+            delta: utterance.delta.clone(),
+        }),
+        VisualizerEvent::UtteranceCompleted { utterance, .. } => {
+            Some(ServerEvent::UtteranceCompleted {
+                sender: utterance.sender.clone(),
+                target: utterance.target.clone(),
+                generation_id: utterance.generation_id,
+                text: utterance.text.clone(),
+                emitted_at: utterance.emitted_at,
+            })
+        }
+        VisualizerEvent::UtteranceEventAppended { row, .. } => {
+            Some(ServerEvent::UtteranceEventAppended {
+                record: server_utterance_event_record(row),
+            })
+        }
+        VisualizerEvent::ExternalActionEventAppended { row, .. } => {
+            Some(ServerEvent::ExternalActionEventAppended {
+                record: server_external_action_event_record(row),
+            })
+        }
+        VisualizerEvent::ExternalActionEventUpdated { row, .. } => {
+            Some(ServerEvent::ExternalActionEventUpdated {
+                record: server_external_action_event_record(row),
+            })
+        }
+        VisualizerEvent::AgentActionInvocationRequested { request, .. } => {
+            Some(ServerEvent::ExternalActionRequested {
+                invocation_id: request.invocation_id.clone(),
+                action_id: request.action_id.clone(),
+                arguments: request.arguments.clone(),
+            })
+        }
+        VisualizerEvent::AgentActionAffordances { affordances, .. } => {
+            Some(ServerEvent::ActionAffordancesChanged {
+                affordances: affordances.clone(),
+            })
+        }
+        _ => None,
+    }
+}
+
+fn server_utterance_event_record(row: &UtteranceEventRowView) -> ServerUtteranceEventRecord {
+    ServerUtteranceEventRecord {
+        id: row.id,
+        server_session_id: row.server_session_id.clone(),
+        event_kind: match row.event_kind {
+            UtteranceEventKindView::Delta => ServerUtteranceEventKind::Delta,
+            UtteranceEventKindView::Completed => ServerUtteranceEventKind::Completed,
+            UtteranceEventKindView::Aborted => ServerUtteranceEventKind::Aborted,
+        },
+        sender: row.sender.clone(),
+        target: row.target.clone(),
+        generation_id: row.generation_id,
+        sequence: row.sequence,
+        content: row.content.clone(),
+        reason: row.reason.clone(),
+        occurred_at: row.occurred_at,
+        created_at: row.created_at,
+    }
+}
+
+fn server_external_action_event_record(
+    row: &ExternalActionEventRowView,
+) -> ServerExternalActionEventRecord {
+    ServerExternalActionEventRecord {
+        id: row.id,
+        server_session_id: row.server_session_id.clone(),
+        invocation_id: row.invocation_id.clone(),
+        invoked_by: row.invoked_by.clone(),
+        action_id: row.action_id.clone(),
+        arguments: row.arguments.clone(),
+        status: match row.status {
+            ExternalActionEventStatusView::Pending => ServerExternalActionEventStatus::Pending,
+            ExternalActionEventStatusView::Completed => ServerExternalActionEventStatus::Completed,
+        },
+        accepted: row.accepted,
+        message: row.message.clone(),
+        requested_at: row.requested_at,
+        completed_at: row.completed_at,
+        created_at: row.created_at,
+        updated_at: row.updated_at,
+    }
 }
 
 async fn run_server(config: ServerConfig, visualizer: &mut VisualizerHook) -> anyhow::Result<()> {
@@ -259,9 +757,164 @@ pub(crate) fn set_runtime_running(
 mod tests {
     use std::sync::mpsc;
 
-    use nuillu_visualizer_protocol::{VisualizerActionKind, VisualizerClientMessage};
+    use nuillu_module::{ActionAffordance, SensoryModality};
+    use nuillu_visualizer_protocol::{
+        AgentActionInvocationRequest, VisualizerActionKind, VisualizerClientMessage,
+    };
 
     use super::*;
+
+    fn test_handle() -> (ServerRuntimeHandle, Receiver<VisualizerClientMessage>) {
+        let (tx, rx) = mpsc::channel();
+        (
+            ServerRuntimeHandle {
+                commands: tx,
+                events: Broadcast::new(EVENT_BACKLOG_LIMIT),
+                visualizer_messages: Broadcast::new(EVENT_BACKLOG_LIMIT),
+                join: Arc::new(Mutex::new(None)),
+            },
+            rx,
+        )
+    }
+
+    #[test]
+    fn runtime_handle_sends_sensory_and_control_commands() {
+        let (handle, rx) = test_handle();
+
+        handle
+            .send_one_shot("audition", Some("Peer".to_string()), "hello")
+            .unwrap();
+        handle
+            .publish_sensory_input(SensoryInput::AmbientSnapshot {
+                entries: vec![AmbientSensoryEntry {
+                    id: "room".to_string(),
+                    modality: SensoryModality::parse("vision"),
+                    content: "lamp is on".to_string(),
+                }],
+                observed_at: chrono::Utc::now(),
+            })
+            .unwrap();
+        handle.pause().unwrap();
+        handle.resume().unwrap();
+        handle.shutdown().unwrap();
+
+        let messages = rx.try_iter().collect::<Vec<_>>();
+        assert!(matches!(
+            &messages[0],
+            VisualizerClientMessage::Command {
+                command: VisualizerCommand::SendOneShotSensoryInput { input, .. }
+            } if input.modality == "audition"
+                && input.direction.as_deref() == Some("Peer")
+                && input.content == "hello"
+        ));
+        assert!(matches!(
+            &messages[1],
+            VisualizerClientMessage::Command {
+                command: VisualizerCommand::PublishSensoryInput {
+                    input: SensoryInput::AmbientSnapshot { entries, .. },
+                    ..
+                }
+            } if entries.len() == 1 && entries[0].content == "lamp is on"
+        ));
+        assert!(matches!(
+            &messages[2],
+            VisualizerClientMessage::InvokeAction { action_id }
+                if action_id == &stop_runtime_action_id(&server_tab_id())
+        ));
+        assert!(matches!(
+            &messages[3],
+            VisualizerClientMessage::InvokeAction { action_id }
+                if action_id == &run_runtime_action_id(&server_tab_id())
+        ));
+        assert!(matches!(
+            &messages[4],
+            VisualizerClientMessage::Command {
+                command: VisualizerCommand::Shutdown
+            }
+        ));
+    }
+
+    #[test]
+    fn runtime_handle_sends_participants_actions_and_action_completion() {
+        let (handle, rx) = test_handle();
+
+        handle
+            .set_participants([Participant::new("Pibi"), Participant::new("Koro")])
+            .unwrap();
+        handle
+            .set_action_affordances(vec![ActionAffordance {
+                id: "poet".to_string(),
+                label: "Poet".to_string(),
+                description: "Write a poem".to_string(),
+                use_when: "A poem is useful".to_string(),
+                effect: "The host records a poem".to_string(),
+                input_schema: serde_json::json!({"type": "object"}),
+            }])
+            .unwrap();
+        handle
+            .complete_external_action("agent-action-1", true, "accepted")
+            .unwrap();
+
+        let messages = rx.try_iter().collect::<Vec<_>>();
+        assert!(matches!(
+            &messages[0],
+            VisualizerClientMessage::Command {
+                command: VisualizerCommand::SaveSceneState { state, .. }
+            } if state.people.iter().map(|person| person.name.as_str()).collect::<Vec<_>>()
+                == vec!["Pibi", "Koro"]
+        ));
+        assert!(matches!(
+            &messages[1],
+            VisualizerClientMessage::Command {
+                command: VisualizerCommand::SetAgentActionAffordances { affordances, .. }
+            } if affordances.len() == 1 && affordances[0].id == "poet"
+        ));
+        assert!(matches!(
+            &messages[2],
+            VisualizerClientMessage::Command {
+                command: VisualizerCommand::CompleteAgentActionInvocation { completion, .. }
+            } if completion.invocation_id == "agent-action-1"
+                && completion.accepted
+                && completion.message == "accepted"
+        ));
+    }
+
+    #[test]
+    fn server_event_maps_external_action_request() {
+        let message =
+            VisualizerServerMessage::event(VisualizerEvent::AgentActionInvocationRequested {
+                tab_id: server_tab_id(),
+                request: AgentActionInvocationRequest {
+                    invocation_id: "agent-action-1".to_string(),
+                    action_id: "poet".to_string(),
+                    arguments: serde_json::json!({ "poem": "quiet rain" }),
+                },
+            });
+
+        assert_eq!(
+            server_event_from_visualizer_message(&message),
+            Some(ServerEvent::ExternalActionRequested {
+                invocation_id: "agent-action-1".to_string(),
+                action_id: "poet".to_string(),
+                arguments: serde_json::json!({ "poem": "quiet rain" }),
+            })
+        );
+    }
+
+    #[test]
+    fn visualizer_channels_replay_backlog() {
+        let (handle, _rx) = test_handle();
+        handle
+            .visualizer_messages
+            .publish(VisualizerServerMessage::hello());
+
+        let (server_rx, _client_tx) = handle.visualizer_channels();
+
+        assert!(matches!(
+            server_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+            VisualizerServerMessage::Hello { .. }
+        ));
+    }
 
     #[test]
     fn set_runtime_running_updates_controller_status_and_actions() {

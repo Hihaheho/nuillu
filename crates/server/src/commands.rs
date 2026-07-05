@@ -110,6 +110,17 @@ async fn handle_server_visualizer_message(
             visualizer.request_shutdown();
             true
         }
+        VisualizerCommand::PublishSensoryInput {
+            tab_id: command_tab,
+            input,
+        } if command_tab == *tab_id => {
+            if !run_controller.is_running() {
+                resume_runtime(visualizer, tab_id, scene, sensory, env, run_controller).await;
+            }
+            let _ = sensory.publish(input.clone()).await;
+            record_sensory_input(visualizer, tab_id, env, &input).await;
+            false
+        }
         VisualizerCommand::SendOneShotSensoryInput {
             tab_id: command_tab,
             input,

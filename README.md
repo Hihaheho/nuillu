@@ -28,6 +28,16 @@ The multi-agent decomposition and the deterministic logic are therefore means, n
 
 A proof-of-concept runtime is currently being built. Core crates, server/runtime wiring, eval tooling, and many built-in modules exist, but the project is still pre-alpha and APIs and behavior remain in flux. The design notes in `docs/design/` are the source of truth for architectural intent. Nothing is published to crates.io.
 
+## Run
+
+The visualizer is the normal entry point; it starts the server runtime in-process.
+
+```bash
+cargo run -p nuillu-visualizer-egui -- --state <path to nuillu-exhibition>
+```
+
+`nuillu-server` remains available for headless/runtime use and can be connected to by a visualizer with `--host`.
+
 ## License
 
 Licensed under the **Mozilla Public License, version 2.0** (MPL-2.0). See [LICENSE](./LICENSE) for the full text.

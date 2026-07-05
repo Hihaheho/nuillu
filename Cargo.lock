@@ -3617,6 +3617,7 @@ name = "nuillu-visualizer-egui"
 version = "0.1.0"
 dependencies = [
  "chrono",
+ "clap",
  "eframe",
  "egui",
  "egui_hooks",
@@ -3624,6 +3625,7 @@ dependencies = [
  "fluent-bundle",
  "font-kit",
  "nuillu-module",
+ "nuillu-server",
  "nuillu-types",
  "nuillu-visualizer-protocol",
  "serde",
