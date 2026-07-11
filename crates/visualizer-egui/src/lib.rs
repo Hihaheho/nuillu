@@ -1370,6 +1370,7 @@ impl RuntimeTab {
                                 ui,
                                 commands,
                                 resource_monitor_now_secs,
+                                "simplified",
                             );
                         },
                     );
@@ -1483,9 +1484,13 @@ impl RuntimeTab {
         ui: &mut egui::Ui,
         commands: &Sender<VisualizerClientMessage>,
         now_secs: f64,
+        id_salt: &'static str,
     ) -> Option<String> {
-        let actions =
-            modules::render_modules_overview(ui, &self.blackboard, &self.modules, now_secs);
+        let actions = ui
+            .push_id(("modules-overview", id_salt), |ui| {
+                modules::render_modules_overview(ui, &self.blackboard, &self.modules, now_secs)
+            })
+            .inner;
         self.handle_module_overview_actions(actions, commands)
     }
 
@@ -1768,8 +1773,12 @@ impl RuntimeTab {
             .default_pos(568.0, 1020.0)
             .default_size(640.0, 360.0)
             .show(ui, |ui| {
-                requested_module =
-                    self.render_modules_overview_contents(ui, commands, resource_monitor_now_secs);
+                requested_module = self.render_modules_overview_contents(
+                    ui,
+                    commands,
+                    resource_monitor_now_secs,
+                    "window",
+                );
             });
         self.record_window_open(modules_id, open);
 

@@ -268,10 +268,12 @@ pub(super) async fn build_server_environment(
         "nuillu-server runtime-event-log path={}",
         runtime_event_log.path().display()
     );
+    emit_startup_progress(&visualizer, "connecting agent store");
     let clock: Rc<dyn Clock> = Rc::new(SystemClock);
     let visualizer_for_events = visualizer.clone();
     let llm_observer = VisualizerLlmObserver::new(SERVER_TAB_ID.to_string(), visualizer.clone());
     let agent_store = connect_agent_store(config).await?;
+    emit_startup_progress(&visualizer, "agent store connected");
     let one_shot_sensory_input_store = agent_store.one_shot_sensory_input_store();
     let ambient_sensory_snapshot_store = agent_store.ambient_sensory_snapshot_store();
     let utterance_event_store = agent_store.utterance_event_store();
@@ -307,6 +309,7 @@ pub(super) async fn build_server_environment(
         clock.clone(),
     ));
     let llm_concurrency_pool = LlmConcurrencyPool::default();
+    emit_startup_progress(&visualizer, "building runtime capabilities");
     let caps = CapabilityProviders::new(CapabilityProviderConfig {
         ports: CapabilityProviderPorts {
             blackboard: blackboard.clone(),
@@ -338,12 +341,18 @@ pub(super) async fn build_server_environment(
         memory.clone(),
         Vec::new(),
     );
+    emit_startup_progress(&visualizer, "seeding startup memories");
     let seeded_memories = seed_memory_from_state_dir(&config.state_dir, &memory_caps)
         .await
         .context("seed startup memories")?;
     if seeded_memories > 0 {
         eprintln!("nuillu-server seeded memory entries count={seeded_memories}");
     }
+    emit_startup_progress(
+        &visualizer,
+        format!("startup memories seeded count={seeded_memories}"),
+    );
+    emit_startup_progress(&visualizer, "bootstrapping identity memories");
     memory_caps
         .bootstrap_identity_memories()
         .await
@@ -351,10 +360,12 @@ pub(super) async fn build_server_environment(
 
     let policy_caps =
         PolicyCapabilities::new(blackboard.clone(), clock.clone(), policy_store, Vec::new());
+    emit_startup_progress(&visualizer, "bootstrapping core policies");
     policy_caps
         .bootstrap_core_policies()
         .await
         .map_err(|error| anyhow::anyhow!("failed to load core policies: {error}"))?;
+    emit_startup_progress(&visualizer, "server environment ready");
 
     Ok(ServerEnvironment {
         server_session_id: config.session_id.clone(),
@@ -372,6 +383,15 @@ pub(super) async fn build_server_environment(
         external_action_event_store,
         external_actions,
     })
+}
+
+fn emit_startup_progress(visualizer: &VisualizerEventSink, message: impl Into<String>) {
+    let message = format!("nuillu-server startup: {}", message.into());
+    eprintln!("{message}");
+    visualizer.send(VisualizerEvent::Log {
+        tab_id: VisualizerTabId::new(SERVER_TAB_ID.to_string()),
+        message,
+    });
 }
 
 fn server_runtime_policy(config: &ServerConfig) -> RuntimePolicy {

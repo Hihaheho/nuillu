@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::{path::PathBuf, time::Duration};
 
 use clap::{Args as ClapArgs, Parser};
 use nuillu_server::{
@@ -44,7 +44,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     if let Some(runtime) = embedded_runtime {
         let _ = runtime.shutdown();
-        let _ = runtime.join();
+        match runtime.join_timeout(Duration::from_secs(2)) {
+            Ok(true) => {}
+            Ok(false) => {
+                eprintln!("nuillu-visualizer-egui server runtime did not stop within 2s; exiting");
+            }
+            Err(error) => {
+                eprintln!("nuillu-visualizer-egui server runtime join failed: {error:#}");
+            }
+        }
     }
     result?;
     Ok(())

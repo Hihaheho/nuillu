@@ -830,7 +830,9 @@ pub fn render_modules_overview(
             overview_header(ui);
             ui.separator();
             for (index, row) in rows.iter().enumerate() {
-                overview_row(ui, row, index, &mut actions, &mut open_config);
+                ui.push_id(("overview-row", row.owner.as_str()), |ui| {
+                    overview_row(ui, row, index, &mut actions, &mut open_config);
+                });
             }
         });
 
@@ -1845,6 +1847,8 @@ fn overview_row(
             overview_replica_cell(ui, row);
             overview_label_cell(
                 ui,
+                row,
+                "allocation",
                 &row.activation_ratio
                     .map(|ratio| format!("{ratio:.2}"))
                     .unwrap_or_else(|| "-".to_string()),
@@ -1853,12 +1857,16 @@ fn overview_row(
             );
             overview_label_cell(
                 ui,
+                row,
+                "bpm",
                 &row.bpm.map(format_bpm).unwrap_or_else(|| "-".to_string()),
                 None,
                 BPM_COLUMN_WIDTH,
             );
             overview_label_cell(
                 ui,
+                row,
+                "period",
                 &row.period_ms
                     .map(format_millis)
                     .unwrap_or_else(|| "-".to_string()),
@@ -1868,11 +1876,20 @@ fn overview_row(
             overview_bpm_wait_cell(ui, row);
             overview_label_cell(
                 ui,
+                row,
+                "tier",
                 row.tier.as_deref().unwrap_or("-"),
                 None,
                 TIER_COLUMN_WIDTH,
             );
-            overview_label_cell(ui, &row.runtime_status, None, STATUS_COLUMN_WIDTH);
+            overview_label_cell(
+                ui,
+                row,
+                "runtime",
+                &row.runtime_status,
+                None,
+                STATUS_COLUMN_WIDTH,
+            );
             overview_llm_status_cell(ui, row);
             let activation_error_label = overview_activation_error_label(row);
             let activation_error_hover = format!(
@@ -1881,6 +1898,8 @@ fn overview_row(
             );
             overview_label_cell(
                 ui,
+                row,
+                "activation-errors",
                 &activation_error_label,
                 Some(&activation_error_hover),
                 ACTIVATION_ERRORS_COLUMN_WIDTH,
@@ -1892,12 +1911,14 @@ fn overview_row(
             );
             overview_label_cell(
                 ui,
+                row,
+                "llm-errors",
                 &llm_error_label,
                 Some(&llm_error_hover),
                 LLM_ERRORS_COLUMN_WIDTH,
             );
             let output = row.latest_llm_output.as_deref().unwrap_or("-");
-            overview_latest_output_cell(ui, output, row.latest_llm_output.as_deref());
+            overview_latest_output_cell(ui, row, output, row.latest_llm_output.as_deref());
         });
     });
 }
@@ -2204,7 +2225,14 @@ fn overview_module_cell(
 
 fn overview_replica_cell(ui: &mut egui::Ui, row: &ModuleOverviewRow) {
     let Some(highlight) = active_replica_highlight(row) else {
-        overview_label_cell(ui, &replica_label(row), None, REPLICA_COLUMN_WIDTH);
+        overview_label_cell(
+            ui,
+            row,
+            "replica",
+            &replica_label(row),
+            None,
+            REPLICA_COLUMN_WIDTH,
+        );
         return;
     };
 
@@ -2226,28 +2254,53 @@ fn overview_replica_cell(ui: &mut egui::Ui, row: &ModuleOverviewRow) {
         .stroke(stroke)
         .inner_margin(egui::Margin::same(0));
     frame.show(ui, |ui| {
-        overview_label_cell(ui, &replica_label(row), Some(hover), REPLICA_COLUMN_WIDTH);
+        overview_label_cell(
+            ui,
+            row,
+            "replica",
+            &replica_label(row),
+            Some(hover),
+            REPLICA_COLUMN_WIDTH,
+        );
     });
 }
 
-fn overview_label_cell(ui: &mut egui::Ui, text: &str, hover: Option<&str>, width: f32) {
-    let response = ui.add_sized(
-        [width, OVERVIEW_ROW_HEIGHT],
-        egui::Label::new(text)
-            .truncate()
-            .show_tooltip_when_elided(true),
-    );
-    if let Some(hover) = hover
-        && !hover.is_empty()
-        && hover != text
-    {
-        response.on_hover_text(hover);
+fn overview_label_cell(
+    ui: &mut egui::Ui,
+    row: &ModuleOverviewRow,
+    column: &'static str,
+    text: &str,
+    hover: Option<&str>,
+    width: f32,
+) {
+    let (_id, rect) = ui.allocate_space(egui::vec2(width, OVERVIEW_ROW_HEIGHT));
+    let color = ui.visuals().text_color();
+    let font_id = egui::TextStyle::Body.resolve(ui.style());
+    let galley = ui
+        .painter()
+        .layout_no_wrap(text.to_string(), font_id.clone(), color);
+    let position = egui::pos2(rect.left(), rect.center().y - (galley.size().y / 2.0));
+    ui.painter()
+        .with_clip_rect(rect)
+        .galley(position, galley, color);
+
+    let text_elided = text_width(ui, text, &font_id, color) > rect.width();
+    let hover_text = hover
+        .filter(|hover| !hover.is_empty() && *hover != text)
+        .or_else(|| text_elided.then_some(text));
+    if let Some(hover_text) = hover_text {
+        ui.interact(
+            rect,
+            ui.make_persistent_id(("modules-overview-cell", row.owner.as_str(), column)),
+            egui::Sense::hover(),
+        )
+        .on_hover_text(hover_text);
     }
 }
 
 fn overview_bpm_wait_cell(ui: &mut egui::Ui, row: &ModuleOverviewRow) {
     let Some(wait) = &row.bpm_wait else {
-        overview_label_cell(ui, "-", None, BPM_WAIT_COLUMN_WIDTH);
+        overview_label_cell(ui, row, "bpm-wait", "-", None, BPM_WAIT_COLUMN_WIDTH);
         return;
     };
     let fill = if ui.visuals().dark_mode {
@@ -2261,6 +2314,8 @@ fn overview_bpm_wait_cell(ui: &mut egui::Ui, row: &ModuleOverviewRow) {
         .show(ui, |ui| {
             overview_label_cell(
                 ui,
+                row,
+                "bpm-wait",
                 &wait.label,
                 Some("BPM wait before the next batch"),
                 BPM_WAIT_COLUMN_WIDTH,
@@ -2269,34 +2324,37 @@ fn overview_bpm_wait_cell(ui: &mut egui::Ui, row: &ModuleOverviewRow) {
 }
 
 fn overview_llm_status_cell(ui: &mut egui::Ui, row: &ModuleOverviewRow) {
-    let response = if row.llm_waiting {
+    let hover = if row.llm_streaming {
+        Some("LLM request in flight")
+    } else if row.llm_waiting {
+        Some("Waiting for LLM concurrency semaphore")
+    } else {
+        None
+    };
+    if row.llm_waiting {
         egui::Frame::new()
             .fill(llm_wait_fill(ui))
             .inner_margin(egui::Margin::same(0))
-            .show(ui, |ui| overview_llm_status_label(ui, row))
-            .inner
+            .show(ui, |ui| {
+                overview_label_cell(
+                    ui,
+                    row,
+                    "llm-status",
+                    &row.llm_status,
+                    hover,
+                    LLM_COLUMN_WIDTH,
+                );
+            });
     } else {
-        overview_llm_status_label(ui, row)
-    };
-    if row.llm_streaming {
-        response.on_hover_text("LLM request in flight");
-    } else if row.llm_waiting {
-        response.on_hover_text("Waiting for LLM concurrency semaphore");
+        overview_label_cell(
+            ui,
+            row,
+            "llm-status",
+            &row.llm_status,
+            hover,
+            LLM_COLUMN_WIDTH,
+        );
     }
-}
-
-fn overview_llm_status_label(ui: &mut egui::Ui, row: &ModuleOverviewRow) -> egui::Response {
-    let text = if row.llm_streaming {
-        egui::RichText::new(&row.llm_status).strong()
-    } else {
-        egui::RichText::new(&row.llm_status)
-    };
-    ui.add_sized(
-        [LLM_COLUMN_WIDTH, OVERVIEW_ROW_HEIGHT],
-        egui::Label::new(text)
-            .truncate()
-            .show_tooltip_when_elided(true),
-    )
 }
 
 fn llm_wait_fill(ui: &egui::Ui) -> egui::Color32 {
@@ -2311,11 +2369,14 @@ fn llm_wait_fill_color(dark_mode: bool) -> egui::Color32 {
     }
 }
 
-fn overview_latest_output_cell(ui: &mut egui::Ui, text: &str, hover: Option<&str>) {
-    let (rect, response) = ui.allocate_exact_size(
-        egui::vec2(LATEST_OUTPUT_COLUMN_WIDTH, OVERVIEW_ROW_HEIGHT),
-        egui::Sense::hover(),
-    );
+fn overview_latest_output_cell(
+    ui: &mut egui::Ui,
+    row: &ModuleOverviewRow,
+    text: &str,
+    hover: Option<&str>,
+) {
+    let (_id, rect) =
+        ui.allocate_space(egui::vec2(LATEST_OUTPUT_COLUMN_WIDTH, OVERVIEW_ROW_HEIGHT));
     let color = ui.visuals().text_color();
     let font_id = egui::TextStyle::Body.resolve(ui.style());
     let display = latest_output_cell_text(ui, text, &font_id, color, rect.width());
@@ -2332,7 +2393,12 @@ fn overview_latest_output_cell(ui: &mut egui::Ui, text: &str, hover: Option<&str
         && !hover.is_empty()
         && hover != display
     {
-        response.on_hover_text(hover);
+        ui.interact(
+            rect,
+            ui.make_persistent_id(("modules-overview-cell", row.owner.as_str(), "latest-output")),
+            egui::Sense::hover(),
+        )
+        .on_hover_text(hover);
     }
 }
 

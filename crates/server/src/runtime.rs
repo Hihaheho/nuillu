@@ -6,8 +6,8 @@ use std::{
         Arc, Mutex,
         mpsc::{self, Receiver, Sender},
     },
-    thread,
-    time::Duration,
+    thread::{self, JoinHandle},
+    time::{Duration, Instant},
 };
 
 use anyhow::Context as _;
@@ -41,13 +41,15 @@ use crate::state::{ActionAffordanceState, ModuleSettingsState, SceneState};
 
 const SERVER_TITLE: &str = "nuillu-server";
 const EVENT_BACKLOG_LIMIT: usize = 512;
+const AGENT_RESTART_LIMIT: u64 = 5;
+const AGENT_RESTART_STABLE_AFTER: Duration = Duration::from_secs(30);
 
 #[derive(Clone)]
 pub struct ServerRuntimeHandle {
     commands: Sender<VisualizerClientMessage>,
     events: Broadcast<ServerEvent>,
     visualizer_messages: Broadcast<VisualizerServerMessage>,
-    join: Arc<Mutex<Option<thread::JoinHandle<anyhow::Result<()>>>>>,
+    join: Arc<Mutex<Option<JoinHandle<anyhow::Result<()>>>>>,
 }
 
 impl ServerRuntimeHandle {
@@ -167,6 +169,31 @@ impl ServerRuntimeHandle {
         };
         join.join()
             .map_err(|panic| anyhow::anyhow!("server runtime thread panicked: {panic:?}"))?
+    }
+
+    pub fn join_timeout(&self, timeout: Duration) -> anyhow::Result<bool> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            {
+                let mut guard = self.join.lock().expect("server runtime join lock poisoned");
+                let Some(join) = guard.as_ref() else {
+                    return Ok(true);
+                };
+                if join.is_finished() {
+                    let join = guard
+                        .take()
+                        .expect("server runtime join handle disappeared");
+                    join.join().map_err(|panic| {
+                        anyhow::anyhow!("server runtime thread panicked: {panic:?}")
+                    })??;
+                    return Ok(true);
+                }
+            }
+            if Instant::now() >= deadline {
+                return Ok(false);
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
     }
 
     fn send_command(&self, command: VisualizerCommand) -> anyhow::Result<()> {
@@ -668,6 +695,7 @@ async fn run_server(config: ServerConfig, visualizer: &mut VisualizerHook) -> an
         apply_persisted_module_settings(&module_settings, visualizer, &tab_id, &env.blackboard)
             .await;
 
+        let run_started_at = Instant::now();
         let result = run_agent(
             allocated,
             AgentEventLoopConfig {
@@ -691,12 +719,31 @@ async fn run_server(config: ServerConfig, visualizer: &mut VisualizerHook) -> an
         )
         .await;
 
+        if run_started_at.elapsed() >= AGENT_RESTART_STABLE_AFTER {
+            restart_count = 0;
+        }
         match result {
             Ok(()) if visualizer.shutdown_requested() => break,
             Ok(()) => {
                 restart_count = restart_count.saturating_add(1);
+                let Some(delay) = agent_restart_delay(restart_count) else {
+                    let message = format!(
+                        "agent runtime ended without a GUI shutdown {restart_count} consecutive times; stopping"
+                    );
+                    eprintln!("nuillu-server {message}");
+                    visualizer.send_event(VisualizerEvent::Log {
+                        tab_id: tab_id.clone(),
+                        message: message.clone(),
+                    });
+                    visualizer.send_event(VisualizerEvent::SetTabStatus {
+                        tab_id,
+                        status: TabStatus::Failed,
+                    });
+                    anyhow::bail!(message);
+                };
                 let message = format!(
-                    "agent runtime ended without a GUI shutdown; restarting attempt={restart_count}"
+                    "agent runtime ended without a GUI shutdown; restarting attempt={restart_count} next_retry_ms={}",
+                    delay.as_millis()
                 );
                 eprintln!("nuillu-server {message}");
                 visualizer.send_event(VisualizerEvent::Log {
@@ -706,8 +753,25 @@ async fn run_server(config: ServerConfig, visualizer: &mut VisualizerHook) -> an
             }
             Err(error) => {
                 restart_count = restart_count.saturating_add(1);
-                let message =
-                    format!("agent runtime error; restarting attempt={restart_count}: {error}");
+                let Some(delay) = agent_restart_delay(restart_count) else {
+                    let message = format!(
+                        "agent runtime error {restart_count} consecutive times; stopping: {error}"
+                    );
+                    eprintln!("nuillu-server {message}");
+                    visualizer.send_event(VisualizerEvent::Log {
+                        tab_id: tab_id.clone(),
+                        message: message.clone(),
+                    });
+                    visualizer.send_event(VisualizerEvent::SetTabStatus {
+                        tab_id,
+                        status: TabStatus::Failed,
+                    });
+                    anyhow::bail!(message);
+                };
+                let message = format!(
+                    "agent runtime error; restarting attempt={restart_count} next_retry_ms={}: {error}",
+                    delay.as_millis()
+                );
                 eprintln!("nuillu-server {message}");
                 visualizer.send_event(VisualizerEvent::Log {
                     tab_id: tab_id.clone(),
@@ -719,13 +783,21 @@ async fn run_server(config: ServerConfig, visualizer: &mut VisualizerHook) -> an
         if visualizer.shutdown_requested() {
             break;
         }
-        tokio::time::sleep(Duration::from_millis(500)).await;
+        tokio::time::sleep(agent_restart_delay(restart_count).unwrap_or_default()).await;
     }
     visualizer.send_event(VisualizerEvent::SetTabStatus {
         tab_id,
         status: TabStatus::Stopped,
     });
     Ok(())
+}
+
+fn agent_restart_delay(attempt: u64) -> Option<Duration> {
+    if attempt >= AGENT_RESTART_LIMIT {
+        return None;
+    }
+    let multiplier = 1_u64 << attempt.saturating_sub(1).min(5);
+    Some(Duration::from_millis(500_u64.saturating_mul(multiplier)))
 }
 
 pub(crate) fn set_runtime_running(
