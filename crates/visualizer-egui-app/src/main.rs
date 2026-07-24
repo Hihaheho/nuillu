@@ -1,12 +1,20 @@
-use std::{path::PathBuf, time::Duration};
+use std::{
+    path::PathBuf,
+    sync::mpsc::{Receiver, Sender, TryRecvError},
+    time::Duration,
+};
 
 use clap::{Args as ClapArgs, Parser};
 use nuillu_server::{
     RuntimeModule, ServerRunOptions, install_lutum_trace_subscriber,
     load_server_config_from_options, spawn_server_runtime,
 };
-use nuillu_visualizer_egui::{VisualizerApp, VisualizerChannels};
-use nuillu_visualizer_protocol::{VisualizerClientMessage, VisualizerClientPort};
+use nuillu_visualizer_egui::{Visualizer, VisualizerConfig};
+use nuillu_visualizer_protocol::{
+    VisualizerClientMessage, VisualizerClientPort, VisualizerCommand, VisualizerServerMessage,
+};
+
+const SERVER_MESSAGES_PER_FRAME: usize = 256;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     install_lutum_trace_subscriber()?;
@@ -23,7 +31,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         (server_messages, client_messages, Some(runtime))
     };
     let native_options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
+        viewport: eframe::egui::ViewportBuilder::default()
             .with_active(true)
             .with_visible(true),
         ..eframe::NativeOptions::default()
@@ -31,14 +39,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let result = eframe::run_native(
         "Nuillu Visualizer",
         native_options,
-        Box::new(|cc| {
-            Ok(Box::new(VisualizerApp::new(
-                cc,
-                VisualizerChannels {
-                    server_messages,
-                    client_messages,
-                    remote: true,
-                },
+        Box::new(|_cc| {
+            Ok(Box::new(StandaloneVisualizerApp::new(
+                server_messages,
+                client_messages,
+                true,
             )))
         }),
     );
@@ -56,6 +61,77 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     result?;
     Ok(())
+}
+
+struct StandaloneVisualizerApp {
+    visualizer: Visualizer,
+    server_messages: Receiver<VisualizerServerMessage>,
+    client_messages: Sender<VisualizerClientMessage>,
+    remote: bool,
+}
+
+impl StandaloneVisualizerApp {
+    fn new(
+        server_messages: Receiver<VisualizerServerMessage>,
+        client_messages: Sender<VisualizerClientMessage>,
+        remote: bool,
+    ) -> Self {
+        Self {
+            visualizer: Visualizer::with_config(
+                eframe::egui::Id::new("nuillu-visualizer"),
+                VisualizerConfig::standalone(),
+            ),
+            server_messages,
+            client_messages,
+            remote,
+        }
+    }
+
+    fn drain_server_messages(&mut self, ctx: &eframe::egui::Context) {
+        let mut drained = 0;
+        loop {
+            if drained >= SERVER_MESSAGES_PER_FRAME {
+                ctx.request_repaint();
+                break;
+            }
+            match self.server_messages.try_recv() {
+                Ok(message) => {
+                    self.visualizer.apply_server_message(message);
+                    drained += 1;
+                }
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
+                    if self.remote {
+                        self.visualizer.mark_disconnected();
+                    }
+                    break;
+                }
+            }
+        }
+    }
+}
+
+impl eframe::App for StandaloneVisualizerApp {
+    fn ui(&mut self, ui: &mut eframe::egui::Ui, _frame: &mut eframe::Frame) {
+        self.drain_server_messages(ui.ctx());
+        for message in self.visualizer.show(ui).into_messages() {
+            if let Err(error) = self.client_messages.send(message) {
+                self.visualizer
+                    .record_send_failure(format!("failed to send visualizer message: {error}"));
+                break;
+            }
+        }
+    }
+
+    fn auto_save_interval(&self) -> Duration {
+        Duration::from_millis(1500)
+    }
+
+    fn on_exit(&mut self) {
+        let _ = self.client_messages.send(VisualizerClientMessage::Command {
+            command: VisualizerCommand::Shutdown,
+        });
+    }
 }
 
 #[derive(Debug, Parser)]

@@ -19,7 +19,8 @@ use crate::{
     runner::visualizer_planned_tabs,
 };
 
-const VISUALIZER_GUI_PACKAGE: &str = "nuillu-visualizer-egui";
+const VISUALIZER_GUI_PACKAGE: &str = "nuillu-visualizer-egui-app";
+const VISUALIZER_GUI_BINARY: &str = "nuillu-visualizer-egui";
 
 pub fn run_suite_with_visualizer(config: RunnerConfig) -> anyhow::Result<()> {
     if config.trials.get() > 1 {
@@ -253,7 +254,7 @@ fn is_visualizer_compiler_artifact(message: &serde_json::Value) -> bool {
         && message
             .pointer("/target/name")
             .and_then(serde_json::Value::as_str)
-            == Some(VISUALIZER_GUI_PACKAGE)
+            == Some(VISUALIZER_GUI_BINARY)
         && message
             .pointer("/target/kind")
             .and_then(serde_json::Value::as_array)

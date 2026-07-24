@@ -91,8 +91,9 @@ impl<'a> PersistedWindow<'a> {
             }
 
             let mut open = effective_state.open;
+            let window_id = ui.id().with(self.id);
             let mut window = Window::new(self.title)
-                .id(egui::Id::new(self.id))
+                .id(window_id)
                 .open(&mut open)
                 .default_pos(Pos2::new(effective_state.pos[0], effective_state.pos[1]))
                 .default_size(Vec2::new(effective_state.size[0], effective_state.size[1]));

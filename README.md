@@ -33,8 +33,13 @@ A proof-of-concept runtime is currently being built. Core crates, server/runtime
 The visualizer is the normal entry point; it starts the server runtime in-process.
 
 ```bash
-cargo run -p nuillu-visualizer-egui -- --state <path to nuillu-exhibition>
+cargo run -p nuillu-visualizer-egui-app -- --state <path to nuillu-exhibition>
 ```
+
+`nuillu-visualizer-egui` is the embeddable egui library. Hosts feed it
+`VisualizerServerMessage` values with `Visualizer::apply_server_message`, call
+`Visualizer::show(ui)`, and forward the returned `VisualizerClientMessage` values
+using their own transport.
 
 `nuillu-server` remains available for headless/runtime use and can be connected to by a visualizer with `--host`.
 

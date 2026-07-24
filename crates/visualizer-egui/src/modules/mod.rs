@@ -1,18 +1,5 @@
-pub mod allocation;
-pub mod attention_schema;
-pub mod cognition_gate;
-pub mod memory;
-pub mod memory_compaction;
-pub mod predict;
-pub mod query_memory;
-pub mod self_model;
-pub mod sensory;
-pub mod speak;
-pub mod surprise;
-
 use std::collections::{BTreeMap, BTreeSet};
 use std::hash::Hash;
-use std::sync::mpsc::Sender;
 use std::time::Duration;
 
 use egui_hooks::UseHookExt as _;
@@ -131,7 +118,7 @@ impl LlmTranscriptHistoryState {
     fn request_page(
         &mut self,
         tab_id: &VisualizerTabId,
-        commands: &Sender<VisualizerClientMessage>,
+        messages: &mut Vec<VisualizerClientMessage>,
     ) {
         if self.loading {
             return;
@@ -139,7 +126,7 @@ impl LlmTranscriptHistoryState {
         self.open = true;
         self.requested_initial_load = true;
         self.loading = true;
-        let _ = commands.send(VisualizerClientMessage::Command {
+        messages.push(VisualizerClientMessage::Command {
             command: VisualizerCommand::LoadLlmTranscriptTurns {
                 tab_id: tab_id.clone(),
                 offset: self.next_offset,
@@ -148,10 +135,10 @@ impl LlmTranscriptHistoryState {
         });
     }
 
-    fn open(&mut self, tab_id: &VisualizerTabId, commands: &Sender<VisualizerClientMessage>) {
+    fn open(&mut self, tab_id: &VisualizerTabId, messages: &mut Vec<VisualizerClientMessage>) {
         if !self.open {
             self.open = true;
-            self.request_page(tab_id, commands);
+            self.request_page(tab_id, messages);
         }
     }
 }
@@ -937,7 +924,7 @@ pub fn render_llm_turns(
     history: &mut LlmTranscriptHistoryState,
     filter: &mut ModuleFilterState,
     modules: &[String],
-    commands: &Sender<VisualizerClientMessage>,
+    messages: &mut Vec<VisualizerClientMessage>,
 ) {
     ui.horizontal_wrapped(|ui| {
         if history.open {
@@ -953,7 +940,7 @@ pub fn render_llm_turns(
                     )
                     .clicked()
             {
-                history.request_page(tab_id, commands);
+                history.request_page(tab_id, messages);
             }
             if history.loading {
                 ui.label(ui.ctx().tr("memory-loading"));
@@ -966,13 +953,13 @@ pub fn render_llm_turns(
                     .button(ui.ctx().tr("module-show-all-llm-turns"))
                     .clicked()
                 {
-                    history.open(tab_id, commands);
+                    history.open(tab_id, messages);
                 }
             }
         }
     });
     if history.open && !history.requested_initial_load && !history.loading {
-        history.request_page(tab_id, commands);
+        history.request_page(tab_id, messages);
     }
     let active_state = if history.open {
         &history.modules
@@ -2050,10 +2037,10 @@ fn render_open_config_popup(
 
     let mut close = false;
     let popup_pos = clamped_config_popup_pos(ui.ctx(), open.anchor);
-    egui::Area::new(egui::Id::new((
-        "module-config-popup",
-        policy.module.as_str(),
-    )))
+    egui::Area::new(
+        ui.id()
+            .with(("module-config-popup", policy.module.as_str())),
+    )
     .order(egui::Order::Foreground)
     .fixed_pos(popup_pos)
     .show(ui.ctx(), |ui| {
@@ -5424,7 +5411,7 @@ mod tests {
         let mut filter = ModuleFilterState::default();
         let modules = state.module_names();
         let tab_id = VisualizerTabId::new("test");
-        let (commands, _received_commands) = std::sync::mpsc::channel();
+        let mut messages = Vec::new();
         let mut history = LlmTranscriptHistoryState::default();
         let mut widths = Vec::new();
 
@@ -5449,7 +5436,7 @@ mod tests {
                             &mut history,
                             &mut filter,
                             &modules,
-                            &commands,
+                            &mut messages,
                         );
                     })
                     .expect("window is open");
@@ -5514,7 +5501,7 @@ mod tests {
             let mut filter = ModuleFilterState::default();
             let modules = state.module_names();
             let tab_id = VisualizerTabId::new("test");
-            let (commands, _received_commands) = std::sync::mpsc::channel();
+            let mut messages = Vec::new();
             let mut history = LlmTranscriptHistoryState::default();
             let mut width = 0.0;
             let input = egui::RawInput {
@@ -5537,7 +5524,7 @@ mod tests {
                             &mut history,
                             &mut filter,
                             &modules,
-                            &commands,
+                            &mut messages,
                         );
                     })
                     .expect("window is open");

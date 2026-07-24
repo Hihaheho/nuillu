@@ -1,5 +1,4 @@
 use std::collections::BTreeMap;
-use std::sync::mpsc::Sender;
 
 use nuillu_module::{AmbientSensoryEntry, SensoryInput};
 
@@ -435,7 +434,7 @@ impl SceneUiState {
     fn request_full_history_page(
         &mut self,
         tab_id: &VisualizerTabId,
-        commands: &Sender<VisualizerClientMessage>,
+        messages: &mut Vec<VisualizerClientMessage>,
     ) {
         if self.full_history.loading {
             return;
@@ -443,7 +442,7 @@ impl SceneUiState {
         self.full_history.open = true;
         self.full_history.requested_initial_load = true;
         self.full_history.loading = true;
-        let _ = commands.send(VisualizerClientMessage::Command {
+        messages.push(VisualizerClientMessage::Command {
             command: VisualizerCommand::LoadActivityRows {
                 tab_id: tab_id.clone(),
                 offset: self.full_history.next_offset,
@@ -459,13 +458,13 @@ impl SceneUiState {
     fn open_full_history(
         &mut self,
         tab_id: &VisualizerTabId,
-        commands: &Sender<VisualizerClientMessage>,
+        messages: &mut Vec<VisualizerClientMessage>,
     ) {
         if !self.full_history.open {
             self.full_history.open = true;
             self.full_history.next_offset = 0;
             self.full_history.has_more = true;
-            self.request_full_history_page(tab_id, commands);
+            self.request_full_history_page(tab_id, messages);
         }
     }
 }
@@ -830,7 +829,7 @@ pub fn ui(
     ui: &mut egui::Ui,
     tab_id: &VisualizerTabId,
     state: &mut SceneUiState,
-    commands: &Sender<VisualizerClientMessage>,
+    messages: &mut Vec<VisualizerClientMessage>,
 ) {
     let available = ui.available_size();
     let width = available.x.max(1.0);
@@ -846,20 +845,20 @@ pub fn ui(
         |ui| {
             egui::ScrollArea::vertical()
                 .id_salt("scene-config-scroll")
-                .show(ui, |ui| scene_config_ui(ui, tab_id, state, commands));
+                .show(ui, |ui| scene_config_ui(ui, tab_id, state, messages));
         },
     );
     ui.add_space(SCENE_ROW_GAP);
     ui.allocate_ui_with_layout(
         egui::vec2(width, activity_height),
         egui::Layout::top_down(egui::Align::Min),
-        |ui| activity_ui(ui, tab_id, state, commands),
+        |ui| activity_ui(ui, tab_id, state, messages),
     );
     ui.add_space(SCENE_ROW_GAP);
     ui.allocate_ui_with_layout(
         egui::vec2(width, composer_height),
         egui::Layout::left_to_right(egui::Align::Center),
-        |ui| person_message_composer_ui(ui, tab_id, state, commands),
+        |ui| person_message_composer_ui(ui, tab_id, state, messages),
     );
 }
 
@@ -882,13 +881,11 @@ fn scene_config_ui(
     ui: &mut egui::Ui,
     tab_id: &VisualizerTabId,
     state: &mut SceneUiState,
-    commands: &Sender<VisualizerClientMessage>,
+    messages: &mut Vec<VisualizerClientMessage>,
 ) {
     if state.has_unsaved_scene_changes() {
         if ui.button(ui.ctx().tr("scene-save")).clicked() {
-            for command in state.save_scene_commands(tab_id) {
-                let _ = commands.send(command);
-            }
+            messages.extend(state.save_scene_commands(tab_id));
         }
         ui.separator();
     }
@@ -1152,13 +1149,13 @@ fn activity_ui(
     ui: &mut egui::Ui,
     tab_id: &VisualizerTabId,
     state: &mut SceneUiState,
-    commands: &Sender<VisualizerClientMessage>,
+    messages: &mut Vec<VisualizerClientMessage>,
 ) {
     if state.full_history.open
         && !state.full_history.requested_initial_load
         && !state.full_history.loading
     {
-        state.request_full_history_page(tab_id, commands);
+        state.request_full_history_page(tab_id, messages);
     }
 
     let full_history_open = state.full_history.open;
@@ -1180,7 +1177,7 @@ fn activity_ui(
                     )
                     .clicked()
             {
-                state.request_full_history_page(tab_id, commands);
+                state.request_full_history_page(tab_id, messages);
             }
             if state.full_history.loading {
                 ui.label(ui.ctx().tr("memory-loading"));
@@ -1188,7 +1185,7 @@ fn activity_ui(
         } else if state.activity_rows_omitted {
             ui.label(ui.ctx().tr("scene-activity-omitted"));
             if ui.button(ui.ctx().tr("scene-show-all-activity")).clicked() {
-                state.open_full_history(tab_id, commands);
+                state.open_full_history(tab_id, messages);
             }
         }
     });
@@ -1216,7 +1213,7 @@ fn person_message_composer_ui(
     ui: &mut egui::Ui,
     tab_id: &VisualizerTabId,
     state: &mut SceneUiState,
-    commands: &Sender<VisualizerClientMessage>,
+    messages: &mut Vec<VisualizerClientMessage>,
 ) -> Option<egui::Response> {
     let has_people = !state.draft_scene.people.is_empty();
     let mut send_requested = false;
@@ -1264,9 +1261,7 @@ fn person_message_composer_ui(
     });
 
     if send_requested {
-        for command in state.send_person_message_commands(tab_id) {
-            let _ = commands.send(command);
-        }
+        messages.extend(state.send_person_message_commands(tab_id));
         if has_people && let Some(message_response) = &message_response {
             message_response.request_focus();
         }
@@ -1624,12 +1619,12 @@ mod tests {
         let mut state = scene_with_two_people();
         state.selected_person_message_row_id = Some("person-2".to_string());
         state.person_message_draft = " hello two ".to_string();
-        let (commands, received_commands) = std::sync::mpsc::channel();
+        let mut messages = Vec::new();
         let ctx = test_i18n_context(Locale::EnUs);
         let mut draft_response_id = None;
 
         let _ = ctx.run_ui(test_raw_input(0.0, Vec::new()), |ui| {
-            let response = person_message_composer_ui(ui, &tab_id, &mut state, &commands)
+            let response = person_message_composer_ui(ui, &tab_id, &mut state, &mut messages)
                 .expect("composer draft field was rendered");
             draft_response_id = Some(response.id);
             response.request_focus();
@@ -1653,13 +1648,13 @@ mod tests {
             ),
             |ui| {
                 ui.memory_mut(|memory| memory.surrender_focus(draft_response_id));
-                let response = person_message_composer_ui(ui, &tab_id, &mut state, &commands)
+                let response = person_message_composer_ui(ui, &tab_id, &mut state, &mut messages)
                     .expect("composer draft field was rendered");
                 assert_eq!(response.id, draft_response_id);
             },
         );
 
-        let commands = received_commands.try_iter().collect::<Vec<_>>();
+        let commands = messages;
         assert_eq!(commands.len(), 1);
         match &commands[0] {
             VisualizerClientMessage::Command {

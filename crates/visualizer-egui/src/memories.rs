@@ -1,5 +1,3 @@
-use std::sync::mpsc::Sender;
-
 use egui::scroll_area::ScrollAreaOutput;
 
 use crate::{
@@ -163,17 +161,17 @@ pub fn ui(
     ui: &mut egui::Ui,
     tab_id: &VisualizerTabId,
     state: &mut MemoriesState,
-    commands: &Sender<VisualizerClientMessage>,
+    messages: &mut Vec<VisualizerClientMessage>,
 ) {
     let now = ui.input(|input| input.time);
     if !state.requested_initial_load {
         state.requested_initial_load = true;
-        request_main_chunk(tab_id, state, commands, 0, now);
+        request_main_chunk(tab_id, state, messages, 0, now);
     } else if matches!(state.scope, MemoryRecordScope::Latest)
         && !state.main_loading
         && now - state.last_latest_refresh_at >= LATEST_REFRESH_INTERVAL_SECS
     {
-        refresh_latest(tab_id, state, commands, now);
+        refresh_latest(tab_id, state, messages, now);
     }
 
     ui.horizontal(|ui| {
@@ -186,14 +184,14 @@ pub fn ui(
                 start_main_scope(
                     tab_id,
                     state,
-                    commands,
+                    messages,
                     MemoryRecordScope::Search { query },
                     now,
                 );
             }
         }
         if ui.button(ui.ctx().tr("memory-latest-button")).clicked() {
-            refresh_latest(tab_id, state, commands, now);
+            refresh_latest(tab_id, state, messages, now);
         }
         ui.label(ui.ctx().tr_args(
             "memory-loaded-status",
@@ -223,12 +221,12 @@ pub fn ui(
     state.main_content_height = output.content_size.y;
     for action in actions {
         match action {
-            MemoryListAction::OpenLinked(index) => open_linked(tab_id, state, commands, index),
-            MemoryListAction::Delete(index) => delete_memory(tab_id, commands, index),
+            MemoryListAction::OpenLinked(index) => open_linked(tab_id, state, messages, index),
+            MemoryListAction::Delete(index) => delete_memory(tab_id, messages, index),
         }
     }
     if should_load_more(&output) {
-        request_main_chunk(tab_id, state, commands, state.records.len(), now);
+        request_main_chunk(tab_id, state, messages, state.records.len(), now);
     }
 
     if !state.linked_memory_index.is_empty() {
@@ -246,7 +244,7 @@ pub fn ui(
             state.linked_generation,
         );
         if should_load_more(&output) {
-            request_linked_chunk(tab_id, state, commands, state.linked_results.len());
+            request_linked_chunk(tab_id, state, messages, state.linked_results.len());
         }
     }
 }
@@ -254,7 +252,7 @@ pub fn ui(
 fn start_main_scope(
     tab_id: &VisualizerTabId,
     state: &mut MemoriesState,
-    commands: &Sender<VisualizerClientMessage>,
+    messages: &mut Vec<VisualizerClientMessage>,
     scope: MemoryRecordScope,
     now: f64,
 ) {
@@ -267,19 +265,19 @@ fn start_main_scope(
     state.linked_has_more = false;
     state.linked_loading = false;
     state.list_generation = state.list_generation.saturating_add(1);
-    request_main_chunk(tab_id, state, commands, 0, now);
+    request_main_chunk(tab_id, state, messages, 0, now);
 }
 
 fn refresh_latest(
     tab_id: &VisualizerTabId,
     state: &mut MemoriesState,
-    commands: &Sender<VisualizerClientMessage>,
+    messages: &mut Vec<VisualizerClientMessage>,
     now: f64,
 ) {
     if matches!(state.scope, MemoryRecordScope::Latest) && !state.records.is_empty() {
-        request_latest_refresh(tab_id, state, commands, now);
+        request_latest_refresh(tab_id, state, messages, now);
     } else {
-        start_main_scope(tab_id, state, commands, MemoryRecordScope::Latest, now);
+        start_main_scope(tab_id, state, messages, MemoryRecordScope::Latest, now);
         state.last_latest_refresh_at = now;
     }
 }
@@ -287,14 +285,14 @@ fn refresh_latest(
 fn request_main_chunk(
     tab_id: &VisualizerTabId,
     state: &mut MemoriesState,
-    commands: &Sender<VisualizerClientMessage>,
+    messages: &mut Vec<VisualizerClientMessage>,
     offset: usize,
     now: f64,
 ) {
     if state.main_loading || !state.main_has_more {
         return;
     }
-    let sent = commands.send(VisualizerClientMessage::Command {
+    messages.push(VisualizerClientMessage::Command {
         command: VisualizerCommand::LoadMemoryRecords {
             tab_id: tab_id.clone(),
             scope: state.scope.clone(),
@@ -302,43 +300,37 @@ fn request_main_chunk(
             limit: MAIN_CHUNK_SIZE,
         },
     });
-    if sent.is_ok() {
-        state.main_loading = true;
-        if matches!(state.scope, MemoryRecordScope::Latest) && offset == 0 {
-            state.last_latest_refresh_at = now;
-        }
+    state.main_loading = true;
+    if matches!(state.scope, MemoryRecordScope::Latest) && offset == 0 {
+        state.last_latest_refresh_at = now;
     }
 }
 
 fn request_latest_refresh(
     tab_id: &VisualizerTabId,
     state: &mut MemoriesState,
-    commands: &Sender<VisualizerClientMessage>,
+    messages: &mut Vec<VisualizerClientMessage>,
     now: f64,
 ) {
     if state.main_loading {
         return;
     }
-    if commands
-        .send(VisualizerClientMessage::Command {
-            command: VisualizerCommand::LoadMemoryRecords {
-                tab_id: tab_id.clone(),
-                scope: MemoryRecordScope::Latest,
-                offset: 0,
-                limit: MAIN_CHUNK_SIZE,
-            },
-        })
-        .is_ok()
-    {
-        state.main_loading = true;
-        state.last_latest_refresh_at = now;
-    }
+    messages.push(VisualizerClientMessage::Command {
+        command: VisualizerCommand::LoadMemoryRecords {
+            tab_id: tab_id.clone(),
+            scope: MemoryRecordScope::Latest,
+            offset: 0,
+            limit: MAIN_CHUNK_SIZE,
+        },
+    });
+    state.main_loading = true;
+    state.last_latest_refresh_at = now;
 }
 
 fn open_linked(
     tab_id: &VisualizerTabId,
     state: &mut MemoriesState,
-    commands: &Sender<VisualizerClientMessage>,
+    messages: &mut Vec<VisualizerClientMessage>,
     index: String,
 ) {
     state.linked_memory_index = index;
@@ -346,40 +338,36 @@ fn open_linked(
     state.linked_has_more = true;
     state.linked_loading = false;
     state.linked_generation = state.linked_generation.saturating_add(1);
-    request_linked_chunk(tab_id, state, commands, 0);
+    request_linked_chunk(tab_id, state, messages, 0);
 }
 
 fn request_linked_chunk(
     tab_id: &VisualizerTabId,
     state: &mut MemoriesState,
-    commands: &Sender<VisualizerClientMessage>,
+    messages: &mut Vec<VisualizerClientMessage>,
     offset: usize,
 ) {
     if state.linked_loading || !state.linked_has_more || state.linked_memory_index.is_empty() {
         return;
     }
-    if commands
-        .send(VisualizerClientMessage::Command {
-            command: VisualizerCommand::LoadLinkedMemories {
-                tab_id: tab_id.clone(),
-                memory_index: state.linked_memory_index.clone(),
-                relation_filter: Vec::new(),
-                offset,
-                limit: LINKED_CHUNK_SIZE,
-            },
-        })
-        .is_ok()
-    {
-        state.linked_loading = true;
-    }
+    messages.push(VisualizerClientMessage::Command {
+        command: VisualizerCommand::LoadLinkedMemories {
+            tab_id: tab_id.clone(),
+            memory_index: state.linked_memory_index.clone(),
+            relation_filter: Vec::new(),
+            offset,
+            limit: LINKED_CHUNK_SIZE,
+        },
+    });
+    state.linked_loading = true;
 }
 
 fn delete_memory(
     tab_id: &VisualizerTabId,
-    commands: &Sender<VisualizerClientMessage>,
+    messages: &mut Vec<VisualizerClientMessage>,
     index: String,
 ) {
-    let _ = commands.send(VisualizerClientMessage::Command {
+    messages.push(VisualizerClientMessage::Command {
         command: VisualizerCommand::DeleteMemory {
             tab_id: tab_id.clone(),
             memory_index: index,

@@ -1,8 +1,25 @@
+//! Embeddable egui components for the Nuillu runtime visualizer.
+//!
+//! The root [`Visualizer`] owns its UI state but not a window, event loop, or
+//! transport. Feed it server messages and forward the messages returned by
+//! [`Visualizer::show`] using the transport chosen by the host application.
+//!
+//! ```no_run
+//! use nuillu_visualizer_egui::{egui, Visualizer, VisualizerClientMessage};
+//!
+//! fn render(
+//!     visualizer: &mut Visualizer,
+//!     ui: &mut egui::Ui,
+//! ) -> Vec<VisualizerClientMessage> {
+//!     visualizer.show(ui).into_messages()
+//! }
+//! ```
+
 pub mod blackboard;
 pub mod chat;
 pub mod cognition;
 pub mod errors;
-mod i18n;
+pub mod i18n;
 pub mod memories;
 pub mod memos;
 pub mod module_filter;
@@ -12,14 +29,12 @@ pub mod text;
 mod time;
 pub mod window;
 
-pub use eframe;
 pub use egui;
 pub use egui_hooks;
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs;
 use std::sync::Arc;
-use std::sync::mpsc::{Receiver, Sender, TryRecvError};
 use std::time::Instant;
 
 use egui_hooks::UseHookExt as _;
@@ -27,7 +42,8 @@ use font_kit::family_name::FamilyName;
 use font_kit::handle::Handle;
 use font_kit::properties::{Properties, Weight};
 use font_kit::source::SystemSource;
-use i18n::{EguiI18nExt as _, I18nArg, I18nCatalog, LOCALE_PERSISTENCE_KEY, Locale};
+use i18n::{EguiI18nExt as _, I18nArg, I18nCatalog, LOCALE_PERSISTENCE_KEY};
+pub use i18n::{Locale, VisualizerUiResources};
 use nuillu_module::{ActionAffordance, RuntimeEvent};
 pub use nuillu_visualizer_protocol::*;
 
@@ -42,78 +58,110 @@ const MAX_ZOOM_FACTOR: f32 = 2.0;
 const ZOOM_BUTTON_STEP_PERCENT: f32 = 1.0;
 const ZOOM_BUTTON_DOUBLE_CLICK_TOTAL_PERCENT: f32 = 10.0;
 const ZOOM_SYNC_EPSILON: f32 = 0.000_1;
-const SERVER_MESSAGES_PER_FRAME: usize = 256;
 
-pub struct VisualizerChannels {
-    pub server_messages: Receiver<VisualizerServerMessage>,
-    pub client_messages: Sender<VisualizerClientMessage>,
-    pub remote: bool,
+/// Configuration for an embeddable [`Visualizer`] component.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VisualizerConfig {
+    pub default_locale: Locale,
+    pub install_fonts: bool,
+    pub install_theme_styles: bool,
 }
 
-pub struct VisualizerApp {
-    server_messages: Receiver<VisualizerServerMessage>,
-    client_messages: Sender<VisualizerClientMessage>,
-    remote: bool,
+impl Default for VisualizerConfig {
+    fn default() -> Self {
+        Self {
+            default_locale: Locale::default(),
+            install_fonts: false,
+            install_theme_styles: false,
+        }
+    }
+}
+
+impl VisualizerConfig {
+    /// Configuration matching the first-party standalone visualizer app.
+    pub fn standalone() -> Self {
+        Self {
+            install_fonts: true,
+            install_theme_styles: true,
+            ..Self::default()
+        }
+    }
+}
+
+/// Outbound protocol messages produced by the component for a visualizer frame.
+#[derive(Debug, Default)]
+pub struct VisualizerResponse {
+    pub messages: Vec<VisualizerClientMessage>,
+}
+
+impl VisualizerResponse {
+    pub fn is_empty(&self) -> bool {
+        self.messages.is_empty()
+    }
+
+    pub fn into_messages(self) -> Vec<VisualizerClientMessage> {
+        self.messages
+    }
+}
+
+/// Stateful Nuillu visualizer component that can be embedded in any egui UI.
+pub struct Visualizer {
+    id: egui::Id,
+    config: VisualizerConfig,
+    initialized: bool,
     i18n_catalog: I18nCatalog,
     current_locale: Locale,
     zoom_persistence_applied: bool,
     zoom_percent_input: String,
     zoom_percent_input_dirty: bool,
     zoom_percent_input_focused: bool,
+    pending_messages: Vec<VisualizerClientMessage>,
     state: VisualizerState,
 }
 
-impl VisualizerApp {
-    pub fn new(cc: &eframe::CreationContext<'_>, channels: VisualizerChannels) -> Self {
-        install_visualizer_fonts(&cc.egui_ctx);
-        install_visualizer_theme_styles(&cc.egui_ctx);
+impl Visualizer {
+    pub fn new(id: egui::Id) -> Self {
+        Self::with_config(id, VisualizerConfig::default())
+    }
+
+    pub fn with_config(id: egui::Id, config: VisualizerConfig) -> Self {
         let i18n_catalog =
             I18nCatalog::embedded().expect("embedded visualizer translations should be valid");
-        let current_locale = Locale::default();
-        cc.egui_ctx
-            .install_i18n(i18n_catalog.for_locale(current_locale));
-
         Self {
-            server_messages: channels.server_messages,
-            client_messages: channels.client_messages,
-            remote: channels.remote,
+            id,
+            config,
+            initialized: false,
             i18n_catalog,
-            current_locale,
+            current_locale: config.default_locale,
             zoom_persistence_applied: false,
             zoom_percent_input: format_zoom_percent(DEFAULT_ZOOM_FACTOR),
             zoom_percent_input_dirty: false,
             zoom_percent_input_focused: false,
+            pending_messages: Vec::new(),
             state: VisualizerState::default(),
         }
+    }
+
+    pub fn state(&self) -> &VisualizerState {
+        &self.state
+    }
+
+    pub fn apply_server_message(&mut self, message: VisualizerServerMessage) {
+        dispatch_agent_action_event(&message, &mut self.pending_messages);
+        self.state.apply_server_message(message);
+    }
+
+    pub fn mark_disconnected(&mut self) {
+        self.state.mark_disconnected();
+    }
+
+    pub fn record_send_failure(&mut self, message: impl Into<String>) {
+        self.state.record_send_failure(message.into());
     }
 
     fn install_locale(&mut self, ctx: &egui::Context, locale: Locale) {
         self.current_locale = locale;
         ctx.install_i18n(self.i18n_catalog.for_locale(locale));
-    }
-
-    fn drain_server_messages(&mut self, ctx: &egui::Context) {
-        let mut drained = 0;
-        loop {
-            if drained >= SERVER_MESSAGES_PER_FRAME {
-                ctx.request_repaint();
-                break;
-            }
-            match self.server_messages.try_recv() {
-                Ok(message) => {
-                    dispatch_agent_action_event(&message, &self.client_messages);
-                    self.state.apply_server_message(message);
-                    drained += 1;
-                }
-                Err(TryRecvError::Empty) => break,
-                Err(TryRecvError::Disconnected) => {
-                    if self.remote {
-                        self.state.mark_disconnected();
-                    }
-                    break;
-                }
-            }
-        }
     }
 }
 
@@ -563,9 +611,28 @@ fn tr_tab_title(ctx: &egui::Context, key: &str, title: &str) -> String {
     ctx.tr_args(key, &[("title", I18nArg::from(title))])
 }
 
-impl eframe::App for VisualizerApp {
-    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        let persisted_locale = ui.use_persisted_state(Locale::default, LOCALE_PERSISTENCE_KEY);
+impl Visualizer {
+    /// Renders one frame and returns protocol messages requested by user interaction.
+    pub fn show(&mut self, ui: &mut egui::Ui) -> VisualizerResponse {
+        if !self.initialized {
+            if self.config.install_fonts {
+                install_visualizer_fonts(ui.ctx());
+            }
+            if self.config.install_theme_styles {
+                install_visualizer_theme_styles(ui.ctx());
+            }
+            self.install_locale(ui.ctx(), self.config.default_locale);
+            self.initialized = true;
+        }
+
+        let mut messages = std::mem::take(&mut self.pending_messages);
+        ui.push_id(self.id, |ui| self.show_contents(ui, &mut messages));
+        VisualizerResponse { messages }
+    }
+
+    fn show_contents(&mut self, ui: &mut egui::Ui, messages: &mut Vec<VisualizerClientMessage>) {
+        let default_locale = self.config.default_locale;
+        let persisted_locale = ui.use_persisted_state(|| default_locale, LOCALE_PERSISTENCE_KEY);
         let locale = *persisted_locale;
         self.install_locale(ui.ctx(), locale);
         let initial_theme = default_visualizer_theme(ui.ctx());
@@ -591,14 +658,13 @@ impl eframe::App for VisualizerApp {
         if !self.zoom_percent_input_focused && !self.zoom_percent_input_dirty {
             self.zoom_percent_input = format_zoom_percent(zoom_factor);
         }
-        self.drain_server_messages(ui.ctx());
         ui.ctx()
             .request_repaint_after(std::time::Duration::from_millis(100));
 
         let mut next_locale = None;
         let mut next_theme = None;
         let mut next_zoom_factor = None;
-        egui::Panel::top("nuillu-visualizer-tabs").show_inside(ui, |ui| {
+        egui::Panel::top(ui.id().with("nuillu-visualizer-tabs")).show_inside(ui, |ui| {
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 next_theme = render_theme_toggle(ui, theme);
                 next_locale = render_language_toggle(ui, locale);
@@ -640,21 +706,12 @@ impl eframe::App for VisualizerApp {
                     }
                     for action in self.state.visible_actions() {
                         if ui.button(&action.label).clicked() {
-                            if let Err(error) =
-                                self.client_messages
-                                    .send(VisualizerClientMessage::InvokeAction {
-                                        action_id: action.id.clone(),
-                                    })
-                            {
-                                self.state.record_action_send_failed(
-                                    &action,
-                                    error.to_string(),
-                                    self.remote,
-                                );
-                            }
+                            messages.push(VisualizerClientMessage::InvokeAction {
+                                action_id: action.id.clone(),
+                            });
                         }
                     }
-                    if self.remote && self.state.disconnected {
+                    if self.state.disconnected {
                         ui.colored_label(
                             ui.visuals().error_fg_color,
                             ui.ctx().tr("status-eval-disconnected"),
@@ -689,12 +746,12 @@ impl eframe::App for VisualizerApp {
                 self.state.selected = Some(tab_id.clone());
                 if let Some(tab) = self.state.tabs.get_mut(&tab_id) {
                     ui.push_id(tab_id.as_str(), |ui| {
-                        tab.ui(ui, &self.client_messages);
+                        tab.ui(ui, messages);
                     });
                 }
             } else {
                 ui.centered_and_justified(|ui| {
-                    if self.remote && self.state.disconnected {
+                    if self.state.disconnected {
                         ui.label(ui.ctx().tr("status-eval-process-disconnected"));
                     } else {
                         ui.label(ui.ctx().tr("status-no-runtime-tabs"));
@@ -703,21 +760,11 @@ impl eframe::App for VisualizerApp {
             }
         });
     }
-
-    fn auto_save_interval(&self) -> std::time::Duration {
-        std::time::Duration::from_millis(1500)
-    }
-
-    fn on_exit(&mut self) {
-        let _ = self.client_messages.send(VisualizerClientMessage::Command {
-            command: VisualizerCommand::Shutdown,
-        });
-    }
 }
 
 fn dispatch_agent_action_event(
     message: &VisualizerServerMessage,
-    commands: &Sender<VisualizerClientMessage>,
+    messages: &mut Vec<VisualizerClientMessage>,
 ) {
     let VisualizerServerMessage::Event {
         event: VisualizerEvent::AgentActionInvocationRequested { tab_id, request },
@@ -727,16 +774,16 @@ fn dispatch_agent_action_event(
     };
 
     if request.action_id == "poet" {
-        handle_poet_action(tab_id, request, commands);
+        handle_poet_action(tab_id, request, messages);
     } else {
-        handle_generic_external_action(tab_id, request, commands);
+        handle_generic_external_action(tab_id, request, messages);
     }
 }
 
 fn handle_poet_action(
     tab_id: &VisualizerTabId,
     request: &AgentActionInvocationRequest,
-    commands: &Sender<VisualizerClientMessage>,
+    messages: &mut Vec<VisualizerClientMessage>,
 ) {
     let poem = request
         .arguments
@@ -750,7 +797,7 @@ fn handle_poet_action(
             &request.invocation_id,
             false,
             "poet action requires a non-empty poem",
-            commands,
+            messages,
         );
         return;
     }
@@ -759,19 +806,19 @@ fn handle_poet_action(
         &request.invocation_id,
         true,
         "poem recorded by visualizer",
-        commands,
+        messages,
     );
     send_action_sensory_feedback(
         tab_id,
         format!("The poet action recorded a poem:\n{poem}"),
-        commands,
+        messages,
     );
 }
 
 fn handle_generic_external_action(
     tab_id: &VisualizerTabId,
     request: &AgentActionInvocationRequest,
-    commands: &Sender<VisualizerClientMessage>,
+    messages: &mut Vec<VisualizerClientMessage>,
 ) {
     let arguments =
         serde_json::to_string(&request.arguments).unwrap_or_else(|_| "<invalid-json>".to_owned());
@@ -783,7 +830,7 @@ fn handle_generic_external_action(
             "external action {} accepted by visualizer",
             request.action_id
         ),
-        commands,
+        messages,
     );
     send_action_sensory_feedback(
         tab_id,
@@ -791,7 +838,7 @@ fn handle_generic_external_action(
             "External action {} was invoked with arguments: {}",
             request.action_id, arguments
         ),
-        commands,
+        messages,
     );
 }
 
@@ -800,9 +847,9 @@ fn send_agent_action_completion(
     invocation_id: &str,
     accepted: bool,
     message: impl Into<String>,
-    commands: &Sender<VisualizerClientMessage>,
+    messages: &mut Vec<VisualizerClientMessage>,
 ) {
-    let _ = commands.send(VisualizerClientMessage::Command {
+    messages.push(VisualizerClientMessage::Command {
         command: VisualizerCommand::CompleteAgentActionInvocation {
             tab_id: tab_id.clone(),
             completion: AgentActionInvocationCompletion {
@@ -817,9 +864,9 @@ fn send_agent_action_completion(
 fn send_action_sensory_feedback(
     tab_id: &VisualizerTabId,
     content: String,
-    commands: &Sender<VisualizerClientMessage>,
+    messages: &mut Vec<VisualizerClientMessage>,
 ) {
-    let _ = commands.send(VisualizerClientMessage::Command {
+    messages.push(VisualizerClientMessage::Command {
         command: VisualizerCommand::SendOneShotSensoryInput {
             tab_id: tab_id.clone(),
             input: OneShotSensoryInput {
@@ -866,20 +913,9 @@ impl VisualizerState {
         }
     }
 
-    fn record_action_send_failed(
-        &mut self,
-        action: &VisualizerAction,
-        error: String,
-        remote: bool,
-    ) {
-        if remote {
-            self.disconnected = true;
-        }
+    fn record_send_failure(&mut self, message: String) {
+        self.disconnected = true;
         self.actions.clear();
-        let message = format!(
-            "failed to send visualizer action {} ({}): {error}",
-            action.label, action.id
-        );
         if let Some(tab_id) = self
             .selected
             .clone()
@@ -1183,10 +1219,10 @@ impl RuntimeTab {
         }
     }
 
-    fn ui(&mut self, ui: &mut egui::Ui, commands: &Sender<VisualizerClientMessage>) {
+    fn ui(&mut self, ui: &mut egui::Ui, messages: &mut Vec<VisualizerClientMessage>) {
         match self.view_mode {
-            RuntimeTabViewMode::Simplified => self.simplified_ui(ui, commands),
-            RuntimeTabViewMode::Windowed => self.windows_ui(ui, commands),
+            RuntimeTabViewMode::Simplified => self.simplified_ui(ui, messages),
+            RuntimeTabViewMode::Windowed => self.windows_ui(ui, messages),
         }
     }
 
@@ -1341,7 +1377,7 @@ impl RuntimeTab {
         }
     }
 
-    fn simplified_ui(&mut self, ui: &mut egui::Ui, commands: &Sender<VisualizerClientMessage>) {
+    fn simplified_ui(&mut self, ui: &mut egui::Ui, messages: &mut Vec<VisualizerClientMessage>) {
         let available = ui.available_size();
         if available.x <= 1.0 || available.y <= 1.0 {
             return;
@@ -1368,7 +1404,7 @@ impl RuntimeTab {
                         |ui| {
                             requested_module = self.render_modules_overview_contents(
                                 ui,
-                                commands,
+                                messages,
                                 resource_monitor_now_secs,
                                 "simplified",
                             );
@@ -1392,7 +1428,7 @@ impl RuntimeTab {
                             ui,
                             Some(memory_title.as_str()),
                             egui::vec2(ui.available_width().max(1.0), lower_height),
-                            |ui| self.render_memory_contents(ui, commands),
+                            |ui| self.render_memory_contents(ui, messages),
                         );
                     });
                 },
@@ -1408,7 +1444,7 @@ impl RuntimeTab {
                         ui,
                         Some(scene_title.as_str()),
                         egui::vec2(ui.available_width(), available.y),
-                        |ui| self.render_scene_contents(ui, commands),
+                        |ui| self.render_scene_contents(ui, messages),
                     );
                 },
             );
@@ -1419,23 +1455,23 @@ impl RuntimeTab {
             self.open_simplified_module(owner);
         }
         self.render_simplified_interoception_window(ui, resource_monitor_now_secs);
-        self.render_simplified_module_popup(ui, commands, module_opened_this_frame);
+        self.render_simplified_module_popup(ui, messages, module_opened_this_frame);
     }
 
     fn render_scene_contents(
         &mut self,
         ui: &mut egui::Ui,
-        commands: &Sender<VisualizerClientMessage>,
+        messages: &mut Vec<VisualizerClientMessage>,
     ) {
-        chat::ui(ui, &self.id, &mut self.scene, commands);
+        chat::ui(ui, &self.id, &mut self.scene, messages);
     }
 
     fn render_memory_contents(
         &mut self,
         ui: &mut egui::Ui,
-        commands: &Sender<VisualizerClientMessage>,
+        messages: &mut Vec<VisualizerClientMessage>,
     ) {
-        memories::ui(ui, &self.id, &mut self.memories, commands);
+        memories::ui(ui, &self.id, &mut self.memories, messages);
     }
 
     fn render_simplified_cognition_pane_contents(&mut self, ui: &mut egui::Ui) {
@@ -1482,7 +1518,7 @@ impl RuntimeTab {
     fn render_modules_overview_contents(
         &mut self,
         ui: &mut egui::Ui,
-        commands: &Sender<VisualizerClientMessage>,
+        messages: &mut Vec<VisualizerClientMessage>,
         now_secs: f64,
         id_salt: &'static str,
     ) -> Option<String> {
@@ -1491,13 +1527,13 @@ impl RuntimeTab {
                 modules::render_modules_overview(ui, &self.blackboard, &self.modules, now_secs)
             })
             .inner;
-        self.handle_module_overview_actions(actions, commands)
+        self.handle_module_overview_actions(actions, messages)
     }
 
     fn handle_module_overview_actions(
         &mut self,
         actions: Vec<modules::ModuleOverviewAction>,
-        commands: &Sender<VisualizerClientMessage>,
+        messages: &mut Vec<VisualizerClientMessage>,
     ) -> Option<String> {
         let mut requested_module = None;
         for action in actions {
@@ -1506,7 +1542,7 @@ impl RuntimeTab {
                     requested_module = Some(owner);
                 }
                 modules::ModuleOverviewAction::SetDisabled { module, disabled } => {
-                    let _ = commands.send(VisualizerClientMessage::Command {
+                    messages.push(VisualizerClientMessage::Command {
                         command: VisualizerCommand::SetModuleDisabled {
                             tab_id: self.id.clone(),
                             module,
@@ -1515,7 +1551,7 @@ impl RuntimeTab {
                     });
                 }
                 modules::ModuleOverviewAction::SetModuleSettings { settings } => {
-                    let _ = commands.send(VisualizerClientMessage::Command {
+                    messages.push(VisualizerClientMessage::Command {
                         command: VisualizerCommand::SetModuleSettings {
                             tab_id: self.id.clone(),
                             settings,
@@ -1531,7 +1567,7 @@ impl RuntimeTab {
         &mut self,
         ui: &mut egui::Ui,
         owner: &str,
-        commands: &Sender<VisualizerClientMessage>,
+        messages: &mut Vec<VisualizerClientMessage>,
     ) {
         let Some(module) = self.modules.get(owner) else {
             return;
@@ -1540,7 +1576,7 @@ impl RuntimeTab {
         for action in module_window_actions {
             match action {
                 modules::ModuleWindowAction::ResetSessionHistory { owner } => {
-                    let _ = commands.send(VisualizerClientMessage::Command {
+                    messages.push(VisualizerClientMessage::Command {
                         command: VisualizerCommand::ResetModuleSessionHistory {
                             tab_id: self.id.clone(),
                             owner,
@@ -1561,10 +1597,7 @@ impl RuntimeTab {
             "window-interoception-title",
             &self.title,
         ))
-        .id(egui::Id::new((
-            self.id.as_str(),
-            "simplified-interoception",
-        )))
+        .id(ui.id().with((self.id.as_str(), "simplified-interoception")))
         .order(egui::Order::Foreground)
         .collapsible(false)
         .default_pos(egui::pos2(24.0, 96.0))
@@ -1577,7 +1610,7 @@ impl RuntimeTab {
     fn render_simplified_module_popup(
         &mut self,
         ui: &mut egui::Ui,
-        commands: &Sender<VisualizerClientMessage>,
+        messages: &mut Vec<VisualizerClientMessage>,
         opened_this_frame: bool,
     ) {
         let Some(owner) = self.active_simplified_module_owner.clone() else {
@@ -1590,18 +1623,16 @@ impl RuntimeTab {
         let title = modules::window_title(ui.ctx(), module);
         let mut open = true;
         let response = egui::Window::new(title)
-            .id(egui::Id::new((
-                self.id.as_str(),
-                "simplified-module-popup",
-                owner.as_str(),
-            )))
+            .id(ui
+                .id()
+                .with((self.id.as_str(), "simplified-module-popup", owner.as_str())))
             .order(egui::Order::Foreground)
             .collapsible(false)
             .open(&mut open)
             .default_pos(egui::pos2(720.0, 128.0))
             .default_size(egui::vec2(520.0, 420.0))
             .show(ui.ctx(), |ui| {
-                self.render_module_contents(ui, &owner, commands);
+                self.render_module_contents(ui, &owner, messages);
             });
 
         let Some(response) = response else {
@@ -1643,7 +1674,7 @@ impl RuntimeTab {
         }
     }
 
-    fn windows_ui(&mut self, ui: &mut egui::Ui, commands: &Sender<VisualizerClientMessage>) {
+    fn windows_ui(&mut self, ui: &mut egui::Ui, messages: &mut Vec<VisualizerClientMessage>) {
         let base = self.id.as_str().to_string();
         let mut window_requests = std::mem::take(&mut self.window_requests);
 
@@ -1653,7 +1684,7 @@ impl RuntimeTab {
             .open_override(window_requests.remove(&chat_id))
             .default_pos(24.0, 88.0)
             .default_size(760.0, 620.0)
-            .show(ui, |ui| self.render_scene_contents(ui, commands));
+            .show(ui, |ui| self.render_scene_contents(ui, messages));
         self.record_window_open(chat_id, open);
 
         let blackboard_id = format!("{base}:blackboard");
@@ -1671,7 +1702,7 @@ impl RuntimeTab {
             .open_override(window_requests.remove(&memories_id))
             .default_pos(96.0, 636.0)
             .default_size(720.0, 360.0)
-            .show(ui, |ui| self.render_memory_contents(ui, commands));
+            .show(ui, |ui| self.render_memory_contents(ui, messages));
         self.record_window_open(memories_id, open);
 
         let memos_id = format!("{base}:memos");
@@ -1706,7 +1737,7 @@ impl RuntimeTab {
                     &mut self.llm_transcript_history,
                     &mut self.llm_turns_module_filter,
                     &llm_turns_filter_modules,
-                    commands,
+                    messages,
                 )
             });
         self.record_window_open(llm_turns_id, open);
@@ -1775,7 +1806,7 @@ impl RuntimeTab {
             .show(ui, |ui| {
                 requested_module = self.render_modules_overview_contents(
                     ui,
-                    commands,
+                    messages,
                     resource_monitor_now_secs,
                     "window",
                 );
@@ -1811,7 +1842,7 @@ impl RuntimeTab {
                     .default_pos(x, y)
                     .default_size(520.0, 360.0)
                     .show(ui, |ui| {
-                        self.render_module_contents(ui, &owner, commands);
+                        self.render_module_contents(ui, &owner, messages);
                     });
                 window_open
             };
@@ -2397,7 +2428,7 @@ mod tests {
     }
 
     #[test]
-    fn action_send_failure_clears_actions_and_logs_on_selected_tab() {
+    fn transport_send_failure_clears_actions_and_logs_on_selected_tab() {
         let mut state = VisualizerState::default();
         let tab_id = VisualizerTabId::new("server");
         state.apply(VisualizerEvent::OpenTab {
@@ -2407,22 +2438,14 @@ mod tests {
         state.apply_server_message(VisualizerServerMessage::OfferAction {
             action: VisualizerAction::stop_runtime(tab_id.clone()),
         });
-        let action = state
-            .visible_actions()
-            .into_iter()
-            .find(|action| action.id == stop_runtime_action_id(&tab_id))
-            .expect("stop action is visible");
-
-        state.record_action_send_failed(&action, "sending on a closed channel".to_string(), true);
+        state.record_send_failure("failed to send visualizer message: disconnected".to_string());
 
         assert!(state.visible_actions().is_empty());
         assert!(state.disconnected);
         let tab = state.tabs().get(&tab_id).expect("tab exists");
         assert_eq!(
             tab.logs.back().map(String::as_str),
-            Some(
-                "failed to send visualizer action Stop (tab:server:stop-runtime): sending on a closed channel"
-            )
+            Some("failed to send visualizer message: disconnected")
         );
     }
 

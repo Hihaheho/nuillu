@@ -39,18 +39,40 @@ const MODULE_NAME_KEYS: &[(&str, &str)] = &[
 ];
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) enum Locale {
+pub enum Locale {
     #[default]
     JaJp,
     EnUs,
 }
 
 impl Locale {
-    pub(crate) fn label(self) -> &'static str {
+    pub fn label(self) -> &'static str {
         match self {
             Self::JaJp => "日本語",
             Self::EnUs => "English",
         }
+    }
+}
+
+/// Embedded translations used by standalone visualizer leaf components.
+///
+/// [`crate::Visualizer`] installs these resources automatically. Lower-level
+/// public modules fall back to the default locale, while consumers can install
+/// this value explicitly to select a locale before the first frame.
+#[derive(Clone)]
+pub struct VisualizerUiResources {
+    catalog: I18nCatalog,
+}
+
+impl VisualizerUiResources {
+    pub fn embedded() -> Result<Self, String> {
+        Ok(Self {
+            catalog: I18nCatalog::embedded()?,
+        })
+    }
+
+    pub fn install(&self, ctx: &egui::Context, locale: Locale) {
+        ctx.install_i18n(self.catalog.for_locale(locale));
     }
 }
 
@@ -219,8 +241,15 @@ pub(crate) trait EguiI18nExt {
 }
 
 fn installed_i18n(ctx: &egui::Context) -> Arc<I18n> {
-    ctx.data(|data| data.get_temp::<Arc<I18n>>(egui::Id::new(I18N_CTX_KEY)))
-        .expect("I18n is not installed in egui::Context")
+    if let Some(i18n) = ctx.data(|data| data.get_temp::<Arc<I18n>>(egui::Id::new(I18N_CTX_KEY))) {
+        return i18n;
+    }
+
+    let i18n = I18nCatalog::embedded()
+        .expect("embedded visualizer translations should be valid")
+        .for_locale(Locale::default());
+    ctx.install_i18n(i18n.clone());
+    i18n
 }
 
 pub(crate) fn localized_module_name(ctx: &egui::Context, module_id: &str) -> String {
