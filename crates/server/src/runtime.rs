@@ -19,10 +19,10 @@ use nuillu_module::{
 };
 use nuillu_visualizer_protocol::{
     AgentActionInvocationCompletion, EditableSceneStateView, ExternalActionEventRowView,
-    ExternalActionEventStatusView, OneShotSensoryInput, TabStatus, UtteranceEventKindView,
-    UtteranceEventRowView, VisualizerAction, VisualizerClientMessage, VisualizerCommand,
-    VisualizerEvent, VisualizerServerMessage, VisualizerServerPort, VisualizerTabId,
-    run_runtime_action_id, stop_runtime_action_id,
+    ExternalActionEventStatusView, LlmObservationEvent, LlmObservationSource, OneShotSensoryInput,
+    TabStatus, UtteranceEventKindView, UtteranceEventRowView, VisualizerAction,
+    VisualizerClientMessage, VisualizerCommand, VisualizerEvent, VisualizerServerMessage,
+    VisualizerServerPort, VisualizerTabId, run_runtime_action_id, stop_runtime_action_id,
 };
 use tokio::{runtime::Builder, task::LocalSet};
 
@@ -216,6 +216,14 @@ pub enum ServerEvent {
     RuntimeEvent {
         event: RuntimeEvent,
     },
+    /// An actual Lutum model operation has received its model input.
+    ///
+    /// This event is observational: the reported call has already started. A
+    /// subscriber can enforce its own budget for subsequent calls by pausing
+    /// or shutting down the [`ServerRuntimeHandle`].
+    LlmCall {
+        call: ServerLlmCall,
+    },
     SensoryInput {
         input: SensoryInput,
     },
@@ -257,6 +265,22 @@ pub enum ServerEvent {
         affordances: Vec<ActionAffordance>,
     },
 }
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServerLlmCall {
+    pub turn_id: String,
+    pub owner: String,
+    pub module: String,
+    pub replica: u8,
+    pub tier: String,
+    pub source: ServerLlmCallSource,
+    pub session_key: Option<String>,
+    pub operation: String,
+    pub activation_id: u64,
+    pub activation_attempt: u32,
+}
+
+pub type ServerLlmCallSource = LlmObservationSource;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ServerRuntimeStatus {
@@ -510,6 +534,36 @@ fn server_event_from_visualizer_message(message: &VisualizerServerMessage) -> Op
         }),
         VisualizerEvent::RuntimeEvent { event, .. } => Some(ServerEvent::RuntimeEvent {
             event: event.clone(),
+        }),
+        VisualizerEvent::LlmObserved {
+            event:
+                LlmObservationEvent::ModelInput {
+                    turn_id,
+                    owner,
+                    module,
+                    replica,
+                    tier,
+                    source,
+                    session_key,
+                    operation,
+                    activation_id,
+                    activation_attempt,
+                    ..
+                },
+            ..
+        } => Some(ServerEvent::LlmCall {
+            call: ServerLlmCall {
+                turn_id: turn_id.clone(),
+                owner: owner.clone(),
+                module: module.clone(),
+                replica: *replica,
+                tier: tier.clone(),
+                source: *source,
+                session_key: session_key.clone(),
+                operation: operation.clone(),
+                activation_id: *activation_id,
+                activation_attempt: *activation_attempt,
+            },
         }),
         VisualizerEvent::SensoryInput { input, .. } => Some(ServerEvent::SensoryInput {
             input: input.clone(),
@@ -985,6 +1039,48 @@ mod tests {
                 invocation_id: "agent-action-1".to_string(),
                 action_id: "poet".to_string(),
                 arguments: serde_json::json!({ "poem": "quiet rain" }),
+            })
+        );
+    }
+
+    #[test]
+    fn server_event_maps_lutum_model_input_to_llm_call() {
+        let message = VisualizerServerMessage::event(VisualizerEvent::LlmObserved {
+            tab_id: server_tab_id(),
+            event: LlmObservationEvent::ModelInput {
+                turn_id: "predict-0:7:1".to_string(),
+                owner: "predict#0".to_string(),
+                module: "predict".to_string(),
+                replica: 0,
+                tier: "Premium".to_string(),
+                source: LlmObservationSource::ModuleTurn,
+                session_key: Some("main".to_string()),
+                operation: "text_turn".to_string(),
+                activation_id: 7,
+                activation_attempt: 1,
+                batch: nuillu_visualizer_protocol::LlmBatchDebugView {
+                    batch_type: "cognition".to_string(),
+                    debug: String::new(),
+                },
+                items: Vec::new(),
+            },
+        });
+
+        assert_eq!(
+            server_event_from_visualizer_message(&message),
+            Some(ServerEvent::LlmCall {
+                call: ServerLlmCall {
+                    turn_id: "predict-0:7:1".to_string(),
+                    owner: "predict#0".to_string(),
+                    module: "predict".to_string(),
+                    replica: 0,
+                    tier: "Premium".to_string(),
+                    source: LlmObservationSource::ModuleTurn,
+                    session_key: Some("main".to_string()),
+                    operation: "text_turn".to_string(),
+                    activation_id: 7,
+                    activation_attempt: 1,
+                },
             })
         );
     }

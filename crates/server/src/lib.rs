@@ -35,9 +35,10 @@ pub use nuillu_llm_trace_file::{FileLlmTraceSink, LlmLogContext};
 pub use registry::ServerModuleRegistrar;
 pub use runtime::{
     ServerAmbientSensorySnapshotRecord, ServerEvent, ServerExternalActionEventRecord,
-    ServerExternalActionEventStatus, ServerOneShotSensoryInputRecord, ServerRuntimeHandle,
-    ServerRuntimeStatus, ServerUtteranceEventKind, ServerUtteranceEventRecord,
-    run_server_with_visualizer, spawn_server_runtime, spawn_server_runtime_with_module_registrars,
+    ServerExternalActionEventStatus, ServerLlmCall, ServerLlmCallSource,
+    ServerOneShotSensoryInputRecord, ServerRuntimeHandle, ServerRuntimeStatus,
+    ServerUtteranceEventKind, ServerUtteranceEventRecord, run_server_with_visualizer,
+    spawn_server_runtime, spawn_server_runtime_with_module_registrars,
 };
 pub use snapshot::{
     duration_millis_u64, linked_memory_record_view, memory_metadata_views, memory_rank_name,

@@ -466,6 +466,8 @@ pub enum RuntimeEvent {
 
 `sequence` is global to the runtime event emitter and preserves event ordering across event kinds. `LlmAccess::lutum().await` emits exactly one `LlmAccessed` event after resolving the holder's current effective tier and before returning the `lutum::Lutum` handle. Its `call` field is the LLM acquisition sequence only; it observes acquisition count, not provider request count. `Memo::write(...).await` emits `MemoUpdated` after the blackboard memo write completes; `char_count` is the memo's character count at write time. `ModuleBatchThrottled` is emitted after a scheduler-owned next-batch cooldown expires and before the module's next `next_batch()` future is started. Sinks must not deny acquisition, memo writes, or delayed scheduler operations. Eval `max-llm-calls` instead observes Lutum's built-in `OnModelInput` hook and requests shutdown after the model input that reaches the limit.
 
+The server maps each Lutum `OnModelInput` observation to `ServerEvent::LlmCall`. Host applications can subscribe through `ServerRuntimeHandle::subscribe_events()` and implement call-, tier-, module-, or source-specific budgets, then pause or shut down the runtime. The event is observational: the reported model operation has already started, and concurrent operations may already be in flight when host policy reacts.
+
 ---
 
 ## 3. Scheduler And Event Loop
