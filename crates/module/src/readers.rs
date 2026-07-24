@@ -6,7 +6,7 @@
 //! cannot read the non-cognitive blackboard, regardless of what its
 //! `run` body tries.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
@@ -15,7 +15,40 @@ use nuillu_blackboard::{
     Blackboard, BlackboardInner, CognitionLog, CognitionLogEntryRecord, InteroceptiveState,
     MemoLogRecord, MemoryMetadata, ModuleRunStatus, ModuleRunStatusRecord, ResourceAllocation,
 };
-use nuillu_types::{MemoryIndex, ModuleInstanceId};
+use nuillu_types::{MemoryIndex, ModuleId, ModuleInstanceId};
+
+type MemoCursor = HashMap<ModuleInstanceId, u64>;
+type SharedMemoCursor = Rc<tokio::sync::Mutex<MemoCursor>>;
+type SharedCognitionCursor = Rc<tokio::sync::Mutex<Option<u64>>>;
+
+/// Role-scoped unread cursors enabled by round-robin update inboxes.
+///
+/// A role is registered synchronously while its module replicas are built.
+/// Readers resolve the shared cursor lazily so constructor argument order does
+/// not affect whether the cursor is shared.
+#[derive(Clone, Default)]
+pub(crate) struct RoleReaderCursors {
+    memo: Rc<RefCell<HashMap<ModuleId, SharedMemoCursor>>>,
+    cognition: Rc<RefCell<HashMap<ModuleId, SharedCognitionCursor>>>,
+}
+
+impl RoleReaderCursors {
+    pub(crate) fn enable_memo_round_robin(&self, role: &ModuleId) {
+        self.memo.borrow_mut().entry(role.clone()).or_default();
+    }
+
+    pub(crate) fn enable_cognition_round_robin(&self, role: &ModuleId) {
+        self.cognition.borrow_mut().entry(role.clone()).or_default();
+    }
+
+    fn memo_for(&self, role: &ModuleId) -> Option<SharedMemoCursor> {
+        self.memo.borrow().get(role).cloned()
+    }
+
+    fn cognition_for(&self, role: &ModuleId) -> Option<SharedCognitionCursor> {
+        self.cognition.borrow().get(role).cloned()
+    }
+}
 
 /// Read-only access to the entire blackboard (memos + memory metadata).
 ///
@@ -25,7 +58,8 @@ use nuillu_types::{MemoryIndex, ModuleInstanceId};
 #[derive(Clone)]
 pub struct BlackboardReader {
     blackboard: Blackboard,
-    last_seen_memo_indices: Arc<Mutex<HashMap<ModuleInstanceId, u64>>>,
+    last_seen_memo_indices: Arc<Mutex<MemoCursor>>,
+    role_cursors: Option<(ModuleId, RoleReaderCursors)>,
 }
 
 impl BlackboardReader {
@@ -33,6 +67,19 @@ impl BlackboardReader {
         Self {
             blackboard,
             last_seen_memo_indices: Arc::new(Mutex::new(HashMap::new())),
+            role_cursors: None,
+        }
+    }
+
+    pub(crate) fn new_for_role(
+        blackboard: Blackboard,
+        role: ModuleId,
+        role_cursors: RoleReaderCursors,
+    ) -> Self {
+        Self {
+            blackboard,
+            last_seen_memo_indices: Arc::new(Mutex::new(HashMap::new())),
+            role_cursors: Some((role, role_cursors)),
         }
     }
 
@@ -59,28 +106,45 @@ impl BlackboardReader {
         &self,
         include: impl Fn(&MemoLogRecord) -> bool,
     ) -> Vec<MemoLogRecord> {
-        let last_seen = self
-            .last_seen_memo_indices
-            .lock()
-            .expect("memo reader cursor poisoned")
-            .clone();
-        let records = self
-            .blackboard
-            .read(|bb| bb.unread_memo_logs(&last_seen))
-            .await;
-        if !records.is_empty() {
+        let shared_cursor = self
+            .role_cursors
+            .as_ref()
+            .and_then(|(role, cursors)| cursors.memo_for(role));
+        let records = if let Some(shared_cursor) = shared_cursor {
+            let mut cursor = shared_cursor.lock().await;
+            let records = self
+                .blackboard
+                .read(|bb| bb.unread_memo_logs(&cursor))
+                .await;
+            advance_memo_cursor(&mut cursor, &records);
+            records
+        } else {
+            let last_seen = self
+                .last_seen_memo_indices
+                .lock()
+                .expect("memo reader cursor poisoned")
+                .clone();
+            let records = self
+                .blackboard
+                .read(|bb| bb.unread_memo_logs(&last_seen))
+                .await;
             let mut cursor = self
                 .last_seen_memo_indices
                 .lock()
                 .expect("memo reader cursor poisoned");
-            for record in &records {
-                cursor
-                    .entry(record.owner.clone())
-                    .and_modify(|index| *index = (*index).max(record.index))
-                    .or_insert(record.index);
-            }
-        }
+            advance_memo_cursor(&mut cursor, &records);
+            records
+        };
         records.into_iter().filter(include).collect()
+    }
+}
+
+fn advance_memo_cursor(cursor: &mut MemoCursor, records: &[MemoLogRecord]) {
+    for record in records {
+        cursor
+            .entry(record.owner.clone())
+            .and_modify(|index| *index = (*index).max(record.index))
+            .or_insert(record.index);
     }
 }
 
@@ -115,6 +179,7 @@ pub struct CognitionLogReader {
     blackboard: Blackboard,
     owner: Option<ModuleInstanceId>,
     last_seen_cognition_index: Rc<Cell<Option<u64>>>,
+    role_cursors: Option<(ModuleId, RoleReaderCursors)>,
 }
 
 impl CognitionLogReader {
@@ -123,14 +188,30 @@ impl CognitionLogReader {
             blackboard,
             owner: None,
             last_seen_cognition_index: Rc::new(Cell::new(None)),
+            role_cursors: None,
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn new_for_owner(blackboard: Blackboard, owner: ModuleInstanceId) -> Self {
         Self {
             blackboard,
             owner: Some(owner),
             last_seen_cognition_index: Rc::new(Cell::new(None)),
+            role_cursors: None,
+        }
+    }
+
+    pub(crate) fn new_for_owner_with_role_cursors(
+        blackboard: Blackboard,
+        owner: ModuleInstanceId,
+        role_cursors: RoleReaderCursors,
+    ) -> Self {
+        Self {
+            blackboard,
+            owner: Some(owner.clone()),
+            last_seen_cognition_index: Rc::new(Cell::new(None)),
+            role_cursors: Some((owner.module, role_cursors)),
         }
     }
 
@@ -160,7 +241,15 @@ impl CognitionLogReader {
     }
 
     pub async fn peek_unread_events(&self) -> Vec<CognitionLogEntryRecord> {
-        let last_seen = self.last_seen_cognition_index.get();
+        let shared_cursor = self
+            .role_cursors
+            .as_ref()
+            .and_then(|(role, cursors)| cursors.cognition_for(role));
+        let last_seen = if let Some(shared_cursor) = shared_cursor {
+            *shared_cursor.lock().await
+        } else {
+            self.last_seen_cognition_index.get()
+        };
         let records = self
             .blackboard
             .read(|bb| bb.unread_cognition_log_entries(last_seen))
@@ -169,14 +258,31 @@ impl CognitionLogReader {
     }
 
     pub async fn unread_events(&self) -> Vec<CognitionLogEntryRecord> {
-        let last_seen = self.last_seen_cognition_index.get();
-        let records = self
-            .blackboard
-            .read(|bb| bb.unread_cognition_log_entries(last_seen))
-            .await;
-        if let Some(index) = records.last().map(|record| record.index) {
-            self.last_seen_cognition_index.set(Some(index));
-        }
+        let shared_cursor = self
+            .role_cursors
+            .as_ref()
+            .and_then(|(role, cursors)| cursors.cognition_for(role));
+        let records = if let Some(shared_cursor) = shared_cursor {
+            let mut cursor = shared_cursor.lock().await;
+            let records = self
+                .blackboard
+                .read(|bb| bb.unread_cognition_log_entries(*cursor))
+                .await;
+            if let Some(index) = records.last().map(|record| record.index) {
+                *cursor = Some(index);
+            }
+            records
+        } else {
+            let last_seen = self.last_seen_cognition_index.get();
+            let records = self
+                .blackboard
+                .read(|bb| bb.unread_cognition_log_entries(last_seen))
+                .await;
+            if let Some(index) = records.last().map(|record| record.index) {
+                self.last_seen_cognition_index.set(Some(index));
+            }
+            records
+        };
         self.filter_records(records)
     }
 

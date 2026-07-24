@@ -18,6 +18,7 @@ use nuillu_types::{
 use crate::activation_gate::ActivationGateHub;
 use crate::channels::{Topic, TopicPolicy, WakeClaim, WakeRegistry};
 use crate::ports::{Clock, CognitionLogRepository, PortError};
+use crate::readers::RoleReaderCursors;
 use crate::runtime_events::{NoopRuntimeEventSink, RuntimeEventEmitter, RuntimeEventSink};
 use crate::runtime_policy::RuntimePolicy;
 use crate::scene::{SceneReader, SceneRegistry};
@@ -65,6 +66,7 @@ struct CapabilityProvidersInner {
     memo_updates: Topic<MemoUpdated>,
     memo_log_evictions: Topic<nuillu_blackboard::MemoLogRecord>,
     sensory_input_topic: Topic<SensoryInput>,
+    role_reader_cursors: RoleReaderCursors,
     activation_gates: ActivationGateHub,
     cognition_log_port: Rc<dyn CognitionLogRepository>,
     clock: Rc<dyn Clock>,
@@ -281,6 +283,7 @@ impl CapabilityProviders {
         let runtime_events = RuntimeEventEmitter::new(event_sink);
         let wakes = WakeRegistry::default();
         let self_wake_permits = SelfWakePermitRegistry::default();
+        let role_reader_cursors = RoleReaderCursors::default();
         Self {
             inner: Rc::new(CapabilityProvidersInner {
                 wakes: wakes.clone(),
@@ -321,6 +324,7 @@ impl CapabilityProviders {
                     wakes,
                     TopicPolicy::RoleLoadBalanced,
                 ),
+                role_reader_cursors,
                 activation_gates: ActivationGateHub::new(blackboard.clone()),
                 blackboard,
                 cognition_log_port,
@@ -917,9 +921,13 @@ impl ModuleCapabilityFactory {
     }
 
     pub fn cognition_log_updated_inbox(&self) -> CognitionLogUpdatedInbox {
-        TopicInbox::new_excluding_self(
+        let role_reader_cursors = self.root.inner.role_reader_cursors.clone();
+        TopicInbox::new_excluding_self_with_round_robin_hook(
             self.owner.clone(),
             self.root.inner.cognition_log_updates.clone(),
+            Some(Rc::new(move |role| {
+                role_reader_cursors.enable_cognition_round_robin(role);
+            })),
         )
     }
 
@@ -945,7 +953,14 @@ impl ModuleCapabilityFactory {
     }
 
     pub fn memo_updated_inbox(&self) -> MemoUpdatedInbox {
-        TopicInbox::new_excluding_self(self.owner.clone(), self.root.inner.memo_updates.clone())
+        let role_reader_cursors = self.root.inner.role_reader_cursors.clone();
+        TopicInbox::new_excluding_self_with_round_robin_hook(
+            self.owner.clone(),
+            self.root.inner.memo_updates.clone(),
+            Some(Rc::new(move |role| {
+                role_reader_cursors.enable_memo_round_robin(role);
+            })),
+        )
     }
 
     pub fn memo_log_evicted_inbox(&self) -> MemoLogEvictedInbox {
@@ -1038,7 +1053,11 @@ impl ModuleCapabilityFactory {
     }
 
     pub fn blackboard_reader(&self) -> BlackboardReader {
-        self.root.blackboard_reader()
+        BlackboardReader::new_for_role(
+            self.root.inner.blackboard.clone(),
+            self.owner.module.clone(),
+            self.root.inner.role_reader_cursors.clone(),
+        )
     }
 
     pub fn memory_metadata_reader(&self) -> MemoryMetadataReader {
@@ -1052,7 +1071,11 @@ impl ModuleCapabilityFactory {
     }
 
     pub fn cognition_log_reader(&self) -> CognitionLogReader {
-        CognitionLogReader::new_for_owner(self.root.inner.blackboard.clone(), self.owner.clone())
+        CognitionLogReader::new_for_owner_with_role_cursors(
+            self.root.inner.blackboard.clone(),
+            self.owner.clone(),
+            self.root.inner.role_reader_cursors.clone(),
+        )
     }
 
     pub fn allocation_reader(&self) -> AllocationReader {
@@ -2501,6 +2524,151 @@ mod tests {
         assert_eq!(event.sender.module, builtin::sensory());
         assert_eq!(event.body.owner.module, builtin::sensory());
         assert!(inbox.take_ready_items().unwrap().items.is_empty());
+    }
+
+    #[tokio::test]
+    async fn memo_updated_inbox_can_round_robin_across_active_replicas() {
+        let mut allocation = ResourceAllocation::default();
+        allocation.set_activation(builtin::predict(), ActivationRatio::ONE);
+        let blackboard = Blackboard::with_allocation(allocation);
+        blackboard
+            .apply(BlackboardCommand::SetModulePolicies {
+                policies: vec![(builtin::predict(), test_policy(0..=2))],
+            })
+            .await;
+        let caps = test_caps(blackboard);
+        let sensory = scoped(&caps, builtin::sensory(), 0);
+        let mut predict_0 = scoped(&caps, builtin::predict(), 0)
+            .memo_updated_inbox()
+            .round_robin();
+        let mut predict_1 = scoped(&caps, builtin::predict(), 1)
+            .memo_updated_inbox()
+            .round_robin();
+        let memo = sensory.memo();
+
+        memo.write("first").await;
+        memo.write("second").await;
+
+        assert_eq!(predict_0.next_item().await.unwrap().body.index, 0);
+        assert_eq!(predict_1.next_item().await.unwrap().body.index, 1);
+        assert!(predict_0.take_ready_items().unwrap().items.is_empty());
+        assert!(predict_1.take_ready_items().unwrap().items.is_empty());
+    }
+
+    #[tokio::test]
+    async fn memo_updated_inbox_broadcast_remains_the_default() {
+        let mut allocation = ResourceAllocation::default();
+        allocation.set_activation(builtin::predict(), ActivationRatio::ONE);
+        let blackboard = Blackboard::with_allocation(allocation);
+        blackboard
+            .apply(BlackboardCommand::SetModulePolicies {
+                policies: vec![(builtin::predict(), test_policy(0..=2))],
+            })
+            .await;
+        let caps = test_caps(blackboard);
+        let sensory = scoped(&caps, builtin::sensory(), 0);
+        let mut predict_0 = scoped(&caps, builtin::predict(), 0).memo_updated_inbox();
+        let mut predict_1 = scoped(&caps, builtin::predict(), 1)
+            .memo_updated_inbox()
+            .broadcast();
+
+        sensory.memo().write("shared").await;
+
+        assert_eq!(predict_0.next_item().await.unwrap().body.index, 0);
+        assert_eq!(predict_1.next_item().await.unwrap().body.index, 0);
+    }
+
+    #[tokio::test]
+    async fn coalesced_inbox_keeps_one_unread_activation_signal() {
+        let caps = test_caps(Blackboard::default());
+        let sensory = scoped(&caps, builtin::sensory(), 0);
+        let mut predict = scoped(&caps, builtin::predict(), 0)
+            .memo_updated_inbox()
+            .coalesce();
+        let memo = sensory.memo();
+
+        memo.write("first").await;
+        memo.write("second").await;
+        memo.write("third").await;
+
+        let ready = predict.take_ready_items().unwrap();
+        assert_eq!(ready.items.len(), 1);
+        assert_eq!(ready.items[0].body.index, 0);
+
+        memo.write("after drain").await;
+        assert_eq!(predict.next_item().await.unwrap().body.index, 3);
+    }
+
+    #[tokio::test]
+    async fn round_robin_memo_inboxes_share_unread_cursor_by_role() {
+        let mut allocation = ResourceAllocation::default();
+        allocation.set_activation(builtin::predict(), ActivationRatio::ONE);
+        let blackboard = Blackboard::with_allocation(allocation);
+        blackboard
+            .apply(BlackboardCommand::SetModulePolicies {
+                policies: vec![(builtin::predict(), test_policy(0..=2))],
+            })
+            .await;
+        let caps = test_caps(blackboard);
+        let predict_0 = scoped(&caps, builtin::predict(), 0);
+        let predict_1 = scoped(&caps, builtin::predict(), 1);
+        // Resolve readers before configuring the inboxes to prove that cursor
+        // selection is independent of constructor argument order.
+        let reader_0 = predict_0.blackboard_reader();
+        let reader_1 = predict_1.blackboard_reader();
+        let mut inbox_0 = predict_0.memo_updated_inbox().round_robin();
+        let mut inbox_1 = predict_1.memo_updated_inbox().round_robin();
+        let sensory = scoped(&caps, builtin::sensory(), 0);
+        let memo = sensory.memo();
+
+        memo.write("first").await;
+        assert_eq!(inbox_0.next_item().await.unwrap().body.index, 0);
+        assert_eq!(reader_0.unread_memo_logs().await[0].content, "first");
+
+        memo.write("second").await;
+        assert_eq!(inbox_1.next_item().await.unwrap().body.index, 1);
+        let unread = reader_1.unread_memo_logs().await;
+        assert_eq!(unread.len(), 1);
+        assert_eq!(unread[0].content, "second");
+        assert!(reader_0.unread_memo_logs().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn round_robin_cognition_inboxes_share_unread_cursor_by_role() {
+        let mut allocation = ResourceAllocation::default();
+        allocation.set_activation(builtin::predict(), ActivationRatio::ONE);
+        let blackboard = Blackboard::with_allocation(allocation);
+        blackboard
+            .apply(BlackboardCommand::SetModulePolicies {
+                policies: vec![(builtin::predict(), test_policy(0..=2))],
+            })
+            .await;
+        let caps = test_caps(blackboard);
+        let predict_0 = scoped(&caps, builtin::predict(), 0);
+        let predict_1 = scoped(&caps, builtin::predict(), 1);
+        let reader_0 = predict_0.cognition_log_reader();
+        let reader_1 = predict_1.cognition_log_reader();
+        let mut inbox_0 = predict_0.cognition_log_updated_inbox().round_robin();
+        let mut inbox_1 = predict_1.cognition_log_updated_inbox().round_robin();
+        let cognition_gate = scoped(&caps, builtin::cognition_gate(), 0);
+        let cognition = cognition_gate.cognition_writer();
+
+        cognition.append("first").await;
+        assert!(matches!(
+            inbox_0.next_item().await.unwrap().body,
+            CognitionLogUpdated::EntryAppended { .. }
+        ));
+        assert_eq!(reader_0.unread_events().await[0].entry.text, "first");
+
+        cognition.append("second").await;
+        assert!(matches!(
+            inbox_1.next_item().await.unwrap().body,
+            CognitionLogUpdated::EntryAppended { .. }
+        ));
+        let unread = reader_1.unread_events().await;
+        assert_eq!(unread.len(), 1);
+        assert_eq!(unread[0].entry.text, "second");
+        assert!(reader_0.unread_events().await.is_empty());
     }
 
     #[tokio::test]

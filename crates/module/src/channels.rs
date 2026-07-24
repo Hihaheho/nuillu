@@ -1,5 +1,7 @@
 use std::borrow::Cow;
 use std::collections::HashMap;
+use std::rc::Rc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use chrono::{DateTime, Utc};
@@ -140,12 +142,14 @@ pub(crate) enum TopicPolicy {
     RoleLoadBalanced,
 }
 
+type RoundRobinHook = Rc<dyn Fn(&ModuleId)>;
+
 #[derive(Clone)]
 pub(crate) struct Topic<T: Clone> {
     inner: Arc<Mutex<TopicInner<T>>>,
     blackboard: Blackboard,
     wakes: WakeRegistry,
-    policy: TopicPolicy,
+    default_policy: TopicPolicy,
 }
 
 impl<T: Clone> Topic<T> {
@@ -154,32 +158,61 @@ impl<T: Clone> Topic<T> {
             inner: Arc::new(Mutex::new(TopicInner::default())),
             blackboard,
             wakes,
-            policy,
+            default_policy: policy,
         }
     }
 
-    fn subscribe(
-        &self,
-        owner: ModuleInstanceId,
-        exclude_self: bool,
-    ) -> mpsc::UnboundedReceiver<Envelope<T>> {
+    fn subscribe(&self, owner: ModuleInstanceId, exclude_self: bool) -> TopicSubscription<T> {
         let (sender, receiver) = mpsc::unbounded();
-        self.inner
-            .lock()
-            .expect("Topic inner poisoned")
-            .subscribers
-            .push(TopicSubscriber {
-                owner,
-                sender,
-                exclude_self,
-            });
-        receiver
+        let pending = Arc::new(AtomicBool::new(false));
+        let mut inner = self.inner.lock().expect("Topic inner poisoned");
+        let id = inner.next_subscription_id;
+        inner.next_subscription_id = inner.next_subscription_id.wrapping_add(1);
+        inner.subscribers.push(TopicSubscriber {
+            id,
+            owner,
+            sender,
+            exclude_self,
+            policy: self.default_policy,
+            coalesce: false,
+            pending: pending.clone(),
+        });
+        TopicSubscription {
+            id,
+            receiver,
+            pending,
+        }
     }
+
+    fn subscriber_mut(inner: &mut TopicInner<T>, id: u64) -> &mut TopicSubscriber<T> {
+        inner
+            .subscribers
+            .iter_mut()
+            .find(|subscriber| subscriber.id == id)
+            .expect("topic subscription disappeared while its inbox is alive")
+    }
+
+    fn configure_delivery(&self, id: u64, policy: TopicPolicy) {
+        let mut inner = self.inner.lock().expect("Topic inner poisoned");
+        Self::subscriber_mut(&mut inner, id).policy = policy;
+    }
+
+    fn configure_coalescing(&self, id: u64) {
+        let mut inner = self.inner.lock().expect("Topic inner poisoned");
+        Self::subscriber_mut(&mut inner, id).coalesce = true;
+    }
+}
+
+struct TopicSubscription<T: Clone> {
+    id: u64,
+    receiver: mpsc::UnboundedReceiver<Envelope<T>>,
+    pending: Arc<AtomicBool>,
 }
 
 struct TopicInner<T: Clone> {
     subscribers: Vec<TopicSubscriber<T>>,
     next_by_role: HashMap<ModuleId, usize>,
+    next_subscription_id: u64,
 }
 
 impl<T: Clone> Default for TopicInner<T> {
@@ -187,14 +220,19 @@ impl<T: Clone> Default for TopicInner<T> {
         Self {
             subscribers: Vec::new(),
             next_by_role: HashMap::new(),
+            next_subscription_id: 0,
         }
     }
 }
 
 struct TopicSubscriber<T: Clone> {
+    id: u64,
     owner: ModuleInstanceId,
     sender: mpsc::UnboundedSender<Envelope<T>>,
     exclude_self: bool,
+    policy: TopicPolicy,
+    coalesce: bool,
+    pending: Arc<AtomicBool>,
 }
 
 /// Publish capability for one typed topic.
@@ -227,69 +265,72 @@ impl<T: Clone> TopicMailbox<T> {
             .subscribers
             .retain(|subscriber| !subscriber.sender.is_closed());
 
-        match self.topic.policy {
-            TopicPolicy::Fanout => {
-                let mut active_by_role = HashMap::<ModuleId, bool>::new();
-                for subscriber in &inner.subscribers {
-                    let active = allocation.is_replica_active(&subscriber.owner);
-                    active_by_role
-                        .entry(subscriber.owner.module.clone())
-                        .and_modify(|any_active| *any_active |= active)
-                        .or_insert(active);
-                }
-                for subscriber in inner.subscribers.iter().filter(|subscriber| {
-                    allocation.is_replica_active(&subscriber.owner)
-                        || (!active_by_role
-                            .get(&subscriber.owner.module)
-                            .copied()
-                            .unwrap_or(false)
-                            && subscriber.owner.replica == nuillu_types::ReplicaIndex::ZERO)
-                }) {
-                    if subscriber.exclude_self && subscriber.owner == envelope.sender {
-                        continue;
-                    }
-                    if subscriber.sender.unbounded_send(envelope.clone()).is_ok() {
-                        delivered += 1;
-                        delivered_owners.push(subscriber.owner.clone());
-                    }
-                }
-            }
-            TopicPolicy::RoleLoadBalanced => {
-                let mut by_role = HashMap::<ModuleId, Vec<usize>>::new();
-                let mut fallback_by_role = HashMap::<ModuleId, usize>::new();
-                for (idx, subscriber) in inner.subscribers.iter().enumerate() {
-                    if subscriber.exclude_self && subscriber.owner == envelope.sender {
-                        continue;
-                    }
-                    if allocation.is_replica_active(&subscriber.owner) {
-                        by_role
-                            .entry(subscriber.owner.module.clone())
-                            .or_default()
-                            .push(idx);
-                    } else if subscriber.owner.replica == nuillu_types::ReplicaIndex::ZERO {
-                        fallback_by_role
-                            .entry(subscriber.owner.module.clone())
-                            .or_insert(idx);
-                    }
-                }
-                for (role, idx) in fallback_by_role {
-                    by_role.entry(role).or_insert_with(|| vec![idx]);
-                }
+        let mut active_by_role = HashMap::<ModuleId, bool>::new();
+        for subscriber in &inner.subscribers {
+            let active = allocation.is_replica_active(&subscriber.owner);
+            active_by_role
+                .entry(subscriber.owner.module.clone())
+                .and_modify(|any_active| *any_active |= active)
+                .or_insert(active);
+        }
 
-                for (role, indexes) in by_role {
-                    let next = inner.next_by_role.entry(role).or_default();
-                    let chosen = indexes[*next % indexes.len()];
-                    *next = next.wrapping_add(1);
-                    let chosen_owner = inner.subscribers[chosen].owner.clone();
-                    if inner.subscribers[chosen]
-                        .sender
-                        .unbounded_send(envelope.clone())
-                        .is_ok()
-                    {
-                        delivered += 1;
-                        delivered_owners.push(chosen_owner);
-                    }
+        let mut chosen = Vec::new();
+        let mut round_robin_by_role = HashMap::<ModuleId, Vec<usize>>::new();
+        let mut round_robin_fallback_by_role = HashMap::<ModuleId, usize>::new();
+        for (idx, subscriber) in inner.subscribers.iter().enumerate() {
+            if subscriber.exclude_self && subscriber.owner == envelope.sender {
+                continue;
+            }
+            let active = allocation.is_replica_active(&subscriber.owner);
+            let fallback = !active_by_role
+                .get(&subscriber.owner.module)
+                .copied()
+                .unwrap_or(false)
+                && subscriber.owner.replica == nuillu_types::ReplicaIndex::ZERO;
+            match subscriber.policy {
+                TopicPolicy::Fanout if active || fallback => chosen.push(idx),
+                TopicPolicy::Fanout => {}
+                TopicPolicy::RoleLoadBalanced if active => {
+                    round_robin_by_role
+                        .entry(subscriber.owner.module.clone())
+                        .or_default()
+                        .push(idx);
                 }
+                TopicPolicy::RoleLoadBalanced
+                    if subscriber.owner.replica == nuillu_types::ReplicaIndex::ZERO =>
+                {
+                    round_robin_fallback_by_role
+                        .entry(subscriber.owner.module.clone())
+                        .or_insert(idx);
+                }
+                TopicPolicy::RoleLoadBalanced => {}
+            }
+        }
+        for (role, idx) in round_robin_fallback_by_role {
+            round_robin_by_role.entry(role).or_insert_with(|| vec![idx]);
+        }
+        for (role, indexes) in round_robin_by_role {
+            let next = inner.next_by_role.entry(role).or_default();
+            chosen.push(indexes[*next % indexes.len()]);
+            *next = next.wrapping_add(1);
+        }
+
+        for idx in chosen {
+            let subscriber = &inner.subscribers[idx];
+            let should_enqueue = !subscriber.coalesce
+                || subscriber
+                    .pending
+                    .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                    .is_ok();
+            if !should_enqueue {
+                delivered += 1;
+                continue;
+            }
+            if subscriber.sender.unbounded_send(envelope.clone()).is_ok() {
+                delivered += 1;
+                delivered_owners.push(subscriber.owner.clone());
+            } else if subscriber.coalesce {
+                subscriber.pending.store(false, Ordering::Release);
             }
         }
         drop(inner);
@@ -309,29 +350,90 @@ impl<T: Clone> TopicMailbox<T> {
 /// Subscribe capability for one typed topic.
 pub struct TopicInbox<T: Clone> {
     owner: ModuleInstanceId,
+    topic: Topic<T>,
+    subscription_id: u64,
     receiver: mpsc::UnboundedReceiver<Envelope<T>>,
+    pending: Arc<AtomicBool>,
     exclude_self: bool,
+    delivery_configured: bool,
+    round_robin_hook: Option<RoundRobinHook>,
 }
 
 impl<T: Clone> TopicInbox<T> {
     pub(crate) fn new(owner: ModuleInstanceId, topic: Topic<T>) -> Self {
+        let subscription = topic.subscribe(owner.clone(), false);
         Self {
-            owner: owner.clone(),
-            receiver: topic.subscribe(owner, false),
+            owner,
+            topic,
+            subscription_id: subscription.id,
+            receiver: subscription.receiver,
+            pending: subscription.pending,
             exclude_self: false,
+            delivery_configured: false,
+            round_robin_hook: None,
         }
     }
 
     pub(crate) fn new_excluding_self(owner: ModuleInstanceId, topic: Topic<T>) -> Self {
+        Self::new_excluding_self_with_round_robin_hook(owner, topic, None)
+    }
+
+    pub(crate) fn new_excluding_self_with_round_robin_hook(
+        owner: ModuleInstanceId,
+        topic: Topic<T>,
+        round_robin_hook: Option<RoundRobinHook>,
+    ) -> Self {
+        let subscription = topic.subscribe(owner.clone(), true);
         Self {
-            owner: owner.clone(),
-            receiver: topic.subscribe(owner, true),
+            owner,
+            topic,
+            subscription_id: subscription.id,
+            receiver: subscription.receiver,
+            pending: subscription.pending,
             exclude_self: true,
+            delivery_configured: false,
+            round_robin_hook,
         }
+    }
+
+    /// Deliver every message to this module replica. This is the default for
+    /// update topics such as memo and cognition-log notifications.
+    pub fn broadcast(mut self) -> Self {
+        self.set_delivery(TopicPolicy::Fanout);
+        self
+    }
+
+    /// Deliver each message to one active replica of this module role.
+    pub fn round_robin(mut self) -> Self {
+        self.set_delivery(TopicPolicy::RoleLoadBalanced);
+        if let Some(hook) = &self.round_robin_hook {
+            hook(&self.owner.module);
+        }
+        self
+    }
+
+    /// Keep at most one unread activation signal in this inbox.
+    ///
+    /// Durable state remains authoritative; additional notifications are
+    /// accepted but do not allocate more queue entries until the pending one
+    /// is consumed.
+    pub fn coalesce(self) -> Self {
+        self.topic.configure_coalescing(self.subscription_id);
+        self
+    }
+
+    fn set_delivery(&mut self, policy: TopicPolicy) {
+        assert!(
+            !self.delivery_configured,
+            "topic inbox delivery strategy may only be configured once"
+        );
+        self.topic.configure_delivery(self.subscription_id, policy);
+        self.delivery_configured = true;
     }
 
     pub async fn next_item(&mut self) -> Result<Envelope<T>, TopicRecvError> {
         while let Some(envelope) = self.receiver.next().await {
+            self.pending.store(false, Ordering::Release);
             if self.accepts(&envelope) {
                 return Ok(envelope);
             }
@@ -344,6 +446,7 @@ impl<T: Clone> TopicInbox<T> {
         loop {
             match self.receiver.try_recv() {
                 Ok(envelope) => {
+                    self.pending.store(false, Ordering::Release);
                     if self.accepts(&envelope) {
                         items.push(envelope);
                     }
