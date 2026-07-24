@@ -503,7 +503,8 @@ mod tests {
                 let tiers = LutumTiers {
                     cheap: handle.clone(),
                     default: handle.clone(),
-                    premium: handle,
+                    premium: handle.clone(),
+                    image: handle,
                 };
                 let sink = Rc::new(RecordingSink::default());
                 let events = RuntimeEventEmitter::new(sink.clone());

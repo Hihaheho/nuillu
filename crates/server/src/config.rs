@@ -35,6 +35,7 @@ pub struct ServerConfig {
     pub cheap_backend: LlmBackendConfig,
     pub default_backend: LlmBackendConfig,
     pub premium_backend: LlmBackendConfig,
+    pub image_backend: LlmBackendConfig,
     pub embedding_backend: EmbeddingBackendConfig,
     pub boot_config: ServerBootConfig,
     pub disabled_modules: Vec<RuntimeModule>,
@@ -162,6 +163,7 @@ pub enum ServerSessionTier {
     #[default]
     Default,
     Premium,
+    Image,
 }
 
 impl From<ServerSessionTier> for ModelTier {
@@ -170,6 +172,7 @@ impl From<ServerSessionTier> for ModelTier {
             ServerSessionTier::Cheap => Self::Cheap,
             ServerSessionTier::Default => Self::Default,
             ServerSessionTier::Premium => Self::Premium,
+            ServerSessionTier::Image => Self::Image,
         }
     }
 }
@@ -839,6 +842,7 @@ pub fn load_server_config_from_options(options: ServerRunOptions) -> anyhow::Res
     let cheap_backend = backends.cheap;
     let default_backend = backends.default;
     let premium_backend = backends.premium;
+    let image_backend = backends.image;
     let embedding_backend = resolve_embedding(&model_set.embedding)?;
     let session_id = resolve_session_id(options.session_id, options.run_id);
     let boot_config = load_server_boot_config(&options.state_dir)?;
@@ -851,6 +855,7 @@ pub fn load_server_config_from_options(options: ServerRunOptions) -> anyhow::Res
         cheap_backend,
         default_backend,
         premium_backend,
+        image_backend,
         embedding_backend,
         boot_config,
         disabled_modules: options.disabled_modules,

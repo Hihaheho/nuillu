@@ -319,6 +319,7 @@ pub(super) async fn build_server_environment(
                 &config.cheap_backend,
                 &config.default_backend,
                 &config.premium_backend,
+                &config.image_backend,
                 &llm_concurrency_pool,
                 Some(llm_observer),
                 Some(server_llm_log_context(config)),
@@ -409,10 +410,11 @@ fn server_allocation_limits() -> AllocationLimits {
 }
 
 fn session_compaction_policy(config: &ServerConfig) -> SessionCompactionPolicy {
-    SessionCompactionPolicy::new(
+    SessionCompactionPolicy::new_with_image(
         config.cheap_backend.compaction_input_token_threshold,
         config.default_backend.compaction_input_token_threshold,
         config.premium_backend.compaction_input_token_threshold,
+        config.image_backend.compaction_input_token_threshold,
     )
 }
 
@@ -585,6 +587,7 @@ pub fn build_tiers(
     cheap: &LlmBackendConfig,
     default: &LlmBackendConfig,
     premium: &LlmBackendConfig,
+    image: &LlmBackendConfig,
     pool: &LlmConcurrencyPool,
     llm_observer: Option<VisualizerLlmObserver>,
     llm_log_context: Option<LlmLogContext>,
@@ -606,7 +609,14 @@ pub fn build_tiers(
             file_trace_sink.clone(),
             db_trace_sink.clone(),
         )?,
-        premium: build_tier_handle(premium, pool, llm_observer, file_trace_sink, db_trace_sink)?,
+        premium: build_tier_handle(
+            premium,
+            pool,
+            llm_observer.clone(),
+            file_trace_sink.clone(),
+            db_trace_sink.clone(),
+        )?,
+        image: build_tier_handle(image, pool, llm_observer, file_trace_sink, db_trace_sink)?,
     })
 }
 
@@ -1002,6 +1012,7 @@ mod tests {
             cheap_backend: test_backend_config(),
             default_backend: test_backend_config(),
             premium_backend: test_backend_config(),
+            image_backend: test_backend_config(),
             embedding_backend: test_embedding_backend(),
             boot_config: ServerBootConfig::default(),
             disabled_modules: Vec::new(),

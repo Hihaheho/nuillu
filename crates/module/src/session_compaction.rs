@@ -33,6 +33,7 @@ pub struct SessionCompactionPolicy {
     pub cheap_input_token_threshold: u64,
     pub default_input_token_threshold: u64,
     pub premium_input_token_threshold: u64,
+    pub image_input_token_threshold: u64,
 }
 
 #[derive(Clone)]
@@ -69,6 +70,21 @@ impl SessionCompactionPolicy {
             cheap_input_token_threshold,
             default_input_token_threshold,
             premium_input_token_threshold,
+            image_input_token_threshold: default_input_token_threshold,
+        }
+    }
+
+    pub const fn new_with_image(
+        cheap_input_token_threshold: u64,
+        default_input_token_threshold: u64,
+        premium_input_token_threshold: u64,
+        image_input_token_threshold: u64,
+    ) -> Self {
+        Self {
+            cheap_input_token_threshold,
+            default_input_token_threshold,
+            premium_input_token_threshold,
+            image_input_token_threshold,
         }
     }
 
@@ -77,6 +93,7 @@ impl SessionCompactionPolicy {
             ModelTier::Cheap => self.cheap_input_token_threshold,
             ModelTier::Default => self.default_input_token_threshold,
             ModelTier::Premium => self.premium_input_token_threshold,
+            ModelTier::Image => self.image_input_token_threshold,
         }
     }
 }

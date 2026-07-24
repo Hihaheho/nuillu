@@ -23,6 +23,9 @@ default-model.$optional = true
 premium-model = `text`
 premium-model.$optional = true
 
+image-model = `text`
+image-model.$optional = true
+
 judge = `$types.tier-binding`
 judge.$optional = true
 
@@ -34,6 +37,9 @@ default.$optional = true
 
 premium = `$types.tier-binding`
 premium.$optional = true
+
+image = `$types.tier-binding`
+image.$optional = true
 
 embedding = `$types.embedding-role`
 

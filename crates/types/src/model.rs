@@ -12,6 +12,7 @@ pub enum ModelTier {
     #[default]
     Default,
     Premium,
+    Image,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]

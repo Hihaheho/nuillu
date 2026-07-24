@@ -98,6 +98,7 @@ fn main() -> anyhow::Result<()> {
     let cheap_backend = backends.cheap;
     let default_backend = backends.default;
     let premium_backend = backends.premium;
+    let image_backend = backends.image;
     let model_concurrency = backends.model_concurrency;
 
     let embedding_backend = resolve_embedding(&model_set.embedding)?;
@@ -114,6 +115,7 @@ fn main() -> anyhow::Result<()> {
         cheap_backend,
         default_backend,
         premium_backend,
+        image_backend,
         embedding_backend,
         fail_fast: args.fail_fast,
         failed_only: args.failed_only,

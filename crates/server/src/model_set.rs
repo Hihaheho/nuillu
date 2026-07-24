@@ -42,6 +42,8 @@ pub struct ModelSet {
     #[eure(default)]
     pub premium_model: Option<String>,
     #[eure(default)]
+    pub image_model: Option<String>,
+    #[eure(default)]
     pub judge: Option<TierBinding>,
     #[eure(default)]
     pub cheap: Option<TierBinding>,
@@ -49,6 +51,8 @@ pub struct ModelSet {
     pub default: Option<TierBinding>,
     #[eure(default)]
     pub premium: Option<TierBinding>,
+    #[eure(default)]
+    pub image: Option<TierBinding>,
     pub embedding: EmbeddingRole,
 }
 
@@ -155,6 +159,7 @@ pub struct ResolvedLlmBackends {
     pub cheap: LlmBackendConfig,
     pub default: LlmBackendConfig,
     pub premium: LlmBackendConfig,
+    pub image: LlmBackendConfig,
     pub model_concurrency: BTreeMap<String, Option<NonZeroUsize>>,
 }
 
@@ -164,6 +169,7 @@ enum TierRole {
     Cheap,
     Default,
     Premium,
+    Image,
 }
 
 #[derive(Debug, Error)]
@@ -235,9 +241,17 @@ pub fn resolve_llm_backends(model_set: &ModelSet) -> anyhow::Result<ResolvedLlmB
     .ok_or_else(|| {
         anyhow::anyhow!("missing premium tier: set premium-model or premium {{ model = ... }}")
     })?;
+    let image = resolve_tier(
+        TierRole::Image,
+        model_set.image.as_ref(),
+        model_set.image_model.as_deref(),
+        &model_set.models,
+        global_compaction,
+    )?
+    .unwrap_or_else(|| default.clone());
 
     let mut model_concurrency = BTreeMap::new();
-    for backend in [&cheap, &default, &premium]
+    for backend in [&cheap, &default, &premium, &image]
         .into_iter()
         .chain(judge.as_ref())
     {
@@ -251,6 +265,7 @@ pub fn resolve_llm_backends(model_set: &ModelSet) -> anyhow::Result<ResolvedLlmB
         cheap,
         default,
         premium,
+        image,
         model_concurrency,
     })
 }
@@ -396,6 +411,7 @@ fn tier_label(role: TierRole) -> &'static str {
         TierRole::Cheap => "cheap",
         TierRole::Default => "default",
         TierRole::Premium => "premium",
+        TierRole::Image => "image",
     }
 }
 
@@ -443,6 +459,13 @@ fn validate_model_set(path: &Path, model_set: &ModelSet) -> Result<(), ModelSetE
         TierRole::Premium,
         model_set.premium.as_ref(),
         model_set.premium_model.as_deref(),
+        &model_set.models,
+    )?;
+    validate_tier_binding(
+        path,
+        TierRole::Image,
+        model_set.image.as_ref(),
+        model_set.image_model.as_deref(),
         &model_set.models,
     )?;
     validate_embedding_role(path, &model_set.embedding)
@@ -769,6 +792,55 @@ premium-model = "gemma4"
             resolved.model_concurrency.get("gemma4"),
             Some(&NonZeroUsize::new(4))
         );
+    }
+
+    #[test]
+    fn image_tier_falls_back_to_default_when_omitted() {
+        let model_set = parse_model_set(
+            r#"
+models {
+  text-model { token = "local" model = "text" }
+}
+cheap-model = "text-model"
+default-model = "text-model"
+premium-model = "text-model"
+"#,
+        )
+        .unwrap();
+
+        let resolved = resolve_llm_backends(&model_set).unwrap();
+        assert_eq!(resolved.image.model_key, resolved.default.model_key);
+        assert_eq!(resolved.image.model, resolved.default.model);
+    }
+
+    #[test]
+    fn resolves_explicit_image_model_and_binding() {
+        for image_config in [
+            "image-model = \"vision-model\"",
+            "image { model = \"vision-model\" }",
+        ] {
+            let model_set = parse_model_set(&format!(
+                r#"
+models {{
+  text-model {{ token = "local" model = "text" }}
+  vision-model {{ token = "local" model = "vision" max-concurrent-llm-calls = 2 }}
+}}
+cheap-model = "text-model"
+default-model = "text-model"
+premium-model = "text-model"
+{image_config}
+"#
+            ))
+            .unwrap();
+
+            let resolved = resolve_llm_backends(&model_set).unwrap();
+            assert_eq!(resolved.image.model_key, "vision-model");
+            assert_eq!(resolved.image.model, "vision");
+            assert_eq!(
+                resolved.model_concurrency.get("vision-model"),
+                Some(&NonZeroUsize::new(2))
+            );
+        }
     }
 
     #[test]

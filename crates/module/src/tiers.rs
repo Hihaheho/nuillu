@@ -41,6 +41,7 @@ pub struct LutumTiers {
     pub cheap: LlmTierHandle,
     pub default: LlmTierHandle,
     pub premium: LlmTierHandle,
+    pub image: LlmTierHandle,
 }
 
 impl LutumTiers {
@@ -53,6 +54,7 @@ impl LutumTiers {
             ModelTier::Cheap => &self.cheap,
             ModelTier::Default => &self.default,
             ModelTier::Premium => &self.premium,
+            ModelTier::Image => &self.image,
         }
     }
 
@@ -68,8 +70,39 @@ impl LutumTiers {
         Self {
             cheap: handle(lutum.clone()),
             default: handle(lutum.clone()),
-            premium: handle(lutum),
+            premium: handle(lutum.clone()),
+            image: handle(lutum),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use lutum::{Lutum, MockLlmAdapter, SharedPoolBudgetManager, SharedPoolBudgetOptions};
+
+    use super::*;
+
+    #[test]
+    fn image_tier_selects_image_handle() {
+        let lutum = Lutum::new(
+            Arc::new(MockLlmAdapter::new()),
+            SharedPoolBudgetManager::new(SharedPoolBudgetOptions::default()),
+        );
+        let handle =
+            |key| LlmTierHandle::new(lutum.clone(), LlmConcurrencyLimiter::new(None), key, false);
+        let tiers = LutumTiers {
+            cheap: handle("cheap"),
+            default: handle("default"),
+            premium: handle("premium"),
+            image: handle("image"),
+        };
+
+        assert_eq!(
+            tiers.pick_handle(ModelTier::Image).model_key.as_ref(),
+            "image"
+        );
     }
 }
 

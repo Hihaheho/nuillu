@@ -212,6 +212,7 @@ pub struct SuiteModelNames {
     pub cheap: String,
     pub default: String,
     pub premium: String,
+    pub image: String,
 }
 
 #[derive(Debug, Clone, Serialize)]

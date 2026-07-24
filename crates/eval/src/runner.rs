@@ -105,6 +105,7 @@ pub struct RunnerConfig {
     pub cheap_backend: LlmBackendConfig,
     pub default_backend: LlmBackendConfig,
     pub premium_backend: LlmBackendConfig,
+    pub image_backend: LlmBackendConfig,
     pub embedding_backend: EmbeddingBackendConfig,
     pub fail_fast: bool,
     pub failed_only: bool,
@@ -582,6 +583,7 @@ fn suite_run_report(
             cheap: config.cheap_backend.model.clone(),
             default: config.default_backend.model.clone(),
             premium: config.premium_backend.model.clone(),
+            image: config.image_backend.model.clone(),
         },
         module_filters: config
             .module_filters
@@ -4511,6 +4513,7 @@ pub(crate) async fn build_eval_environment(
         &config.cheap_backend,
         &config.default_backend,
         &config.premium_backend,
+        &config.image_backend,
         &config.llm_concurrency_pool,
         llm_observer,
         Some(eval_llm_log_context(config, case_id)),
@@ -4570,10 +4573,11 @@ pub(crate) fn eval_llm_log_directory(config: &RunnerConfig, case_id: &str) -> Pa
 }
 
 fn session_compaction_policy(config: &RunnerConfig) -> SessionCompactionPolicy {
-    SessionCompactionPolicy::new(
+    SessionCompactionPolicy::new_with_image(
         config.cheap_backend.compaction_input_token_threshold,
         config.default_backend.compaction_input_token_threshold,
         config.premium_backend.compaction_input_token_threshold,
+        config.image_backend.compaction_input_token_threshold,
     )
 }
 
@@ -7409,6 +7413,7 @@ mod tests {
             ("cheap-model".to_string(), None),
             ("default-model".to_string(), None),
             ("premium-model".to_string(), None),
+            ("image-model".to_string(), None),
         ])
     }
 
@@ -7422,6 +7427,7 @@ mod tests {
             cheap_backend: test_backend_config_with_model("cheap-model"),
             default_backend: test_backend_config_with_model("default-model"),
             premium_backend: test_backend_config_with_model("premium-model"),
+            image_backend: test_backend_config_with_model("image-model"),
             embedding_backend: test_embedding_backend(),
             fail_fast: false,
             failed_only: false,
@@ -7458,6 +7464,7 @@ mod tests {
                 cheap: "cheap".to_string(),
                 default: "default".to_string(),
                 premium: "premium".to_string(),
+                image: "image".to_string(),
             },
             module_filters: Vec::new(),
             disabled_modules: Vec::new(),
@@ -8358,6 +8365,7 @@ id = "module-query-memory-special-memory"
             cheap_backend: test_backend_config(),
             default_backend: test_backend_config(),
             premium_backend: test_backend_config(),
+            image_backend: test_backend_config(),
             embedding_backend: test_embedding_backend(),
             fail_fast: false,
             failed_only: false,
@@ -9356,6 +9364,7 @@ limits {{
             cheap_backend,
             default_backend: test_backend_config_with_model("default-model"),
             premium_backend: test_backend_config_with_model("premium-model"),
+            image_backend: test_backend_config_with_model("image-model"),
             embedding_backend: failing_embedding_backend(),
             fail_fast: false,
             failed_only: false,
@@ -9369,6 +9378,7 @@ limits {{
                 },
                 test_backend_config_with_model("default-model"),
                 test_backend_config_with_model("premium-model"),
+                test_backend_config_with_model("image-model"),
             ]),
             llm_concurrency_pool: LlmConcurrencyPool::default(),
             trials: NonZeroUsize::new(1).unwrap(),
@@ -9404,6 +9414,7 @@ limits {{
         assert_eq!(report.run.models.cheap, "cheap-model");
         assert_eq!(report.run.models.default, "default-model");
         assert_eq!(report.run.models.premium, "premium-model");
+        assert_eq!(report.run.models.image, "image-model");
         assert_eq!(report.run.module_filters, Vec::<String>::new());
         assert_eq!(report.case_count, 2);
         assert_eq!(report.passed_cases, 0);
@@ -9443,6 +9454,7 @@ limits {{
                     "default-model": null,
                     "judge-model": null,
                     "premium-model": null,
+                    "image-model": null,
                 },
                 "trials": 1,
                 "full_agent_concurrency": 3,
@@ -9453,6 +9465,7 @@ limits {{
                     "cheap": "cheap-model",
                     "default": "default-model",
                     "premium": "premium-model",
+                    "image": "image-model",
                 },
                 "module_filters": [],
                 "disabled_modules": [],

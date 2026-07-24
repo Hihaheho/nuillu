@@ -129,6 +129,7 @@ $variant: union
 variants.cheap = { = "cheap", $variant => "literal" }
 variants.default = { = "default", $variant => "literal" }
 variants.premium = { = "premium", $variant => "literal" }
+variants.image = { = "image", $variant => "literal" }
 
 @ $types.nullable-text
 $variant: union
