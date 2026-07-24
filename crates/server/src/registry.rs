@@ -1,13 +1,42 @@
 use std::rc::Rc;
+use std::sync::Arc;
 
 use nuillu_blackboard::{ActivationRatio, Bpm, ModulePolicy, ResourceAllocation, linear_ratio_fn};
 use nuillu_memory::MemoryCapabilities;
 use nuillu_module::ModuleRegistry;
+use nuillu_module::ModuleRegistryError;
 use nuillu_reward::PolicyCapabilities;
 use nuillu_speak::{UtteranceSink, UtteranceWriter};
 use nuillu_types::ModuleId;
 
 use super::config::{RuntimeModule, ServerBootConfig, ServerModuleGroup, ServerModuleSpec};
+
+/// Host-provided registration hook applied after the built-in server modules.
+///
+/// Registrars are retained by the server and invoked again whenever the agent
+/// runtime is rebuilt, so each invocation must return fresh module builders.
+pub trait ServerModuleRegistrar: Send + Sync {
+    fn register(&self, registry: ModuleRegistry) -> Result<ModuleRegistry, ModuleRegistryError>;
+}
+
+impl<F> ServerModuleRegistrar for F
+where
+    F: Fn(ModuleRegistry) -> Result<ModuleRegistry, ModuleRegistryError> + Send + Sync,
+{
+    fn register(&self, registry: ModuleRegistry) -> Result<ModuleRegistry, ModuleRegistryError> {
+        self(registry)
+    }
+}
+
+pub(super) fn apply_server_module_registrars(
+    mut registry: ModuleRegistry,
+    registrars: &[Arc<dyn ServerModuleRegistrar>],
+) -> Result<ModuleRegistry, ModuleRegistryError> {
+    for registrar in registrars {
+        registry = registrar.register(registry)?;
+    }
+    Ok(registry)
+}
 
 pub(super) fn server_registry(
     boot_config: &ServerBootConfig,
@@ -509,6 +538,8 @@ fn set_allocation_module(allocation: &mut ResourceAllocation, id: ModuleId, acti
 mod tests {
     use super::*;
 
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
     use lutum::Session;
     use nuillu_module::{
         ActionAffordanceReader, ActionAffordancesUpdatedInbox, AllocationReader, AllocationWriter,
@@ -617,5 +648,21 @@ mod tests {
             ActivationRatio::from_f64(0.75)
         );
         assert!(!allocation.has_activation(&builtin::policy()));
+    }
+
+    #[test]
+    fn host_registrars_are_reusable_for_agent_rebuilds() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let registrar_calls = calls.clone();
+        let registrar: Arc<dyn ServerModuleRegistrar> = Arc::new(move |registry| {
+            registrar_calls.fetch_add(1, Ordering::Relaxed);
+            Ok(registry)
+        });
+        let registrars = vec![registrar];
+
+        apply_server_module_registrars(ModuleRegistry::new(), &registrars).unwrap();
+        apply_server_module_registrars(ModuleRegistry::new(), &registrars).unwrap();
+
+        assert_eq!(calls.load(Ordering::Relaxed), 2);
     }
 }

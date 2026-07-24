@@ -35,7 +35,9 @@ use crate::config::ServerConfig;
 use crate::environment::build_server_environment;
 use crate::gui::VisualizerHook;
 use crate::llm_db_trace::emit_persisted_llm_transcripts;
-use crate::registry::{full_agent_allocation, server_registry};
+use crate::registry::{
+    ServerModuleRegistrar, apply_server_module_registrars, full_agent_allocation, server_registry,
+};
 use crate::snapshot::emit_visualizer_blackboard_snapshot;
 use crate::state::{ActionAffordanceState, ModuleSettingsState, SceneState};
 
@@ -349,10 +351,17 @@ pub fn run_server_with_visualizer(config: ServerConfig) -> anyhow::Result<()> {
 
     let (command_rx, event_tx) = port.into_channels();
     send_visualizer_startup(&event_tx);
-    run_server_on_current_thread(config, event_tx, command_rx)
+    run_server_on_current_thread(config, Vec::new(), event_tx, command_rx)
 }
 
 pub fn spawn_server_runtime(config: ServerConfig) -> anyhow::Result<ServerRuntimeHandle> {
+    spawn_server_runtime_with_module_registrars(config, Vec::new())
+}
+
+pub fn spawn_server_runtime_with_module_registrars(
+    config: ServerConfig,
+    registrars: Vec<Arc<dyn ServerModuleRegistrar>>,
+) -> anyhow::Result<ServerRuntimeHandle> {
     let (command_tx, command_rx) = mpsc::channel();
     let (visualizer_tx, visualizer_rx) = mpsc::channel();
     let events = Broadcast::new(EVENT_BACKLOG_LIMIT);
@@ -360,7 +369,7 @@ pub fn spawn_server_runtime(config: ServerConfig) -> anyhow::Result<ServerRuntim
     spawn_visualizer_message_pump(visualizer_rx, visualizer_messages.clone(), events.clone());
     let join = thread::spawn(move || {
         send_visualizer_startup(&visualizer_tx);
-        run_server_on_current_thread(config, visualizer_tx, command_rx)
+        run_server_on_current_thread(config, registrars, visualizer_tx, command_rx)
     });
 
     Ok(ServerRuntimeHandle {
@@ -373,6 +382,7 @@ pub fn spawn_server_runtime(config: ServerConfig) -> anyhow::Result<ServerRuntim
 
 fn run_server_on_current_thread(
     config: ServerConfig,
+    registrars: Vec<Arc<dyn ServerModuleRegistrar>>,
     event_tx: Sender<VisualizerServerMessage>,
     command_rx: Receiver<VisualizerClientMessage>,
 ) -> anyhow::Result<()> {
@@ -382,7 +392,8 @@ fn run_server_on_current_thread(
         .context("build server tokio runtime")?;
     let local = LocalSet::new();
     let mut visualizer = VisualizerHook::new(event_tx, command_rx);
-    let result = runtime.block_on(local.run_until(run_server(config, &mut visualizer)));
+    let result =
+        runtime.block_on(local.run_until(run_server(config, &registrars, &mut visualizer)));
     if let Err(error) = &result {
         eprintln!("nuillu-server runtime failed: {error:#}");
         let tab_id = VisualizerTabId::new(SERVER_TAB_ID.to_string());
@@ -617,7 +628,11 @@ fn server_external_action_event_record(
     }
 }
 
-async fn run_server(config: ServerConfig, visualizer: &mut VisualizerHook) -> anyhow::Result<()> {
+async fn run_server(
+    config: ServerConfig,
+    registrars: &[Arc<dyn ServerModuleRegistrar>],
+    visualizer: &mut VisualizerHook,
+) -> anyhow::Result<()> {
     let tab_id = VisualizerTabId::new(SERVER_TAB_ID.to_string());
     visualizer.send_event(VisualizerEvent::Log {
         tab_id: tab_id.clone(),
@@ -684,14 +699,15 @@ async fn run_server(config: ServerConfig, visualizer: &mut VisualizerHook) -> an
     set_runtime_running(visualizer, &tab_id, &run_controller, true);
     let mut restart_count = 0_u64;
     loop {
-        let allocated = server_registry(
+        let mut registry = server_registry(
             &config.boot_config,
             &env.memory_caps,
             &env.policy_caps,
             &env.utterance_sink,
-        )
-        .build(&env.caps)
-        .await?;
+        );
+        registry = apply_server_module_registrars(registry, registrars)
+            .context("register host-provided server modules")?;
+        let allocated = registry.build(&env.caps).await?;
         apply_persisted_module_settings(&module_settings, visualizer, &tab_id, &env.blackboard)
             .await;
 
