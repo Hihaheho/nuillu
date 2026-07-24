@@ -229,9 +229,7 @@ impl InterpreterModule {
 }
 
 #[async_trait(?Send)]
-impl Module for InterpreterModule {
-    type Batch = InterpreterBatch;
-
+impl nuillu_module::StaticModule for InterpreterModule {
     fn id() -> &'static str {
         "interpreter"
     }
@@ -241,6 +239,11 @@ impl Module for InterpreterModule {
             "Interpreter forms concise inner interpretations, hypotheses, analogies, and story seeds from the current cognition log.",
         )
     }
+}
+
+#[async_trait(?Send)]
+impl Module for InterpreterModule {
+    type Batch = InterpreterBatch;
 
     async fn next_batch(&mut self) -> Result<Self::Batch> {
         InterpreterModule::next_batch(self).await
@@ -335,20 +338,27 @@ mod tests {
         caps: &CapabilityProviders,
     ) -> nuillu_module::AllocatedModule {
         let modules = ModuleRegistry::new()
-            .register(module_policy(), |caps| async move {
-                Ok(InterpreterModule::new(
-                    caps.cognition_log_updated_inbox(),
-                    caps.cognition_log_reader(),
-                    caps.cognition_writer(),
-                    caps.llm("main")
-                        .with_tier(nuillu_types::ModelTier::Default)
-                        .into(),
-                    caps.session("main")
-                        .with_tier(nuillu_types::ModelTier::Default)
-                        .with_auto_compaction(session_auto_compaction())
-                        .await?,
-                ))
-            })
+            .register(
+                nuillu_module::ModuleRegistrationSpec::for_static::<InterpreterModule>(
+                    module_policy(),
+                    nuillu_blackboard::ActivationRatio::ZERO,
+                )
+                .unwrap(),
+                |caps| async move {
+                    Ok(InterpreterModule::new(
+                        caps.cognition_log_updated_inbox(),
+                        caps.cognition_log_reader(),
+                        caps.cognition_writer(),
+                        caps.llm("main")
+                            .with_tier(nuillu_types::ModelTier::Default)
+                            .into(),
+                        caps.session("main")
+                            .with_tier(nuillu_types::ModelTier::Default)
+                            .with_auto_compaction(session_auto_compaction())
+                            .await?,
+                    ))
+                },
+            )
             .unwrap()
             .build(caps)
             .await

@@ -1,5 +1,6 @@
 use nuillu_blackboard::CorePolicyRecord;
 use nuillu_types::ModuleId;
+use std::sync::Arc;
 
 /// Build a system prompt that prepends peer-context entries for every other
 /// module registered in the agent. The owner module is excluded so each
@@ -11,7 +12,7 @@ use nuillu_types::ModuleId;
 /// stable.
 pub fn format_system_prompt(
     base: &str,
-    catalog: &[(ModuleId, &'static str)],
+    catalog: &[(ModuleId, Arc<str>)],
     owner: &ModuleId,
     core_policies: &[CorePolicyRecord],
 ) -> String {
@@ -38,7 +39,7 @@ pub fn format_policy_system_prompt(base: &str, core_policies: &[CorePolicyRecord
 /// activation context.
 pub fn format_faculty_system_prompt(
     base: &str,
-    catalog: &[(ModuleId, &'static str)],
+    catalog: &[(ModuleId, Arc<str>)],
     owner: &ModuleId,
 ) -> String {
     let peers = sorted_peer_lines(catalog, owner);
@@ -47,7 +48,7 @@ pub fn format_faculty_system_prompt(
     prompt
 }
 
-fn sorted_peer_lines(catalog: &[(ModuleId, &'static str)], owner: &ModuleId) -> Vec<String> {
+fn sorted_peer_lines(catalog: &[(ModuleId, Arc<str>)], owner: &ModuleId) -> Vec<String> {
     let mut peers = catalog
         .iter()
         .filter(|(id, _)| id != owner)
@@ -94,9 +95,9 @@ mod tests {
     #[test]
     fn excludes_owner_and_sorts_peers() {
         let catalog = vec![
-            (builtin::sensory(), "sensory role"),
-            (builtin::speak(), "speak role"),
-            (builtin::cognition_gate(), "gate role"),
+            (builtin::sensory(), Arc::from("sensory role")),
+            (builtin::speak(), Arc::from("speak role")),
+            (builtin::cognition_gate(), Arc::from("gate role")),
         ];
         let prompt = format_system_prompt("BASE", &catalog, &builtin::sensory(), &[]);
         assert!(prompt.starts_with("BASE\n\nYou are part of a cognitive system."));
@@ -117,7 +118,7 @@ mod tests {
 
     #[test]
     fn solo_module_returns_base_unchanged() {
-        let catalog = vec![(builtin::sensory(), "sensory role")];
+        let catalog = vec![(builtin::sensory(), Arc::from("sensory role"))];
         let prompt = format_system_prompt("BASE", &catalog, &builtin::sensory(), &[]);
         assert_eq!(prompt, "BASE");
     }

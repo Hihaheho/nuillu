@@ -2416,7 +2416,7 @@ fn spawn_activate(
     batch: ModuleBatch,
     config: AgentEventLoopConfig,
     runtime: AgentRuntimeControl,
-    peer_contexts: Vec<(ModuleId, &'static str)>,
+    peer_contexts: Vec<(ModuleId, Arc<str>)>,
     identity_memories: Vec<IdentityMemoryRecord>,
     core_policies: Vec<CorePolicyRecord>,
     parent: &tracing::Span,
@@ -2483,7 +2483,7 @@ async fn collect_activation_gate_votes(
 async fn activate_with_retries(
     mut module: AllocatedModule,
     runtime: &AgentRuntimeControl,
-    peer_contexts: &[(ModuleId, &'static str)],
+    peer_contexts: &[(ModuleId, Arc<str>)],
     identity_memories: &[IdentityMemoryRecord],
     core_policies: &[CorePolicyRecord],
     batch: &ModuleBatch,
@@ -2622,9 +2622,9 @@ mod tests {
         AttentionControlRequestInbox, CognitionLogReader, CognitionLogUpdated,
         CognitionLogUpdatedInbox, CognitionWriter, LlmAccess, LlmBatchDebug, LlmRequestMetadata,
         LlmRequestSource, Memo, MemoUpdated, MemoUpdatedInbox, Module, ModuleCapabilityFactory,
-        ModuleDependencies, ModuleRegistry, ModuleRegistryError, PersistedSessionSnapshot,
-        RuntimeEvent, RuntimeEventSink, RuntimePolicy, SelfWake, SessionCompactionPolicy,
-        SessionKey, SessionStore,
+        ModuleDependencies, ModuleRegistrationSpec, ModuleRegistry, ModuleRegistryError,
+        PersistedSessionSnapshot, RuntimeEvent, RuntimeEventSink, RuntimePolicy, SelfWake,
+        SessionCompactionPolicy, SessionKey, SessionStore, StaticModule,
     };
     use nuillu_types::{
         MemoryContent, MemoryIndex, ModelTier, ModuleActivationId, ModuleId, ModuleInstanceId,
@@ -2697,10 +2697,7 @@ mod tests {
 
     struct RestartProbeModule;
 
-    #[async_trait(?Send)]
-    impl Module for RestartProbeModule {
-        type Batch = ();
-
+    impl StaticModule for RestartProbeModule {
         fn id() -> &'static str {
             "restart-probe"
         }
@@ -2708,6 +2705,11 @@ mod tests {
         fn peer_context() -> Option<&'static str> {
             None
         }
+    }
+
+    #[async_trait(?Send)]
+    impl Module for RestartProbeModule {
+        type Batch = ();
 
         async fn next_batch(&mut self) -> anyhow::Result<Self::Batch> {
             std::future::pending().await
@@ -2729,7 +2731,7 @@ mod tests {
             builder: F,
         ) -> Result<ModuleRegistry, ModuleRegistryError>
         where
-            M: Module + 'static,
+            M: Module + StaticModule + 'static,
             F: Fn(ModuleCapabilityFactory) -> M + 'static;
     }
 
@@ -2740,10 +2742,11 @@ mod tests {
             builder: F,
         ) -> Result<ModuleRegistry, ModuleRegistryError>
         where
-            M: Module + 'static,
+            M: Module + StaticModule + 'static,
             F: Fn(ModuleCapabilityFactory) -> M + 'static,
         {
-            self.register(policy, move |caps| {
+            let spec = ModuleRegistrationSpec::for_static::<M>(policy, ActivationRatio::ZERO)?;
+            self.register(spec, move |caps| {
                 std::future::ready(Ok::<M, ModuleRegistryError>(builder(caps)))
             })
         }
@@ -2784,10 +2787,7 @@ mod tests {
         on_done: Option<oneshot::Sender<()>>,
     }
 
-    #[async_trait(?Send)]
-    impl Module for EchoModule {
-        type Batch = AttentionControlRequest;
-
+    impl StaticModule for EchoModule {
         fn id() -> &'static str {
             "echo"
         }
@@ -2795,6 +2795,11 @@ mod tests {
         fn peer_context() -> Option<&'static str> {
             Some("test stub")
         }
+    }
+
+    #[async_trait(?Send)]
+    impl Module for EchoModule {
+        type Batch = AttentionControlRequest;
 
         async fn next_batch(&mut self) -> anyhow::Result<Self::Batch> {
             Ok(self.attention_control_inbox.next_item().await?.body)
@@ -2820,10 +2825,7 @@ mod tests {
         activations: Rc<Cell<u32>>,
     }
 
-    #[async_trait(?Send)]
-    impl Module for ControllerTickModule {
-        type Batch = AttentionControlRequest;
-
+    impl StaticModule for ControllerTickModule {
         fn id() -> &'static str {
             "allocation"
         }
@@ -2831,6 +2833,11 @@ mod tests {
         fn peer_context() -> Option<&'static str> {
             Some("test attention controller")
         }
+    }
+
+    #[async_trait(?Send)]
+    impl Module for ControllerTickModule {
+        type Batch = AttentionControlRequest;
 
         async fn next_batch(&mut self) -> anyhow::Result<Self::Batch> {
             Ok(self.attention_control_inbox.next_item().await?.body)
@@ -2855,10 +2862,7 @@ mod tests {
                 batches: Rc<RefCell<Vec<String>>>,
             }
 
-            #[async_trait(?Send)]
-            impl Module for $name {
-                type Batch = AttentionControlRequest;
-
+            impl StaticModule for $name {
                 fn id() -> &'static str {
                     $id
                 }
@@ -2866,6 +2870,11 @@ mod tests {
                 fn peer_context() -> Option<&'static str> {
                     Some("test zero-replica target")
                 }
+            }
+
+            #[async_trait(?Send)]
+            impl Module for $name {
+                type Batch = AttentionControlRequest;
 
                 async fn next_batch(&mut self) -> anyhow::Result<Self::Batch> {
                     Ok(self.attention_control_inbox.next_item().await?.body)
@@ -2907,10 +2916,7 @@ mod tests {
         threshold: u64,
     }
 
-    #[async_trait(?Send)]
-    impl Module for CompactionMetadataObserver {
-        type Batch = AttentionControlRequest;
-
+    impl StaticModule for CompactionMetadataObserver {
         fn id() -> &'static str {
             "compaction-observer"
         }
@@ -2918,6 +2924,11 @@ mod tests {
         fn peer_context() -> Option<&'static str> {
             Some("test stub")
         }
+    }
+
+    #[async_trait(?Send)]
+    impl Module for CompactionMetadataObserver {
+        type Batch = AttentionControlRequest;
 
         async fn next_batch(&mut self) -> anyhow::Result<Self::Batch> {
             Ok(self.attention_control_inbox.next_item().await?.body)
@@ -2966,10 +2977,7 @@ mod tests {
         session_compaction: Option<LlmRequestMetadata>,
     }
 
-    #[async_trait(?Send)]
-    impl Module for LlmMetadataRetryObserver {
-        type Batch = AttentionControlRequest;
-
+    impl StaticModule for LlmMetadataRetryObserver {
         fn id() -> &'static str {
             "llm-metadata-observer"
         }
@@ -2977,6 +2985,11 @@ mod tests {
         fn peer_context() -> Option<&'static str> {
             Some("test stub")
         }
+    }
+
+    #[async_trait(?Send)]
+    impl Module for LlmMetadataRetryObserver {
+        type Batch = AttentionControlRequest;
 
         async fn next_batch(&mut self) -> anyhow::Result<Self::Batch> {
             Ok(self.attention_control_inbox.next_item().await?.body)
@@ -3016,10 +3029,7 @@ mod tests {
         }
     }
 
-    #[async_trait(?Send)]
-    impl Module for QueryBatchRecorder {
-        type Batch = Vec<String>;
-
+    impl StaticModule for QueryBatchRecorder {
         fn id() -> &'static str {
             "batch-recorder"
         }
@@ -3027,6 +3037,11 @@ mod tests {
         fn peer_context() -> Option<&'static str> {
             Some("test stub")
         }
+    }
+
+    #[async_trait(?Send)]
+    impl Module for QueryBatchRecorder {
+        type Batch = Vec<String>;
 
         async fn next_batch(&mut self) -> anyhow::Result<Self::Batch> {
             let first =
@@ -3072,10 +3087,7 @@ mod tests {
         on_done: Option<oneshot::Sender<()>>,
     }
 
-    #[async_trait(?Send)]
-    impl Module for GatedEchoModule {
-        type Batch = AttentionControlRequest;
-
+    impl StaticModule for GatedEchoModule {
         fn id() -> &'static str {
             "gated-echo"
         }
@@ -3083,6 +3095,11 @@ mod tests {
         fn peer_context() -> Option<&'static str> {
             Some("test gated target")
         }
+    }
+
+    #[async_trait(?Send)]
+    impl Module for GatedEchoModule {
+        type Batch = AttentionControlRequest;
 
         async fn next_batch(&mut self) -> anyhow::Result<Self::Batch> {
             Ok(self.attention_control_inbox.next_item().await?.body)
@@ -3113,10 +3130,7 @@ mod tests {
                 on_seen: Option<oneshot::Sender<()>>,
             }
 
-            #[async_trait(?Send)]
-            impl Module for $name {
-                type Batch = ActivationGateEvent<GatedEchoModule>;
-
+            impl StaticModule for $name {
                 fn id() -> &'static str {
                     $id
                 }
@@ -3124,6 +3138,11 @@ mod tests {
                 fn peer_context() -> Option<&'static str> {
                     Some("test activation gate")
                 }
+            }
+
+            #[async_trait(?Send)]
+            impl Module for $name {
+                type Batch = ActivationGateEvent<GatedEchoModule>;
 
                 async fn next_batch(&mut self) -> anyhow::Result<Self::Batch> {
                     Ok(self.gate.next_event().await?)
@@ -3157,10 +3176,7 @@ mod tests {
         second_done: Option<oneshot::Sender<()>>,
     }
 
-    #[async_trait(?Send)]
-    impl Module for TimedQueryBatchRecorder {
-        type Batch = Vec<String>;
-
+    impl StaticModule for TimedQueryBatchRecorder {
         fn id() -> &'static str {
             "timed-batch-recorder"
         }
@@ -3168,6 +3184,11 @@ mod tests {
         fn peer_context() -> Option<&'static str> {
             Some("test stub")
         }
+    }
+
+    #[async_trait(?Send)]
+    impl Module for TimedQueryBatchRecorder {
+        type Batch = Vec<String>;
 
         async fn next_batch(&mut self) -> anyhow::Result<Self::Batch> {
             let first =
@@ -3219,10 +3240,7 @@ mod tests {
         on_done: Option<oneshot::Sender<()>>,
     }
 
-    #[async_trait(?Send)]
-    impl Module for CognitionGateStub {
-        type Batch = ();
-
+    impl StaticModule for CognitionGateStub {
         fn id() -> &'static str {
             "cognition-gate"
         }
@@ -3230,6 +3248,11 @@ mod tests {
         fn peer_context() -> Option<&'static str> {
             Some("test stub")
         }
+    }
+
+    #[async_trait(?Send)]
+    impl Module for CognitionGateStub {
+        type Batch = ();
 
         async fn next_batch(&mut self) -> anyhow::Result<Self::Batch> {
             if self.on_done.is_some() {
@@ -3259,10 +3282,7 @@ mod tests {
         batch_sent: bool,
     }
 
-    #[async_trait(?Send)]
-    impl Module for RetryStub {
-        type Batch = String;
-
+    impl StaticModule for RetryStub {
         fn id() -> &'static str {
             "retry"
         }
@@ -3270,6 +3290,11 @@ mod tests {
         fn peer_context() -> Option<&'static str> {
             Some("test stub")
         }
+    }
+
+    #[async_trait(?Send)]
+    impl Module for RetryStub {
+        type Batch = String;
 
         async fn next_batch(&mut self) -> anyhow::Result<Self::Batch> {
             if self.batch_sent {
@@ -3307,10 +3332,7 @@ mod tests {
         completed: bool,
     }
 
-    #[async_trait(?Send)]
-    impl Module for FailsFiveAttemptsThenSucceeds {
-        type Batch = ();
-
+    impl StaticModule for FailsFiveAttemptsThenSucceeds {
         fn id() -> &'static str {
             "fails-five-attempts-then-succeeds"
         }
@@ -3318,6 +3340,11 @@ mod tests {
         fn peer_context() -> Option<&'static str> {
             Some("test parked activation")
         }
+    }
+
+    #[async_trait(?Send)]
+    impl Module for FailsFiveAttemptsThenSucceeds {
+        type Batch = ();
 
         async fn next_batch(&mut self) -> anyhow::Result<Self::Batch> {
             if self.completed {
@@ -3352,10 +3379,7 @@ mod tests {
         completed: bool,
     }
 
-    #[async_trait(?Send)]
-    impl Module for FailsFirstBatchThenSucceeds {
-        type Batch = ();
-
+    impl StaticModule for FailsFirstBatchThenSucceeds {
         fn id() -> &'static str {
             "fails-first-batch-then-succeeds"
         }
@@ -3363,6 +3387,11 @@ mod tests {
         fn peer_context() -> Option<&'static str> {
             Some("test parked next_batch")
         }
+    }
+
+    #[async_trait(?Send)]
+    impl Module for FailsFirstBatchThenSucceeds {
+        type Batch = ();
 
         async fn next_batch(&mut self) -> anyhow::Result<Self::Batch> {
             if !self.failed_once {
@@ -3393,10 +3422,7 @@ mod tests {
         batch_sent: bool,
     }
 
-    #[async_trait(?Send)]
-    impl Module for StopAfterOneFailureDependency {
-        type Batch = ();
-
+    impl StaticModule for StopAfterOneFailureDependency {
         fn id() -> &'static str {
             "stop-after-one-failure-dependency"
         }
@@ -3404,6 +3430,11 @@ mod tests {
         fn peer_context() -> Option<&'static str> {
             Some("test stopped dependency")
         }
+    }
+
+    #[async_trait(?Send)]
+    impl Module for StopAfterOneFailureDependency {
+        type Batch = ();
 
         async fn next_batch(&mut self) -> anyhow::Result<Self::Batch> {
             if self.batch_sent {
@@ -3429,10 +3460,7 @@ mod tests {
         batch_sent: bool,
     }
 
-    #[async_trait(?Send)]
-    impl Module for IdentityCxObserver {
-        type Batch = ();
-
+    impl StaticModule for IdentityCxObserver {
         fn id() -> &'static str {
             "identity-cx-observer"
         }
@@ -3440,6 +3468,11 @@ mod tests {
         fn peer_context() -> Option<&'static str> {
             Some("test stub")
         }
+    }
+
+    #[async_trait(?Send)]
+    impl Module for IdentityCxObserver {
+        type Batch = ();
 
         async fn next_batch(&mut self) -> anyhow::Result<Self::Batch> {
             if self.batch_sent {
@@ -3478,10 +3511,7 @@ mod tests {
         on_done: Option<oneshot::Sender<()>>,
     }
 
-    #[async_trait(?Send)]
-    impl Module for DeadlockObserver {
-        type Batch = CognitionLogUpdated;
-
+    impl StaticModule for DeadlockObserver {
         fn id() -> &'static str {
             "deadlock-observer"
         }
@@ -3489,6 +3519,11 @@ mod tests {
         fn peer_context() -> Option<&'static str> {
             Some("test stub")
         }
+    }
+
+    #[async_trait(?Send)]
+    impl Module for DeadlockObserver {
+        type Batch = CognitionLogUpdated;
 
         async fn next_batch(&mut self) -> anyhow::Result<Self::Batch> {
             Ok(self.updates.next_item().await?.body)
@@ -3510,10 +3545,7 @@ mod tests {
 
     struct HangingBatchStub;
 
-    #[async_trait(?Send)]
-    impl Module for HangingBatchStub {
-        type Batch = ();
-
+    impl StaticModule for HangingBatchStub {
         fn id() -> &'static str {
             "status-awaiting"
         }
@@ -3521,6 +3553,11 @@ mod tests {
         fn peer_context() -> Option<&'static str> {
             Some("test stub")
         }
+    }
+
+    #[async_trait(?Send)]
+    impl Module for HangingBatchStub {
+        type Batch = ();
 
         async fn next_batch(&mut self) -> anyhow::Result<Self::Batch> {
             std::future::pending().await
@@ -3539,10 +3576,7 @@ mod tests {
         ($name:ident, $id:literal) => {
             struct $name;
 
-            #[async_trait(?Send)]
-            impl Module for $name {
-                type Batch = ();
-
+            impl StaticModule for $name {
                 fn id() -> &'static str {
                     $id
                 }
@@ -3550,6 +3584,11 @@ mod tests {
                 fn peer_context() -> Option<&'static str> {
                     Some("test silent dependency")
                 }
+            }
+
+            #[async_trait(?Send)]
+            impl Module for $name {
+                type Batch = ();
 
                 async fn next_batch(&mut self) -> anyhow::Result<Self::Batch> {
                     std::future::pending().await
@@ -3576,10 +3615,7 @@ mod tests {
         batch_sent: bool,
     }
 
-    #[async_trait(?Send)]
-    impl Module for BlockingActivateStub {
-        type Batch = ();
-
+    impl StaticModule for BlockingActivateStub {
         fn id() -> &'static str {
             "status-activating"
         }
@@ -3587,6 +3623,11 @@ mod tests {
         fn peer_context() -> Option<&'static str> {
             Some("test stub")
         }
+    }
+
+    #[async_trait(?Send)]
+    impl Module for BlockingActivateStub {
+        type Batch = ();
 
         async fn next_batch(&mut self) -> anyhow::Result<Self::Batch> {
             if self.batch_sent {
@@ -3619,10 +3660,7 @@ mod tests {
         batch_sent: bool,
     }
 
-    #[async_trait(?Send)]
-    impl Module for PauseBlockingModule {
-        type Batch = ();
-
+    impl StaticModule for PauseBlockingModule {
         fn id() -> &'static str {
             "pause-blocking"
         }
@@ -3630,6 +3668,11 @@ mod tests {
         fn peer_context() -> Option<&'static str> {
             Some("test pause blocking module")
         }
+    }
+
+    #[async_trait(?Send)]
+    impl Module for PauseBlockingModule {
+        type Batch = ();
 
         async fn next_batch(&mut self) -> anyhow::Result<Self::Batch> {
             if self.batch_sent {
@@ -3666,10 +3709,7 @@ mod tests {
         batch_sent: bool,
     }
 
-    #[async_trait(?Send)]
-    impl Module for BlockingAllocationModule {
-        type Batch = AttentionControlRequest;
-
+    impl StaticModule for BlockingAllocationModule {
         fn id() -> &'static str {
             "allocation"
         }
@@ -3677,6 +3717,11 @@ mod tests {
         fn peer_context() -> Option<&'static str> {
             Some("test blocking allocation")
         }
+    }
+
+    #[async_trait(?Send)]
+    impl Module for BlockingAllocationModule {
+        type Batch = AttentionControlRequest;
 
         async fn next_batch(&mut self) -> anyhow::Result<Self::Batch> {
             if self.batch_sent {
@@ -3711,10 +3756,7 @@ mod tests {
         on_done: Option<oneshot::Sender<()>>,
     }
 
-    #[async_trait(?Send)]
-    impl Module for PendingDependencyModule {
-        type Batch = ();
-
+    impl StaticModule for PendingDependencyModule {
         fn id() -> &'static str {
             "pending-dependency"
         }
@@ -3722,6 +3764,11 @@ mod tests {
         fn peer_context() -> Option<&'static str> {
             Some("test dependency")
         }
+    }
+
+    #[async_trait(?Send)]
+    impl Module for PendingDependencyModule {
+        type Batch = ();
 
         async fn next_batch(&mut self) -> anyhow::Result<Self::Batch> {
             if let Some(release) = self.release.take() {
@@ -3751,10 +3798,7 @@ mod tests {
         on_done: Option<oneshot::Sender<()>>,
     }
 
-    #[async_trait(?Send)]
-    impl Module for ImmediateDependentModule {
-        type Batch = ();
-
+    impl StaticModule for ImmediateDependentModule {
         fn id() -> &'static str {
             "immediate-dependent"
         }
@@ -3762,6 +3806,11 @@ mod tests {
         fn peer_context() -> Option<&'static str> {
             Some("test dependent")
         }
+    }
+
+    #[async_trait(?Send)]
+    impl Module for ImmediateDependentModule {
+        type Batch = ();
 
         async fn next_batch(&mut self) -> anyhow::Result<Self::Batch> {
             if self.batch_sent {
@@ -3789,10 +3838,7 @@ mod tests {
         activated: Rc<Cell<bool>>,
     }
 
-    #[async_trait(?Send)]
-    impl Module for GatedKickTargetModule {
-        type Batch = ();
-
+    impl StaticModule for GatedKickTargetModule {
         fn id() -> &'static str {
             "gated-kick-target"
         }
@@ -3800,6 +3846,11 @@ mod tests {
         fn peer_context() -> Option<&'static str> {
             Some("test gated dependency")
         }
+    }
+
+    #[async_trait(?Send)]
+    impl Module for GatedKickTargetModule {
+        type Batch = ();
 
         async fn next_batch(&mut self) -> anyhow::Result<Self::Batch> {
             if self.batch_sent {
@@ -3826,10 +3877,7 @@ mod tests {
         allow: Option<oneshot::Receiver<()>>,
     }
 
-    #[async_trait(?Send)]
-    impl Module for BlockingAllowGateModule {
-        type Batch = ActivationGateEvent<GatedKickTargetModule>;
-
+    impl StaticModule for BlockingAllowGateModule {
         fn id() -> &'static str {
             "blocking-allow-gate"
         }
@@ -3837,6 +3885,11 @@ mod tests {
         fn peer_context() -> Option<&'static str> {
             Some("test blocking activation gate")
         }
+    }
+
+    #[async_trait(?Send)]
+    impl Module for BlockingAllowGateModule {
+        type Batch = ActivationGateEvent<GatedKickTargetModule>;
 
         async fn next_batch(&mut self) -> anyhow::Result<Self::Batch> {
             Ok(self.gate.next_event().await?)
@@ -3863,10 +3916,7 @@ mod tests {
         writer: CognitionWriter,
     }
 
-    #[async_trait(?Send)]
-    impl Module for AttentionCognitionGateStub {
-        type Batch = String;
-
+    impl StaticModule for AttentionCognitionGateStub {
         fn id() -> &'static str {
             "cognition-gate"
         }
@@ -3874,6 +3924,11 @@ mod tests {
         fn peer_context() -> Option<&'static str> {
             Some("test cognition gate")
         }
+    }
+
+    #[async_trait(?Send)]
+    impl Module for AttentionCognitionGateStub {
+        type Batch = String;
 
         async fn next_batch(&mut self) -> anyhow::Result<Self::Batch> {
             Ok(self.input.next_item().await?.body.into_inner())
@@ -3894,10 +3949,7 @@ mod tests {
         memo: Memo,
     }
 
-    #[async_trait(?Send)]
-    impl Module for QueryMemoryMemoStub {
-        type Batch = String;
-
+    impl StaticModule for QueryMemoryMemoStub {
         fn id() -> &'static str {
             "query-memory"
         }
@@ -3905,6 +3957,11 @@ mod tests {
         fn peer_context() -> Option<&'static str> {
             Some("test query memory")
         }
+    }
+
+    #[async_trait(?Send)]
+    impl Module for QueryMemoryMemoStub {
+        type Batch = String;
 
         async fn next_batch(&mut self) -> anyhow::Result<Self::Batch> {
             Ok(self.input.next_item().await?.body.into_inner())
@@ -3925,10 +3982,7 @@ mod tests {
         writer: CognitionWriter,
     }
 
-    #[async_trait(?Send)]
-    impl Module for MemoCognitionGateStub {
-        type Batch = MemoUpdated;
-
+    impl StaticModule for MemoCognitionGateStub {
         fn id() -> &'static str {
             "cognition-gate"
         }
@@ -3936,6 +3990,11 @@ mod tests {
         fn peer_context() -> Option<&'static str> {
             Some("test memo cognition gate")
         }
+    }
+
+    #[async_trait(?Send)]
+    impl Module for MemoCognitionGateStub {
+        type Batch = MemoUpdated;
 
         async fn next_batch(&mut self) -> anyhow::Result<Self::Batch> {
             Ok(self.updates.next_item().await?.body)
@@ -3960,10 +4019,7 @@ mod tests {
         on_done: Option<oneshot::Sender<()>>,
     }
 
-    #[async_trait(?Send)]
-    impl Module for SpeakCognitionSnapshotStub {
-        type Batch = Vec<String>;
-
+    impl StaticModule for SpeakCognitionSnapshotStub {
         fn id() -> &'static str {
             "speak"
         }
@@ -3971,6 +4027,11 @@ mod tests {
         fn peer_context() -> Option<&'static str> {
             Some("test speak")
         }
+    }
+
+    #[async_trait(?Send)]
+    impl Module for SpeakCognitionSnapshotStub {
+        type Batch = Vec<String>;
 
         async fn next_batch(&mut self) -> anyhow::Result<Self::Batch> {
             let _ = self.input.next_item().await?;
@@ -4004,10 +4065,7 @@ mod tests {
         on_two: Option<oneshot::Sender<()>>,
     }
 
-    #[async_trait(?Send)]
-    impl Module for BlockingWakeClaimModule {
-        type Batch = String;
-
+    impl StaticModule for BlockingWakeClaimModule {
         fn id() -> &'static str {
             "wake-claim-recorder"
         }
@@ -4015,6 +4073,11 @@ mod tests {
         fn peer_context() -> Option<&'static str> {
             Some("test wake claim")
         }
+    }
+
+    #[async_trait(?Send)]
+    impl Module for BlockingWakeClaimModule {
+        type Batch = String;
 
         async fn next_batch(&mut self) -> anyhow::Result<Self::Batch> {
             let body = self.input.next_item().await?.body.into_inner();
@@ -4048,10 +4111,7 @@ mod tests {
         release: Option<oneshot::Receiver<()>>,
     }
 
-    #[async_trait(?Send)]
-    impl Module for FailingBatchModule {
-        type Batch = ();
-
+    impl StaticModule for FailingBatchModule {
         fn id() -> &'static str {
             "failing-batch"
         }
@@ -4059,6 +4119,11 @@ mod tests {
         fn peer_context() -> Option<&'static str> {
             Some("test failing batch")
         }
+    }
+
+    #[async_trait(?Send)]
+    impl Module for FailingBatchModule {
+        type Batch = ();
 
         async fn next_batch(&mut self) -> anyhow::Result<Self::Batch> {
             if let Some(release) = self.release.take() {
@@ -4082,10 +4147,7 @@ mod tests {
         batch_sent: bool,
     }
 
-    #[async_trait(?Send)]
-    impl Module for FailingActivateAfterReleaseModule {
-        type Batch = ();
-
+    impl StaticModule for FailingActivateAfterReleaseModule {
         fn id() -> &'static str {
             "failing-activate-after-release"
         }
@@ -4093,6 +4155,11 @@ mod tests {
         fn peer_context() -> Option<&'static str> {
             Some("test failing activation")
         }
+    }
+
+    #[async_trait(?Send)]
+    impl Module for FailingActivateAfterReleaseModule {
+        type Batch = ();
 
         async fn next_batch(&mut self) -> anyhow::Result<Self::Batch> {
             if self.batch_sent {
@@ -5277,7 +5344,9 @@ mod tests {
                         let primary_votes = Rc::clone(&primary_votes);
                         let primary_seen_tx = Rc::clone(&primary_seen_tx);
                         move |caps| PrimaryGateStub {
-                            gate: caps.activation_gate_for::<GatedEchoModule>(),
+                            gate: caps.activation_gate_for::<GatedEchoModule>(
+                                ModuleId::new(GatedEchoModule::id()).unwrap(),
+                            ),
                             votes: Rc::clone(&primary_votes),
                             on_seen: primary_seen_tx.borrow_mut().pop_front(),
                         }
@@ -5297,7 +5366,9 @@ mod tests {
                         let secondary_votes = Rc::clone(&secondary_votes);
                         let secondary_seen_tx = Rc::clone(&secondary_seen_tx);
                         move |caps| SecondaryGateStub {
-                            gate: caps.activation_gate_for::<GatedEchoModule>(),
+                            gate: caps.activation_gate_for::<GatedEchoModule>(
+                                ModuleId::new(GatedEchoModule::id()).unwrap(),
+                            ),
                             votes: Rc::clone(&secondary_votes),
                             on_seen: secondary_seen_tx.borrow_mut().pop_front(),
                         }
@@ -7362,7 +7433,9 @@ mod tests {
                             let gate_seen_tx = Rc::clone(&gate_seen_tx);
                             let gate_allow_rx = Rc::clone(&gate_allow_rx);
                             move |caps| BlockingAllowGateModule {
-                                gate: caps.activation_gate_for::<GatedKickTargetModule>(),
+                                gate: caps.activation_gate_for::<GatedKickTargetModule>(
+                                    ModuleId::new(GatedKickTargetModule::id()).unwrap(),
+                                ),
                                 seen: gate_seen_tx.borrow_mut().take(),
                                 allow: gate_allow_rx.borrow_mut().take(),
                             }

@@ -106,7 +106,7 @@ impl MemoryAssociationModule {
         llm: LlmAccess,
     ) -> Self {
         Self {
-            owner: nuillu_types::ModuleId::new(<Self as Module>::id())
+            owner: nuillu_types::ModuleId::new(<Self as nuillu_module::StaticModule>::id())
                 .expect("memory-association id is valid"),
             interoception_updates,
             blackboard,
@@ -367,9 +367,7 @@ fn format_association_context(memory_metadata: &[MemoryMetadataContext]) -> Stri
 }
 
 #[async_trait(?Send)]
-impl Module for MemoryAssociationModule {
-    type Batch = ();
-
+impl nuillu_module::StaticModule for MemoryAssociationModule {
     fn id() -> &'static str {
         "memory-association"
     }
@@ -377,6 +375,11 @@ impl Module for MemoryAssociationModule {
     fn peer_context() -> Option<&'static str> {
         None
     }
+}
+
+#[async_trait(?Send)]
+impl Module for MemoryAssociationModule {
+    type Batch = ();
 
     async fn next_batch(&mut self) -> Result<Self::Batch> {
         MemoryAssociationModule::next_batch(self).await
@@ -504,21 +507,28 @@ mod tests {
         memory_caps: MemoryCapabilities,
     ) -> nuillu_module::AllocatedModule {
         let modules = ModuleRegistry::new()
-            .register(test_policy(), move |caps| {
-                let memory_caps = memory_caps.clone();
-                async move {
-                    Ok(MemoryAssociationModule::new(
-                        caps.interoception_updated_inbox(),
-                        caps.blackboard_reader(),
-                        memory_caps.content_reader(),
-                        memory_caps.writer(),
-                        memory_caps.associator(),
-                        caps.llm("main")
-                            .with_tier(nuillu_types::ModelTier::Cheap)
-                            .into(),
-                    ))
-                }
-            })
+            .register(
+                nuillu_module::ModuleRegistrationSpec::for_static::<MemoryAssociationModule>(
+                    test_policy(),
+                    nuillu_blackboard::ActivationRatio::ZERO,
+                )
+                .unwrap(),
+                move |caps| {
+                    let memory_caps = memory_caps.clone();
+                    async move {
+                        Ok(MemoryAssociationModule::new(
+                            caps.interoception_updated_inbox(),
+                            caps.blackboard_reader(),
+                            memory_caps.content_reader(),
+                            memory_caps.writer(),
+                            memory_caps.associator(),
+                            caps.llm("main")
+                                .with_tier(nuillu_types::ModelTier::Cheap)
+                                .into(),
+                        ))
+                    }
+                },
+            )
             .unwrap()
             .build(caps)
             .await

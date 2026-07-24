@@ -47,7 +47,7 @@ impl DreamingModule {
         llm: LlmAccess,
     ) -> Self {
         Self {
-            owner: nuillu_types::ModuleId::new(<Self as Module>::id())
+            owner: nuillu_types::ModuleId::new(<Self as nuillu_module::StaticModule>::id())
                 .expect("dreaming id is valid"),
             interoception_updates,
             allocation,
@@ -224,9 +224,7 @@ fn prepare_dream_memo(text: String) -> Option<String> {
 }
 
 #[async_trait(?Send)]
-impl Module for DreamingModule {
-    type Batch = ();
-
+impl nuillu_module::StaticModule for DreamingModule {
     fn id() -> &'static str {
         "dreaming"
     }
@@ -234,6 +232,11 @@ impl Module for DreamingModule {
     fn peer_context() -> Option<&'static str> {
         None
     }
+}
+
+#[async_trait(?Send)]
+impl Module for DreamingModule {
+    type Batch = ();
 
     async fn next_batch(&mut self) -> Result<Self::Batch> {
         DreamingModule::next_batch(self).await

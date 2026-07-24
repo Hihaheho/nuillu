@@ -213,9 +213,7 @@ fn suppression_commands(
 }
 
 #[async_trait(?Send)]
-impl Module for HomeostasisModule {
-    type Batch = ();
-
+impl nuillu_module::StaticModule for HomeostasisModule {
     fn id() -> &'static str {
         "homeostasis"
     }
@@ -223,6 +221,11 @@ impl Module for HomeostasisModule {
     fn peer_context() -> Option<&'static str> {
         None
     }
+}
+
+#[async_trait(?Send)]
+impl Module for HomeostasisModule {
+    type Batch = ();
 
     async fn next_batch(&mut self) -> Result<Self::Batch> {
         HomeostasisModule::next_batch(self).await

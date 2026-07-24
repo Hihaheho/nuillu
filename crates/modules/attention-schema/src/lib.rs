@@ -356,9 +356,7 @@ impl AttentionSchemaModule {
 }
 
 #[async_trait(?Send)]
-impl Module for AttentionSchemaModule {
-    type Batch = AttentionSchemaBatch;
-
+impl nuillu_module::StaticModule for AttentionSchemaModule {
     fn id() -> &'static str {
         "attention-schema"
     }
@@ -366,6 +364,11 @@ impl Module for AttentionSchemaModule {
     fn peer_context() -> Option<&'static str> {
         Some("Attention-schema forms a first-person model of what is currently held in attention.")
     }
+}
+
+#[async_trait(?Send)]
+impl Module for AttentionSchemaModule {
+    type Batch = AttentionSchemaBatch;
 
     async fn next_batch(&mut self) -> Result<Self::Batch> {
         AttentionSchemaModule::next_batch(self).await
@@ -547,22 +550,29 @@ mod tests {
         caps: &CapabilityProviders,
     ) -> nuillu_module::AllocatedModule {
         let modules = ModuleRegistry::new()
-            .register(module_policy(), |caps| async move {
-                Ok(AttentionSchemaModule::new(
-                    caps.memo_updated_inbox(),
-                    caps.cognition_log_updated_inbox(),
-                    caps.blackboard_reader(),
-                    caps.cognition_log_reader(),
-                    caps.memo(),
-                    caps.llm("main")
-                        .with_tier(nuillu_types::ModelTier::Default)
-                        .into(),
-                    caps.session("main")
-                        .with_tier(nuillu_types::ModelTier::Default)
-                        .with_auto_compaction(session_auto_compaction())
-                        .await?,
-                ))
-            })
+            .register(
+                nuillu_module::ModuleRegistrationSpec::for_static::<AttentionSchemaModule>(
+                    module_policy(),
+                    nuillu_blackboard::ActivationRatio::ZERO,
+                )
+                .unwrap(),
+                |caps| async move {
+                    Ok(AttentionSchemaModule::new(
+                        caps.memo_updated_inbox(),
+                        caps.cognition_log_updated_inbox(),
+                        caps.blackboard_reader(),
+                        caps.cognition_log_reader(),
+                        caps.memo(),
+                        caps.llm("main")
+                            .with_tier(nuillu_types::ModelTier::Default)
+                            .into(),
+                        caps.session("main")
+                            .with_tier(nuillu_types::ModelTier::Default)
+                            .with_auto_compaction(session_auto_compaction())
+                            .await?,
+                    ))
+                },
+            )
             .unwrap()
             .build(caps)
             .await

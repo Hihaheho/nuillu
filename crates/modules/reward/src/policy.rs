@@ -210,7 +210,8 @@ impl PolicyModule {
         session: Session,
     ) -> Self {
         Self {
-            owner: ModuleId::new(<Self as Module>::id()).expect("policy id is valid"),
+            owner: ModuleId::new(<Self as nuillu_module::StaticModule>::id())
+                .expect("policy id is valid"),
             memo_updates,
             cognition_updates,
             blackboard,
@@ -659,9 +660,7 @@ fn render_policy_consideration(memo: &PolicyConsiderationPayload) -> String {
 }
 
 #[async_trait(?Send)]
-impl Module for PolicyModule {
-    type Batch = ();
-
+impl nuillu_module::StaticModule for PolicyModule {
     fn id() -> &'static str {
         "policy"
     }
@@ -669,6 +668,11 @@ impl Module for PolicyModule {
     fn peer_context() -> Option<&'static str> {
         None
     }
+}
+
+#[async_trait(?Send)]
+impl Module for PolicyModule {
+    type Batch = ();
 
     async fn next_batch(&mut self) -> Result<Self::Batch> {
         tokio::select! {
@@ -959,28 +963,35 @@ mod tests {
         policy_caps: PolicyCapabilities,
     ) -> nuillu_module::AllocatedModule {
         let modules = ModuleRegistry::new()
-            .register(module_policy(), move |caps| {
-                let policy_caps = policy_caps.clone();
-                async move {
-                    Ok(PolicyModule::new(
-                        caps.memo_updated_inbox(),
-                        caps.cognition_log_updated_inbox(),
-                        caps.blackboard_reader(),
-                        caps.cognition_log_reader(),
-                        caps.interoception_reader(),
-                        policy_caps.searcher(),
-                        caps.memo(),
-                        policy_caps.consideration_writer(caps.owner().clone()),
-                        caps.llm("main")
-                            .with_tier(nuillu_types::ModelTier::Default)
-                            .into(),
-                        caps.session("main")
-                            .with_tier(nuillu_types::ModelTier::Default)
-                            .with_auto_compaction(policy_session_auto_compaction())
-                            .await?,
-                    ))
-                }
-            })
+            .register(
+                nuillu_module::ModuleRegistrationSpec::for_static::<PolicyModule>(
+                    module_policy(),
+                    nuillu_blackboard::ActivationRatio::ZERO,
+                )
+                .unwrap(),
+                move |caps| {
+                    let policy_caps = policy_caps.clone();
+                    async move {
+                        Ok(PolicyModule::new(
+                            caps.memo_updated_inbox(),
+                            caps.cognition_log_updated_inbox(),
+                            caps.blackboard_reader(),
+                            caps.cognition_log_reader(),
+                            caps.interoception_reader(),
+                            policy_caps.searcher(),
+                            caps.memo(),
+                            policy_caps.consideration_writer(caps.owner().clone()),
+                            caps.llm("main")
+                                .with_tier(nuillu_types::ModelTier::Default)
+                                .into(),
+                            caps.session("main")
+                                .with_tier(nuillu_types::ModelTier::Default)
+                                .with_auto_compaction(policy_session_auto_compaction())
+                                .await?,
+                        ))
+                    }
+                },
+            )
             .unwrap()
             .build(caps)
             .await

@@ -3,8 +3,7 @@ use std::sync::Arc;
 
 use nuillu_blackboard::{ActivationRatio, Bpm, ModulePolicy, ResourceAllocation, linear_ratio_fn};
 use nuillu_memory::MemoryCapabilities;
-use nuillu_module::ModuleRegistry;
-use nuillu_module::ModuleRegistryError;
+use nuillu_module::{ModuleRegistrationSpec, ModuleRegistry, ModuleRegistryError, StaticModule};
 use nuillu_reward::PolicyCapabilities;
 use nuillu_speak::{UtteranceSink, UtteranceWriter};
 use nuillu_types::ModuleId;
@@ -14,7 +13,9 @@ use super::config::{RuntimeModule, ServerBootConfig, ServerModuleGroup, ServerMo
 /// Host-provided registration hook applied after the built-in server modules.
 ///
 /// Registrars are retained by the server and invoked again whenever the agent
-/// runtime is rebuilt, so each invocation must return fresh module builders.
+/// runtime is rebuilt, so each invocation must return fresh module builders
+/// for the same immutable, pre-parsed registration catalog. To apply a changed
+/// file-backed catalog, construct a new server/agent environment.
 pub trait ServerModuleRegistrar: Send + Sync {
     fn register(&self, registry: ModuleRegistry) -> Result<ModuleRegistry, ModuleRegistryError>;
 }
@@ -46,14 +47,8 @@ pub(super) fn server_registry(
 ) -> ModuleRegistry {
     let mut registry = ModuleRegistry::new();
     for module in &boot_config.modules {
-        registry = register_server_module(
-            registry,
-            module,
-            boot_config,
-            memory_caps,
-            policy_caps,
-            utterance_sink,
-        );
+        registry =
+            register_server_module(registry, module, memory_caps, policy_caps, utterance_sink);
     }
     configured_dependency_edges(boot_config)
         .into_iter()
@@ -65,15 +60,26 @@ pub(super) fn server_registry(
 trait ServerRegistryExt {
     fn register_server<B>(self, spec: &ServerModuleSpec, builder: B) -> ModuleRegistry
     where
-        B: nuillu_module::ModuleRegisterer + 'static;
+        B: nuillu_module::ModuleRegisterer + 'static,
+        B::Module: StaticModule;
 }
 
 impl ServerRegistryExt for ModuleRegistry {
     fn register_server<B>(self, spec: &ServerModuleSpec, builder: B) -> ModuleRegistry
     where
         B: nuillu_module::ModuleRegisterer + 'static,
+        B::Module: StaticModule,
     {
-        self.register_with_replica_capacity(policy(spec), spec.replica_capacity, builder)
+        let mut registration = ModuleRegistrationSpec::for_static::<B::Module>(
+            policy(spec),
+            ActivationRatio::from_f64(spec.initial_activation),
+        )
+        .expect("built-in module id should be valid")
+        .with_replica_capacity(spec.replica_capacity);
+        for group in &spec.groups {
+            registration = registration.in_group(group.module_group_id());
+        }
+        self.register(registration, builder)
             .expect("server module registration should be unique")
     }
 }
@@ -81,7 +87,6 @@ impl ServerRegistryExt for ModuleRegistry {
 fn register_server_module(
     registry: ModuleRegistry,
     spec: &ServerModuleSpec,
-    boot_config: &ServerBootConfig,
     memory_caps: &MemoryCapabilities,
     policy_caps: &PolicyCapabilities,
     utterance_sink: &Rc<dyn UtteranceSink>,
@@ -125,55 +130,53 @@ fn register_server_module(
             })
         }
         RuntimeModule::Allocation => {
-            let voluntary = group_modules(boot_config, ServerModuleGroup::Voluntary);
             let main_tier = spec.session_tier("main");
-            registry.register_server(spec, move |caps| {
-                let voluntary = voluntary.clone();
-                async move {
-                    Ok(nuillu_allocation::AllocationModule::new(
-                        caps.memo_updated_inbox(),
-                        caps.attention_control_inbox(),
-                        caps.blackboard_reader(),
-                        caps.cognition_log_reader(),
-                        caps.allocation_reader(),
-                        caps.interoception_reader(),
-                        caps.allocation_writer(voluntary.clone(), Vec::new()),
-                        caps.llm("main").with_tier(main_tier).into(),
-                        caps.session("main")
-                            .with_tier(main_tier)
-                            .with_auto_compaction(nuillu_allocation::session_auto_compaction())
-                            .await?,
-                    ))
-                }
+            registry.register_server(spec, move |caps| async move {
+                let voluntary = caps
+                    .module_catalog()
+                    .members(&ServerModuleGroup::Voluntary.module_group_id());
+                Ok(nuillu_allocation::AllocationModule::new(
+                    caps.memo_updated_inbox(),
+                    caps.attention_control_inbox(),
+                    caps.blackboard_reader(),
+                    caps.cognition_log_reader(),
+                    caps.allocation_reader(),
+                    caps.interoception_reader(),
+                    caps.allocation_writer(voluntary, Vec::new()),
+                    caps.llm("main").with_tier(main_tier).into(),
+                    caps.session("main")
+                        .with_tier(main_tier)
+                        .with_auto_compaction(nuillu_allocation::session_auto_compaction())
+                        .await?,
+                ))
             })
         }
         RuntimeModule::Action => {
-            let action_targets = group_modules(boot_config, ServerModuleGroup::ActionTarget);
             let main_tier = spec.session_tier("main");
-            registry.register_server(spec, move |caps| {
-                let action_targets = action_targets.clone();
-                async move {
-                    Ok(nuillu_action::ActionModule::new(
-                        caps.memo_updated_inbox(),
-                        caps.cognition_log_updated_inbox(),
-                        caps.interoception_updated_inbox(),
-                        caps.action_affordances_updated_inbox(),
-                        caps.blackboard_reader(),
-                        caps.cognition_log_reader(),
-                        caps.allocation_reader(),
-                        caps.interoception_reader(),
-                        caps.action_affordance_reader(),
-                        caps.external_action_invoker(),
-                        caps.allocation_writer(action_targets.clone(), Vec::new()),
-                        caps.interoception_writer(),
-                        caps.memo(),
-                        caps.llm("main").with_tier(main_tier).into(),
-                        caps.session("main")
-                            .with_tier(main_tier)
-                            .with_auto_compaction(nuillu_action::session_auto_compaction())
-                            .await?,
-                    ))
-                }
+            registry.register_server(spec, move |caps| async move {
+                let action_targets = caps
+                    .module_catalog()
+                    .members(&ServerModuleGroup::ActionTarget.module_group_id());
+                Ok(nuillu_action::ActionModule::new(
+                    caps.memo_updated_inbox(),
+                    caps.cognition_log_updated_inbox(),
+                    caps.interoception_updated_inbox(),
+                    caps.action_affordances_updated_inbox(),
+                    caps.blackboard_reader(),
+                    caps.cognition_log_reader(),
+                    caps.allocation_reader(),
+                    caps.interoception_reader(),
+                    caps.action_affordance_reader(),
+                    caps.external_action_invoker(),
+                    caps.allocation_writer(action_targets.clone(), Vec::new()),
+                    caps.interoception_writer(),
+                    caps.memo(),
+                    caps.llm("main").with_tier(main_tier).into(),
+                    caps.session("main")
+                        .with_tier(main_tier)
+                        .with_auto_compaction(nuillu_action::session_auto_compaction())
+                        .await?,
+                ))
             })
         }
         RuntimeModule::AttentionSchema => {
@@ -332,21 +335,19 @@ fn register_server_module(
                 ))
             })
         }
-        RuntimeModule::Homeostasis => {
-            let drive_modules = group_modules(boot_config, ServerModuleGroup::HomeostaticDrive);
-            let suppressed = group_modules(boot_config, ServerModuleGroup::SleepSuppressed);
-            registry.register_server(spec, move |caps| {
-                let drive_modules = drive_modules.clone();
-                let suppressed = suppressed.clone();
-                async move {
-                    Ok(nuillu_homeostasis::HomeostasisModule::new(
-                        caps.interoception_updated_inbox(),
-                        caps.interoception_reader(),
-                        caps.allocation_writer(drive_modules, suppressed),
-                    ))
-                }
-            })
-        }
+        RuntimeModule::Homeostasis => registry.register_server(spec, move |caps| async move {
+            let drive_modules = caps
+                .module_catalog()
+                .members(&ServerModuleGroup::HomeostaticDrive.module_group_id());
+            let suppressed = caps
+                .module_catalog()
+                .members(&ServerModuleGroup::SleepSuppressed.module_group_id());
+            Ok(nuillu_homeostasis::HomeostasisModule::new(
+                caps.interoception_updated_inbox(),
+                caps.interoception_reader(),
+                caps.allocation_writer(drive_modules, suppressed),
+            ))
+        }),
         RuntimeModule::Policy => {
             let policy_caps = policy_caps.clone();
             let main_tier = spec.session_tier("main");
@@ -514,6 +515,7 @@ fn configured_dependency_edges(boot_config: &ServerBootConfig) -> Vec<(ModuleId,
     edges
 }
 
+#[cfg(test)]
 fn group_modules(boot_config: &ServerBootConfig, group: ServerModuleGroup) -> Vec<ModuleId> {
     boot_config
         .specs_in_group(group)
@@ -548,6 +550,25 @@ mod tests {
         LlmAccess, Memo, MemoUpdatedInbox,
     };
     use nuillu_types::builtin;
+
+    struct DynamicServerModule;
+
+    #[async_trait::async_trait(?Send)]
+    impl nuillu_module::Module for DynamicServerModule {
+        type Batch = ();
+
+        async fn next_batch(&mut self) -> anyhow::Result<Self::Batch> {
+            std::future::pending().await
+        }
+
+        async fn activate(
+            &mut self,
+            _cx: &nuillu_module::ActivateCx<'_>,
+            _batch: &Self::Batch,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
 
     type InterpreterConstructor = fn(
         CognitionLogUpdatedInbox,
@@ -654,15 +675,39 @@ mod tests {
     fn host_registrars_are_reusable_for_agent_rebuilds() {
         let calls = Arc::new(AtomicUsize::new(0));
         let registrar_calls = calls.clone();
-        let registrar: Arc<dyn ServerModuleRegistrar> = Arc::new(move |registry| {
-            registrar_calls.fetch_add(1, Ordering::Relaxed);
-            Ok(registry)
-        });
+        let module_ids = Arc::new(vec![
+            ModuleId::new("mcp-files").unwrap(),
+            ModuleId::new("mcp-issues").unwrap(),
+        ]);
+        let registrar_ids = Arc::clone(&module_ids);
+        let registrar: Arc<dyn ServerModuleRegistrar> =
+            Arc::new(move |mut registry: ModuleRegistry| {
+                registrar_calls.fetch_add(1, Ordering::Relaxed);
+                for module in registrar_ids.iter().cloned() {
+                    let spec = ModuleRegistrationSpec::new(
+                        module,
+                        ModulePolicy::new(
+                            nuillu_types::ReplicaCapRange::new(1, 1).unwrap(),
+                            Bpm::from_f64(60.0)..=Bpm::from_f64(60.0),
+                            linear_ratio_fn,
+                        ),
+                        ActivationRatio::ONE,
+                    )
+                    .in_group(ServerModuleGroup::Voluntary.module_group_id());
+                    registry =
+                        registry.register(spec, |_caps| async { Ok(DynamicServerModule) })?;
+                }
+                Ok(registry)
+            });
         let registrars = vec![registrar];
 
-        apply_server_module_registrars(ModuleRegistry::new(), &registrars).unwrap();
-        apply_server_module_registrars(ModuleRegistry::new(), &registrars).unwrap();
+        let first = apply_server_module_registrars(ModuleRegistry::new(), &registrars).unwrap();
+        let second = apply_server_module_registrars(ModuleRegistry::new(), &registrars).unwrap();
 
         assert_eq!(calls.load(Ordering::Relaxed), 2);
+        for module in module_ids.iter() {
+            assert!(format!("{first:?}").contains(module.as_str()));
+            assert!(format!("{second:?}").contains(module.as_str()));
+        }
     }
 }

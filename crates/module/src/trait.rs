@@ -1,6 +1,7 @@
 use std::any::{Any, TypeId};
 use std::fmt::Debug;
 use std::rc::Rc;
+use std::sync::Arc;
 
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
@@ -23,7 +24,7 @@ use crate::{PersistedSessionSnapshot, SessionCompactionRuntime, compact_session}
 /// agent-global state that any module may consult, such as registered peer
 /// contexts used to build module prompts.
 pub struct ActivateCx<'a> {
-    peer_contexts: &'a [(ModuleId, &'static str)],
+    peer_contexts: &'a [(ModuleId, Arc<str>)],
     identity_memories: &'a [IdentityMemoryRecord],
     core_policies: &'a [CorePolicyRecord],
     session_compaction: SessionCompactionRuntime,
@@ -35,7 +36,7 @@ pub struct ActivateCx<'a> {
 
 impl<'a> ActivateCx<'a> {
     pub fn new(
-        peer_contexts: &'a [(ModuleId, &'static str)],
+        peer_contexts: &'a [(ModuleId, Arc<str>)],
         identity_memories: &'a [IdentityMemoryRecord],
         core_policies: &'a [CorePolicyRecord],
         session_compaction: SessionCompactionRuntime,
@@ -88,7 +89,7 @@ impl<'a> ActivateCx<'a> {
 
     /// Peer-context entries for modules that should be described in sibling
     /// system prompts: `(id, peer_context)`.
-    pub fn peer_contexts(&self) -> &[(ModuleId, &'static str)] {
+    pub fn peer_contexts(&self) -> &[(ModuleId, Arc<str>)] {
         self.peer_contexts
     }
 
@@ -228,19 +229,21 @@ fn format_session_save_error(
 pub trait Module {
     type Batch: Debug + 'static;
 
-    /// Stable kebab-case identifier for this module type.
-    fn id() -> &'static str
-    where
-        Self: Sized;
+    async fn next_batch(&mut self) -> Result<Self::Batch>;
+    async fn activate(&mut self, cx: &ActivateCx<'_>, batch: &Self::Batch) -> Result<()>;
+}
+
+/// Static registration metadata for built-in and other one-role module types.
+///
+/// Dynamic registrations do not implement identity here: callers construct a
+/// [`crate::ModuleRegistrationSpec`] with the runtime [`ModuleId`] instead.
+pub trait StaticModule: Module {
+    /// Stable kebab-case default identifier for this module type.
+    fn id() -> &'static str;
 
     /// Context about this module shown in peer module system prompts. Return
     /// `None` to keep this module out of peer-context catalogs.
-    fn peer_context() -> Option<&'static str>
-    where
-        Self: Sized;
-
-    async fn next_batch(&mut self) -> Result<Self::Batch>;
-    async fn activate(&mut self, cx: &ActivateCx<'_>, batch: &Self::Batch) -> Result<()>;
+    fn peer_context() -> Option<&'static str>;
 }
 
 pub struct ModuleBatch {

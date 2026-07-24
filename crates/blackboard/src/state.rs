@@ -19,13 +19,14 @@ use crate::{
 
 const DEFAULT_MEMO_RETAINED_PER_OWNER: usize = 8;
 const DEFAULT_COGNITION_LOG_RETAINED_ENTRIES: usize = 16;
+type PeerContexts = Vec<(ModuleId, Arc<str>)>;
 
 /// The non-cognitive blackboard plus the cognitive surface and its
 /// allocation snapshot. This is a cheap cloneable handle; locking is an
 /// implementation detail hidden behind its methods.
 ///
 /// `peer_contexts` lives outside the inner lock as a write-once
-/// `OnceLock<Vec<(ModuleId, &'static str)>>` value: it is
+/// `OnceLock<Vec<(ModuleId, Arc<str>)>>` value: it is
 /// populated by `ModuleRegistry::build` before any module is constructed and
 /// never change afterwards, so module constructors can read them synchronously
 /// without taking the async lock.
@@ -35,7 +36,7 @@ pub struct Blackboard {
     activation_waiters: Arc<Mutex<Vec<ActivationWaiter>>>,
     activation_increase_waiters: Arc<Mutex<Vec<ActivationIncreaseWaiter>>>,
     allocation_change_waiters: Arc<Mutex<Vec<oneshot::Sender<()>>>>,
-    peer_contexts: Arc<OnceLock<Vec<(ModuleId, &'static str)>>>,
+    peer_contexts: Arc<OnceLock<PeerContexts>>,
 }
 
 /// Inner blackboard state. Public so read closures in other crates can
@@ -357,7 +358,7 @@ impl Blackboard {
     /// Install the registered-module peer context catalog.
     /// Idempotent on first call; subsequent calls are silently ignored to keep
     /// the post-boot snapshot stable for prompt caching.
-    pub fn set_module_contexts(&self, peer_contexts: Vec<(ModuleId, &'static str)>) {
+    pub fn set_module_contexts(&self, peer_contexts: Vec<(ModuleId, Arc<str>)>) {
         let _ = self.peer_contexts.set(peer_contexts);
     }
 
@@ -365,7 +366,7 @@ impl Blackboard {
     /// before the catalog is installed, which lets tests that skip registry
     /// boot still build modules; the system prompt simply omits the peer list
     /// in that case.
-    pub fn peer_contexts(&self) -> &[(ModuleId, &'static str)] {
+    pub fn peer_contexts(&self) -> &[(ModuleId, Arc<str>)] {
         self.peer_contexts
             .get()
             .map(|v| v.as_slice())
@@ -1046,6 +1047,25 @@ impl BlackboardInner {
                     self.module_replica_capacities
                         .insert(module, capacity.max(1));
                 }
+            }
+            BlackboardCommand::SetRegisteredModules { registrations } => {
+                self.module_policies.clear();
+                self.module_replica_capacities.clear();
+                for registration in registrations {
+                    if !self.base_allocation.has_activation(&registration.module) {
+                        self.base_allocation.set_activation(
+                            registration.module.clone(),
+                            registration.initial_activation,
+                        );
+                    }
+                    self.module_replica_capacities.insert(
+                        registration.module.clone(),
+                        registration.replica_capacity.max(1),
+                    );
+                    self.module_policies
+                        .insert(registration.module, registration.policy);
+                }
+                self.recompute_effective_allocation();
             }
             BlackboardCommand::SetAllocationLimits(limits) => {
                 self.allocation_limits = limits;

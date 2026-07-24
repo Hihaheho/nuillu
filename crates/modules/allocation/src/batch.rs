@@ -134,17 +134,19 @@ mod tests {
         recorder: BatchRecorder,
     }
 
-    #[async_trait(?Send)]
-    impl Module for RecordingAllocation {
-        type Batch = NextBatch;
-
+    impl nuillu_module::StaticModule for RecordingAllocation {
         fn id() -> &'static str {
-            AllocationModule::id()
+            <AllocationModule as nuillu_module::StaticModule>::id()
         }
 
         fn peer_context() -> Option<&'static str> {
-            AllocationModule::peer_context()
+            <AllocationModule as nuillu_module::StaticModule>::peer_context()
         }
+    }
+
+    #[async_trait(?Send)]
+    impl Module for RecordingAllocation {
+        type Batch = NextBatch;
 
         async fn next_batch(&mut self) -> Result<Self::Batch> {
             let batch = self.inner.next_batch().await?;
@@ -180,11 +182,15 @@ mod tests {
     ) -> nuillu_module::AllocatedModule {
         let modules = ModuleRegistry::new()
             .register(
-                nuillu_blackboard::ModulePolicy::new(
-                    nuillu_types::ReplicaCapRange::new(1, 1).unwrap(),
-                    Bpm::from_f64(60_000.0)..=Bpm::from_f64(60_000.0),
-                    linear_ratio_fn,
-                ),
+                nuillu_module::ModuleRegistrationSpec::for_static::<RecordingAllocation>(
+                    nuillu_blackboard::ModulePolicy::new(
+                        nuillu_types::ReplicaCapRange::new(1, 1).unwrap(),
+                        Bpm::from_f64(60_000.0)..=Bpm::from_f64(60_000.0),
+                        linear_ratio_fn,
+                    ),
+                    nuillu_blackboard::ActivationRatio::ONE,
+                )
+                .unwrap(),
                 move |caps| {
                     let recorder = recorder.clone();
                     async move {

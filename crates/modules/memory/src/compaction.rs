@@ -118,7 +118,7 @@ impl MemoryCompactionModule {
         audit_llm: LlmAccess,
     ) -> Self {
         Self {
-            owner: nuillu_types::ModuleId::new(<Self as Module>::id())
+            owner: nuillu_types::ModuleId::new(<Self as nuillu_module::StaticModule>::id())
                 .expect("memory-compaction id is valid"),
             interoception_updates,
             blackboard,
@@ -501,9 +501,7 @@ fn memory_rank_strength(rank: MemoryRank) -> u8 {
 }
 
 #[async_trait(?Send)]
-impl Module for MemoryCompactionModule {
-    type Batch = ();
-
+impl nuillu_module::StaticModule for MemoryCompactionModule {
     fn id() -> &'static str {
         "memory-compaction"
     }
@@ -511,6 +509,11 @@ impl Module for MemoryCompactionModule {
     fn peer_context() -> Option<&'static str> {
         None
     }
+}
+
+#[async_trait(?Send)]
+impl Module for MemoryCompactionModule {
+    type Batch = ();
 
     async fn next_batch(&mut self) -> Result<Self::Batch> {
         MemoryCompactionModule::next_batch(self).await
@@ -845,22 +848,29 @@ mod tests {
         let memory_caps =
             MemoryCapabilities::new(blackboard.clone(), clock, store.clone(), Vec::new());
         let modules = ModuleRegistry::new()
-            .register(test_policy(), move |caps| {
-                let memory_caps = memory_caps.clone();
-                async move {
-                    Ok(MemoryCompactionModule::new(
-                        caps.interoception_updated_inbox(),
-                        caps.blackboard_reader(),
-                        memory_caps.compactor(),
-                        caps.llm("main")
-                            .with_tier(nuillu_types::ModelTier::Cheap)
-                            .into(),
-                        caps.llm("audit")
-                            .with_tier(nuillu_types::ModelTier::Default)
-                            .into(),
-                    ))
-                }
-            })
+            .register(
+                nuillu_module::ModuleRegistrationSpec::for_static::<MemoryCompactionModule>(
+                    test_policy(),
+                    nuillu_blackboard::ActivationRatio::ZERO,
+                )
+                .unwrap(),
+                move |caps| {
+                    let memory_caps = memory_caps.clone();
+                    async move {
+                        Ok(MemoryCompactionModule::new(
+                            caps.interoception_updated_inbox(),
+                            caps.blackboard_reader(),
+                            memory_caps.compactor(),
+                            caps.llm("main")
+                                .with_tier(nuillu_types::ModelTier::Cheap)
+                                .into(),
+                            caps.llm("audit")
+                                .with_tier(nuillu_types::ModelTier::Default)
+                                .into(),
+                        ))
+                    }
+                },
+            )
             .unwrap()
             .build(&caps)
             .await

@@ -283,7 +283,8 @@ impl AllocationModule {
         session: Session,
     ) -> Self {
         Self {
-            owner: ModuleId::new(<Self as Module>::id()).expect("allocation id is valid"),
+            owner: ModuleId::new(<Self as nuillu_module::StaticModule>::id())
+                .expect("allocation id is valid"),
             updates,
             requests,
             blackboard,
@@ -609,9 +610,7 @@ fn no_decision_failure_detail(tool_names: &str) -> String {
 }
 
 #[async_trait(?Send)]
-impl Module for AllocationModule {
-    type Batch = batch::NextBatch;
-
+impl nuillu_module::StaticModule for AllocationModule {
     fn id() -> &'static str {
         "allocation"
     }
@@ -619,6 +618,11 @@ impl Module for AllocationModule {
     fn peer_context() -> Option<&'static str> {
         None
     }
+}
+
+#[async_trait(?Send)]
+impl Module for AllocationModule {
+    type Batch = batch::NextBatch;
 
     async fn next_batch(&mut self) -> Result<Self::Batch> {
         AllocationModule::next_batch(self).await
@@ -783,6 +787,13 @@ mod tests {
         policy_with_replicas(0, 1)
     }
 
+    fn registration<M: nuillu_module::StaticModule>(
+        policy: ModulePolicy,
+    ) -> nuillu_module::ModuleRegistrationSpec {
+        nuillu_module::ModuleRegistrationSpec::for_static::<M>(policy, ActivationRatio::ZERO)
+            .unwrap()
+    }
+
     fn allocation_no_change_base_allocation() -> ResourceAllocation {
         let mut allocation = ResourceAllocation::default();
         for module in [builtin::allocation(), builtin::sensory()] {
@@ -803,10 +814,7 @@ mod tests {
         ($name:ident, $id:literal) => {
             struct $name;
 
-            #[async_trait(?Send)]
-            impl Module for $name {
-                type Batch = ();
-
+            impl nuillu_module::StaticModule for $name {
                 fn id() -> &'static str {
                     $id
                 }
@@ -814,6 +822,11 @@ mod tests {
                 fn peer_context() -> Option<&'static str> {
                     Some("test stub")
                 }
+            }
+
+            #[async_trait(?Send)]
+            impl Module for $name {
+                type Batch = ();
 
                 async fn next_batch(&mut self) -> Result<Self::Batch> {
                     std::future::pending().await
@@ -859,7 +872,7 @@ mod tests {
         let source_cognition_sink = Rc::clone(&source_cognition_cell);
 
         let _modules = ModuleRegistry::new()
-            .register(test_policy(), move |caps| {
+            .register(registration::<AllocationStub>(test_policy()), move |caps| {
                 let controller_sink = Rc::clone(&controller_sink);
                 async move {
                     *controller_sink.borrow_mut() = Some(AllocationModule::new(
@@ -885,7 +898,7 @@ mod tests {
                 }
             })
             .unwrap()
-            .register(test_policy(), move |caps| {
+            .register(registration::<SensoryStub>(test_policy()), move |caps| {
                 let source_memo_sink = Rc::clone(&source_memo_sink);
                 let source_cognition_sink = Rc::clone(&source_cognition_sink);
                 async move {
@@ -909,7 +922,7 @@ mod tests {
     struct AllocationNoChangeFixture {
         controller: AllocationModule,
         source_memo: Memo,
-        peer_contexts: Vec<(ModuleId, &'static str)>,
+        peer_contexts: Vec<(ModuleId, Arc<str>)>,
     }
 
     async fn allocation_no_change_fixture_with_turn_adapter<T>(
@@ -928,56 +941,70 @@ mod tests {
         let source_memo_sink = Rc::clone(&source_memo_cell);
 
         let _modules = ModuleRegistry::new()
-            .register(always_active_policy(), move |caps| {
-                let controller_sink = Rc::clone(&controller_sink);
-                async move {
-                    *controller_sink.borrow_mut() = Some(AllocationModule::new(
-                        caps.memo_updated_inbox(),
-                        caps.attention_control_inbox(),
-                        caps.blackboard_reader(),
-                        caps.cognition_log_reader(),
-                        caps.allocation_reader(),
-                        caps.interoception_reader(),
-                        caps.allocation_writer(
-                            vec![
-                                builtin::query_memory(),
-                                builtin::memory(),
-                                builtin::self_model(),
-                                builtin::speak(),
-                            ],
-                            Vec::new(),
-                        ),
-                        caps.llm("main")
-                            .with_tier(nuillu_types::ModelTier::Default)
-                            .into(),
-                        caps.session("main")
-                            .with_tier(nuillu_types::ModelTier::Default)
-                            .with_auto_compaction(session_auto_compaction())
-                            .await?,
-                    ));
-                    Ok(AllocationStub)
-                }
-            })
+            .register(
+                registration::<AllocationStub>(always_active_policy()),
+                move |caps| {
+                    let controller_sink = Rc::clone(&controller_sink);
+                    async move {
+                        *controller_sink.borrow_mut() = Some(AllocationModule::new(
+                            caps.memo_updated_inbox(),
+                            caps.attention_control_inbox(),
+                            caps.blackboard_reader(),
+                            caps.cognition_log_reader(),
+                            caps.allocation_reader(),
+                            caps.interoception_reader(),
+                            caps.allocation_writer(
+                                vec![
+                                    builtin::query_memory(),
+                                    builtin::memory(),
+                                    builtin::self_model(),
+                                    builtin::speak(),
+                                ],
+                                Vec::new(),
+                            ),
+                            caps.llm("main")
+                                .with_tier(nuillu_types::ModelTier::Default)
+                                .into(),
+                            caps.session("main")
+                                .with_tier(nuillu_types::ModelTier::Default)
+                                .with_auto_compaction(session_auto_compaction())
+                                .await?,
+                        ));
+                        Ok(AllocationStub)
+                    }
+                },
+            )
             .unwrap()
-            .register(always_active_policy(), move |caps| {
-                let source_memo_sink = Rc::clone(&source_memo_sink);
-                async move {
-                    *source_memo_sink.borrow_mut() = Some(caps.memo());
-                    Ok(SensoryStub)
-                }
-            })
+            .register(
+                registration::<SensoryStub>(always_active_policy()),
+                move |caps| {
+                    let source_memo_sink = Rc::clone(&source_memo_sink);
+                    async move {
+                        *source_memo_sink.borrow_mut() = Some(caps.memo());
+                        Ok(SensoryStub)
+                    }
+                },
+            )
             .unwrap()
-            .register(optionally_active_policy(), |_caps| async {
-                Ok(QueryMemoryStub)
-            })
+            .register(
+                registration::<QueryMemoryStub>(optionally_active_policy()),
+                |_caps| async { Ok(QueryMemoryStub) },
+            )
             .unwrap()
-            .register(optionally_active_policy(), |_caps| async { Ok(MemoryStub) })
+            .register(
+                registration::<MemoryStub>(optionally_active_policy()),
+                |_caps| async { Ok(MemoryStub) },
+            )
             .unwrap()
-            .register(optionally_active_policy(), |_caps| async {
-                Ok(SelfModelStub)
-            })
+            .register(
+                registration::<SelfModelStub>(optionally_active_policy()),
+                |_caps| async { Ok(SelfModelStub) },
+            )
             .unwrap()
-            .register(optionally_active_policy(), |_caps| async { Ok(SpeakStub) })
+            .register(
+                registration::<SpeakStub>(optionally_active_policy()),
+                |_caps| async { Ok(SpeakStub) },
+            )
             .unwrap()
             .build(&caps)
             .await
@@ -987,10 +1014,10 @@ mod tests {
             controller: controller_cell.borrow_mut().take().unwrap(),
             source_memo: source_memo_cell.borrow_mut().take().unwrap(),
             peer_contexts: vec![
-                (builtin::query_memory(), "test stub"),
-                (builtin::memory(), "test stub"),
-                (builtin::self_model(), "test stub"),
-                (builtin::speak(), "test stub"),
+                (builtin::query_memory(), Arc::from("test stub")),
+                (builtin::memory(), Arc::from("test stub")),
+                (builtin::self_model(), Arc::from("test stub")),
+                (builtin::speak(), Arc::from("test stub")),
             ],
         }
     }
@@ -1402,7 +1429,7 @@ mod tests {
         let mut fixture = controller_fixture_with_turn_adapter(Arc::new(capture)).await;
 
         let lutum = fixture.controller.llm.lutum().await;
-        let peer_contexts = vec![(builtin::sensory(), "test stub")];
+        let peer_contexts = vec![(builtin::sensory(), Arc::from("test stub"))];
         let identity_memories = Vec::new();
         let compaction = nuillu_module::SessionCompactionRuntime::new(
             lutum.lutum().clone(),
@@ -1508,7 +1535,7 @@ mod tests {
         let mut fixture = controller_fixture_with_turn_adapter(Arc::new(capture)).await;
 
         let lutum = fixture.controller.llm.lutum().await;
-        let peer_contexts = vec![(builtin::sensory(), "test stub")];
+        let peer_contexts = vec![(builtin::sensory(), Arc::from("test stub"))];
         let identity_memories = Vec::new();
         let compaction = nuillu_module::SessionCompactionRuntime::new(
             lutum.lutum().clone(),

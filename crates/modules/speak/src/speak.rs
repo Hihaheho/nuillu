@@ -596,9 +596,7 @@ impl SpeakModule {
 }
 
 #[async_trait(?Send)]
-impl Module for SpeakModule {
-    type Batch = SpeakBatch;
-
+impl nuillu_module::StaticModule for SpeakModule {
     fn id() -> &'static str {
         "speak"
     }
@@ -606,6 +604,11 @@ impl Module for SpeakModule {
     fn peer_context() -> Option<&'static str> {
         Some("Speak is the outward expression path for admitted cognition.")
     }
+}
+
+#[async_trait(?Send)]
+impl Module for SpeakModule {
+    type Batch = SpeakBatch;
 
     async fn next_batch(&mut self) -> Result<Self::Batch> {
         SpeakModule::next_batch(self).await
@@ -933,38 +936,45 @@ mod tests {
         let utterance_sink_for_closure = sink.clone();
 
         let _modules = ModuleRegistry::new()
-            .register(test_policy(), move |caps| {
-                let module_sink = Rc::clone(&module_sink);
-                let attention_control_sink = Rc::clone(&attention_control_sink);
-                let utterance_sink_for_closure = utterance_sink_for_closure.clone();
-                async move {
-                    *attention_control_sink.borrow_mut() = Some(caps.attention_control_inbox());
-                    *module_sink.borrow_mut() = Some(SpeakModule::new(SpeakModuleParts {
-                        cognition_updates: caps.cognition_log_updated_inbox(),
-                        cognition_log: caps.cognition_log_reader(),
-                        attention_control: caps.attention_control_mailbox(),
-                        memo: caps.memo(),
-                        utterance: UtteranceWriter::new(
-                            caps.owner().clone(),
-                            caps.blackboard(),
-                            utterance_sink_for_closure.clone(),
-                            caps.clock(),
-                        ),
-                        planning_llm: caps
-                            .llm("planning")
-                            .with_tier(nuillu_types::ModelTier::Premium)
-                            .into(),
-                        scene: caps.scene_reader(),
-                        clock: caps.clock(),
-                        planning_session: caps
-                            .session("planning")
-                            .with_tier(nuillu_types::ModelTier::Premium)
-                            .with_auto_compaction(planning_session_auto_compaction())
-                            .await?,
-                    }));
-                    Ok(SpeakStub)
-                }
-            })
+            .register(
+                nuillu_module::ModuleRegistrationSpec::for_static::<SpeakModule>(
+                    test_policy(),
+                    nuillu_blackboard::ActivationRatio::ZERO,
+                )
+                .unwrap(),
+                move |caps| {
+                    let module_sink = Rc::clone(&module_sink);
+                    let attention_control_sink = Rc::clone(&attention_control_sink);
+                    let utterance_sink_for_closure = utterance_sink_for_closure.clone();
+                    async move {
+                        *attention_control_sink.borrow_mut() = Some(caps.attention_control_inbox());
+                        *module_sink.borrow_mut() = Some(SpeakModule::new(SpeakModuleParts {
+                            cognition_updates: caps.cognition_log_updated_inbox(),
+                            cognition_log: caps.cognition_log_reader(),
+                            attention_control: caps.attention_control_mailbox(),
+                            memo: caps.memo(),
+                            utterance: UtteranceWriter::new(
+                                caps.owner().clone(),
+                                caps.blackboard(),
+                                utterance_sink_for_closure.clone(),
+                                caps.clock(),
+                            ),
+                            planning_llm: caps
+                                .llm("planning")
+                                .with_tier(nuillu_types::ModelTier::Premium)
+                                .into(),
+                            scene: caps.scene_reader(),
+                            clock: caps.clock(),
+                            planning_session: caps
+                                .session("planning")
+                                .with_tier(nuillu_types::ModelTier::Premium)
+                                .with_auto_compaction(planning_session_auto_compaction())
+                                .await?,
+                        }));
+                        Ok(SpeakStub)
+                    }
+                },
+            )
             .unwrap()
             .build(&caps)
             .await

@@ -4906,7 +4906,8 @@ trait EvalRegistryExt {
         builder: B,
     ) -> Result<ModuleRegistry, nuillu_module::ModuleRegistryError>
     where
-        B: nuillu_module::ModuleRegisterer + 'static;
+        B: nuillu_module::ModuleRegisterer + 'static,
+        B::Module: nuillu_module::StaticModule;
 }
 
 impl EvalRegistryExt for ModuleRegistry {
@@ -4918,12 +4919,18 @@ impl EvalRegistryExt for ModuleRegistry {
     ) -> Result<ModuleRegistry, nuillu_module::ModuleRegistryError>
     where
         B: nuillu_module::ModuleRegisterer + 'static,
+        B::Module: nuillu_module::StaticModule,
     {
         let replica_capacity = match replica_hard_cap {
             ReplicaHardCap::PolicyMax => policy.max_active_replicas(),
             ReplicaHardCap::V1Max => ReplicaCapRange::V1_MAX,
         };
-        self.register_with_replica_capacity(policy, replica_capacity, builder)
+        let spec = nuillu_module::ModuleRegistrationSpec::for_static::<B::Module>(
+            policy,
+            ActivationRatio::ZERO,
+        )?
+        .with_replica_capacity(replica_capacity);
+        self.register(spec, builder)
     }
 }
 
@@ -9955,7 +9962,13 @@ prompt = "What am I attending to?"
                 let caps = test_caps_with_adapter(blackboard.clone(), adapter);
                 let modules = ModuleRegistry::new()
                     .register(
-                        eval_policy(1..=1, Bpm::from_f64(60_000.0)..=Bpm::from_f64(60_000.0)),
+                        nuillu_module::ModuleRegistrationSpec::for_static::<
+                            nuillu_attention_schema::AttentionSchemaModule,
+                        >(
+                            eval_policy(1..=1, Bpm::from_f64(60_000.0)..=Bpm::from_f64(60_000.0)),
+                            ActivationRatio::ONE,
+                        )
+                        .unwrap(),
                         |caps| async move {
                             Ok(nuillu_attention_schema::AttentionSchemaModule::new(
                                 caps.memo_updated_inbox(),

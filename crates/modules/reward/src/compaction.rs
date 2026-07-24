@@ -102,7 +102,8 @@ impl PolicyCompactionModule {
         llm: LlmAccess,
     ) -> Self {
         Self {
-            owner: ModuleId::new(<Self as Module>::id()).expect("policy-compaction id is valid"),
+            owner: ModuleId::new(<Self as nuillu_module::StaticModule>::id())
+                .expect("policy-compaction id is valid"),
             interoception_updates,
             blackboard,
             compactor,
@@ -353,9 +354,7 @@ fn format_policy_compaction_context(policies: &[PolicyContentView]) -> String {
 }
 
 #[async_trait(?Send)]
-impl Module for PolicyCompactionModule {
-    type Batch = ();
-
+impl nuillu_module::StaticModule for PolicyCompactionModule {
     fn id() -> &'static str {
         "policy-compaction"
     }
@@ -363,6 +362,11 @@ impl Module for PolicyCompactionModule {
     fn peer_context() -> Option<&'static str> {
         None
     }
+}
+
+#[async_trait(?Send)]
+impl Module for PolicyCompactionModule {
+    type Batch = ();
 
     async fn next_batch(&mut self) -> Result<Self::Batch> {
         PolicyCompactionModule::next_batch(self).await
@@ -467,19 +471,26 @@ mod tests {
         policy_caps: PolicyCapabilities,
     ) -> nuillu_module::AllocatedModule {
         let modules = ModuleRegistry::new()
-            .register(test_policy(), move |caps| {
-                let policy_caps = policy_caps.clone();
-                async move {
-                    Ok(PolicyCompactionModule::new(
-                        caps.interoception_updated_inbox(),
-                        caps.blackboard_reader(),
-                        policy_caps.compactor(),
-                        caps.llm("main")
-                            .with_tier(nuillu_types::ModelTier::Cheap)
-                            .into(),
-                    ))
-                }
-            })
+            .register(
+                nuillu_module::ModuleRegistrationSpec::for_static::<PolicyCompactionModule>(
+                    test_policy(),
+                    nuillu_blackboard::ActivationRatio::ZERO,
+                )
+                .unwrap(),
+                move |caps| {
+                    let policy_caps = policy_caps.clone();
+                    async move {
+                        Ok(PolicyCompactionModule::new(
+                            caps.interoception_updated_inbox(),
+                            caps.blackboard_reader(),
+                            policy_caps.compactor(),
+                            caps.llm("main")
+                                .with_tier(nuillu_types::ModelTier::Cheap)
+                                .into(),
+                        ))
+                    }
+                },
+            )
             .unwrap()
             .build(caps)
             .await

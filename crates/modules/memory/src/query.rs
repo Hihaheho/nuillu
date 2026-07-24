@@ -289,7 +289,7 @@ impl QueryMemoryModule {
         session: Session,
     ) -> Self {
         Self {
-            owner: nuillu_types::ModuleId::new(<Self as Module>::id())
+            owner: nuillu_types::ModuleId::new(<Self as nuillu_module::StaticModule>::id())
                 .expect("query-memory id is valid"),
             cognition_updates,
             blackboard,
@@ -1225,9 +1225,7 @@ fn format_memory_questions(questions: &[String]) -> String {
 }
 
 #[async_trait(?Send)]
-impl Module for QueryMemoryModule {
-    type Batch = QueryMemoryBatch;
-
+impl nuillu_module::StaticModule for QueryMemoryModule {
     fn id() -> &'static str {
         "query-memory"
     }
@@ -1235,6 +1233,11 @@ impl Module for QueryMemoryModule {
     fn peer_context() -> Option<&'static str> {
         Some("Query-memory brings relevant remembered experience into the current cognitive state.")
     }
+}
+
+#[async_trait(?Send)]
+impl Module for QueryMemoryModule {
+    type Batch = QueryMemoryBatch;
 
     async fn next_batch(&mut self) -> Result<Self::Batch> {
         QueryMemoryModule::next_batch(self).await
@@ -1267,7 +1270,9 @@ mod tests {
         MockTextScenario, ModelInput, ModelInputItem, RawStructuredTurnEvent, RawTextTurnEvent,
         SharedPoolBudgetManager, SharedPoolBudgetOptions, TurnAdapter, Usage,
     };
-    use nuillu_blackboard::{Blackboard, Bpm, ModulePolicy, TypedMemoLogRecord, linear_ratio_fn};
+    use nuillu_blackboard::{
+        ActivationRatio, Blackboard, Bpm, ModulePolicy, TypedMemoLogRecord, linear_ratio_fn,
+    };
     use nuillu_module::ports::{NoopCognitionLogRepository, PortError, SystemClock};
     use nuillu_module::{
         CapabilityProviderPorts, CapabilityProviders, CognitionLogUpdated, LlmConcurrencyLimiter,
@@ -1580,11 +1585,15 @@ mod tests {
     ) -> nuillu_module::AllocatedModule {
         let modules = ModuleRegistry::new()
             .register(
-                ModulePolicy::new(
-                    ReplicaCapRange::new(1, 1).unwrap(),
-                    Bpm::from_f64(60_000.0)..=Bpm::from_f64(60_000.0),
-                    linear_ratio_fn,
-                ),
+                nuillu_module::ModuleRegistrationSpec::for_static::<QueryMemoryModule>(
+                    ModulePolicy::new(
+                        ReplicaCapRange::new(1, 1).unwrap(),
+                        Bpm::from_f64(60_000.0)..=Bpm::from_f64(60_000.0),
+                        linear_ratio_fn,
+                    ),
+                    ActivationRatio::ONE,
+                )
+                .unwrap(),
                 move |caps| {
                     let memory_caps = memory_caps.clone();
                     async move {

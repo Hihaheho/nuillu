@@ -206,7 +206,8 @@ impl MemoryModule {
         session: Session,
     ) -> Self {
         Self {
-            owner: nuillu_types::ModuleId::new(<Self as Module>::id()).expect("memory id is valid"),
+            owner: nuillu_types::ModuleId::new(<Self as nuillu_module::StaticModule>::id())
+                .expect("memory id is valid"),
             memo_updates,
             cognition_updates,
             blackboard,
@@ -735,9 +736,7 @@ impl MemoryModule {
 }
 
 #[async_trait(?Send)]
-impl Module for MemoryModule {
-    type Batch = MemoryBatch;
-
+impl nuillu_module::StaticModule for MemoryModule {
     fn id() -> &'static str {
         "memory"
     }
@@ -745,6 +744,11 @@ impl Module for MemoryModule {
     fn peer_context() -> Option<&'static str> {
         Some("Memory preserves useful memo and cognition evidence for later recall.")
     }
+}
+
+#[async_trait(?Send)]
+impl Module for MemoryModule {
+    type Batch = MemoryBatch;
 
     async fn next_batch(&mut self) -> Result<Self::Batch> {
         MemoryModule::next_batch(self).await
@@ -775,7 +779,7 @@ mod tests {
         Lutum, MessageContent, MockLlmAdapter, MockTextScenario, ModelInput, ModelInputItem,
         RawTextTurnEvent, SharedPoolBudgetManager, SharedPoolBudgetOptions, TurnAdapter, Usage,
     };
-    use nuillu_blackboard::{Blackboard, Bpm, ModulePolicy, linear_ratio_fn};
+    use nuillu_blackboard::{ActivationRatio, Blackboard, Bpm, ModulePolicy, linear_ratio_fn};
     use nuillu_module::ports::{NoopCognitionLogRepository, PortError, SystemClock};
     use nuillu_module::{
         CapabilityProviderPorts, CapabilityProviders, CognitionLogUpdated, LlmConcurrencyLimiter,
@@ -992,17 +996,19 @@ mod tests {
         recorder: BatchRecorder,
     }
 
-    #[async_trait(?Send)]
-    impl Module for RecordingMemory {
-        type Batch = MemoryBatch;
-
+    impl nuillu_module::StaticModule for RecordingMemory {
         fn id() -> &'static str {
-            MemoryModule::id()
+            <MemoryModule as nuillu_module::StaticModule>::id()
         }
 
         fn peer_context() -> Option<&'static str> {
-            MemoryModule::peer_context()
+            <MemoryModule as nuillu_module::StaticModule>::peer_context()
         }
+    }
+
+    #[async_trait(?Send)]
+    impl Module for RecordingMemory {
+        type Batch = MemoryBatch;
 
         async fn next_batch(&mut self) -> Result<Self::Batch> {
             let batch = self.inner.next_batch().await?;
@@ -1107,11 +1113,15 @@ mod tests {
     ) -> nuillu_module::AllocatedModule {
         let modules = ModuleRegistry::new()
             .register(
-                ModulePolicy::new(
-                    ReplicaCapRange::new(1, 1).unwrap(),
-                    Bpm::from_f64(60_000.0)..=Bpm::from_f64(60_000.0),
-                    linear_ratio_fn,
-                ),
+                nuillu_module::ModuleRegistrationSpec::for_static::<RecordingMemory>(
+                    ModulePolicy::new(
+                        ReplicaCapRange::new(1, 1).unwrap(),
+                        Bpm::from_f64(60_000.0)..=Bpm::from_f64(60_000.0),
+                        linear_ratio_fn,
+                    ),
+                    ActivationRatio::ONE,
+                )
+                .unwrap(),
                 move |caps| {
                     let memory_caps = memory_caps.clone();
                     let recorder = recorder.clone();
@@ -1153,28 +1163,35 @@ mod tests {
         memory_caps: MemoryCapabilities,
     ) -> nuillu_module::AllocatedModule {
         let modules = ModuleRegistry::new()
-            .register(module_policy(), move |caps| {
-                let memory_caps = memory_caps.clone();
-                async move {
-                    Ok(MemoryModule::new(
-                        caps.memo_updated_inbox(),
-                        caps.cognition_log_updated_inbox(),
-                        caps.blackboard_reader(),
-                        caps.cognition_log_reader(),
-                        caps.memory_metadata_reader(),
-                        memory_caps.writer(),
-                        memory_caps.deleter(),
-                        memory_caps.retriever(),
-                        caps.llm("main")
-                            .with_tier(nuillu_types::ModelTier::Cheap)
-                            .into(),
-                        caps.session("main")
-                            .with_tier(nuillu_types::ModelTier::Cheap)
-                            .with_auto_compaction(session_auto_compaction())
-                            .await?,
-                    ))
-                }
-            })
+            .register(
+                nuillu_module::ModuleRegistrationSpec::for_static::<MemoryModule>(
+                    module_policy(),
+                    ActivationRatio::ZERO,
+                )
+                .unwrap(),
+                move |caps| {
+                    let memory_caps = memory_caps.clone();
+                    async move {
+                        Ok(MemoryModule::new(
+                            caps.memo_updated_inbox(),
+                            caps.cognition_log_updated_inbox(),
+                            caps.blackboard_reader(),
+                            caps.cognition_log_reader(),
+                            caps.memory_metadata_reader(),
+                            memory_caps.writer(),
+                            memory_caps.deleter(),
+                            memory_caps.retriever(),
+                            caps.llm("main")
+                                .with_tier(nuillu_types::ModelTier::Cheap)
+                                .into(),
+                            caps.session("main")
+                                .with_tier(nuillu_types::ModelTier::Cheap)
+                                .with_auto_compaction(session_auto_compaction())
+                                .await?,
+                        ))
+                    }
+                },
+            )
             .unwrap()
             .build(caps)
             .await

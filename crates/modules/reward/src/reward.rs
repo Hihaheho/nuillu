@@ -824,9 +824,7 @@ fn render_reward_memo(memo: &RewardMemo, assessment: &RewardAssessment) -> Strin
 }
 
 #[async_trait(?Send)]
-impl Module for RewardModule {
-    type Batch = Vec<PolicyConsiderationEvicted>;
-
+impl nuillu_module::StaticModule for RewardModule {
     fn id() -> &'static str {
         "reward"
     }
@@ -834,6 +832,11 @@ impl Module for RewardModule {
     fn peer_context() -> Option<&'static str> {
         None
     }
+}
+
+#[async_trait(?Send)]
+impl Module for RewardModule {
+    type Batch = Vec<PolicyConsiderationEvicted>;
 
     async fn next_batch(&mut self) -> Result<Self::Batch> {
         let Some(first) = self.policy_evictions.next_item().await else {
@@ -1007,27 +1010,34 @@ mod tests {
         policy_caps: PolicyCapabilities,
     ) -> nuillu_module::AllocatedModule {
         let modules = ModuleRegistry::new()
-            .register(module_policy(), move |caps| {
-                let policy_caps = policy_caps.clone();
-                async move {
-                    Ok(RewardModule::new(
-                        policy_caps.consideration_evicted_inbox(),
-                        caps.blackboard_reader(),
-                        caps.cognition_log_reader(),
-                        caps.interoception_reader(),
-                        policy_caps.searcher(),
-                        policy_caps.upserter(),
-                        caps.memo(),
-                        caps.llm("main")
-                            .with_tier(nuillu_types::ModelTier::Default)
-                            .into(),
-                        caps.session("main")
-                            .with_tier(nuillu_types::ModelTier::Default)
-                            .with_auto_compaction(reward_session_auto_compaction())
-                            .await?,
-                    ))
-                }
-            })
+            .register(
+                nuillu_module::ModuleRegistrationSpec::for_static::<RewardModule>(
+                    module_policy(),
+                    nuillu_blackboard::ActivationRatio::ZERO,
+                )
+                .unwrap(),
+                move |caps| {
+                    let policy_caps = policy_caps.clone();
+                    async move {
+                        Ok(RewardModule::new(
+                            policy_caps.consideration_evicted_inbox(),
+                            caps.blackboard_reader(),
+                            caps.cognition_log_reader(),
+                            caps.interoception_reader(),
+                            policy_caps.searcher(),
+                            policy_caps.upserter(),
+                            caps.memo(),
+                            caps.llm("main")
+                                .with_tier(nuillu_types::ModelTier::Default)
+                                .into(),
+                            caps.session("main")
+                                .with_tier(nuillu_types::ModelTier::Default)
+                                .with_auto_compaction(reward_session_auto_compaction())
+                                .await?,
+                        ))
+                    }
+                },
+            )
             .unwrap()
             .build(caps)
             .await

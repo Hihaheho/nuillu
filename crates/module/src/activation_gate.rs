@@ -105,9 +105,9 @@ impl ActivationGateHub {
     pub(crate) fn subscribe<M: Module + 'static>(
         &self,
         owner: ModuleInstanceId,
+        target_module: ModuleId,
     ) -> ActivationGate<M> {
         let (sender, receiver) = mpsc::unbounded();
-        let target_module = ModuleId::new(M::id()).expect("module id is valid");
         self.inner
             .lock()
             .expect("activation gate hub poisoned")
@@ -185,9 +185,7 @@ mod tests {
     struct TargetModule;
 
     #[async_trait(?Send)]
-    impl Module for TargetModule {
-        type Batch = String;
-
+    impl crate::StaticModule for TargetModule {
         fn id() -> &'static str {
             "gate-target"
         }
@@ -195,6 +193,11 @@ mod tests {
         fn peer_context() -> Option<&'static str> {
             Some("test target")
         }
+    }
+
+    #[async_trait(?Send)]
+    impl Module for TargetModule {
+        type Batch = String;
 
         async fn next_batch(&mut self) -> anyhow::Result<Self::Batch> {
             Ok(String::new())
@@ -215,7 +218,7 @@ mod tests {
 
     fn target_owner() -> ModuleInstanceId {
         ModuleInstanceId::new(
-            ModuleId::new(TargetModule::id()).unwrap(),
+            ModuleId::new(<TargetModule as crate::StaticModule>::id()).unwrap(),
             ReplicaIndex::ZERO,
         )
     }
@@ -242,8 +245,10 @@ mod tests {
         let blackboard = Blackboard::with_allocation(allocation);
         install_gate_policy(&blackboard).await;
         let caps = test_caps(blackboard);
-        let mut gate_0 = scoped(&caps, gate_id(), 0).activation_gate_for::<TargetModule>();
-        let mut gate_1 = scoped(&caps, gate_id(), 1).activation_gate_for::<TargetModule>();
+        let target = ModuleId::new(<TargetModule as crate::StaticModule>::id()).unwrap();
+        let mut gate_0 =
+            scoped(&caps, gate_id(), 0).activation_gate_for::<TargetModule>(target.clone());
+        let mut gate_1 = scoped(&caps, gate_id(), 1).activation_gate_for::<TargetModule>(target);
 
         let requests = caps
             .runtime_control()
@@ -268,7 +273,9 @@ mod tests {
         let blackboard = Blackboard::with_allocation(allocation);
         install_gate_policy(&blackboard).await;
         let caps = test_caps(blackboard);
-        let _gate_0 = scoped(&caps, gate_id(), 0).activation_gate_for::<TargetModule>();
+        let _gate_0 = scoped(&caps, gate_id(), 0).activation_gate_for::<TargetModule>(
+            ModuleId::new(<TargetModule as crate::StaticModule>::id()).unwrap(),
+        );
 
         let requests = caps
             .runtime_control()
@@ -276,5 +283,27 @@ mod tests {
             .await;
 
         assert!(requests.is_empty());
+    }
+
+    #[tokio::test]
+    async fn explicit_target_role_disambiguates_the_same_module_type() {
+        let mut allocation = ResourceAllocation::default();
+        allocation.set_activation(gate_id(), ActivationRatio::ONE);
+        let blackboard = Blackboard::with_allocation(allocation);
+        install_gate_policy(&blackboard).await;
+        let caps = test_caps(blackboard);
+        let alpha = ModuleId::new("dynamic-alpha").unwrap();
+        let beta = ModuleId::new("dynamic-beta").unwrap();
+        let _alpha_gate =
+            scoped(&caps, gate_id(), 0).activation_gate_for::<TargetModule>(alpha.clone());
+        let _beta_gate = scoped(&caps, gate_id(), 0).activation_gate_for::<TargetModule>(beta);
+        let alpha_owner = ModuleInstanceId::new(alpha, ReplicaIndex::ZERO);
+
+        let requests = caps
+            .runtime_control()
+            .activation_gate_requests(&alpha_owner, ModuleBatch::new("candidate".to_owned()))
+            .await;
+
+        assert_eq!(requests.len(), 1);
     }
 }

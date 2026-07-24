@@ -2,10 +2,19 @@ use chrono::{DateTime, Utc};
 use nuillu_types::{MemoryIndex, MemoryRank, ModuleId, ModuleInstanceId, PolicyIndex, PolicyRank};
 
 use crate::{
-    AgenticDeadlockMarker, AllocationLimits, CognitionLogEntry, CorePolicyRecord,
+    ActivationRatio, AgenticDeadlockMarker, AllocationLimits, CognitionLogEntry, CorePolicyRecord,
     IdentityMemoryRecord, InteroceptivePatch, MemoryMetaPatch, ModulePolicy, ModuleRunStatus,
     PolicyMetaPatch, ResourceAllocation, UtteranceProgress,
 };
+
+/// Registry-owned boot policy for one module role.
+#[derive(Debug, Clone)]
+pub struct RegisteredModulePolicy {
+    pub module: ModuleId,
+    pub policy: ModulePolicy,
+    pub replica_capacity: u8,
+    pub initial_activation: ActivationRatio,
+}
 
 /// Internal blackboard mutation. Constructed only by the agent's
 /// capability layer (each capability is responsible for one variant) and
@@ -68,6 +77,11 @@ pub enum BlackboardCommand {
     },
     SetModuleReplicaCapacities {
         capacities: Vec<(ModuleId, u8)>,
+    },
+    /// Replace the registered role set and seed initial activation for roles
+    /// that are not already present in the host base allocation.
+    SetRegisteredModules {
+        registrations: Vec<RegisteredModulePolicy>,
     },
     SetAllocationLimits(AllocationLimits),
     SetMemoRetentionPerOwner(usize),

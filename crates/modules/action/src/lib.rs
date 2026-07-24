@@ -526,9 +526,7 @@ fn action_observation_input(memos: Option<String>, cognition: Option<String>) ->
 }
 
 #[async_trait(?Send)]
-impl Module for ActionModule {
-    type Batch = ();
-
+impl nuillu_module::StaticModule for ActionModule {
     fn id() -> &'static str {
         "action"
     }
@@ -538,6 +536,11 @@ impl Module for ActionModule {
             "Action executes concrete action tools: speak allocation, built-in sleep, and host-owned external affordances.",
         )
     }
+}
+
+#[async_trait(?Send)]
+impl Module for ActionModule {
+    type Batch = ();
 
     async fn next_batch(&mut self) -> Result<Self::Batch> {
         ActionModule::next_batch(self).await

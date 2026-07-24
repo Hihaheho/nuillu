@@ -79,6 +79,11 @@ pub trait Module {
     async fn next_batch(&mut self) -> anyhow::Result<Self::Batch>;
     async fn activate(&mut self, batch: &Self::Batch) -> anyhow::Result<()>;
 }
+
+pub trait StaticModule: Module {
+    fn id() -> &'static str;
+    fn peer_context() -> Option<&'static str>;
+}
 ```
 
 Modules own inbox capabilities and decide how to form a deterministic module-local batch. They do not own a persistent run loop; the agent event loop awaits `next_batch`, keeps the batch, and invokes `activate(&batch)`.
@@ -103,18 +108,17 @@ pub struct ModuleInstanceId {
 
 `ReplicaCapRange` is boot-time policy. It must satisfy `min <= max`, and v1 caps should stay within `0..=3` unless a later runtime design explicitly raises the global limit. The runtime creates `max` module instances for the registration. Allocation chooses the effective active replica count and is clamped to `min..=max`.
 
-Application boot registers modules as `(module_id, cap_range, builder)`:
+Application boot registers explicit role metadata separately from the module
+implementation. `for_static` is a convenience for the usual one-type/one-role
+case:
 
 ```rust
-let registry = ModuleRegistry::new().register(builtin::query_memory(), 0..=3, |caps| {
-    QueryMemoryModule::new(
-        caps.cognition_log_updated_inbox(),
-        caps.allocation_reader(),
-        caps.blackboard_reader(),
-        caps.memory_searcher(),
-        caps.memo(),
-        caps.llm_access(),
-    )
+let spec = ModuleRegistrationSpec::for_static::<QueryMemoryModule>(
+    query_memory_policy(),
+    ActivationRatio::ZERO,
+)?;
+let registry = ModuleRegistry::new().register(spec, |caps| async move {
+    Ok(QueryMemoryModule::new(/* owner-stamped capabilities from caps */))
 })?;
 ```
 
@@ -470,21 +474,48 @@ Boot expands registered modules into persistent replica instances before the sch
 
 ```rust
 let modules = ModuleRegistry::new()
-    .register(builtin::query_memory(), 0..=3, |caps| {
-        QueryMemoryModule::new(
-            caps.cognition_log_updated_inbox(),
-            caps.allocation_reader(),
-            caps.blackboard_reader(),
-            caps.memory_searcher(),
-            caps.memo(),
-            caps.llm_access(),
-        )
+    .register(query_memory_spec, |caps| async move {
+        Ok(QueryMemoryModule::new(/* capabilities */))
     })?
     .build(&caps)
     .await?;
 ```
 
-`ModuleRegistry::register` validates `cap_range.min <= cap_range.max` and the v1 global cap limit. `build` creates one `ModuleCapabilityFactory` per replica index in `0..cap_range.max`, calls the builder once per scoped factory, and records cap metadata for routing, event-loop activation, and allocation schema generation.
+`ModuleRegistry::register` validates unique ids, replica capacity, and the v1
+global cap limit. `build` compiles and freezes a `ModuleCatalog`, seeds initial
+activation only for roles absent from the host allocation, creates one
+`ModuleCapabilityFactory` per persistent replica, and records metadata for
+routing, event-loop activation, groups, dependencies, and allocation schema
+generation. Rebuilding the same catalog is allowed; changing it on the same
+capability-provider environment fails and requires a fresh environment.
+
+### Boot-time dynamic roles
+
+The implementation type does not determine dynamic identity. A host may parse
+an immutable runtime file and register the same compiled module type once per
+MCP server. Each file entry must provide a stable kebab-case `module-id`:
+
+```rust
+for server in mcp_servers {
+    let spec = ModuleRegistrationSpec::new(
+        ModuleId::new(server.module_id)?,
+        mcp_policy(),
+        ActivationRatio::ONE,
+    )
+    .with_peer_context(server.peer_context)
+    .in_group(ModuleGroupId::new("voluntary")?);
+    let config = server.config.clone();
+    registry = registry.register(spec, move |caps| {
+        let config = config.clone();
+        async move { McpServerModule::new(config, caps).await }
+    })?;
+}
+```
+
+The parsed list is captured by `ServerModuleRegistrar`, which is invoked again
+only to create fresh builders after a scheduler restart. It must reproduce the
+same catalog. Changing the file requires constructing a new agent environment;
+live add/remove is outside v1.
 
 The scheduler owns the loop over built modules:
 

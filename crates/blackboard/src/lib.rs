@@ -36,7 +36,7 @@ pub use cognition_log::{
     AgenticDeadlockMarker, CognitionLog, CognitionLogEntry, CognitionLogEntryRecord,
     CognitionLogOrigin, CognitionLogRecord, CognitionLogSet,
 };
-pub use command::BlackboardCommand;
+pub use command::{BlackboardCommand, RegisteredModulePolicy};
 pub use interoception::{InteroceptiveMode, InteroceptivePatch, InteroceptiveState};
 pub use memory::{IdentityMemoryRecord, MemoryMetaPatch, MemoryMetadata};
 pub use policy::{CorePolicyRecord, PolicyMetaPatch, PolicyMetadata};

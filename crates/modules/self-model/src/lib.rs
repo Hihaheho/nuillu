@@ -137,9 +137,7 @@ impl SelfModelModule {
 }
 
 #[async_trait(?Send)]
-impl Module for SelfModelModule {
-    type Batch = SelfModelBatch;
-
+impl nuillu_module::StaticModule for SelfModelModule {
     fn id() -> &'static str {
         "self-model"
     }
@@ -149,6 +147,11 @@ impl Module for SelfModelModule {
             "Self-model forms the current first-person sense of identity, agency, intention, capability, and affective self-state.",
         )
     }
+}
+
+#[async_trait(?Send)]
+impl Module for SelfModelModule {
+    type Batch = SelfModelBatch;
 
     async fn next_batch(&mut self) -> Result<Self::Batch> {
         SelfModelModule::next_batch(self).await

@@ -70,8 +70,9 @@ pub use allocation_writer::AllocationWriter;
 pub use capabilities::{
     AgentRuntimeControl, AllocatedModule, AllocatedModules, CapabilityProviderConfig,
     CapabilityProviderPorts, CapabilityProviderRuntime, CapabilityProviders, HostIo,
-    InternalHarnessIo, LlmCapabilityRequest, ModuleCapabilityFactory, ModuleDependencies,
-    ModuleRegisterer, ModuleRegistry, ModuleRegistryError, SelfWake, SelfWakePermitClaim,
+    InternalHarnessIo, LlmCapabilityRequest, ModuleCapabilityFactory, ModuleCatalog,
+    ModuleDependencies, ModuleRegisterer, ModuleRegistrationSpec, ModuleRegistry,
+    ModuleRegistryError, SelfWake, SelfWakePermitClaim,
 };
 pub use channels::{
     ActionAffordancesUpdated, ActionAffordancesUpdatedInbox, ActionAffordancesUpdatedMailbox,
@@ -108,7 +109,7 @@ pub use mind_session::{
     REASONING_SYSTEM_PROMPT, format_system_seed, push_formatted_cognition_log_batch,
     push_formatted_memo_log_batch, seed_persistent_faculty_session,
 };
-pub use nuillu_types::ModuleId;
+pub use nuillu_types::{ModuleGroupId, ModuleId};
 pub use ports::Embedder;
 pub use prompt::{format_faculty_system_prompt, format_policy_system_prompt, format_system_prompt};
 pub use readers::{
@@ -133,4 +134,4 @@ pub use tiers::{LlmConcurrencyPool, LlmTierHandle, LutumTiers};
 pub use time_division::{TimeDivision, TimeDivisionBucket, TimeDivisionError};
 pub use tool_text_guard::{AbortOnAvailableToolNameInText, ToolNameInAssistantText};
 pub use tool_trace::emit_trace_tool_calls;
-pub use r#trait::{ActivateCx, ErasedModule, Module, ModuleBatch};
+pub use r#trait::{ActivateCx, ErasedModule, Module, ModuleBatch, StaticModule};

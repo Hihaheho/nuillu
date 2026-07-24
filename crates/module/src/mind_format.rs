@@ -421,7 +421,7 @@ pub fn format_current_allocation_state(allocation: &ResourceAllocation) -> Optio
     format_current_allocation_lines(allocation, "Current allocation state:")
 }
 
-pub fn format_available_faculties(faculties: &[(ModuleId, &'static str)]) -> Option<String> {
+pub fn format_available_faculties(faculties: &[(ModuleId, std::sync::Arc<str>)]) -> Option<String> {
     if faculties.is_empty() {
         return None;
     }
@@ -664,6 +664,7 @@ mod tests {
     use chrono::TimeZone as _;
     use nuillu_blackboard::{CognitionLogEntry, CognitionLogOrigin, MemoLogRecord};
     use nuillu_types::{MemoryContent, ReplicaIndex, builtin};
+    use std::sync::Arc;
 
     fn now() -> DateTime<Utc> {
         Utc.with_ymd_and_hms(2026, 5, 11, 6, 23, 0).unwrap()
@@ -954,7 +955,7 @@ mod tests {
             Some("Current allocation state:\n- sensory (strong)".to_owned())
         );
         assert_eq!(
-            format_available_faculties(&[(builtin::sensory(), "observes the world")]),
+            format_available_faculties(&[(builtin::sensory(), Arc::from("observes the world"))]),
             Some("Available faculties:\n- sensory: observes the world".to_owned())
         );
         assert_eq!(

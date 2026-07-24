@@ -592,9 +592,7 @@ fn normalize_candidate_id(value: &str) -> String {
 }
 
 #[async_trait(?Send)]
-impl Module for CognitionGateModule {
-    type Batch = CognitionGateBatch;
-
+impl nuillu_module::StaticModule for CognitionGateModule {
     fn id() -> &'static str {
         "cognition-gate"
     }
@@ -602,6 +600,11 @@ impl Module for CognitionGateModule {
     fn peer_context() -> Option<&'static str> {
         None
     }
+}
+
+#[async_trait(?Send)]
+impl Module for CognitionGateModule {
+    type Batch = CognitionGateBatch;
 
     async fn next_batch(&mut self) -> Result<Self::Batch> {
         CognitionGateModule::next_batch(self).await
@@ -725,10 +728,7 @@ mod tests {
         ($name:ident, $id:literal) => {
             struct $name;
 
-            #[async_trait(?Send)]
-            impl Module for $name {
-                type Batch = ();
-
+            impl nuillu_module::StaticModule for $name {
                 fn id() -> &'static str {
                     $id
                 }
@@ -736,6 +736,11 @@ mod tests {
                 fn peer_context() -> Option<&'static str> {
                     Some("test stub")
                 }
+            }
+
+            #[async_trait(?Send)]
+            impl Module for $name {
+                type Batch = ();
 
                 async fn next_batch(&mut self) -> Result<Self::Batch> {
                     std::future::pending().await
@@ -779,32 +784,46 @@ mod tests {
         let source_memo_sink = Rc::clone(&source_memo_cell);
 
         let _modules = ModuleRegistry::new()
-            .register(test_policy(), move |caps| {
-                let gate_sink = Rc::clone(&gate_sink);
-                async move {
-                    *gate_sink.borrow_mut() = Some(CognitionGateModule::new(
-                        caps.memo_updated_inbox(),
-                        caps.blackboard_reader(),
-                        caps.cognition_writer(),
-                        caps.llm("main")
-                            .with_tier(nuillu_types::ModelTier::Default)
-                            .into(),
-                        caps.session("main")
-                            .with_tier(nuillu_types::ModelTier::Default)
-                            .with_auto_compaction(session_auto_compaction())
-                            .await?,
-                    ));
-                    Ok(CognitionGateStub)
-                }
-            })
+            .register(
+                nuillu_module::ModuleRegistrationSpec::for_static::<CognitionGateStub>(
+                    test_policy(),
+                    ActivationRatio::ZERO,
+                )
+                .unwrap(),
+                move |caps| {
+                    let gate_sink = Rc::clone(&gate_sink);
+                    async move {
+                        *gate_sink.borrow_mut() = Some(CognitionGateModule::new(
+                            caps.memo_updated_inbox(),
+                            caps.blackboard_reader(),
+                            caps.cognition_writer(),
+                            caps.llm("main")
+                                .with_tier(nuillu_types::ModelTier::Default)
+                                .into(),
+                            caps.session("main")
+                                .with_tier(nuillu_types::ModelTier::Default)
+                                .with_auto_compaction(session_auto_compaction())
+                                .await?,
+                        ));
+                        Ok(CognitionGateStub)
+                    }
+                },
+            )
             .unwrap()
-            .register(test_policy(), move |caps| {
-                let source_memo_sink = Rc::clone(&source_memo_sink);
-                async move {
-                    *source_memo_sink.borrow_mut() = Some(caps.memo());
-                    Ok(SensoryStub)
-                }
-            })
+            .register(
+                nuillu_module::ModuleRegistrationSpec::for_static::<SensoryStub>(
+                    test_policy(),
+                    ActivationRatio::ZERO,
+                )
+                .unwrap(),
+                move |caps| {
+                    let source_memo_sink = Rc::clone(&source_memo_sink);
+                    async move {
+                        *source_memo_sink.borrow_mut() = Some(caps.memo());
+                        Ok(SensoryStub)
+                    }
+                },
+            )
             .unwrap()
             .build(&caps)
             .await
@@ -1401,7 +1420,7 @@ mod tests {
         let mut fixture = gate_fixture_with_turn_adapter(Arc::new(capture)).await;
 
         let lutum = fixture.gate.llm.lutum().await;
-        let peer_contexts = vec![(builtin::sensory(), "test stub")];
+        let peer_contexts = vec![(builtin::sensory(), Arc::from("test stub"))];
         let identity_memories: Vec<IdentityMemoryRecord> = Vec::new();
         let cx = nuillu_module::ActivateCx::new(
             &peer_contexts,
@@ -2269,7 +2288,7 @@ mod tests {
         let mut fixture = gate_fixture_with_turn_adapter(Arc::new(capture)).await;
 
         let lutum = fixture.gate.llm.lutum().await;
-        let peer_contexts = vec![(builtin::sensory(), "test stub")];
+        let peer_contexts = vec![(builtin::sensory(), Arc::from("test stub"))];
         let identity_memories: Vec<IdentityMemoryRecord> = Vec::new();
         let cx = nuillu_module::ActivateCx::new(
             &peer_contexts,
@@ -2360,7 +2379,7 @@ mod tests {
         let mut fixture = gate_fixture_with_turn_adapter(Arc::new(capture)).await;
 
         let lutum = fixture.gate.llm.lutum().await;
-        let peer_contexts = vec![(builtin::sensory(), "test stub")];
+        let peer_contexts = vec![(builtin::sensory(), Arc::from("test stub"))];
         let identity_memories: Vec<IdentityMemoryRecord> = Vec::new();
         let cx = nuillu_module::ActivateCx::new(
             &peer_contexts,
@@ -2434,7 +2453,7 @@ mod tests {
         let mut fixture = gate_fixture_with_turn_adapter(Arc::new(capture)).await;
 
         let lutum = fixture.gate.llm.lutum().await;
-        let peer_contexts = vec![(builtin::sensory(), "test stub")];
+        let peer_contexts = vec![(builtin::sensory(), Arc::from("test stub"))];
         let identity_memories: Vec<IdentityMemoryRecord> = Vec::new();
         let cx = nuillu_module::ActivateCx::new(
             &peer_contexts,
@@ -2627,7 +2646,7 @@ mod tests {
         let mut fixture = gate_fixture_with_adapter(adapter).await;
 
         let lutum = fixture.gate.llm.lutum().await;
-        let peer_contexts = vec![(builtin::sensory(), "test stub")];
+        let peer_contexts = vec![(builtin::sensory(), Arc::from("test stub"))];
         let identity_memories = vec![IdentityMemoryRecord {
             index: nuillu_types::MemoryIndex::new("identity-1"),
             content: nuillu_types::MemoryContent::new("The agent is named Nuillu."),

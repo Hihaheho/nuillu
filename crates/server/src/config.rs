@@ -13,7 +13,7 @@ use eure::document::{
     parse::{ParseContext, ParseError, ParseErrorKind},
 };
 use nuillu_module::ActionAffordance;
-use nuillu_types::{ModelTier, ModuleId, ReplicaCapRange, builtin};
+use nuillu_types::{ModelTier, ModuleGroupId, ModuleId, ReplicaCapRange, builtin};
 use tracing_subscriber::layer::SubscriberExt as _;
 use uuid::Uuid;
 
@@ -228,6 +228,18 @@ pub enum ServerModuleGroup {
     SleepSuppressed,
     HomeostaticDrive,
     ActionTarget,
+}
+
+impl ServerModuleGroup {
+    pub fn module_group_id(self) -> ModuleGroupId {
+        let id = match self {
+            Self::Voluntary => "voluntary",
+            Self::SleepSuppressed => "sleep-suppressed",
+            Self::HomeostaticDrive => "homeostatic-drive",
+            Self::ActionTarget => "action-target",
+        };
+        ModuleGroupId::new(id).expect("server module group ids are valid")
+    }
 }
 
 pub const DEFAULT_MODULES: &[RuntimeModule] = &[

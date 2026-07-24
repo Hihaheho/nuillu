@@ -32,6 +32,39 @@ impl ModuleId {
     }
 }
 
+/// Identifier for a boot-time group of module roles.
+///
+/// Groups are host wiring metadata (for example, modules that the allocation
+/// controller may target). They use the same stable kebab-case syntax as
+/// [`ModuleId`].
+#[derive(
+    Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, JsonSchema,
+)]
+pub struct ModuleGroupId(String);
+
+impl ModuleGroupId {
+    pub fn new(name: impl Into<String>) -> Result<Self, ModuleGroupIdParseError> {
+        let name = name.into();
+        if name.is_empty() {
+            return Err(ModuleGroupIdParseError::Empty);
+        }
+        if !is_kebab_case(&name) {
+            return Err(ModuleGroupIdParseError::InvalidChar);
+        }
+        Ok(Self(name))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for ModuleGroupId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
 fn is_kebab_case(value: &str) -> bool {
     let bytes = value.as_bytes();
     if !bytes.first().is_some_and(|b| b.is_ascii_lowercase()) {
@@ -171,6 +204,14 @@ pub enum ModuleIdParseError {
     #[error("module id must not be empty")]
     Empty,
     #[error("module id must be kebab-case: [a-z][a-z0-9]*(?:-[a-z0-9]+)*")]
+    InvalidChar,
+}
+
+#[derive(Debug, Error, PartialEq, Eq)]
+pub enum ModuleGroupIdParseError {
+    #[error("module group id must not be empty")]
+    Empty,
+    #[error("module group id must be kebab-case: [a-z][a-z0-9]*(?:-[a-z0-9]+)*")]
     InvalidChar,
 }
 

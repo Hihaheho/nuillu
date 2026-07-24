@@ -341,9 +341,7 @@ fn render_expected_memo(args: &MarkExpectedEventArgs) -> String {
 }
 
 #[async_trait(?Send)]
-impl Module for SurpriseModule {
-    type Batch = ();
-
+impl nuillu_module::StaticModule for SurpriseModule {
     fn id() -> &'static str {
         "surprise"
     }
@@ -353,6 +351,11 @@ impl Module for SurpriseModule {
             "Surprise detects when current cognition departs from expectation or recent continuity.",
         )
     }
+}
+
+#[async_trait(?Send)]
+impl Module for SurpriseModule {
+    type Batch = ();
 
     async fn next_batch(&mut self) -> Result<Self::Batch> {
         SurpriseModule::next_batch(self).await
@@ -470,10 +473,7 @@ mod tests {
         ($name:ident, $id:literal) => {
             struct $name;
 
-            #[async_trait::async_trait(?Send)]
-            impl Module for $name {
-                type Batch = ();
-
+            impl nuillu_module::StaticModule for $name {
                 fn id() -> &'static str {
                     $id
                 }
@@ -481,6 +481,11 @@ mod tests {
                 fn peer_context() -> Option<&'static str> {
                     Some("test stub")
                 }
+            }
+
+            #[async_trait::async_trait(?Send)]
+            impl Module for $name {
+                type Batch = ();
 
                 async fn next_batch(&mut self) -> Result<Self::Batch> {
                     std::future::pending().await
@@ -517,28 +522,36 @@ mod tests {
         let attention_requests_sink = Rc::clone(&attention_requests_cell);
 
         ModuleRegistry::new()
-            .register(test_policy(), move |caps| {
-                let module_sink = Rc::clone(&module_sink);
-                let attention_requests_sink = Rc::clone(&attention_requests_sink);
-                async move {
-                    *module_sink.borrow_mut() = Some(SurpriseModule::new(
-                        caps.cognition_log_updated_inbox(),
-                        caps.cognition_log_reader(),
-                        caps.blackboard_reader(),
-                        caps.attention_control_mailbox(),
-                        caps.memo(),
-                        caps.llm("main")
-                            .with_tier(nuillu_types::ModelTier::Default)
-                            .into(),
-                        caps.session("main")
-                            .with_tier(nuillu_types::ModelTier::Default)
-                            .with_auto_compaction(session_auto_compaction())
-                            .await?,
-                    ));
-                    *attention_requests_sink.borrow_mut() = Some(caps.attention_control_inbox());
-                    Ok(SurpriseStub)
-                }
-            })
+            .register(
+                nuillu_module::ModuleRegistrationSpec::for_static::<SurpriseModule>(
+                    test_policy(),
+                    nuillu_blackboard::ActivationRatio::ZERO,
+                )
+                .unwrap(),
+                move |caps| {
+                    let module_sink = Rc::clone(&module_sink);
+                    let attention_requests_sink = Rc::clone(&attention_requests_sink);
+                    async move {
+                        *module_sink.borrow_mut() = Some(SurpriseModule::new(
+                            caps.cognition_log_updated_inbox(),
+                            caps.cognition_log_reader(),
+                            caps.blackboard_reader(),
+                            caps.attention_control_mailbox(),
+                            caps.memo(),
+                            caps.llm("main")
+                                .with_tier(nuillu_types::ModelTier::Default)
+                                .into(),
+                            caps.session("main")
+                                .with_tier(nuillu_types::ModelTier::Default)
+                                .with_auto_compaction(session_auto_compaction())
+                                .await?,
+                        ));
+                        *attention_requests_sink.borrow_mut() =
+                            Some(caps.attention_control_inbox());
+                        Ok(SurpriseStub)
+                    }
+                },
+            )
             .unwrap()
             .build(&caps)
             .await

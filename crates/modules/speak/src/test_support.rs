@@ -38,10 +38,7 @@ macro_rules! noop_stub {
     ($name:ident, $id:literal) => {
         pub(crate) struct $name;
 
-        #[async_trait(?Send)]
-        impl Module for $name {
-            type Batch = ();
-
+        impl nuillu_module::StaticModule for $name {
             fn id() -> &'static str {
                 $id
             }
@@ -49,6 +46,11 @@ macro_rules! noop_stub {
             fn peer_context() -> Option<&'static str> {
                 Some("test stub")
             }
+        }
+
+        #[async_trait(?Send)]
+        impl Module for $name {
+            type Batch = ();
 
             async fn next_batch(&mut self) -> Result<Self::Batch> {
                 std::future::pending().await

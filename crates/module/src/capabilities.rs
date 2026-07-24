@@ -1,18 +1,20 @@
 use std::cell::{Cell, RefCell};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fmt;
 use std::future::{Future, IntoFuture};
 use std::pin::Pin;
 use std::rc::Rc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use lutum::{Lutum, Session};
 use nuillu_blackboard::{
     ActivationRatio, AgenticDeadlockMarker, Blackboard, BlackboardCommand, Bpm, ModulePolicy,
-    ModuleRunStatus, ZeroReplicaWindowPolicy,
+    ModuleRunStatus, RegisteredModulePolicy, ZeroReplicaWindowPolicy,
 };
 use nuillu_types::{
-    ModelTier, ModuleActivationId, ModuleId, ModuleInstanceId, ReplicaCapRange, ReplicaIndex,
+    ModelTier, ModuleActivationId, ModuleGroupId, ModuleId, ModuleInstanceId, ReplicaCapRange,
+    ReplicaIndex,
 };
 
 use crate::activation_gate::ActivationGateHub;
@@ -40,9 +42,178 @@ use crate::{
     MemoLogEvictedInbox, MemoLogEvictedMailbox, MemoLogRepository, MemoUpdated, MemoUpdatedInbox,
     MemoUpdatedMailbox, MemoryMetadataReader, Module, ModuleBatch, ModuleStatusReader,
     NoopAllocationStore, NoopExternalActionExecutor, NoopMemoLogRepository, PersistedMemoLogEntry,
-    SensoryInput, SensoryInputInbox, SensoryInputMailbox, SessionCompactionPolicy, TimeDivision,
-    TopicInbox, TopicMailbox, TypedMemo,
+    SensoryInput, SensoryInputInbox, SensoryInputMailbox, SessionCompactionPolicy, StaticModule,
+    TimeDivision, TopicInbox, TopicMailbox, TypedMemo,
 };
+
+/// Immutable boot-time description of one registered module role.
+#[derive(Debug, Clone)]
+pub struct ModuleRegistrationSpec {
+    module: ModuleId,
+    peer_context: Option<Arc<str>>,
+    policy: ModulePolicy,
+    replica_capacity: u8,
+    initial_activation: ActivationRatio,
+    groups: BTreeSet<ModuleGroupId>,
+    dependencies: Vec<ModuleId>,
+}
+
+impl ModuleRegistrationSpec {
+    pub fn new(
+        module: ModuleId,
+        policy: ModulePolicy,
+        initial_activation: ActivationRatio,
+    ) -> Self {
+        let replica_capacity = policy.max_active_replicas();
+        Self {
+            module,
+            peer_context: None,
+            policy,
+            replica_capacity,
+            initial_activation,
+            groups: BTreeSet::new(),
+            dependencies: Vec::new(),
+        }
+    }
+
+    pub fn for_static<M: StaticModule>(
+        policy: ModulePolicy,
+        initial_activation: ActivationRatio,
+    ) -> Result<Self, nuillu_types::ModuleIdParseError> {
+        let mut spec = Self::new(ModuleId::new(M::id())?, policy, initial_activation);
+        if let Some(context) = M::peer_context() {
+            spec.peer_context = Some(Arc::from(context));
+        }
+        Ok(spec)
+    }
+
+    pub fn with_peer_context(mut self, peer_context: impl Into<Arc<str>>) -> Self {
+        self.peer_context = Some(peer_context.into());
+        self
+    }
+
+    pub fn without_peer_context(mut self) -> Self {
+        self.peer_context = None;
+        self
+    }
+
+    pub fn with_replica_capacity(mut self, replica_capacity: u8) -> Self {
+        self.replica_capacity = replica_capacity;
+        self
+    }
+
+    pub fn in_group(mut self, group: ModuleGroupId) -> Self {
+        self.groups.insert(group);
+        self
+    }
+
+    pub fn depends_on(mut self, dependency: ModuleId) -> Self {
+        if !self.dependencies.contains(&dependency) {
+            self.dependencies.push(dependency);
+        }
+        self
+    }
+
+    pub fn module(&self) -> &ModuleId {
+        &self.module
+    }
+
+    pub fn peer_context(&self) -> Option<&str> {
+        self.peer_context.as_deref()
+    }
+
+    pub fn policy(&self) -> &ModulePolicy {
+        &self.policy
+    }
+
+    pub fn replica_capacity(&self) -> u8 {
+        self.replica_capacity
+    }
+
+    pub fn initial_activation(&self) -> ActivationRatio {
+        self.initial_activation
+    }
+
+    pub fn groups(&self) -> &BTreeSet<ModuleGroupId> {
+        &self.groups
+    }
+
+    pub fn dependencies(&self) -> &[ModuleId] {
+        &self.dependencies
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ModuleCatalogEntry {
+    module: ModuleId,
+    peer_context: Option<Arc<str>>,
+    groups: BTreeSet<ModuleGroupId>,
+    replica_range: ReplicaCapRange,
+    replica_capacity: u8,
+    initial_activation: ActivationRatio,
+    bpm_range_bits: (u64, u64),
+    activation_curve_bits: [(u64, u64); 3],
+    zero_replica_window: ZeroReplicaWindowPolicy,
+}
+
+/// Immutable catalog of the module roles registered in one agent environment.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ModuleCatalog {
+    entries: Arc<[ModuleCatalogEntry]>,
+    dependency_edges: Arc<[(ModuleId, ModuleId)]>,
+}
+
+impl ModuleCatalog {
+    fn from_registrations(
+        registrations: &[ModuleRegistration],
+        dependencies: &[(ModuleId, ModuleId)],
+    ) -> Self {
+        let entries = registrations
+            .iter()
+            .map(|registration| {
+                let policy = &registration.spec.policy;
+                let curve_at = |activation| {
+                    let (replicas, rate) = (policy.activation_ratio_fn)(activation);
+                    (replicas.as_f64().to_bits(), rate.as_f64().to_bits())
+                };
+                ModuleCatalogEntry {
+                    module: registration.spec.module.clone(),
+                    peer_context: registration.spec.peer_context.clone(),
+                    groups: registration.spec.groups.clone(),
+                    replica_range: policy.replicas_range,
+                    replica_capacity: registration.spec.replica_capacity,
+                    initial_activation: registration.spec.initial_activation,
+                    bpm_range_bits: (
+                        policy.rate_limit_range.start().as_f64().to_bits(),
+                        policy.rate_limit_range.end().as_f64().to_bits(),
+                    ),
+                    activation_curve_bits: [
+                        curve_at(ActivationRatio::ZERO),
+                        curve_at(ActivationRatio::from_f64(0.5)),
+                        curve_at(ActivationRatio::ONE),
+                    ],
+                    zero_replica_window: policy.zero_replica_window,
+                }
+            })
+            .collect::<Vec<_>>();
+        Self {
+            entries: entries.into(),
+            dependency_edges: dependencies.to_vec().into(),
+        }
+    }
+
+    pub fn members(&self, group: &ModuleGroupId) -> Vec<ModuleId> {
+        self.entries
+            .iter()
+            .filter(|entry| entry.groups.contains(group))
+            .map(|entry| entry.module.clone())
+            .collect()
+    }
+
+    pub fn contains(&self, module: &ModuleId) -> bool {
+        self.entries.iter().any(|entry| &entry.module == module)
+    }
+}
 
 /// Provides [capabilities](crate) at agent boot.
 ///
@@ -80,6 +251,7 @@ struct CapabilityProvidersInner {
     session_store: Rc<dyn SessionStore>,
     allocation_store: Rc<dyn AllocationStore>,
     memo_log_repository: Rc<dyn MemoLogRepository>,
+    module_catalog: OnceLock<ModuleCatalog>,
 }
 
 /// Owner-stamped handle for requesting another scheduler pass for the holder.
@@ -339,6 +511,7 @@ impl CapabilityProviders {
                 session_store,
                 allocation_store,
                 memo_log_repository,
+                module_catalog: OnceLock::new(),
             }),
         }
     }
@@ -360,22 +533,28 @@ impl CapabilityProviders {
         }
     }
 
-    pub(crate) async fn set_module_policies(&self, policies: Vec<(ModuleId, ModulePolicy)>) {
-        self.inner
-            .blackboard
-            .apply(BlackboardCommand::SetModulePolicies { policies })
-            .await;
-    }
-
-    pub(crate) async fn set_module_replica_capacities(&self, capacities: Vec<(ModuleId, u8)>) {
-        self.inner
-            .blackboard
-            .apply(BlackboardCommand::SetModuleReplicaCapacities { capacities })
-            .await;
-    }
-
-    pub(crate) fn set_module_contexts(&self, peer_contexts: Vec<(ModuleId, &'static str)>) {
+    pub(crate) fn set_module_contexts(&self, peer_contexts: Vec<(ModuleId, Arc<str>)>) {
         self.inner.blackboard.set_module_contexts(peer_contexts);
+    }
+
+    fn install_module_catalog(&self, catalog: ModuleCatalog) -> Result<(), ModuleRegistryError> {
+        if let Some(installed) = self.inner.module_catalog.get() {
+            if installed == &catalog {
+                return Ok(());
+            }
+            return Err(ModuleRegistryError::CatalogChangedAfterBoot);
+        }
+        self.inner
+            .module_catalog
+            .set(catalog)
+            .map_err(|_| ModuleRegistryError::CatalogChangedAfterBoot)
+    }
+
+    async fn set_registered_modules(&self, registrations: Vec<RegisteredModulePolicy>) {
+        self.inner
+            .blackboard
+            .apply(BlackboardCommand::SetRegisteredModules { registrations })
+            .await;
     }
 
     pub(crate) async fn apply_runtime_policy(&self) {
@@ -629,7 +808,7 @@ impl AgentRuntimeControl {
     /// Snapshot of the registered-module peer-context catalog. Cheap
     /// synchronous read; the scheduler turns this into an [`ActivateCx`] for
     /// each `activate` call.
-    pub fn peer_contexts(&self) -> Vec<(ModuleId, &'static str)> {
+    pub fn peer_contexts(&self) -> Vec<(ModuleId, Arc<str>)> {
         self.blackboard.peer_contexts().to_vec()
     }
 
@@ -899,6 +1078,16 @@ impl ModuleCapabilityFactory {
         &self.owner
     }
 
+    /// The immutable catalog compiled from all registrations before any
+    /// module constructor runs.
+    pub fn module_catalog(&self) -> &ModuleCatalog {
+        self.root
+            .inner
+            .module_catalog
+            .get()
+            .expect("module catalog is installed before module construction")
+    }
+
     pub fn self_wake(&self) -> SelfWake {
         SelfWake::new(
             self.owner.clone(),
@@ -984,11 +1173,14 @@ impl ModuleCapabilityFactory {
         )
     }
 
-    pub fn activation_gate_for<M: Module + 'static>(&self) -> crate::ActivationGate<M> {
+    pub fn activation_gate_for<M: Module + 'static>(
+        &self,
+        target: ModuleId,
+    ) -> crate::ActivationGate<M> {
         self.root
             .inner
             .activation_gates
-            .subscribe::<M>(self.owner.clone())
+            .subscribe::<M>(self.owner.clone(), target)
     }
 
     fn claim_memo(&self) {
@@ -1379,20 +1571,14 @@ impl fmt::Debug for ModuleRegistry {
 }
 
 struct ModuleRegistration {
-    module: ModuleId,
-    peer_context: Option<&'static str>,
-    policy: ModulePolicy,
-    replica_capacity: u8,
+    spec: ModuleRegistrationSpec,
     builder: ErasedModuleBuilder,
 }
 
 impl fmt::Debug for ModuleRegistration {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ModuleRegistration")
-            .field("module", &self.module)
-            .field("peer_context", &self.peer_context)
-            .field("policy", &self.policy)
-            .field("replica_capacity", &self.replica_capacity)
+            .field("spec", &self.spec)
             .finish_non_exhaustive()
     }
 }
@@ -1450,76 +1636,40 @@ impl ModuleRegistry {
         }
 
         self.registrations
-            .retain(|registration| !removed.contains(&registration.module));
+            .retain(|registration| !removed.contains(&registration.spec.module));
         self.dependencies.retain(|(dependent, dependency)| {
             !removed.contains(dependent) && !removed.contains(dependency)
         });
         self
     }
 
-    /// Register a module type with its boot-time policy. The module's identity
-    /// and peer prompt catalog entry come from [`Module::id`] and
-    /// [`Module::peer_context`].
+    /// Register a module implementation under the explicit boot-time role in
+    /// `spec`. The same concrete module type may be registered under multiple
+    /// distinct ids.
     pub fn register<B>(
         mut self,
-        policy: ModulePolicy,
+        spec: ModuleRegistrationSpec,
         builder: B,
     ) -> Result<Self, ModuleRegistryError>
     where
         B: ModuleRegisterer + 'static,
     {
-        let module = ModuleId::new(<B::Module as Module>::id())?;
-        let peer_context = <B::Module as Module>::peer_context();
+        let module = spec.module.clone();
         if self
             .registrations
             .iter()
-            .any(|registration| registration.module == module)
+            .any(|registration| registration.spec.module == module)
         {
             return Err(ModuleRegistryError::DuplicateModule { module });
         }
-        let replica_capacity = policy.max_active_replicas();
-        self.registrations.push(ModuleRegistration {
-            module,
-            peer_context,
-            policy,
-            replica_capacity,
-            builder: Rc::new(move |caps| {
-                let future = builder(caps);
-                Box::pin(async move {
-                    future
-                        .await
-                        .map(|module| Box::new(module) as Box<dyn ErasedModule>)
-                })
-            }),
-        });
-        Ok(self)
-    }
-
-    pub fn register_with_replica_capacity<B>(
-        mut self,
-        policy: ModulePolicy,
-        replica_capacity: u8,
-        builder: B,
-    ) -> Result<Self, ModuleRegistryError>
-    where
-        B: ModuleRegisterer + 'static,
-    {
-        let module = ModuleId::new(<B::Module as Module>::id())?;
-        let peer_context = <B::Module as Module>::peer_context();
-        if self
-            .registrations
-            .iter()
-            .any(|registration| registration.module == module)
-        {
-            return Err(ModuleRegistryError::DuplicateModule { module });
-        }
+        let replica_capacity = spec.replica_capacity;
         if replica_capacity > ReplicaCapRange::V1_MAX {
             return Err(ModuleRegistryError::ReplicaCapacityAboveV1Max {
                 module,
                 capacity: replica_capacity,
             });
         }
-        let policy_capacity = policy.max_active_replicas();
+        let policy_capacity = spec.policy.max_active_replicas();
         if replica_capacity < policy_capacity {
             return Err(ModuleRegistryError::ReplicaCapacityBelowPolicyMax {
                 module,
@@ -1527,11 +1677,14 @@ impl ModuleRegistry {
                 policy_capacity,
             });
         }
+        self.dependencies.extend(
+            spec.dependencies
+                .iter()
+                .cloned()
+                .map(|dependency| (spec.module.clone(), dependency)),
+        );
         self.registrations.push(ModuleRegistration {
-            module,
-            peer_context,
-            policy,
-            replica_capacity,
+            spec,
             builder: Rc::new(move |caps| {
                 let future = builder(caps);
                 Box::pin(async move {
@@ -1549,19 +1702,19 @@ impl ModuleRegistry {
         caps: &CapabilityProviders,
     ) -> Result<AllocatedModules, ModuleRegistryError> {
         let dependencies = self.compile_dependencies()?;
+        let catalog = ModuleCatalog::from_registrations(&self.registrations, &self.dependencies);
+        caps.install_module_catalog(catalog)?;
 
         caps.apply_runtime_policy().await;
-        caps.set_module_policies(
+        caps.set_registered_modules(
             self.registrations
                 .iter()
-                .map(|registration| (registration.module.clone(), registration.policy.clone()))
-                .collect(),
-        )
-        .await;
-        caps.set_module_replica_capacities(
-            self.registrations
-                .iter()
-                .map(|registration| (registration.module.clone(), registration.replica_capacity))
+                .map(|registration| RegisteredModulePolicy {
+                    module: registration.spec.module.clone(),
+                    policy: registration.spec.policy.clone(),
+                    replica_capacity: registration.spec.replica_capacity,
+                    initial_activation: registration.spec.initial_activation,
+                })
                 .collect(),
         )
         .await;
@@ -1582,8 +1735,10 @@ impl ModuleRegistry {
                 .iter()
                 .filter_map(|registration| {
                     registration
+                        .spec
                         .peer_context
-                        .map(|context| (registration.module.clone(), context))
+                        .clone()
+                        .map(|context| (registration.spec.module.clone(), context))
                 })
                 .collect(),
         );
@@ -1591,10 +1746,12 @@ impl ModuleRegistry {
         for registration in &self.registrations {
             // Build every possible replica up to the registered max, with a
             // replica-0 floor so inactive modules can retain queued messages.
-            let total_replicas = registration.replica_capacity;
+            let total_replicas = registration.spec.replica_capacity;
             for replica in 0..total_replicas {
-                let owner =
-                    ModuleInstanceId::new(registration.module.clone(), ReplicaIndex::new(replica));
+                let owner = ModuleInstanceId::new(
+                    registration.spec.module.clone(),
+                    ReplicaIndex::new(replica),
+                );
                 let scoped = caps.scoped(owner.clone());
                 modules.push(AllocatedModule::new(
                     owner,
@@ -1615,7 +1772,7 @@ impl ModuleRegistry {
         let registered = self
             .registrations
             .iter()
-            .map(|registration| &registration.module)
+            .map(|registration| &registration.spec.module)
             .collect::<HashSet<_>>();
         let mut deps_of = HashMap::<ModuleId, Vec<ModuleId>>::new();
         let mut dependents_of = HashMap::<ModuleId, Vec<ModuleId>>::new();
@@ -1711,6 +1868,10 @@ pub enum ModuleRegistryError {
     ModuleId(#[from] nuillu_types::ModuleIdParseError),
     #[error("module {module} is already registered")]
     DuplicateModule { module: ModuleId },
+    #[error(
+        "module catalog changed after this agent environment booted; create a new environment to apply registration changes"
+    )]
+    CatalogChangedAfterBoot,
     #[error("module {module} replica capacity {capacity} exceeds v1 limit")]
     ReplicaCapacityAboveV1Max { module: ModuleId, capacity: u8 },
     #[error(
@@ -2104,9 +2265,7 @@ mod tests {
     struct NoopModule;
 
     #[async_trait(?Send)]
-    impl Module for NoopModule {
-        type Batch = ();
-
+    impl StaticModule for NoopModule {
         fn id() -> &'static str {
             "noop"
         }
@@ -2114,6 +2273,11 @@ mod tests {
         fn peer_context() -> Option<&'static str> {
             Some("test stub")
         }
+    }
+
+    #[async_trait(?Send)]
+    impl Module for NoopModule {
+        type Batch = ();
 
         async fn next_batch(&mut self) -> anyhow::Result<Self::Batch> {
             Ok(())
@@ -2135,9 +2299,7 @@ mod tests {
     struct NoPeerContextModule;
 
     #[async_trait(?Send)]
-    impl Module for NoPeerContextModule {
-        type Batch = ();
-
+    impl StaticModule for NoPeerContextModule {
         fn id() -> &'static str {
             "no-peer-context"
         }
@@ -2145,6 +2307,11 @@ mod tests {
         fn peer_context() -> Option<&'static str> {
             None
         }
+    }
+
+    #[async_trait(?Send)]
+    impl Module for NoPeerContextModule {
+        type Batch = ();
 
         async fn next_batch(&mut self) -> anyhow::Result<Self::Batch> {
             Ok(())
@@ -2165,14 +2332,18 @@ mod tests {
         Ok(NoPeerContextModule)
     }
 
+    fn static_spec<M: StaticModule>(policy: ModulePolicy) -> ModuleRegistrationSpec {
+        ModuleRegistrationSpec::for_static::<M>(policy, ActivationRatio::ZERO).unwrap()
+    }
+
     #[test]
     fn register_rejects_duplicate_module_ids() {
         let registry = ModuleRegistry::new()
-            .register(test_policy(0..=0), noop_builder)
+            .register(static_spec::<NoopModule>(test_policy(0..=0)), noop_builder)
             .unwrap();
 
         let err = registry
-            .register(test_policy(0..=0), noop_builder)
+            .register(static_spec::<NoopModule>(test_policy(0..=0)), noop_builder)
             .unwrap_err();
 
         let expected = nuillu_types::ModuleId::new(NoopModule::id()).unwrap();
@@ -2187,7 +2358,10 @@ mod tests {
         let blackboard = Blackboard::default();
         let caps = test_caps(blackboard.clone());
         let allocated = ModuleRegistry::new()
-            .register_with_replica_capacity(test_policy(0..=1), 2, noop_builder)
+            .register(
+                static_spec::<NoopModule>(test_policy(0..=1)).with_replica_capacity(2),
+                noop_builder,
+            )
             .unwrap()
             .build(&caps)
             .await
@@ -2216,9 +2390,12 @@ mod tests {
         let blackboard = Blackboard::default();
         let caps = test_caps(blackboard.clone());
         ModuleRegistry::new()
-            .register(test_policy(0..=0), noop_builder)
+            .register(static_spec::<NoopModule>(test_policy(0..=0)), noop_builder)
             .unwrap()
-            .register(test_policy(0..=0), no_peer_context_builder)
+            .register(
+                static_spec::<NoPeerContextModule>(test_policy(0..=0)),
+                no_peer_context_builder,
+            )
             .unwrap()
             .build(&caps)
             .await
@@ -2228,8 +2405,193 @@ mod tests {
 
         assert_eq!(
             blackboard.peer_contexts().to_vec(),
-            vec![(noop, "test stub")]
+            vec![(noop, Arc::from("test stub"))]
         );
+    }
+
+    #[tokio::test]
+    async fn dynamic_registrations_reuse_one_module_type_with_distinct_roles() {
+        let blackboard = Blackboard::default();
+        let caps = test_caps(blackboard.clone());
+        let alpha = ModuleId::new("mcp-alpha").unwrap();
+        let beta = ModuleId::new("mcp-beta").unwrap();
+        let group = ModuleGroupId::new("external-tools").unwrap();
+        let built_owners = Rc::new(RefCell::new(Vec::new()));
+        let catalog_seen_during_build = Rc::new(RefCell::new(Vec::new()));
+
+        let alpha_owners = Rc::clone(&built_owners);
+        let alpha_catalog = Rc::clone(&catalog_seen_during_build);
+        let alpha_group = group.clone();
+        let beta_owners = Rc::clone(&built_owners);
+        let allocated = ModuleRegistry::new()
+            .register(
+                ModuleRegistrationSpec::new(
+                    alpha.clone(),
+                    test_policy(0..=1),
+                    ActivationRatio::ONE,
+                )
+                .with_peer_context(Arc::<str>::from("alpha tools"))
+                .in_group(group.clone()),
+                move |caps| {
+                    let alpha_owners = Rc::clone(&alpha_owners);
+                    let alpha_catalog = Rc::clone(&alpha_catalog);
+                    let alpha_group = alpha_group.clone();
+                    async move {
+                        *alpha_catalog.borrow_mut() = caps.module_catalog().members(&alpha_group);
+                        alpha_owners.borrow_mut().push(caps.owner().clone());
+                        Ok(NoopModule)
+                    }
+                },
+            )
+            .unwrap()
+            .register(
+                ModuleRegistrationSpec::new(
+                    beta.clone(),
+                    test_policy(0..=1),
+                    ActivationRatio::from_f64(0.5),
+                )
+                .with_peer_context(Arc::<str>::from("beta tools"))
+                .in_group(group.clone())
+                .depends_on(alpha.clone()),
+                move |caps| {
+                    let beta_owners = Rc::clone(&beta_owners);
+                    async move {
+                        beta_owners.borrow_mut().push(caps.owner().clone());
+                        Ok(NoopModule)
+                    }
+                },
+            )
+            .unwrap()
+            .build(&caps)
+            .await
+            .unwrap();
+
+        assert_eq!(allocated.len(), 2);
+        assert_eq!(
+            built_owners.borrow().as_slice(),
+            &[
+                ModuleInstanceId::new(alpha.clone(), ReplicaIndex::ZERO),
+                ModuleInstanceId::new(beta.clone(), ReplicaIndex::ZERO),
+            ]
+        );
+        assert_eq!(
+            allocated.dependencies().deps_of(&beta),
+            std::slice::from_ref(&alpha)
+        );
+        assert_eq!(
+            catalog_seen_during_build.borrow().as_slice(),
+            &[alpha.clone(), beta.clone()]
+        );
+        let (alpha_activation, beta_activation) = blackboard
+            .read(|bb| {
+                (
+                    bb.allocation().activation_for(&alpha),
+                    bb.allocation().activation_for(&beta),
+                )
+            })
+            .await;
+        assert_eq!(alpha_activation, ActivationRatio::ONE);
+        assert_eq!(beta_activation, ActivationRatio::from_f64(0.5));
+        assert_eq!(
+            caps.scoped(ModuleInstanceId::new(alpha, ReplicaIndex::ZERO))
+                .module_catalog()
+                .members(&group),
+            vec![ModuleId::new("mcp-alpha").unwrap(), beta]
+        );
+    }
+
+    #[tokio::test]
+    async fn registry_build_preserves_existing_base_activation() {
+        let module = ModuleId::new("mcp-existing").unwrap();
+        let mut base = ResourceAllocation::default();
+        base.set_activation(module.clone(), ActivationRatio::from_f64(0.25));
+        let blackboard = Blackboard::with_allocation(base);
+        let caps = test_caps(blackboard.clone());
+
+        ModuleRegistry::new()
+            .register(
+                ModuleRegistrationSpec::new(
+                    module.clone(),
+                    test_policy(0..=1),
+                    ActivationRatio::ONE,
+                ),
+                noop_builder,
+            )
+            .unwrap()
+            .build(&caps)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            blackboard
+                .read(|bb| bb.allocation().activation_for(&module))
+                .await,
+            ActivationRatio::from_f64(0.25)
+        );
+    }
+
+    #[tokio::test]
+    async fn environment_rejects_a_different_catalog_after_boot() {
+        let module = ModuleId::new("mcp-stable").unwrap();
+        let blackboard = Blackboard::default();
+        let caps = test_caps(blackboard.clone());
+        let original =
+            ModuleRegistrationSpec::new(module.clone(), test_policy(0..=1), ActivationRatio::ONE)
+                .with_peer_context(Arc::<str>::from("stable tools"));
+
+        ModuleRegistry::new()
+            .register(original, noop_builder)
+            .unwrap()
+            .build(&caps)
+            .await
+            .unwrap();
+        let changed = ModuleRegistrationSpec::new(module, test_policy(0..=1), ActivationRatio::ONE)
+            .with_peer_context(Arc::<str>::from("changed tools"));
+
+        let result = ModuleRegistry::new()
+            .register(changed, noop_builder)
+            .unwrap()
+            .build(&caps)
+            .await;
+        let error = match result {
+            Ok(_) => panic!("changed catalog unexpectedly rebuilt"),
+            Err(error) => error,
+        };
+
+        assert!(matches!(
+            error,
+            ModuleRegistryError::CatalogChangedAfterBoot
+        ));
+        assert_eq!(
+            blackboard.peer_contexts(),
+            &[(
+                ModuleId::new("mcp-stable").unwrap(),
+                Arc::<str>::from("stable tools")
+            )]
+        );
+    }
+
+    #[tokio::test]
+    async fn environment_allows_rebuilding_the_same_catalog() {
+        let module = ModuleId::new("mcp-rebuild").unwrap();
+        let blackboard = Blackboard::default();
+        let caps = test_caps(blackboard);
+
+        for _ in 0..2 {
+            let spec = ModuleRegistrationSpec::new(
+                module.clone(),
+                test_policy(0..=1),
+                ActivationRatio::ONE,
+            )
+            .with_peer_context(Arc::<str>::from("rebuild tools"));
+            let allocated = ModuleRegistry::new()
+                .register(spec, noop_builder)
+                .unwrap()
+                .build(&caps)
+                .await
+                .unwrap();
+            assert_eq!(allocated.len(), 1);
+        }
     }
 
     #[tokio::test]
@@ -2237,9 +2599,12 @@ mod tests {
         let blackboard = Blackboard::default();
         let caps = test_caps(blackboard.clone());
         let allocated = ModuleRegistry::new()
-            .register(test_policy(0..=1), noop_builder)
+            .register(static_spec::<NoopModule>(test_policy(0..=1)), noop_builder)
             .unwrap()
-            .register(test_policy(0..=1), no_peer_context_builder)
+            .register(
+                static_spec::<NoPeerContextModule>(test_policy(0..=1)),
+                no_peer_context_builder,
+            )
             .unwrap()
             .remove_module(nuillu_types::ModuleId::new(NoopModule::id()).unwrap())
             .build(&caps)
@@ -2268,9 +2633,12 @@ mod tests {
         let dependent = nuillu_types::ModuleId::new(NoopModule::id()).unwrap();
         let dependency = nuillu_types::ModuleId::new(NoPeerContextModule::id()).unwrap();
         let allocated = ModuleRegistry::new()
-            .register(test_policy(0..=1), noop_builder)
+            .register(static_spec::<NoopModule>(test_policy(0..=1)), noop_builder)
             .unwrap()
-            .register(test_policy(0..=1), no_peer_context_builder)
+            .register(
+                static_spec::<NoPeerContextModule>(test_policy(0..=1)),
+                no_peer_context_builder,
+            )
             .unwrap()
             .depends_on(dependent.clone(), dependency.clone())
             .remove_modules([dependency.clone()])
@@ -3026,9 +3394,12 @@ mod tests {
         let caps = test_caps_with_allocation_store(blackboard.clone(), Rc::new(store));
 
         ModuleRegistry::new()
-            .register(test_policy(0..=1), noop_builder)
+            .register(static_spec::<NoopModule>(test_policy(0..=1)), noop_builder)
             .unwrap()
-            .register(test_policy(0..=1), no_peer_context_builder)
+            .register(
+                static_spec::<NoPeerContextModule>(test_policy(0..=1)),
+                no_peer_context_builder,
+            )
             .unwrap()
             .build(&caps)
             .await
@@ -3083,7 +3454,7 @@ mod tests {
         );
 
         ModuleRegistry::new()
-            .register(test_policy(0..=1), noop_builder)
+            .register(static_spec::<NoopModule>(test_policy(0..=1)), noop_builder)
             .unwrap()
             .build(&caps)
             .await
@@ -3127,7 +3498,7 @@ mod tests {
         let caps = test_caps_with_cognition_repo(blackboard.clone(), Rc::new(repo));
 
         ModuleRegistry::new()
-            .register(test_policy(0..=1), noop_builder)
+            .register(static_spec::<NoopModule>(test_policy(0..=1)), noop_builder)
             .unwrap()
             .build(&caps)
             .await

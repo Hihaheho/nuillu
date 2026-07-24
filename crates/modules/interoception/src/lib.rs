@@ -679,9 +679,7 @@ fn return_toward_zero(value: f32, step: f32) -> f32 {
 }
 
 #[async_trait(?Send)]
-impl Module for InteroceptionModule {
-    type Batch = InteroceptionBatch;
-
+impl nuillu_module::StaticModule for InteroceptionModule {
     fn id() -> &'static str {
         "interoception"
     }
@@ -689,6 +687,11 @@ impl Module for InteroceptionModule {
     fn peer_context() -> Option<&'static str> {
         None
     }
+}
+
+#[async_trait(?Send)]
+impl Module for InteroceptionModule {
+    type Batch = InteroceptionBatch;
 
     async fn next_batch(&mut self) -> Result<Self::Batch> {
         InteroceptionModule::next_batch(self).await
@@ -1158,22 +1161,29 @@ mod tests {
         caps: &CapabilityProviders,
     ) -> nuillu_module::AllocatedModule {
         let modules = ModuleRegistry::new()
-            .register(module_policy(), |caps| async move {
-                Ok(InteroceptionModule::new(
-                    caps.memo_updated_inbox(),
-                    caps.cognition_log_updated_inbox(),
-                    caps.blackboard_reader(),
-                    caps.interoception_policy(),
-                    caps.interoception_writer(),
-                    caps.llm("main")
-                        .with_tier(nuillu_types::ModelTier::Cheap)
-                        .into(),
-                    caps.session("main")
-                        .with_tier(nuillu_types::ModelTier::Cheap)
-                        .with_auto_compaction(session_auto_compaction())
-                        .await?,
-                ))
-            })
+            .register(
+                nuillu_module::ModuleRegistrationSpec::for_static::<InteroceptionModule>(
+                    module_policy(),
+                    nuillu_blackboard::ActivationRatio::ZERO,
+                )
+                .unwrap(),
+                |caps| async move {
+                    Ok(InteroceptionModule::new(
+                        caps.memo_updated_inbox(),
+                        caps.cognition_log_updated_inbox(),
+                        caps.blackboard_reader(),
+                        caps.interoception_policy(),
+                        caps.interoception_writer(),
+                        caps.llm("main")
+                            .with_tier(nuillu_types::ModelTier::Cheap)
+                            .into(),
+                        caps.session("main")
+                            .with_tier(nuillu_types::ModelTier::Cheap)
+                            .with_auto_compaction(session_auto_compaction())
+                            .await?,
+                    ))
+                },
+            )
             .unwrap()
             .build(caps)
             .await

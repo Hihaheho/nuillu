@@ -114,9 +114,7 @@ impl PredictModule {
 }
 
 #[async_trait(?Send)]
-impl Module for PredictModule {
-    type Batch = ();
-
+impl nuillu_module::StaticModule for PredictModule {
     fn id() -> &'static str {
         "predict"
     }
@@ -126,6 +124,11 @@ impl Module for PredictModule {
             "Predict forms expectations about what may happen next from the current cognitive state.",
         )
     }
+}
+
+#[async_trait(?Send)]
+impl Module for PredictModule {
+    type Batch = ();
 
     async fn next_batch(&mut self) -> Result<Self::Batch> {
         PredictModule::next_batch(self).await

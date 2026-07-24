@@ -243,7 +243,7 @@ impl SensoryModule {
     ) -> Self {
         let next_one_shot_sequence = next_one_shot_sequence_from_session(&one_shot_session);
         Self {
-            owner: nuillu_types::ModuleId::new(<Self as Module>::id())
+            owner: nuillu_types::ModuleId::new(<Self as nuillu_module::StaticModule>::id())
                 .expect("sensory id is valid"),
             inbox,
             memo,
@@ -1150,9 +1150,7 @@ fn is_participant_name_char(ch: char) -> bool {
 }
 
 #[async_trait(?Send)]
-impl Module for SensoryModule {
-    type Batch = SensoryBatch;
-
+impl nuillu_module::StaticModule for SensoryModule {
     fn id() -> &'static str {
         "sensory"
     }
@@ -1160,6 +1158,11 @@ impl Module for SensoryModule {
     fn peer_context() -> Option<&'static str> {
         None
     }
+}
+
+#[async_trait(?Send)]
+impl Module for SensoryModule {
+    type Batch = SensoryBatch;
 
     async fn next_batch(&mut self) -> Result<Self::Batch> {
         SensoryModule::next_batch(self).await
@@ -1222,17 +1225,19 @@ mod tests {
         recorder: SensoryTestRecorder,
     }
 
-    #[async_trait(?Send)]
-    impl Module for RecordingSensoryModule {
-        type Batch = SensoryBatch;
-
+    impl nuillu_module::StaticModule for RecordingSensoryModule {
         fn id() -> &'static str {
-            SensoryModule::id()
+            <SensoryModule as nuillu_module::StaticModule>::id()
         }
 
         fn peer_context() -> Option<&'static str> {
-            SensoryModule::peer_context()
+            <SensoryModule as nuillu_module::StaticModule>::peer_context()
         }
+    }
+
+    #[async_trait(?Send)]
+    impl Module for RecordingSensoryModule {
+        type Batch = SensoryBatch;
 
         async fn next_batch(&mut self) -> Result<Self::Batch> {
             self.inner.next_batch().await
@@ -1465,34 +1470,41 @@ mod tests {
         session_history: Vec<String>,
     ) -> nuillu_module::AllocatedModules {
         ModuleRegistry::new()
-            .register(test_policy(), move |caps| {
-                let recorder = recorder.clone();
-                let session_history = session_history.clone();
-                async move {
-                    let mut inner = SensoryModule::new(
-                        caps.sensory_input_inbox(),
-                        caps.memo(),
-                        caps.scene_reader(),
-                        caps.clock(),
-                        caps.llm("one-shot")
-                            .with_tier(nuillu_types::ModelTier::Cheap)
-                            .into(),
-                        caps.session("one-shot")
-                            .with_tier(nuillu_types::ModelTier::Cheap)
-                            .with_auto_compaction(one_shot_session_auto_compaction())
-                            .await?,
-                        caps.session("ambient")
-                            .with_tier(nuillu_types::ModelTier::Cheap)
-                            .with_auto_compaction(ambient_session_auto_compaction())
-                            .await?,
-                    )
-                    .with_burst_config(burst);
-                    for item in &session_history {
-                        inner.one_shot_session.push_user(item.clone());
+            .register(
+                nuillu_module::ModuleRegistrationSpec::for_static::<RecordingSensoryModule>(
+                    test_policy(),
+                    nuillu_blackboard::ActivationRatio::ZERO,
+                )
+                .unwrap(),
+                move |caps| {
+                    let recorder = recorder.clone();
+                    let session_history = session_history.clone();
+                    async move {
+                        let mut inner = SensoryModule::new(
+                            caps.sensory_input_inbox(),
+                            caps.memo(),
+                            caps.scene_reader(),
+                            caps.clock(),
+                            caps.llm("one-shot")
+                                .with_tier(nuillu_types::ModelTier::Cheap)
+                                .into(),
+                            caps.session("one-shot")
+                                .with_tier(nuillu_types::ModelTier::Cheap)
+                                .with_auto_compaction(one_shot_session_auto_compaction())
+                                .await?,
+                            caps.session("ambient")
+                                .with_tier(nuillu_types::ModelTier::Cheap)
+                                .with_auto_compaction(ambient_session_auto_compaction())
+                                .await?,
+                        )
+                        .with_burst_config(burst);
+                        for item in &session_history {
+                            inner.one_shot_session.push_user(item.clone());
+                        }
+                        Ok(RecordingSensoryModule { inner, recorder })
                     }
-                    Ok(RecordingSensoryModule { inner, recorder })
-                }
-            })
+                },
+            )
             .unwrap()
             .build(caps)
             .await
