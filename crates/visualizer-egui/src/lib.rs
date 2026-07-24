@@ -14,6 +14,25 @@
 //!     visualizer.show(ui).into_messages()
 //! }
 //! ```
+//!
+//! A host can layer its own FTL over the embedded translations. The host may
+//! provide the source with its own `include_str!` or load it at runtime.
+//!
+//! ```
+//! use nuillu_visualizer_egui::{
+//!     egui, Locale, Visualizer, VisualizerConfig, VisualizerUiResources,
+//! };
+//!
+//! let resources = VisualizerUiResources::builder()
+//!     .add_ftl(Locale::EnUs, "menu-zoom = Host zoom")
+//!     .build()?;
+//! let visualizer = Visualizer::with_resources(
+//!     egui::Id::new("host-visualizer"),
+//!     VisualizerConfig::default(),
+//!     resources,
+//! );
+//! # Ok::<(), String>(())
+//! ```
 
 pub mod blackboard;
 pub mod chat;
@@ -42,8 +61,8 @@ use font_kit::family_name::FamilyName;
 use font_kit::handle::Handle;
 use font_kit::properties::{Properties, Weight};
 use font_kit::source::SystemSource;
-use i18n::{EguiI18nExt as _, I18nArg, I18nCatalog, LOCALE_PERSISTENCE_KEY};
-pub use i18n::{Locale, VisualizerUiResources};
+use i18n::{EguiI18nExt as _, LOCALE_PERSISTENCE_KEY};
+pub use i18n::{I18nArg, Locale, VisualizerUiResources, VisualizerUiResourcesBuilder};
 use nuillu_module::{ActionAffordance, RuntimeEvent};
 pub use nuillu_visualizer_protocol::*;
 
@@ -109,7 +128,7 @@ pub struct Visualizer {
     id: egui::Id,
     config: VisualizerConfig,
     initialized: bool,
-    i18n_catalog: I18nCatalog,
+    ui_resources: VisualizerUiResources,
     current_locale: Locale,
     zoom_persistence_applied: bool,
     zoom_percent_input: String,
@@ -125,13 +144,21 @@ impl Visualizer {
     }
 
     pub fn with_config(id: egui::Id, config: VisualizerConfig) -> Self {
-        let i18n_catalog =
-            I18nCatalog::embedded().expect("embedded visualizer translations should be valid");
+        let ui_resources = VisualizerUiResources::embedded()
+            .expect("embedded visualizer translations should be valid");
+        Self::with_resources(id, config, ui_resources)
+    }
+
+    pub fn with_resources(
+        id: egui::Id,
+        config: VisualizerConfig,
+        ui_resources: VisualizerUiResources,
+    ) -> Self {
         Self {
             id,
             config,
             initialized: false,
-            i18n_catalog,
+            ui_resources,
             current_locale: config.default_locale,
             zoom_persistence_applied: false,
             zoom_percent_input: format_zoom_percent(DEFAULT_ZOOM_FACTOR),
@@ -161,7 +188,7 @@ impl Visualizer {
 
     fn install_locale(&mut self, ctx: &egui::Context, locale: Locale) {
         self.current_locale = locale;
-        ctx.install_i18n(self.i18n_catalog.for_locale(locale));
+        ctx.install_i18n(self.ui_resources.for_locale(locale));
     }
 }
 
@@ -1997,9 +2024,31 @@ mod tests {
 
     fn test_i18n_context(locale: Locale) -> egui::Context {
         let ctx = egui::Context::default();
-        let catalog = I18nCatalog::embedded().expect("embedded translations load");
-        ctx.install_i18n(catalog.for_locale(locale));
+        let resources = VisualizerUiResources::embedded().expect("embedded translations load");
+        resources.install(&ctx, locale);
         ctx
+    }
+
+    #[test]
+    fn visualizer_accepts_user_ui_resources() {
+        let resources = VisualizerUiResources::builder()
+            .add_ftl(Locale::EnUs, "menu-zoom = Host zoom")
+            .build()
+            .expect("user translations load");
+        let visualizer = Visualizer::with_resources(
+            egui::Id::new("custom-resources"),
+            VisualizerConfig {
+                default_locale: Locale::EnUs,
+                ..VisualizerConfig::default()
+            },
+            resources,
+        );
+        let ctx = egui::Context::default();
+        visualizer
+            .ui_resources
+            .install(&ctx, visualizer.config.default_locale);
+
+        assert_eq!(ctx.tr("menu-zoom"), "Host zoom");
     }
 
     #[test]

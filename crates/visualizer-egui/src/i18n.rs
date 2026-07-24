@@ -52,13 +52,20 @@ impl Locale {
             Self::EnUs => "English",
         }
     }
+
+    fn language_tag(self) -> &'static str {
+        match self {
+            Self::JaJp => "ja-JP",
+            Self::EnUs => "en-US",
+        }
+    }
 }
 
-/// Embedded translations used by standalone visualizer leaf components.
+/// User and embedded translations used by visualizer components.
 ///
-/// [`crate::Visualizer`] installs these resources automatically. Lower-level
-/// public modules fall back to the default locale, while consumers can install
-/// this value explicitly to select a locale before the first frame.
+/// [`crate::Visualizer`] installs its resources automatically. Lower-level
+/// public modules fall back to the embedded default locale, while consumers can
+/// install this value explicitly to select a locale before the first frame.
 #[derive(Clone)]
 pub struct VisualizerUiResources {
     catalog: I18nCatalog,
@@ -66,13 +73,57 @@ pub struct VisualizerUiResources {
 
 impl VisualizerUiResources {
     pub fn embedded() -> Result<Self, String> {
-        Ok(Self {
-            catalog: I18nCatalog::embedded()?,
-        })
+        Self::builder().build()
+    }
+
+    pub fn builder() -> VisualizerUiResourcesBuilder {
+        VisualizerUiResourcesBuilder::default()
     }
 
     pub fn install(&self, ctx: &egui::Context, locale: Locale) {
         ctx.install_i18n(self.catalog.for_locale(locale));
+    }
+
+    /// Translates a key using the same user-plus-embedded fallback chain as the
+    /// visualizer components.
+    pub fn translate(&self, locale: Locale, id: &str) -> String {
+        self.catalog.for_locale(locale).tr(id)
+    }
+
+    /// Translates a key with Fluent arguments.
+    pub fn translate_args(&self, locale: Locale, id: &str, args: &[(&str, I18nArg<'_>)]) -> String {
+        self.catalog.for_locale(locale).tr_args(id, args)
+    }
+
+    pub(crate) fn for_locale(&self, locale: Locale) -> Arc<I18n> {
+        self.catalog.for_locale(locale)
+    }
+}
+
+/// Builds visualizer translations from user FTL followed by embedded fallbacks.
+#[derive(Debug, Default)]
+pub struct VisualizerUiResourcesBuilder {
+    ja: Vec<String>,
+    en: Vec<String>,
+}
+
+impl VisualizerUiResourcesBuilder {
+    /// Adds an FTL source for a locale.
+    ///
+    /// Sources added later have higher priority than earlier sources. User
+    /// translations have priority over embedded translations.
+    pub fn add_ftl(mut self, locale: Locale, source: impl Into<String>) -> Self {
+        match locale {
+            Locale::JaJp => self.ja.push(source.into()),
+            Locale::EnUs => self.en.push(source.into()),
+        }
+        self
+    }
+
+    pub fn build(self) -> Result<VisualizerUiResources, String> {
+        Ok(VisualizerUiResources {
+            catalog: I18nCatalog::with_user_ftl(&self.ja, &self.en)?,
+        })
     }
 }
 
@@ -84,14 +135,15 @@ pub(crate) struct I18nCatalog {
 
 impl I18nCatalog {
     pub(crate) fn embedded() -> Result<Self, String> {
-        let en = Arc::new(I18n::load(&[("en-US", EN_US_FTL)]).map_err(|error| {
-            format!("failed to load embedded en-US visualizer translations: {error}")
-        })?);
-        let ja = Arc::new(
-            I18n::load(&[("ja-JP", JA_JP_FTL), ("en-US", EN_US_FTL)]).map_err(|error| {
-                format!("failed to load embedded ja-JP visualizer translations: {error}")
-            })?,
-        );
+        Self::with_user_ftl(&[], &[])
+    }
+
+    fn with_user_ftl(ja_user: &[String], en_user: &[String]) -> Result<Self, String> {
+        let en_resources = locale_resources(Locale::EnUs, EN_US_FTL, en_user);
+        let ja_resources = locale_resources(Locale::JaJp, JA_JP_FTL, ja_user);
+
+        let en = Arc::new(I18n::load([&en_resources])?);
+        let ja = Arc::new(I18n::load([&ja_resources, &en_resources])?);
         Ok(Self { ja, en })
     }
 
@@ -103,27 +155,61 @@ impl I18nCatalog {
     }
 }
 
+struct LocaleResources<'a> {
+    locale: Locale,
+    sources: Vec<FtlSource<'a>>,
+}
+
+struct FtlSource<'a> {
+    label: String,
+    source: &'a str,
+}
+
+fn locale_resources<'a>(
+    locale: Locale,
+    embedded: &'a str,
+    user_sources: &'a [String],
+) -> LocaleResources<'a> {
+    let mut sources = vec![FtlSource {
+        label: format!("embedded `{}` FTL", locale.language_tag()),
+        source: embedded,
+    }];
+    sources.extend(
+        user_sources
+            .iter()
+            .enumerate()
+            .map(|(index, source)| FtlSource {
+                label: format!("user `{}` FTL #{}", locale.language_tag(), index + 1),
+                source,
+            }),
+    );
+    LocaleResources { locale, sources }
+}
+
 pub(crate) struct I18n {
     bundles: Vec<Bundle>,
 }
 
 impl I18n {
-    fn load(locale_chain: &[(&str, &str)]) -> Result<Self, String> {
+    fn load<'a>(
+        locale_chain: impl IntoIterator<Item = &'a LocaleResources<'a>>,
+    ) -> Result<Self, String> {
         let mut bundles = Vec::new();
 
-        for (locale, source) in locale_chain {
+        for resources in locale_chain {
+            let locale = resources.locale.language_tag();
             let langid: LanguageIdentifier = locale
                 .parse()
                 .map_err(|error| format!("invalid locale `{locale}`: {error}"))?;
-            let resource =
-                FluentResource::try_new((*source).to_string()).map_err(|(_resource, errors)| {
-                    format!("failed to parse `{locale}` FTL: {errors:?}")
-                })?;
             let mut bundle: Bundle = FluentBundle::new_concurrent(vec![langid]);
             bundle.set_use_isolating(false);
-            bundle
-                .add_resource(Arc::new(resource))
-                .map_err(|errors| format!("failed to add `{locale}` FTL: {errors:?}"))?;
+
+            for input in &resources.sources {
+                let resource = FluentResource::try_new(input.source.to_string()).map_err(
+                    |(_resource, errors)| format!("failed to parse {}: {errors:?}", input.label),
+                )?;
+                bundle.add_resource_overriding(Arc::new(resource));
+            }
             bundles.push(bundle);
         }
 
@@ -184,7 +270,7 @@ fn module_name_key(module_id: &str) -> Option<&'static str> {
 }
 
 #[derive(Debug, Clone)]
-pub(crate) enum I18nArg<'a> {
+pub enum I18nArg<'a> {
     Str(&'a str),
     Owned(String),
     Usize(usize),
@@ -339,13 +425,71 @@ mod tests {
     }
 
     #[test]
-    fn args_are_formatted() {
-        let catalog = I18nCatalog::embedded().expect("embedded translations load");
+    fn user_ftl_overrides_embedded_and_preserves_locale_fallbacks() {
+        let resources = VisualizerUiResources::builder()
+            .add_ftl(
+                Locale::JaJp,
+                "menu-zoom = ユーザー倍率\nuser-ja-only = ユーザー日本語\nuser-composed = { menu-theme-light } + ユーザー",
+            )
+            .add_ftl(
+                Locale::EnUs,
+                "i18n-fallback-probe = User English fallback\nuser-en-only = User English",
+            )
+            .build()
+            .expect("user translations load");
+        let ja = resources.for_locale(Locale::JaJp);
+        let en = resources.for_locale(Locale::EnUs);
 
         assert_eq!(
-            catalog
-                .for_locale(Locale::EnUs)
-                .tr_args("i18n-hello-name", &[("name", "egui".into())]),
+            resources.translate(Locale::JaJp, "menu-zoom"),
+            "ユーザー倍率"
+        );
+        assert_eq!(
+            resources.translate(Locale::JaJp, "user-ja-only"),
+            "ユーザー日本語"
+        );
+        assert_eq!(
+            resources.translate(Locale::JaJp, "user-composed"),
+            "ライト + ユーザー"
+        );
+        assert_eq!(ja.tr("menu-theme-light"), "ライト");
+        assert_eq!(ja.tr("user-en-only"), "User English");
+        assert_eq!(ja.tr("i18n-fallback-probe"), "User English fallback");
+        assert_eq!(en.tr("i18n-fallback-probe"), "User English fallback");
+        assert_eq!(en.tr("menu-theme-light"), "Light");
+    }
+
+    #[test]
+    fn later_user_ftl_has_higher_priority() {
+        let resources = VisualizerUiResources::builder()
+            .add_ftl(Locale::EnUs, "menu-zoom = First user value")
+            .add_ftl(Locale::EnUs, "menu-zoom = Second user value")
+            .build()
+            .expect("user translations load");
+
+        assert_eq!(
+            resources.for_locale(Locale::EnUs).tr("menu-zoom"),
+            "Second user value"
+        );
+    }
+
+    #[test]
+    fn invalid_user_ftl_reports_its_source() {
+        let error = VisualizerUiResources::builder()
+            .add_ftl(Locale::JaJp, "broken = {")
+            .build()
+            .err()
+            .expect("invalid user FTL is rejected");
+
+        assert!(error.contains("user `ja-JP` FTL #1"), "{error}");
+    }
+
+    #[test]
+    fn args_are_formatted() {
+        let resources = VisualizerUiResources::embedded().expect("embedded translations load");
+
+        assert_eq!(
+            resources.translate_args(Locale::EnUs, "i18n-hello-name", &[("name", "egui".into())],),
             "Hello, egui."
         );
     }

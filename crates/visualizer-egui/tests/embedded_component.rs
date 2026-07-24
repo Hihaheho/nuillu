@@ -1,7 +1,8 @@
+use nuillu_visualizer_egui::Locale;
 use nuillu_visualizer_egui::{
     AgentActionInvocationRequest, BlackboardSnapshot, Visualizer, VisualizerClientMessage,
     VisualizerCommand, VisualizerConfig, VisualizerEvent, VisualizerServerMessage, VisualizerTabId,
-    blackboard, egui,
+    VisualizerUiResources, blackboard, egui,
 };
 
 fn embedded_config() -> VisualizerConfig {
@@ -78,4 +79,28 @@ fn leaf_component_has_a_safe_default_i18n_context() {
     let _ = ctx.run_ui(input, |ui| {
         blackboard::ui(ui, &BlackboardSnapshot::default());
     });
+}
+
+#[test]
+fn host_ftl_combines_with_embedded_translations() {
+    let resources = VisualizerUiResources::builder()
+        .add_ftl(
+            Locale::JaJp,
+            "host-title = { menu-theme-light } + host\nmenu-zoom = Host override",
+        )
+        .build()
+        .expect("host translations load");
+
+    assert_eq!(
+        resources.translate(Locale::JaJp, "host-title"),
+        "ライト + host"
+    );
+    assert_eq!(
+        resources.translate(Locale::JaJp, "menu-zoom"),
+        "Host override"
+    );
+    assert_eq!(
+        resources.translate(Locale::JaJp, "i18n-fallback-probe"),
+        "English fallback"
+    );
 }

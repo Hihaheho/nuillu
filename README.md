@@ -41,6 +41,22 @@ cargo run -p nuillu-visualizer-egui-app -- --state <path to nuillu-exhibition>
 `Visualizer::show(ui)`, and forward the returned `VisualizerClientMessage` values
 using their own transport.
 
+Hosts can layer their FTL over the embedded fallback translations:
+
+```rust
+use nuillu_visualizer_egui::{Locale, Visualizer, VisualizerUiResources};
+
+let resources = VisualizerUiResources::builder()
+    .add_ftl(Locale::JaJp, include_str!("i18n/ja-JP/app.ftl"))
+    .add_ftl(Locale::EnUs, include_str!("i18n/en-US/app.ftl"))
+    .build()?;
+let visualizer = Visualizer::with_resources(id, config, resources);
+```
+
+For each locale, user resources override the built-in `include_str!` resource;
+later calls to `add_ftl` have higher priority. Japanese then falls back to the
+combined English resources for keys that remain missing.
+
 `nuillu-server` remains available for headless/runtime use and can be connected to by a visualizer with `--host`.
 
 ## License
