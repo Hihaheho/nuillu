@@ -464,7 +464,7 @@ pub enum RuntimeEvent {
 }
 ```
 
-`sequence` is global to the runtime event emitter and preserves event ordering across event kinds. `LlmAccess::lutum().await` emits exactly one `LlmAccessed` event after resolving the holder's current effective tier and before returning the `lutum::Lutum` handle. Its `call` field is the LLM acquisition sequence only; it observes acquisition count, not provider request count. `Memo::write(...).await` emits `MemoUpdated` after the blackboard memo write completes; `char_count` is the memo's character count at write time. `ModuleBatchThrottled` is emitted after a scheduler-owned next-batch cooldown expires and before the module's next `next_batch()` future is started. Sinks must not deny acquisition, memo writes, or delayed scheduler operations; limit policies such as eval `max-llm-calls` request shutdown after observing `LlmAccessed`.
+`sequence` is global to the runtime event emitter and preserves event ordering across event kinds. `LlmAccess::lutum().await` emits exactly one `LlmAccessed` event after resolving the holder's current effective tier and before returning the `lutum::Lutum` handle. Its `call` field is the LLM acquisition sequence only; it observes acquisition count, not provider request count. `Memo::write(...).await` emits `MemoUpdated` after the blackboard memo write completes; `char_count` is the memo's character count at write time. `ModuleBatchThrottled` is emitted after a scheduler-owned next-batch cooldown expires and before the module's next `next_batch()` future is started. Sinks must not deny acquisition, memo writes, or delayed scheduler operations. Eval `max-llm-calls` instead observes Lutum's built-in `OnModelInput` hook and requests shutdown after the model input that reaches the limit.
 
 ---
 
@@ -874,7 +874,7 @@ Common eval behavior:
 4. each case writes `artifact.json`, `report.json`, `events.json`, and `trace.json` under `.tmp/eval/<run-id>/<case-id>/`; failed, invalid, runtime-error, and panic cases also write `raw-trace.json` for provider/protocol-level debugging, and the suite writes both `suite-report.json` and append-only `events.jsonl`,
 5. live progress is always emitted to stderr for suite start/end, case start/end, full-agent allocation changes, completed utterances, `LlmAccessed` events, `ModuleBatchThrottled` events, and stop requests,
 6. limits include max loop iterations, optional loop sleep, and `max-llm-calls`,
-7. `max-llm-calls` counts `LlmAccessed` runtime events and requests scheduler shutdown after the event that reaches the limit; the acquisition is observed, not denied.
+7. `max-llm-calls` counts Lutum `OnModelInput` hook calls shared across all model tiers and requests scheduler shutdown after the model input that reaches the limit; the request is observed, not denied.
 
 This keeps realistic artifacts observable without adding request/response correlation to module channels. Full-agent artifacts are collected at the host boundary from `UtteranceSink`; module artifacts remain memo-authoritative.
 
@@ -935,6 +935,6 @@ This keeps realistic artifacts observable without adding request/response correl
 | Surprise has no forward-modeling responsibility | it receives no direct memo path from predict; predict output arrives through unread memo-log entries on `BlackboardReader` |
 | Predict and surprise ablations are wiring-only | boot wiring may include predict, surprise, both, or neither |
 | Conversation artifacts are boundary observations | eval collects utterances from `UtteranceSink`, not channel responses |
-| LLM call limits observe acquisitions | `LlmAccess::lutum()` emits `LlmAccessed`; eval requests shutdown after the limit event rather than denying the handle |
+| LLM call limits observe Lutum model inputs | Eval attaches one shared `OnModelInput` hook to all Lutum tiers and requests shutdown after the limit hook call rather than denying the request |
 
 Mailbox backpressure policy remains a separate runtime policy decision. Current typed topics use unbounded per-subscriber queues; if bounded queues are introduced, overflow policy must be explicit per topic. The source-of-truth state is not carried in channel payloads.

@@ -7,7 +7,7 @@ use std::{
     panic::AssertUnwindSafe,
     path::{Path, PathBuf},
     rc::Rc,
-    sync::atomic::{AtomicBool, AtomicUsize, Ordering},
+    sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
@@ -16,6 +16,7 @@ use anyhow::{Context, Result};
 use async_trait::async_trait;
 use chrono::{DateTime, Duration as ChronoDuration, FixedOffset, Utc};
 use futures::{FutureExt as _, StreamExt as _, stream::FuturesUnordered};
+use lutum::{LutumHooksSet, ModelInputHookContext, OnModelInput};
 use lutum_eval::{RawTraceSnapshot, TraceSnapshot};
 use lutum_libsql_adapter::{LibsqlAgentStore, LibsqlAgentStoreConfig};
 use nuillu_agent::{AgentEventLoopConfig, run as run_agent};
@@ -4456,7 +4457,6 @@ pub(crate) async fn build_eval_environment(
     let blackboard = Blackboard::with_allocation(allocation);
     let events = Rc::new(RecordingRuntimeEventSink::new(
         case_id.to_string(),
-        limits.max_llm_calls,
         reporter.clone(),
         visualizer.clone(),
     ));
@@ -4509,7 +4509,7 @@ pub(crate) async fn build_eval_environment(
     let llm_observer = visualizer
         .clone()
         .map(|sender| VisualizerLlmObserver::new(case_id.to_string(), sender));
-    let tiers = build_tiers(
+    let mut tiers = build_tiers(
         &config.cheap_backend,
         &config.default_backend,
         &config.premium_backend,
@@ -4523,6 +4523,22 @@ pub(crate) async fn build_eval_environment(
         path: output_dir.to_path_buf(),
         message: error.to_string(),
     })?;
+    let llm_call_limit = LlmCallLimitHook::new(
+        case_id.to_string(),
+        limits.max_llm_calls,
+        events.stop.clone(),
+        reporter.clone(),
+    );
+    for handle in [
+        &mut tiers.cheap,
+        &mut tiers.default,
+        &mut tiers.premium,
+        &mut tiers.image,
+    ] {
+        handle
+            .lutum
+            .extend_hooks(LutumHooksSet::new().with_on_model_input(llm_call_limit.clone()));
+    }
     let runtime_policy = RuntimePolicy {
         memo_retained_per_owner: EVAL_MEMO_RETAINED_PER_OWNER,
         cognition_log_retained_entries: EVAL_COGNITION_LOG_RETAINED_ENTRIES,
@@ -6871,9 +6887,8 @@ pub(crate) struct RecordingRuntimeEventSink {
     case_started: Instant,
     progress_events: AtomicUsize,
     llm_in_flight: AtomicUsize,
-    stop: AtomicBool,
+    stop: Arc<AtomicBool>,
     case_id: String,
-    max_llm_calls: Option<u64>,
     reporter: LiveReporter,
     visualizer: Option<VisualizerEventSink>,
 }
@@ -6881,7 +6896,6 @@ pub(crate) struct RecordingRuntimeEventSink {
 impl RecordingRuntimeEventSink {
     fn new(
         case_id: String,
-        max_llm_calls: Option<u64>,
         reporter: LiveReporter,
         visualizer: Option<VisualizerEventSink>,
     ) -> Self {
@@ -6891,9 +6905,8 @@ impl RecordingRuntimeEventSink {
             case_started: Instant::now(),
             progress_events: AtomicUsize::new(0),
             llm_in_flight: AtomicUsize::new(0),
-            stop: AtomicBool::new(false),
+            stop: Arc::new(AtomicBool::new(false)),
             case_id,
-            max_llm_calls,
             reporter,
             visualizer,
         }
@@ -6959,6 +6972,57 @@ impl RecordingRuntimeEventSink {
     }
 }
 
+#[derive(Clone)]
+struct LlmCallLimitHook {
+    case_id: String,
+    max_llm_calls: Option<u64>,
+    calls: Arc<AtomicU64>,
+    stop: Arc<AtomicBool>,
+    reporter: LiveReporter,
+}
+
+impl LlmCallLimitHook {
+    fn new(
+        case_id: String,
+        max_llm_calls: Option<u64>,
+        stop: Arc<AtomicBool>,
+        reporter: LiveReporter,
+    ) -> Self {
+        Self {
+            case_id,
+            max_llm_calls,
+            calls: Arc::new(AtomicU64::new(0)),
+            stop,
+            reporter,
+        }
+    }
+
+    fn record_call(&self) {
+        let call = self.calls.fetch_add(1, Ordering::Relaxed).saturating_add(1);
+        if !self.max_llm_calls.is_some_and(|max| call >= max)
+            || self.stop.swap(true, Ordering::Relaxed)
+        {
+            return;
+        }
+        let _ = self.reporter.emit_port(
+            Some(&self.case_id),
+            "stop_requested",
+            serde_json::json!({ "reason": "max-llm-calls" }),
+            format!(
+                "{} stop requested {} reason=max-llm-calls",
+                self.reporter.log_prefix(),
+                self.reporter.log_scope(&self.case_id)
+            ),
+        );
+    }
+}
+
+impl OnModelInput for LlmCallLimitHook {
+    async fn call(&self, _cx: &ModelInputHookContext<'_>) {
+        self.record_call();
+    }
+}
+
 fn scheduled_wait_remaining_from_timed_events(
     timed_events: &[(u64, RuntimeEvent)],
     elapsed: Duration,
@@ -6998,23 +7062,6 @@ fn runtime_event_counts_as_eval_progress(event: &RuntimeEvent) -> bool {
 
 impl RuntimeEventSink for RecordingRuntimeEventSink {
     fn on_event(&self, event: RuntimeEvent) -> Result<(), PortError> {
-        let should_stop = match &event {
-            RuntimeEvent::LlmSemaphoreWaitStarted { .. } => false,
-            RuntimeEvent::LlmAccessed { call, .. } => self
-                .max_llm_calls
-                .is_some_and(|max| call.saturating_add(1) >= max),
-            RuntimeEvent::LlmCompleted { .. } => false,
-            RuntimeEvent::MemoUpdated { .. } => false,
-            RuntimeEvent::ModuleBatchThrottled { .. } => false,
-            RuntimeEvent::ModuleBatchReady { .. } => false,
-            RuntimeEvent::ModuleActivationCompleted { .. } => false,
-            RuntimeEvent::ModuleActivationAttemptFailed { .. } => false,
-            RuntimeEvent::ModuleTaskFailed { .. } => false,
-            RuntimeEvent::ModuleWarning { .. } => false,
-            RuntimeEvent::SessionCompactionStarted { .. } => false,
-            RuntimeEvent::SessionCompactionCompleted { .. } => false,
-            RuntimeEvent::SessionCompactionFailed { .. } => false,
-        };
         match &event {
             RuntimeEvent::LlmAccessed { .. } => {
                 self.llm_in_flight.fetch_add(1, Ordering::Relaxed);
@@ -7248,18 +7295,6 @@ impl RuntimeEventSink for RecordingRuntimeEventSink {
                 }
                 _ => {}
             }
-        }
-        if should_stop && !self.stop.swap(true, Ordering::Relaxed) {
-            self.reporter.emit_port(
-                Some(&self.case_id),
-                "stop_requested",
-                serde_json::json!({ "reason": "max-llm-calls" }),
-                format!(
-                    "{} stop requested {} reason=max-llm-calls",
-                    self.reporter.log_prefix(),
-                    self.reporter.log_scope(&self.case_id)
-                ),
-            )?;
         }
         Ok(())
     }
@@ -9013,50 +9048,20 @@ id = "module-query-memory-special-memory"
     }
 
     #[test]
-    fn max_llm_calls_requests_stop_after_limit_event() {
+    fn max_llm_calls_requests_stop_after_lutum_model_input_hook() {
         let dir = tempfile::tempdir().unwrap();
         let reporter = LiveReporter::new("test-run", dir.path()).unwrap();
-        let sink = RecordingRuntimeEventSink::new("test-case".to_string(), Some(3), reporter, None);
-        let owner = ModuleInstanceId::new(builtin::query_memory(), ReplicaIndex::ZERO);
+        let stop = Arc::new(AtomicBool::new(false));
+        let hook = LlmCallLimitHook::new("test-case".to_string(), Some(3), stop.clone(), reporter);
 
-        sink.on_event(RuntimeEvent::LlmAccessed {
-            sequence: 0,
-            call: 0,
-            owner: owner.clone(),
-            tier: ModelTier::Default,
-        })
-        .unwrap();
-        assert!(!sink.stop_requested());
-        assert_eq!(sink.progress_event_count(), 1);
+        hook.record_call();
+        hook.record_call();
+        assert!(!stop.load(Ordering::Relaxed));
+        hook.record_call();
+        assert!(stop.load(Ordering::Relaxed));
+        hook.record_call();
 
-        sink.on_event(RuntimeEvent::LlmAccessed {
-            sequence: 1,
-            call: 1,
-            owner: owner.clone(),
-            tier: ModelTier::Default,
-        })
-        .unwrap();
-        assert!(!sink.stop_requested());
-
-        sink.on_event(RuntimeEvent::LlmAccessed {
-            sequence: 2,
-            call: 2,
-            owner: owner.clone(),
-            tier: ModelTier::Default,
-        })
-        .unwrap();
-
-        assert!(sink.stop_requested());
-        sink.on_event(RuntimeEvent::LlmAccessed {
-            sequence: 3,
-            call: 3,
-            owner,
-            tier: ModelTier::Default,
-        })
-        .unwrap();
-        assert_eq!(sink.snapshot().len(), 4);
         let jsonl = std::fs::read_to_string(dir.path().join("events.jsonl")).unwrap();
-        assert!(jsonl.contains("\"kind\":\"runtime_event\""));
         assert!(jsonl.contains("\"kind\":\"stop_requested\""));
         assert_eq!(jsonl.matches("\"kind\":\"stop_requested\"").count(), 1);
     }
@@ -9065,7 +9070,7 @@ id = "module-query-memory-special-memory"
     fn recording_runtime_event_sink_builds_activation_timeline() {
         let dir = tempfile::tempdir().unwrap();
         let reporter = LiveReporter::new("test-run", dir.path()).unwrap();
-        let sink = RecordingRuntimeEventSink::new("test-case".to_string(), None, reporter, None);
+        let sink = RecordingRuntimeEventSink::new("test-case".to_string(), reporter, None);
         let owner = ModuleInstanceId::new(builtin::speak(), ReplicaIndex::ZERO);
 
         sink.on_event(RuntimeEvent::ModuleBatchReady {
@@ -9097,7 +9102,7 @@ id = "module-query-memory-special-memory"
     fn runtime_progress_count_ignores_scheduler_noise() {
         let dir = tempfile::tempdir().unwrap();
         let reporter = LiveReporter::new("test-run", dir.path()).unwrap();
-        let sink = RecordingRuntimeEventSink::new("test-case".to_string(), None, reporter, None);
+        let sink = RecordingRuntimeEventSink::new("test-case".to_string(), reporter, None);
         let owner = ModuleInstanceId::new(builtin::homeostasis(), ReplicaIndex::ZERO);
 
         sink.on_event(RuntimeEvent::ModuleBatchThrottled {
@@ -9182,7 +9187,7 @@ id = "module-query-memory-special-memory"
     fn llm_in_flight_tracks_access_and_completion() {
         let dir = tempfile::tempdir().unwrap();
         let reporter = LiveReporter::new("test-run", dir.path()).unwrap();
-        let sink = RecordingRuntimeEventSink::new("test-case".to_string(), None, reporter, None);
+        let sink = RecordingRuntimeEventSink::new("test-case".to_string(), reporter, None);
         let owner = ModuleInstanceId::new(builtin::cognition_gate(), ReplicaIndex::ZERO);
 
         assert_eq!(sink.llm_in_flight_count(), 0);
@@ -9257,7 +9262,7 @@ id = "module-query-memory-special-memory"
             .await;
         let dir = tempfile::tempdir().unwrap();
         let reporter = LiveReporter::new("test-run", dir.path()).unwrap();
-        let events = RecordingRuntimeEventSink::new("test-case".to_string(), None, reporter, None);
+        let events = RecordingRuntimeEventSink::new("test-case".to_string(), reporter, None);
 
         let outcome = wait_for_step_modules_to_settle(
             &blackboard,
@@ -9281,7 +9286,7 @@ id = "module-query-memory-special-memory"
             .await;
         let dir = tempfile::tempdir().unwrap();
         let reporter = LiveReporter::new("test-run", dir.path()).unwrap();
-        let events = RecordingRuntimeEventSink::new("test-case".to_string(), None, reporter, None);
+        let events = RecordingRuntimeEventSink::new("test-case".to_string(), reporter, None);
 
         let outcome = wait_for_step_modules_to_settle(
             &blackboard,
@@ -9299,7 +9304,7 @@ id = "module-query-memory-special-memory"
         let blackboard = Blackboard::default();
         let dir = tempfile::tempdir().unwrap();
         let reporter = LiveReporter::new("test-run", dir.path()).unwrap();
-        let events = RecordingRuntimeEventSink::new("test-case".to_string(), None, reporter, None);
+        let events = RecordingRuntimeEventSink::new("test-case".to_string(), reporter, None);
         let wait_for = WaitFor::MemoFrom {
             module: EvalModule::Surprise,
             timeout_ms: 500,
