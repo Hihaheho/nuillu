@@ -217,7 +217,8 @@ impl I18n {
     }
 
     fn tr(&self, id: &str) -> String {
-        self.tr_fluent_args(id, None)
+        self.try_tr_fluent_args(id, None)
+            .unwrap_or_else(|| format!("[[{id}]]"))
     }
 
     fn tr_args(&self, id: &str, args: &[(&str, I18nArg<'_>)]) -> String {
@@ -229,6 +230,11 @@ impl I18n {
     }
 
     fn tr_fluent_args(&self, id: &str, args: Option<&FluentArgs<'_>>) -> String {
+        self.try_tr_fluent_args(id, args)
+            .unwrap_or_else(|| format!("[[{id}]]"))
+    }
+
+    fn try_tr_fluent_args(&self, id: &str, args: Option<&FluentArgs<'_>>) -> Option<String> {
         for bundle in &self.bundles {
             let Some(message) = bundle.get_message(id) else {
                 continue;
@@ -241,15 +247,16 @@ impl I18n {
             if !errors.is_empty() {
                 eprintln!("Fluent format errors for `{id}`: {errors:?}");
             }
-            return value.into_owned();
+            return Some(value.into_owned());
         }
-
-        format!("[[{id}]]")
+        None
     }
 
     fn localized_module_name(&self, module_id: &str) -> String {
-        module_name_key(module_id)
-            .map(|key| self.tr(key))
+        let key = module_name_key(module_id)
+            .map(str::to_owned)
+            .unwrap_or_else(|| format!("module-name-{module_id}"));
+        self.try_tr_fluent_args(&key, None)
             .unwrap_or_else(|| module_id.to_string())
     }
 
@@ -527,6 +534,28 @@ mod tests {
         assert_eq!(
             ja.localized_module_name_with_id("custom-module"),
             "custom-module"
+        );
+    }
+
+    #[test]
+    fn user_ftl_can_name_a_dynamic_module() {
+        let resources = VisualizerUiResources::builder()
+            .add_ftl(Locale::JaJp, "module-name-ripgrep = ripgrep 検索")
+            .add_ftl(Locale::EnUs, "module-name-ripgrep = ripgrep search")
+            .build()
+            .expect("dynamic module translations load");
+
+        assert_eq!(
+            resources
+                .for_locale(Locale::JaJp)
+                .localized_module_name("ripgrep"),
+            "ripgrep 検索"
+        );
+        assert_eq!(
+            resources
+                .for_locale(Locale::EnUs)
+                .localized_module_name_with_id("ripgrep"),
+            "ripgrep search (ripgrep)"
         );
     }
 }
