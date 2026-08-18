@@ -10,11 +10,14 @@ workspace = true
 
 [dependencies]
 nuillu-blackboard = { workspace = true }
+nuillu-memory = { workspace = true }
 nuillu-module = { workspace = true }
+nuillu-reward = { workspace = true }
 nuillu-types = { workspace = true }
 
 async-trait = { workspace = true }
 chrono = { workspace = true }
+uuid = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true }

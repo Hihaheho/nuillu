@@ -1,5 +1,14 @@
 //! In-memory adapters for local development and tests.
 
+mod embedding;
+mod memory;
+mod persistence;
+mod policy;
+
+pub use memory::InMemoryMemoryStore;
+pub use persistence::{InMemoryAllocationStore, InMemoryMemoLogRepository, InMemorySessionStore};
+pub use policy::InMemoryPolicyStore;
+
 use std::sync::Mutex;
 
 use async_trait::async_trait;

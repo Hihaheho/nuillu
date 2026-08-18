@@ -2922,9 +2922,12 @@ dependencies = [
  "async-trait",
  "chrono",
  "nuillu-blackboard",
+ "nuillu-memory",
  "nuillu-module",
+ "nuillu-reward",
  "nuillu-types",
  "tokio",
+ "uuid",
 ]
 
 [[package]]
