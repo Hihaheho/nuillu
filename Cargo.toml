@@ -5,6 +5,7 @@ members = [
     "crates/blackboard",
     "crates/module",
     "crates/agent",
+    "crates/storage",
     "crates/adapters/in-memory",
     "crates/adapters/libsql",
     "crates/adapters/openai-embedding",
@@ -66,6 +67,7 @@ nuillu-types = { path = "crates/types" }
 nuillu-blackboard = { path = "crates/blackboard" }
 nuillu-module = { path = "crates/module" }
 nuillu-agent = { path = "crates/agent" }
+nuillu-storage = { path = "crates/storage" }
 lutum-in-memory-adapter = { path = "crates/adapters/in-memory" }
 lutum-libsql-adapter = { path = "crates/adapters/libsql" }
 nuillu-openai-embedding-adapter = { path = "crates/adapters/openai-embedding" }

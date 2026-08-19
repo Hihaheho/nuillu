@@ -10,10 +10,8 @@ use lutum::{
     ErasedTextTurnEvent, LutumHooksSet, LutumStreamEvent, ModelInputHookContext, OnModelInput,
     OnStreamEvent, OperationKind, RequestExtensions, StreamEventHookContext, Usage,
 };
-use lutum_libsql_adapter::{
-    LibsqlLlmTranscriptStore, LlmTranscriptTurnRecord, NewLlmTranscriptTurn,
-};
 use nuillu_module::{LlmRequestMetadata, ModuleSessionMetadata};
+use nuillu_storage::{LlmTranscriptStore, LlmTranscriptTurnRecord, NewLlmTranscriptTurn};
 use nuillu_types::ModuleInstanceId;
 use nuillu_visualizer_protocol::{
     LlmBatchDebugView, LlmInputItemView, LlmObservationSource, LlmOutputItemView,
@@ -37,7 +35,7 @@ pub struct DbLlmTraceSink {
 
 struct DbLlmTraceSinkInner {
     server_session_id: String,
-    store: LibsqlLlmTranscriptStore,
+    store: Arc<dyn LlmTranscriptStore>,
     next_turn: AtomicU64,
     turns: Mutex<BTreeMap<usize, CompletedTurnTrace>>,
     activation_attempt_turns: Mutex<BTreeMap<(String, u32), String>>,
@@ -102,7 +100,7 @@ struct ToolCallTrace {
 }
 
 impl DbLlmTraceSink {
-    pub fn new(server_session_id: String, store: LibsqlLlmTranscriptStore) -> Self {
+    pub fn new(server_session_id: String, store: Arc<dyn LlmTranscriptStore>) -> Self {
         Self {
             inner: Arc::new(DbLlmTraceSinkInner {
                 server_session_id,
@@ -354,7 +352,7 @@ impl OnStreamEvent for DbLlmTraceSink {
 }
 
 pub async fn emit_persisted_llm_transcripts(
-    store: &LibsqlLlmTranscriptStore,
+    store: &dyn LlmTranscriptStore,
     tab_id: &str,
     visualizer: &VisualizerEventSink,
 ) {
@@ -740,7 +738,9 @@ mod tests {
     use std::sync::mpsc;
 
     use lutum::{FinishReason, ModelInput};
-    use lutum_libsql_adapter::{LibsqlAgentStore, LibsqlAgentStoreConfig};
+    use lutum_libsql_adapter::{
+        LibsqlAgentStore, LibsqlAgentStoreConfig, LibsqlLlmTranscriptStore,
+    };
     use nuillu_module::{
         LlmRequestSource,
         ports::{Embedder, PortError},
@@ -775,7 +775,7 @@ mod tests {
     #[tokio::test]
     async fn failed_active_turn_is_inserted_into_transcript_db() {
         let store = test_transcript_store().await;
-        let sink = DbLlmTraceSink::new("server-session".to_string(), store.clone());
+        let sink = DbLlmTraceSink::new("server-session".to_string(), Arc::new(store.clone()));
         let owner = ModuleInstanceId::new(builtin::predict(), ReplicaIndex::ZERO);
         let trace = test_trace(&owner, "turn-active", TranscriptTurnStatus::InProgress);
 
@@ -804,7 +804,7 @@ mod tests {
     #[tokio::test]
     async fn completed_turn_can_be_updated_and_replayed_as_failed() {
         let store = test_transcript_store().await;
-        let sink = DbLlmTraceSink::new("server-session".to_string(), store.clone());
+        let sink = DbLlmTraceSink::new("server-session".to_string(), Arc::new(store.clone()));
         let owner = ModuleInstanceId::new(builtin::predict(), ReplicaIndex::ZERO);
         let trace = test_trace(&owner, "turn-completed", TranscriptTurnStatus::Completed);
 
@@ -881,7 +881,7 @@ mod tests {
     #[tokio::test]
     async fn model_input_supersedes_stale_active_trace_and_keeps_completed_turn_distinct() {
         let store = test_transcript_store().await;
-        let sink = DbLlmTraceSink::new("server-session".to_string(), store.clone());
+        let sink = DbLlmTraceSink::new("server-session".to_string(), Arc::new(store.clone()));
         let owner = ModuleInstanceId::new(builtin::predict(), ReplicaIndex::ZERO);
         let mut extensions = RequestExtensions::new();
         extensions.insert(request_metadata(&owner, 1));

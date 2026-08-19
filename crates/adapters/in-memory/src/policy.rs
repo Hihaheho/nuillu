@@ -7,6 +7,7 @@ use nuillu_module::ports::{Embedder, PortError};
 use nuillu_reward::{
     IndexedPolicy, NewPolicy, PolicyQuery, PolicyRecord, PolicySearchHit, PolicyStore,
 };
+use nuillu_storage::EmbeddingProfile;
 use nuillu_types::{PolicyIndex, PolicyRank, SignedUnitF32, UnitF32};
 use uuid::Uuid;
 
@@ -29,7 +30,7 @@ struct StoredPolicy {
 /// [`Embedder`]. No lexical-search fallback is used.
 pub struct InMemoryPolicyStore {
     embedder: Rc<dyn Embedder>,
-    dimensions: usize,
+    active_profile: EmbeddingProfile,
     state: Mutex<PolicyState>,
 }
 
@@ -37,24 +38,43 @@ impl std::fmt::Debug for InMemoryPolicyStore {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("InMemoryPolicyStore")
-            .field("dimensions", &self.dimensions)
+            .field("active_profile", &self.active_profile)
             .field("state", &self.state)
             .finish_non_exhaustive()
     }
 }
 
 impl InMemoryPolicyStore {
-    pub fn new(embedder: Rc<dyn Embedder>) -> Self {
-        Self {
-            dimensions: embedder.dimensions(),
+    pub fn new(
+        active_profile: EmbeddingProfile,
+        embedder: Rc<dyn Embedder>,
+    ) -> Result<Self, PortError> {
+        active_profile.validate()?;
+        if embedder.dimensions() != active_profile.dimensions {
+            return Err(PortError::InvalidInput(format!(
+                "in-memory policy embedding dimension mismatch: profile={}, embedder={}",
+                active_profile.dimensions,
+                embedder.dimensions()
+            )));
+        }
+        Ok(Self {
+            active_profile,
             embedder,
             state: Mutex::new(PolicyState::default()),
-        }
+        })
+    }
+
+    pub fn active_profile(&self) -> &EmbeddingProfile {
+        &self.active_profile
+    }
+
+    pub fn profile_id(&self) -> String {
+        self.active_profile.profile_id()
     }
 
     async fn embed(&self, text: &str) -> Result<Vec<f32>, PortError> {
         let embedding = self.embedder.embed(text).await?;
-        crate::embedding::validate("policy", self.dimensions, embedding)
+        crate::embedding::validate("policy", self.active_profile.dimensions, embedding)
     }
 
     fn put_locked(state: &mut PolicyState, policy: IndexedPolicy, embedding: Vec<f32>) {
@@ -259,7 +279,11 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn search_filters_expired_and_orders_by_similarity() {
-        let store = InMemoryPolicyStore::new(Rc::new(TestEmbedder));
+        let store = InMemoryPolicyStore::new(
+            EmbeddingProfile::default_for_dimensions(3),
+            Rc::new(TestEmbedder),
+        )
+        .unwrap();
         store
             .put(indexed("alpha", "alpha launch", PolicyRank::Tentative))
             .await
@@ -294,7 +318,11 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn reinforce_clamps_values_and_promotes_rank() {
-        let store = InMemoryPolicyStore::new(Rc::new(TestEmbedder));
+        let store = InMemoryPolicyStore::new(
+            EmbeddingProfile::default_for_dimensions(3),
+            Rc::new(TestEmbedder),
+        )
+        .unwrap();
         store
             .put(IndexedPolicy {
                 confidence: UnitF32::clamp(0.9),

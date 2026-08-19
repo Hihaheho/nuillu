@@ -17,18 +17,27 @@ use nuillu_memory::{
 };
 pub use nuillu_module::ports::Embedder;
 use nuillu_module::{
-    AllocationStore, AmbientSensoryEntry, MemoLogRepository, PersistedAllocationSnapshot,
-    PersistedMemoLogEntry, PersistedSessionSnapshot, SessionKey, SessionStore,
+    AllocationStore, MemoLogRepository, PersistedAllocationSnapshot, PersistedMemoLogEntry,
+    PersistedSessionSnapshot, SessionKey, SessionStore,
     ports::{CognitionLogRepository, PersistedCognitionLogEntry, PortError},
 };
 use nuillu_reward::{
     IndexedPolicy, NewPolicy, PolicyQuery, PolicyRecord, PolicySearchHit, PolicyStore,
 };
+use nuillu_storage::{
+    AgentStore, AmbientSensorySnapshotStore, ExternalActionEventStore, LlmTranscriptStore,
+    OneShotSensoryInputStore, UtteranceEventStore,
+};
+pub use nuillu_storage::{
+    AmbientSensorySnapshotRecord, EmbeddingProfile, ExternalActionEventRecord,
+    ExternalActionEventStatus, LlmTranscriptTurnRecord, NewAmbientSensorySnapshot,
+    NewExternalActionEvent, NewLlmTranscriptTurn, NewOneShotSensoryInput, NewUtteranceEvent,
+    OneShotSensoryInputRecord, UtteranceEventKind, UtteranceEventRecord,
+};
 use nuillu_types::{
     MemoryContent, MemoryIndex, MemoryRank, ModuleId, ModuleInstanceId, PolicyIndex, PolicyRank,
     ReplicaIndex, SignedUnitF32, UnitF32,
 };
-use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 mod migrations;
@@ -39,54 +48,6 @@ const DEFAULT_MEMORY_TABLE: &str = "memories";
 const DEFAULT_POLICY_TABLE: &str = "policies";
 const PROFILE_REGISTRY_TABLE: &str = "memory_embedding_profiles";
 const POLICY_PROFILE_REGISTRY_TABLE: &str = "policy_embedding_profiles";
-const MAX_VECTOR_DIMS: usize = 65_536;
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct EmbeddingProfile {
-    pub name: String,
-    pub version: String,
-    pub dimensions: usize,
-}
-
-impl EmbeddingProfile {
-    pub fn new(name: impl Into<String>, version: impl Into<String>, dimensions: usize) -> Self {
-        Self {
-            name: name.into(),
-            version: version.into(),
-            dimensions,
-        }
-    }
-
-    pub fn default_for_dimensions(dimensions: usize) -> Self {
-        Self::new("default", "v1", dimensions)
-    }
-
-    pub fn profile_id(&self) -> String {
-        let mut hasher = Sha256::new();
-        hasher.update(self.name.as_bytes());
-        hasher.update([0]);
-        hasher.update(self.version.as_bytes());
-        hasher.update([0]);
-        hasher.update(self.dimensions.to_string().as_bytes());
-        let digest = hasher.finalize();
-        format!("p{}", hex_string(&digest[..8]))
-    }
-
-    fn validate(&self) -> Result<(), PortError> {
-        if self.name.trim().is_empty() {
-            return Err(PortError::InvalidInput(
-                "embedding profile name must not be empty".into(),
-            ));
-        }
-        if self.version.trim().is_empty() {
-            return Err(PortError::InvalidInput(
-                "embedding profile version must not be empty".into(),
-            ));
-        }
-        validate_dimensions("embedding profile dimensions", self.dimensions)
-    }
-}
-
 #[derive(Clone, Debug)]
 pub struct LibsqlAgentStoreConfig {
     pub path: PathBuf,
@@ -197,162 +158,6 @@ pub struct LibsqlExternalActionEventStore {
 #[derive(Clone)]
 pub struct LibsqlConversationHistoryStore {
     conn: Connection,
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub struct NewLlmTranscriptTurn {
-    pub server_session_id: String,
-    pub turn_id: String,
-    pub owner: String,
-    pub owner_module: String,
-    pub owner_replica: u8,
-    pub tier: String,
-    pub source: String,
-    pub session_key: Option<String>,
-    pub operation: String,
-    pub started_at_ms: i64,
-    pub completed_at_ms: i64,
-    pub trace_json: serde_json::Value,
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub struct LlmTranscriptTurnRecord {
-    pub id: i64,
-    pub server_session_id: String,
-    pub turn_id: String,
-    pub owner: String,
-    pub owner_module: String,
-    pub owner_replica: u8,
-    pub tier: String,
-    pub source: String,
-    pub session_key: Option<String>,
-    pub operation: String,
-    pub started_at_ms: i64,
-    pub completed_at_ms: i64,
-    pub trace_json: serde_json::Value,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct NewOneShotSensoryInput {
-    pub server_session_id: String,
-    pub modality: String,
-    pub direction: Option<String>,
-    pub content: String,
-    pub observed_at_ms: i64,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct OneShotSensoryInputRecord {
-    pub id: i64,
-    pub server_session_id: String,
-    pub modality: String,
-    pub direction: Option<String>,
-    pub content: String,
-    pub observed_at_ms: i64,
-    pub created_at_ms: i64,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct NewAmbientSensorySnapshot {
-    pub server_session_id: String,
-    pub entries: Vec<AmbientSensoryEntry>,
-    pub observed_at_ms: i64,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct AmbientSensorySnapshotRecord {
-    pub id: i64,
-    pub server_session_id: String,
-    pub entries: Vec<AmbientSensoryEntry>,
-    pub observed_at_ms: i64,
-    pub created_at_ms: i64,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum UtteranceEventKind {
-    Delta,
-    Completed,
-    Aborted,
-}
-
-impl UtteranceEventKind {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Delta => "delta",
-            Self::Completed => "completed",
-            Self::Aborted => "aborted",
-        }
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct NewUtteranceEvent {
-    pub server_session_id: String,
-    pub event_kind: UtteranceEventKind,
-    pub sender: ModuleInstanceId,
-    pub target: String,
-    pub generation_id: u64,
-    pub sequence: u32,
-    pub content: String,
-    pub reason: Option<String>,
-    pub occurred_at_ms: i64,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct UtteranceEventRecord {
-    pub id: i64,
-    pub server_session_id: String,
-    pub event_kind: UtteranceEventKind,
-    pub sender: ModuleInstanceId,
-    pub target: String,
-    pub generation_id: u64,
-    pub sequence: u32,
-    pub content: String,
-    pub reason: Option<String>,
-    pub occurred_at_ms: i64,
-    pub created_at_ms: i64,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ExternalActionEventStatus {
-    Pending,
-    Completed,
-}
-
-impl ExternalActionEventStatus {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Pending => "pending",
-            Self::Completed => "completed",
-        }
-    }
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub struct NewExternalActionEvent {
-    pub server_session_id: String,
-    pub invocation_id: String,
-    pub invoked_by: ModuleInstanceId,
-    pub action_id: String,
-    pub arguments: serde_json::Value,
-    pub requested_at_ms: i64,
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub struct ExternalActionEventRecord {
-    pub id: i64,
-    pub server_session_id: String,
-    pub invocation_id: String,
-    pub invoked_by: ModuleInstanceId,
-    pub action_id: String,
-    pub arguments: serde_json::Value,
-    pub status: ExternalActionEventStatus,
-    pub accepted: Option<bool>,
-    pub message: Option<String>,
-    pub requested_at_ms: i64,
-    pub completed_at_ms: Option<i64>,
-    pub created_at_ms: i64,
-    pub updated_at_ms: i64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1561,6 +1366,150 @@ impl LibsqlExternalActionEventStore {
         }
         records.reverse();
         Ok(records)
+    }
+}
+
+#[async_trait]
+impl LlmTranscriptStore for LibsqlLlmTranscriptStore {
+    async fn insert_completed_turn(&self, turn: NewLlmTranscriptTurn) -> Result<(), PortError> {
+        LibsqlLlmTranscriptStore::insert_completed_turn(self, turn).await
+    }
+
+    async fn completed_turns_page(
+        &self,
+        offset: usize,
+        limit: usize,
+    ) -> Result<Vec<LlmTranscriptTurnRecord>, PortError> {
+        LibsqlLlmTranscriptStore::completed_turns_page(self, offset, limit).await
+    }
+
+    async fn prune_completed_turns(&self, keep: usize) -> Result<(), PortError> {
+        LibsqlLlmTranscriptStore::prune_completed_turns(self, keep).await
+    }
+}
+
+#[async_trait(?Send)]
+impl OneShotSensoryInputStore for LibsqlOneShotSensoryInputStore {
+    async fn append(
+        &self,
+        input: NewOneShotSensoryInput,
+    ) -> Result<OneShotSensoryInputRecord, PortError> {
+        LibsqlOneShotSensoryInputStore::append(self, input).await
+    }
+
+    async fn recent_page(
+        &self,
+        offset: usize,
+        limit: usize,
+    ) -> Result<Vec<OneShotSensoryInputRecord>, PortError> {
+        LibsqlOneShotSensoryInputStore::recent_page(self, offset, limit).await
+    }
+}
+
+#[async_trait(?Send)]
+impl AmbientSensorySnapshotStore for LibsqlAmbientSensorySnapshotStore {
+    async fn append(
+        &self,
+        snapshot: NewAmbientSensorySnapshot,
+    ) -> Result<AmbientSensorySnapshotRecord, PortError> {
+        LibsqlAmbientSensorySnapshotStore::append(self, snapshot).await
+    }
+
+    async fn recent_page(
+        &self,
+        offset: usize,
+        limit: usize,
+    ) -> Result<Vec<AmbientSensorySnapshotRecord>, PortError> {
+        LibsqlAmbientSensorySnapshotStore::recent_page(self, offset, limit).await
+    }
+}
+
+#[async_trait(?Send)]
+impl UtteranceEventStore for LibsqlUtteranceEventStore {
+    async fn append(&self, event: NewUtteranceEvent) -> Result<UtteranceEventRecord, PortError> {
+        LibsqlUtteranceEventStore::append(self, event).await
+    }
+
+    async fn recent_page(
+        &self,
+        offset: usize,
+        limit: usize,
+    ) -> Result<Vec<UtteranceEventRecord>, PortError> {
+        LibsqlUtteranceEventStore::recent_page(self, offset, limit).await
+    }
+}
+
+#[async_trait(?Send)]
+impl ExternalActionEventStore for LibsqlExternalActionEventStore {
+    async fn append_pending(
+        &self,
+        event: NewExternalActionEvent,
+    ) -> Result<ExternalActionEventRecord, PortError> {
+        LibsqlExternalActionEventStore::append_pending(self, event).await
+    }
+
+    async fn complete(
+        &self,
+        id: i64,
+        accepted: bool,
+        message: String,
+        completed_at_ms: i64,
+    ) -> Result<ExternalActionEventRecord, PortError> {
+        LibsqlExternalActionEventStore::complete(self, id, accepted, message, completed_at_ms).await
+    }
+
+    async fn recent_page(
+        &self,
+        offset: usize,
+        limit: usize,
+    ) -> Result<Vec<ExternalActionEventRecord>, PortError> {
+        LibsqlExternalActionEventStore::recent_page(self, offset, limit).await
+    }
+}
+
+impl AgentStore for LibsqlAgentStore {
+    fn memory_store(&self) -> std::rc::Rc<dyn MemoryStore> {
+        std::rc::Rc::new(LibsqlAgentStore::memory_store(self))
+    }
+
+    fn policy_store(&self) -> std::rc::Rc<dyn PolicyStore> {
+        std::rc::Rc::new(LibsqlAgentStore::policy_store(self))
+    }
+
+    fn session_store(&self) -> std::rc::Rc<dyn SessionStore> {
+        std::rc::Rc::new(LibsqlAgentStore::session_store(self))
+    }
+
+    fn allocation_store(&self) -> std::rc::Rc<dyn AllocationStore> {
+        std::rc::Rc::new(LibsqlAgentStore::allocation_store(self))
+    }
+
+    fn cognition_log_repository(&self) -> std::rc::Rc<dyn CognitionLogRepository> {
+        std::rc::Rc::new(LibsqlAgentStore::cognition_log_repository(self))
+    }
+
+    fn memo_log_repository(&self) -> std::rc::Rc<dyn MemoLogRepository> {
+        std::rc::Rc::new(LibsqlAgentStore::memo_log_repository(self))
+    }
+
+    fn llm_transcript_store(&self) -> std::sync::Arc<dyn LlmTranscriptStore> {
+        std::sync::Arc::new(LibsqlAgentStore::llm_transcript_store(self))
+    }
+
+    fn one_shot_sensory_input_store(&self) -> std::rc::Rc<dyn OneShotSensoryInputStore> {
+        std::rc::Rc::new(LibsqlAgentStore::one_shot_sensory_input_store(self))
+    }
+
+    fn ambient_sensory_snapshot_store(&self) -> std::rc::Rc<dyn AmbientSensorySnapshotStore> {
+        std::rc::Rc::new(LibsqlAgentStore::ambient_sensory_snapshot_store(self))
+    }
+
+    fn utterance_event_store(&self) -> std::rc::Rc<dyn UtteranceEventStore> {
+        std::rc::Rc::new(LibsqlAgentStore::utterance_event_store(self))
+    }
+
+    fn external_action_event_store(&self) -> std::rc::Rc<dyn ExternalActionEventStore> {
+        std::rc::Rc::new(LibsqlAgentStore::external_action_event_store(self))
     }
 }
 
@@ -3839,20 +3788,6 @@ struct PendingPolicyEmbedding {
     trigger_updated_at_ms: i64,
 }
 
-fn validate_dimensions(label: &str, dimensions: usize) -> Result<(), PortError> {
-    if dimensions == 0 {
-        return Err(PortError::InvalidInput(format!(
-            "{label} must be greater than zero"
-        )));
-    }
-    if dimensions > MAX_VECTOR_DIMS {
-        return Err(PortError::InvalidInput(format!(
-            "{label} must be <= {MAX_VECTOR_DIMS}, got {dimensions}"
-        )));
-    }
-    Ok(())
-}
-
 fn validate_identifier(label: &str, value: &str) -> Result<(), PortError> {
     let mut chars = value.chars();
     let Some(first) = chars.next() else {
@@ -4120,16 +4055,6 @@ fn datetime_from_millis(
         .ok_or_else(|| PortError::InvalidData(format!("invalid {label} timestamp: {timestamp_ms}")))
 }
 
-fn hex_string(bytes: &[u8]) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut out = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        out.push(HEX[(byte >> 4) as usize] as char);
-        out.push(HEX[(byte & 0x0f) as usize] as char);
-    }
-    out
-}
-
 fn now_ms() -> i64 {
     chrono::Utc::now().timestamp_millis()
 }
@@ -4156,6 +4081,7 @@ mod tests {
         SchemaVersion, run_migration_bundle,
     };
     use chrono::TimeZone as _;
+    use nuillu_module::AmbientSensoryEntry;
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static NEXT_TEST_DIR: AtomicU64 = AtomicU64::new(0);

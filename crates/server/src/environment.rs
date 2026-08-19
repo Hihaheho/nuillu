@@ -10,11 +10,7 @@ use lutum::{
     RequestExtensions, Seed, SharedPoolBudgetManager, SharedPoolBudgetOptions, StopSequences,
     Temperature, TopK, TopP,
 };
-use lutum_libsql_adapter::{
-    EmbeddingProfile, LibsqlAgentStore, LibsqlAgentStoreConfig, LibsqlAmbientSensorySnapshotStore,
-    LibsqlExternalActionEventStore, LibsqlLlmTranscriptStore, LibsqlOneShotSensoryInputStore,
-    LibsqlUtteranceEventStore, NewExternalActionEvent, NewUtteranceEvent, UtteranceEventKind,
-};
+use lutum_libsql_adapter::{LibsqlAgentStore, LibsqlAgentStoreConfig};
 use lutum_openai::{FeatureFlags, OpenAiAdapter, OpenAiReasoningEffort};
 use nuillu_blackboard::{AllocationLimits, Blackboard};
 use nuillu_llm_trace_file::{FileLlmTraceSink, LlmLogContext};
@@ -27,8 +23,13 @@ use nuillu_module::{
     RuntimeEventSink, RuntimePolicy, SessionCompactionPolicy,
 };
 use nuillu_openai_embedding_adapter::{OpenAiEmbedder, OpenAiEmbedderConfig};
-use nuillu_reward::{PolicyCapabilities, PolicyStore};
+use nuillu_reward::PolicyCapabilities;
 use nuillu_speak::{Utterance, UtteranceAbort, UtteranceDelta, UtteranceSink};
+use nuillu_storage::{
+    AgentStore, AmbientSensorySnapshotStore, EmbeddingProfile, ExternalActionEventStore,
+    LlmTranscriptStore, NewExternalActionEvent, NewUtteranceEvent, OneShotSensoryInputStore,
+    UtteranceEventKind, UtteranceEventStore,
+};
 use nuillu_visualizer_protocol::{
     AgentActionInvocationCompletion, AgentActionInvocationRequest, VisualizerEvent, VisualizerTabId,
 };
@@ -54,11 +55,11 @@ pub(super) struct ServerEnvironment {
     pub(super) policy_caps: PolicyCapabilities,
     pub(super) clock: Rc<dyn Clock>,
     pub(super) utterance_sink: Rc<dyn UtteranceSink>,
-    pub(super) llm_transcript_store: LibsqlLlmTranscriptStore,
-    pub(super) one_shot_sensory_input_store: LibsqlOneShotSensoryInputStore,
-    pub(super) ambient_sensory_snapshot_store: LibsqlAmbientSensorySnapshotStore,
-    pub(super) utterance_event_store: LibsqlUtteranceEventStore,
-    pub(super) external_action_event_store: LibsqlExternalActionEventStore,
+    pub(super) llm_transcript_store: Arc<dyn LlmTranscriptStore>,
+    pub(super) one_shot_sensory_input_store: Rc<dyn OneShotSensoryInputStore>,
+    pub(super) ambient_sensory_snapshot_store: Rc<dyn AmbientSensorySnapshotStore>,
+    pub(super) utterance_event_store: Rc<dyn UtteranceEventStore>,
+    pub(super) external_action_event_store: Rc<dyn ExternalActionEventStore>,
     pub(super) external_actions: Rc<ServerExternalActionState>,
 }
 
@@ -71,7 +72,7 @@ pub(super) struct ServerExternalActionState {
     server_session_id: String,
     tab_id: VisualizerTabId,
     visualizer: VisualizerEventSink,
-    store: LibsqlExternalActionEventStore,
+    store: Rc<dyn ExternalActionEventStore>,
     clock: Rc<dyn Clock>,
     pending: RefCell<BTreeMap<String, PendingExternalActionInvocation>>,
     next_invocation: RefCell<u64>,
@@ -82,7 +83,7 @@ impl ServerExternalActionState {
         server_session_id: String,
         tab_id: VisualizerTabId,
         visualizer: VisualizerEventSink,
-        store: LibsqlExternalActionEventStore,
+        store: Rc<dyn ExternalActionEventStore>,
         clock: Rc<dyn Clock>,
     ) -> Self {
         Self {
@@ -285,12 +286,12 @@ pub(super) async fn build_server_environment(
         utterance_event_store.clone(),
         clock.clone(),
     ));
-    let memory: Rc<dyn MemoryStore> = Rc::new(agent_store.memory_store());
-    let policy_store: Rc<dyn PolicyStore> = Rc::new(agent_store.policy_store());
-    let session_store = Rc::new(agent_store.session_store());
-    let allocation_store = Rc::new(agent_store.allocation_store());
-    let memo_log_repository = Rc::new(agent_store.memo_log_repository());
-    let cognition_log_repository = Rc::new(agent_store.cognition_log_repository());
+    let memory = agent_store.memory_store();
+    let policy_store = agent_store.policy_store();
+    let session_store = agent_store.session_store();
+    let allocation_store = agent_store.allocation_store();
+    let memo_log_repository = agent_store.memo_log_repository();
+    let cognition_log_repository = agent_store.cognition_log_repository();
     let llm_transcript_store = agent_store.llm_transcript_store();
     let db_trace_sink =
         DbLlmTraceSink::new(config.session_id.clone(), llm_transcript_store.clone());
@@ -418,7 +419,7 @@ fn session_compaction_policy(config: &ServerConfig) -> SessionCompactionPolicy {
     )
 }
 
-async fn connect_agent_store(config: &ServerConfig) -> anyhow::Result<LibsqlAgentStore> {
+async fn connect_agent_store(config: &ServerConfig) -> anyhow::Result<Rc<dyn AgentStore>> {
     let (memory_embedder, memory_profile, memory_dimensions) =
         build_embedder(&config.embedding_backend)?;
     let (policy_embedder, policy_profile, policy_dimensions) =
@@ -434,7 +435,7 @@ async fn connect_agent_store(config: &ServerConfig) -> anyhow::Result<LibsqlAgen
             );
         }
     }
-    LibsqlAgentStore::connect(
+    let store = LibsqlAgentStore::connect(
         LibsqlAgentStoreConfig::local(
             config.agent_db_path.clone(),
             memory_dimensions,
@@ -446,7 +447,8 @@ async fn connect_agent_store(config: &ServerConfig) -> anyhow::Result<LibsqlAgen
         policy_embedder,
     )
     .await
-    .context("connect libsql agent store")
+    .context("connect libsql agent store")?;
+    Ok(Rc::new(store))
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -831,7 +833,7 @@ struct ServerUtteranceSink {
     tab_id: String,
     server_session_id: String,
     visualizer: VisualizerEventSink,
-    store: LibsqlUtteranceEventStore,
+    store: Rc<dyn UtteranceEventStore>,
     clock: Rc<dyn Clock>,
 }
 
@@ -840,7 +842,7 @@ impl ServerUtteranceSink {
         tab_id: String,
         server_session_id: String,
         visualizer: VisualizerEventSink,
-        store: LibsqlUtteranceEventStore,
+        store: Rc<dyn UtteranceEventStore>,
         clock: Rc<dyn Clock>,
     ) -> Self {
         Self {
@@ -1140,7 +1142,7 @@ mod tests {
                     "server-session".to_string(),
                     VisualizerTabId::new("server"),
                     crate::gui::VisualizerEventSink::new(events_tx),
-                    store.clone(),
+                    Rc::new(store.clone()),
                     clock,
                 ));
 

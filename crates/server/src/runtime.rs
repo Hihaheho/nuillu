@@ -742,7 +742,7 @@ async fn run_server(
 
     emit_visualizer_blackboard_snapshot(SERVER_TAB_ID, &env.blackboard, visualizer).await;
     emit_persisted_llm_transcripts(
-        &env.llm_transcript_store,
+        env.llm_transcript_store.as_ref(),
         SERVER_TAB_ID,
         &visualizer.event_sender(),
     )

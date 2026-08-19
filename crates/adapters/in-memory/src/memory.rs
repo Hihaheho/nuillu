@@ -9,6 +9,7 @@ use nuillu_memory::{
     MemoryLinkRelation, MemoryQuery, MemoryRecord, MemoryStore, NewMemory, NewMemoryLink,
 };
 use nuillu_module::ports::{Embedder, PortError};
+use nuillu_storage::EmbeddingProfile;
 use nuillu_types::{MemoryIndex, MemoryRank};
 use uuid::Uuid;
 
@@ -39,7 +40,7 @@ struct StoredLink {
 /// [`Embedder`]. No lexical-search fallback is used.
 pub struct InMemoryMemoryStore {
     embedder: Rc<dyn Embedder>,
-    dimensions: usize,
+    active_profile: EmbeddingProfile,
     state: Mutex<MemoryState>,
 }
 
@@ -47,24 +48,43 @@ impl std::fmt::Debug for InMemoryMemoryStore {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("InMemoryMemoryStore")
-            .field("dimensions", &self.dimensions)
+            .field("active_profile", &self.active_profile)
             .field("state", &self.state)
             .finish_non_exhaustive()
     }
 }
 
 impl InMemoryMemoryStore {
-    pub fn new(embedder: Rc<dyn Embedder>) -> Self {
-        Self {
-            dimensions: embedder.dimensions(),
+    pub fn new(
+        active_profile: EmbeddingProfile,
+        embedder: Rc<dyn Embedder>,
+    ) -> Result<Self, PortError> {
+        active_profile.validate()?;
+        if embedder.dimensions() != active_profile.dimensions {
+            return Err(PortError::InvalidInput(format!(
+                "in-memory embedding dimension mismatch: profile={}, embedder={}",
+                active_profile.dimensions,
+                embedder.dimensions()
+            )));
+        }
+        Ok(Self {
+            active_profile,
             embedder,
             state: Mutex::new(MemoryState::default()),
-        }
+        })
+    }
+
+    pub fn active_profile(&self) -> &EmbeddingProfile {
+        &self.active_profile
+    }
+
+    pub fn profile_id(&self) -> String {
+        self.active_profile.profile_id()
     }
 
     async fn embed(&self, text: &str) -> Result<Vec<f32>, PortError> {
         let embedding = self.embedder.embed(text).await?;
-        crate::embedding::validate("memory", self.dimensions, embedding)
+        crate::embedding::validate("memory", self.active_profile.dimensions, embedding)
     }
 
     fn lock(&self) -> Result<std::sync::MutexGuard<'_, MemoryState>, PortError> {
@@ -485,7 +505,11 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn search_filters_and_orders_records() {
-        let store = InMemoryMemoryStore::new(Rc::new(TestEmbedder));
+        let store = InMemoryMemoryStore::new(
+            EmbeddingProfile::default_for_dimensions(3),
+            Rc::new(TestEmbedder),
+        )
+        .unwrap();
         let old_at = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
         let new_at = Utc.with_ymd_and_hms(2026, 1, 2, 0, 0, 0).unwrap();
         store
@@ -534,7 +558,11 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn links_and_compaction_are_updated_atomically() {
-        let store = InMemoryMemoryStore::new(Rc::new(TestEmbedder));
+        let store = InMemoryMemoryStore::new(
+            EmbeddingProfile::default_for_dimensions(3),
+            Rc::new(TestEmbedder),
+        )
+        .unwrap();
         let at = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
         let first = MemoryIndex::new("first");
         let second = MemoryIndex::new("second");
@@ -581,5 +609,16 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn constructor_rejects_profile_embedder_dimension_mismatch() {
+        let error = InMemoryMemoryStore::new(
+            EmbeddingProfile::default_for_dimensions(4),
+            Rc::new(TestEmbedder),
+        )
+        .unwrap_err();
+
+        assert!(matches!(error, PortError::InvalidInput(_)));
     }
 }

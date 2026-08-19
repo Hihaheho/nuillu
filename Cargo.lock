@@ -2925,7 +2925,9 @@ dependencies = [
  "nuillu-memory",
  "nuillu-module",
  "nuillu-reward",
+ "nuillu-storage",
  "nuillu-types",
+ "serde_json",
  "tokio",
  "uuid",
 ]
@@ -2942,6 +2944,7 @@ dependencies = [
  "nuillu-memory",
  "nuillu-module",
  "nuillu-reward",
+ "nuillu-storage",
  "nuillu-types",
  "serde_json",
  "sha2",
@@ -3556,6 +3559,7 @@ dependencies = [
  "nuillu-self-model",
  "nuillu-sensory",
  "nuillu-speak",
+ "nuillu-storage",
  "nuillu-surprise",
  "nuillu-types",
  "nuillu-visualizer-protocol",
@@ -3586,6 +3590,19 @@ dependencies = [
  "serde_json",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "nuillu-storage"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "nuillu-memory",
+ "nuillu-module",
+ "nuillu-reward",
+ "nuillu-types",
+ "serde_json",
+ "sha2",
 ]
 
 [[package]]

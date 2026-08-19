@@ -1,10 +1,17 @@
 //! In-memory adapters for local development and tests.
 
+mod agent;
 mod embedding;
+mod events;
 mod memory;
 mod persistence;
 mod policy;
 
+pub use agent::InMemoryAgentStore;
+pub use events::{
+    InMemoryAmbientSensorySnapshotStore, InMemoryExternalActionEventStore,
+    InMemoryLlmTranscriptStore, InMemoryOneShotSensoryInputStore, InMemoryUtteranceEventStore,
+};
 pub use memory::InMemoryMemoryStore;
 pub use persistence::{InMemoryAllocationStore, InMemoryMemoLogRepository, InMemorySessionStore};
 pub use policy::InMemoryPolicyStore;
@@ -86,7 +93,7 @@ mod tests {
     use nuillu_blackboard::CognitionLogOrigin;
     use nuillu_types::{ReplicaIndex, builtin};
 
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     async fn cognition_log_repo_filters_by_time() {
         let repo = InMemoryCognitionLogRepository::new();
         let stream = ModuleInstanceId::new(builtin::cognition_gate(), ReplicaIndex::ZERO);
