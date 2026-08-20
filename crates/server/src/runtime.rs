@@ -41,7 +41,7 @@ use crate::registry::{
 use crate::snapshot::emit_visualizer_blackboard_snapshot;
 use crate::state::{ActionAffordanceState, ModuleSettingsState, SceneState};
 
-const SERVER_TITLE: &str = "nuillu-server";
+pub(crate) const SERVER_TITLE: &str = "nuillu-server";
 const EVENT_BACKLOG_LIMIT: usize = 512;
 const AGENT_RESTART_LIMIT: u64 = 5;
 const AGENT_RESTART_STABLE_AFTER: Duration = Duration::from_secs(30);
@@ -145,6 +145,16 @@ impl ServerRuntimeHandle {
 
     pub fn shutdown(&self) -> anyhow::Result<()> {
         self.send_command(VisualizerCommand::Shutdown)
+    }
+
+    /// Asks the runtime to re-emit the authoritative visualizer state.
+    ///
+    /// Use this after recreating a UI view or message bridge. The resulting messages can be
+    /// consumed in batches with [`crate::VisualizerServerMessageReceiverExt::drain`].
+    pub fn request_visualizer_snapshot(&self) -> anyhow::Result<()> {
+        self.commands
+            .send(VisualizerClientMessage::request_snapshot(server_tab_id()))
+            .context("request server visualizer snapshot")
     }
 
     pub fn subscribe_events(&self) -> Receiver<ServerEvent> {
@@ -949,6 +959,7 @@ mod tests {
             .unwrap();
         handle.pause().unwrap();
         handle.resume().unwrap();
+        handle.request_visualizer_snapshot().unwrap();
         handle.shutdown().unwrap();
 
         let messages = rx.try_iter().collect::<Vec<_>>();
@@ -981,6 +992,12 @@ mod tests {
         ));
         assert!(matches!(
             &messages[4],
+            VisualizerClientMessage::Command {
+                command: VisualizerCommand::RequestSnapshot { tab_id }
+            } if tab_id == &server_tab_id()
+        ));
+        assert!(matches!(
+            &messages[5],
             VisualizerClientMessage::Command {
                 command: VisualizerCommand::Shutdown
             }

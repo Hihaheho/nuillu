@@ -26,7 +26,7 @@ pub use environment::{
     build_embedder, build_embedder_with_api_key, build_lutum, build_lutum_with_api_key,
     build_lutum_with_http_client, build_model_handle, build_tiers, server_llm_log_context,
 };
-pub use gui::{VisualizerEventSink, VisualizerHook};
+pub use gui::{VisualizerEventSink, VisualizerHook, VisualizerServerMessageReceiverExt};
 pub use llm_observer::VisualizerLlmObserver;
 pub use model_set::{
     EmbeddingRole, ModelDefinition, ModelSet, ModelSetError, ModelSetFile, ReasoningEffort,

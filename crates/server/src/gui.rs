@@ -8,6 +8,35 @@ use nuillu_visualizer_protocol::{
     VisualizerAction, VisualizerClientMessage, VisualizerEvent, VisualizerServerMessage,
 };
 
+/// Non-blocking batch access to queued visualizer server messages.
+///
+/// This is implemented for both channel kinds accepted by [`VisualizerHook`], so native and
+/// wasm hosts can forward one `Vec<VisualizerServerMessage>` per bridge call instead of crossing
+/// the host boundary once per message.
+pub trait VisualizerServerMessageReceiverExt {
+    /// Removes at most `max` currently queued messages, preserving their send order.
+    fn drain(&mut self, max: usize) -> Vec<VisualizerServerMessage>;
+}
+
+impl VisualizerServerMessageReceiverExt for Receiver<VisualizerServerMessage> {
+    fn drain(&mut self, max: usize) -> Vec<VisualizerServerMessage> {
+        self.try_iter().take(max).collect()
+    }
+}
+
+impl VisualizerServerMessageReceiverExt for async_mpsc::UnboundedReceiver<VisualizerServerMessage> {
+    fn drain(&mut self, max: usize) -> Vec<VisualizerServerMessage> {
+        let mut messages = Vec::with_capacity(max.min(64));
+        while messages.len() < max {
+            match self.try_recv() {
+                Ok(message) => messages.push(message),
+                Err(async_mpsc::TryRecvError::Empty | async_mpsc::TryRecvError::Closed) => break,
+            }
+        }
+        messages
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct VisualizerEventSink {
     events: EventSender,
@@ -194,5 +223,35 @@ mod tests {
             Some(VisualizerClientMessage::Hello { .. })
         ));
         assert!(event_rx.next().await.is_some());
+    }
+
+    #[test]
+    fn sync_receiver_drains_up_to_max_in_send_order() {
+        let (event_tx, mut event_rx) = std::sync::mpsc::channel();
+        event_tx.send(VisualizerServerMessage::hello()).unwrap();
+        event_tx.send(VisualizerServerMessage::hello()).unwrap();
+        event_tx.send(VisualizerServerMessage::hello()).unwrap();
+
+        assert_eq!(event_rx.drain(2).len(), 2);
+        assert_eq!(event_rx.drain(2).len(), 1);
+        assert!(event_rx.drain(2).is_empty());
+    }
+
+    #[test]
+    fn async_receiver_drains_up_to_max_in_send_order() {
+        let (event_tx, mut event_rx) = async_mpsc::unbounded();
+        event_tx
+            .unbounded_send(VisualizerServerMessage::hello())
+            .unwrap();
+        event_tx
+            .unbounded_send(VisualizerServerMessage::hello())
+            .unwrap();
+        event_tx
+            .unbounded_send(VisualizerServerMessage::hello())
+            .unwrap();
+
+        assert_eq!(event_rx.drain(2).len(), 2);
+        assert_eq!(event_rx.drain(2).len(), 1);
+        assert!(event_rx.drain(2).is_empty());
     }
 }

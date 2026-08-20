@@ -1,3 +1,9 @@
+//! Transport-neutral visualizer message types plus the native JSON-lines TCP transport.
+//!
+//! The message schema is defined by Serde, not by JSON. Native TCP currently uses `serde_json`
+//! for debuggable newline-delimited frames. Other hosts may serialize the same message values as
+//! a JSON batch or with another Serde data format without changing the protocol model.
+
 use std::{
     collections::BTreeMap,
     io::{self, BufRead, BufReader, BufWriter, ErrorKind, Write},
@@ -12,7 +18,7 @@ use nuillu_module::{ActionAffordance, AmbientSensoryEntry, RuntimeEvent, Sensory
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use thiserror::Error;
 
-pub const VISUALIZER_PROTOCOL_VERSION: u32 = 4;
+pub const VISUALIZER_PROTOCOL_VERSION: u32 = 5;
 pub const START_SUITE_ACTION_ID: &str = "suite:start";
 
 pub fn start_activation_action_id(tab_id: &VisualizerTabId) -> String {
@@ -83,6 +89,12 @@ impl VisualizerClientMessage {
     pub fn hello() -> Self {
         Self::Hello {
             version: VISUALIZER_PROTOCOL_VERSION,
+        }
+    }
+
+    pub fn request_snapshot(tab_id: VisualizerTabId) -> Self {
+        Self::Command {
+            command: VisualizerCommand::RequestSnapshot { tab_id },
         }
     }
 }
@@ -284,6 +296,10 @@ pub enum VisualizerEvent {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum VisualizerCommand {
+    /// Re-emits the authoritative UI state for a tab after a worker or view restart.
+    RequestSnapshot {
+        tab_id: VisualizerTabId,
+    },
     PublishSensoryInput {
         tab_id: VisualizerTabId,
         input: SensoryInput,
@@ -1389,6 +1405,21 @@ mod tests {
         assert_eq!(action.id, start_activation_action_id(&tab_id));
         assert_eq!(action.scope, VisualizerActionScope::Tab { tab_id });
         assert_eq!(action.kind, VisualizerActionKind::StartActivation);
+    }
+
+    #[test]
+    fn snapshot_request_round_trips_through_json() {
+        let message = VisualizerClientMessage::request_snapshot(VisualizerTabId::new("server"));
+
+        let json = serde_json::to_string(&message).unwrap();
+        let actual: VisualizerClientMessage = serde_json::from_str(&json).unwrap();
+
+        assert!(matches!(
+            actual,
+            VisualizerClientMessage::Command {
+                command: VisualizerCommand::RequestSnapshot { tab_id }
+            } if tab_id == VisualizerTabId::new("server")
+        ));
     }
 
     #[test]

@@ -374,9 +374,7 @@ pub async fn emit_persisted_llm_transcripts(
         };
         turns.push(turn);
     }
-    if !turns.is_empty() {
-        visualizer.send(VisualizerEvent::LlmTranscriptSnapshot { tab_id, turns });
-    }
+    visualizer.send(VisualizerEvent::LlmTranscriptSnapshot { tab_id, turns });
 }
 
 pub(crate) fn transcript_turn_view_from_record(

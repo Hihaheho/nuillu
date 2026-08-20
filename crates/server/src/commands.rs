@@ -26,8 +26,8 @@ use crate::SERVER_TAB_ID;
 use crate::config::ServerBootConfig;
 use crate::environment::ServerEnvironment;
 use crate::gui::VisualizerHook;
-use crate::llm_db_trace::transcript_turn_view_from_record;
-use crate::runtime::set_runtime_running;
+use crate::llm_db_trace::{emit_persisted_llm_transcripts, transcript_turn_view_from_record};
+use crate::runtime::{SERVER_TITLE, set_runtime_running};
 use crate::snapshot::{
     emit_visualizer_blackboard_snapshot, linked_memory_record_view, memory_record_view,
 };
@@ -123,6 +123,21 @@ async fn handle_server_visualizer_message(
         VisualizerClientMessage::Command { command } => command,
     };
     match command {
+        VisualizerCommand::RequestSnapshot {
+            tab_id: command_tab,
+        } if command_tab == *tab_id => {
+            emit_current_visualizer_snapshot(
+                visualizer,
+                tab_id,
+                scene,
+                action_affordances,
+                boot_config,
+                env,
+                run_controller,
+            )
+            .await;
+            false
+        }
         VisualizerCommand::Shutdown => {
             visualizer.request_shutdown();
             true
@@ -575,6 +590,58 @@ async fn handle_server_visualizer_message(
             false
         }
         _ => false,
+    }
+}
+
+async fn emit_current_visualizer_snapshot(
+    visualizer: &VisualizerHook,
+    tab_id: &VisualizerTabId,
+    scene: &SceneState,
+    action_affordances: &ActionAffordanceState,
+    boot_config: &ServerBootConfig,
+    env: &ServerEnvironment,
+    run_controller: &AgentRunController,
+) {
+    visualizer.send_server_message(nuillu_visualizer_protocol::VisualizerServerMessage::hello());
+    visualizer.send_event(VisualizerEvent::OpenTab {
+        tab_id: tab_id.clone(),
+        title: SERVER_TITLE.to_owned(),
+    });
+    visualizer.send_event(VisualizerEvent::SetTabStatus {
+        tab_id: tab_id.clone(),
+        status: if run_controller.is_running() {
+            nuillu_visualizer_protocol::TabStatus::Running
+        } else {
+            nuillu_visualizer_protocol::TabStatus::Stopped
+        },
+    });
+    emit_scene_state(scene, visualizer, tab_id);
+    emit_action_affordances(
+        visualizer,
+        tab_id,
+        boot_config.overlay_action_affordances(action_affordances.affordances()),
+    );
+    emit_recent_activity_rows(env, visualizer, tab_id).await;
+    emit_visualizer_blackboard_snapshot(SERVER_TAB_ID, &env.blackboard, visualizer).await;
+    emit_persisted_llm_transcripts(
+        env.llm_transcript_store.as_ref(),
+        SERVER_TAB_ID,
+        &visualizer.event_sender(),
+    )
+    .await;
+
+    let run_action_id = run_runtime_action_id(tab_id);
+    let stop_action_id = stop_runtime_action_id(tab_id);
+    visualizer.revoke_action(run_action_id);
+    visualizer.revoke_action(stop_action_id);
+    if run_controller.is_running() {
+        visualizer.offer_action(nuillu_visualizer_protocol::VisualizerAction::stop_runtime(
+            tab_id.clone(),
+        ));
+    } else {
+        visualizer.offer_action(nuillu_visualizer_protocol::VisualizerAction::run_runtime(
+            tab_id.clone(),
+        ));
     }
 }
 
