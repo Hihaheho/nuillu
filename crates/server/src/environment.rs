@@ -11,7 +11,7 @@ use lutum::{
     Temperature, TopK, TopP,
 };
 use lutum_libsql_adapter::{LibsqlAgentStore, LibsqlAgentStoreConfig};
-use lutum_openai::{FeatureFlags, OpenAiAdapter, OpenAiReasoningEffort};
+use lutum_openai::{FeatureFlags, HttpClient, OpenAiAdapter, OpenAiReasoningEffort};
 use nuillu_blackboard::{AllocationLimits, Blackboard};
 use nuillu_llm_trace_file::{FileLlmTraceSink, LlmLogContext};
 use nuillu_memory::{MemoryCapabilities, MemoryStore};
@@ -574,9 +574,20 @@ fn agent_db_backup_path(
 pub fn build_embedder(
     embedding: &EmbeddingBackendConfig,
 ) -> anyhow::Result<(Box<dyn Embedder>, EmbeddingProfile, usize)> {
+    build_embedder_with_api_key(embedding, embedding.token.clone())
+}
+
+/// Builds an embedder with an API key supplied by the runtime.
+///
+/// This leaves the backend configuration reusable when credentials are acquired
+/// after configuration loading but before the runtime worker is created.
+pub fn build_embedder_with_api_key(
+    embedding: &EmbeddingBackendConfig,
+    api_key: impl Into<String>,
+) -> anyhow::Result<(Box<dyn Embedder>, EmbeddingProfile, usize)> {
     let embedder = OpenAiEmbedder::new(OpenAiEmbedderConfig {
         base_url: embedding.endpoint.clone(),
-        api_key: embedding.token.clone(),
+        api_key: api_key.into(),
         model: embedding.model.clone(),
         target_dimensions: embedding.dimensions,
         request_timeout: None,
@@ -656,15 +667,65 @@ pub fn build_lutum(
     build_lutum_with_file_trace(config, llm_observer, None, None)
 }
 
+/// Builds a Lutum client with an API key supplied by the runtime.
+///
+/// Callers can load a key after application startup and defer runtime worker
+/// creation until this function succeeds.
+pub fn build_lutum_with_api_key(
+    config: &LlmBackendConfig,
+    api_key: impl Into<String>,
+    llm_observer: Option<VisualizerLlmObserver>,
+) -> anyhow::Result<Lutum> {
+    build_lutum_from_adapter(
+        config,
+        OpenAiAdapter::new(api_key),
+        llm_observer,
+        None,
+        None,
+    )
+}
+
+/// Builds a Lutum client with runtime credentials and a caller-provided HTTP client.
+pub fn build_lutum_with_http_client(
+    config: &LlmBackendConfig,
+    api_key: impl Into<String>,
+    http_client: impl HttpClient + 'static,
+    llm_observer: Option<VisualizerLlmObserver>,
+) -> anyhow::Result<Lutum> {
+    build_lutum_from_adapter(
+        config,
+        OpenAiAdapter::new_with_http_client(api_key, http_client),
+        llm_observer,
+        None,
+        None,
+    )
+}
+
 pub fn build_lutum_with_file_trace(
     config: &LlmBackendConfig,
     llm_observer: Option<VisualizerLlmObserver>,
     file_trace_sink: Option<FileLlmTraceSink>,
     db_trace_sink: Option<DbLlmTraceSink>,
 ) -> anyhow::Result<Lutum> {
+    build_lutum_from_adapter(
+        config,
+        OpenAiAdapter::new(config.token.clone()),
+        llm_observer,
+        file_trace_sink,
+        db_trace_sink,
+    )
+}
+
+fn build_lutum_from_adapter(
+    config: &LlmBackendConfig,
+    adapter: OpenAiAdapter,
+    llm_observer: Option<VisualizerLlmObserver>,
+    file_trace_sink: Option<FileLlmTraceSink>,
+    db_trace_sink: Option<DbLlmTraceSink>,
+) -> anyhow::Result<Lutum> {
     let feature_flags = FeatureFlags::OPENAI
         .with_top_k(config.generation.top_k.is_some() && !config.use_responses_api);
-    let adapter = OpenAiAdapter::new(config.token.clone())
+    let adapter = adapter
         .with_base_url(config.endpoint.clone())
         .with_default_model(ModelName::new(&config.model)?)
         .with_feature_flags(feature_flags)
@@ -1073,6 +1134,36 @@ mod tests {
             Some(lutum::GenerationSetting::Set(value))
                 if value.as_slice().len() == 1 && value.as_slice()[0] == "END"
         ));
+    }
+
+    #[test]
+    fn build_lutum_accepts_api_key_supplied_after_config_loading() {
+        let mut backend = test_backend_config();
+        backend.token.clear();
+
+        build_lutum_with_api_key(&backend, "runtime-key", None).unwrap();
+        build_lutum_with_http_client(
+            &backend,
+            "runtime-key",
+            lutum_openai::ReqwestHttpClient::new(),
+            None,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn build_embedder_accepts_api_key_supplied_after_config_loading() {
+        let mut backend = test_embedding_backend();
+        backend.token.clear();
+
+        assert!(build_embedder(&backend).is_err());
+
+        let (_, profile, dimensions) =
+            build_embedder_with_api_key(&backend, "runtime-key").unwrap();
+        assert_eq!(
+            (profile, dimensions),
+            (EmbeddingProfile::new("embed", "openai", 8), 8)
+        );
     }
 
     #[test]

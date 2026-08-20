@@ -23,7 +23,8 @@ pub use config::{
     load_server_config_from_options,
 };
 pub use environment::{
-    build_embedder, build_lutum, build_model_handle, build_tiers, server_llm_log_context,
+    build_embedder, build_embedder_with_api_key, build_lutum, build_lutum_with_api_key,
+    build_lutum_with_http_client, build_model_handle, build_tiers, server_llm_log_context,
 };
 pub use gui::{VisualizerEventSink, VisualizerHook};
 pub use llm_observer::VisualizerLlmObserver;
