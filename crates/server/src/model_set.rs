@@ -191,14 +191,23 @@ pub fn parse_model_set_file(path: &Path) -> Result<ModelSet, ModelSetError> {
         path: path.to_path_buf(),
         source,
     })?;
+    parse_model_set_content(&content, path.to_path_buf())
+}
+
+/// Parses a model set supplied by an in-memory editor or another non-file source.
+///
+/// `origin` is used only to identify the input in parse and validation errors.
+pub fn parse_model_set_str(content: &str, origin: &str) -> Result<ModelSet, ModelSetError> {
+    parse_model_set_content(content, PathBuf::from(origin))
+}
+
+fn parse_model_set_content(content: &str, path: PathBuf) -> Result<ModelSet, ModelSetError> {
     let file: ModelSetFile =
-        eure::parse_content(&content, path.to_path_buf()).map_err(|message| {
-            ModelSetError::Parse {
-                path: path.to_path_buf(),
-                message,
-            }
+        eure::parse_content(content, path.clone()).map_err(|message| ModelSetError::Parse {
+            path: path.clone(),
+            message,
         })?;
-    validate_model_set(path, &file.model_set)?;
+    validate_model_set(&path, &file.model_set)?;
     Ok(file.model_set)
 }
 
@@ -728,8 +737,6 @@ fn validate_optional_text(
 
 #[cfg(test)]
 mod tests {
-    use std::path::Path;
-
     use super::*;
 
     const TEST_EMBEDDING: &str = r#"
@@ -745,16 +752,19 @@ embedding {
     }
 
     fn parse_model_set_exact(content: &str) -> Result<ModelSet, ModelSetError> {
-        let path = Path::new("test-model-set.eure");
-        let file: ModelSetFile =
-            eure::parse_content(content, path.to_path_buf()).map_err(|message| {
-                ModelSetError::Parse {
-                    path: path.to_path_buf(),
-                    message,
-                }
-            })?;
-        validate_model_set(path, &file.model_set)?;
-        Ok(file.model_set)
+        parse_model_set_str(content, "test-model-set.eure")
+    }
+
+    #[test]
+    fn in_memory_parse_reports_the_supplied_origin() {
+        let error = parse_model_set_str("not valid eure = {", "local-storage:model-set")
+            .expect_err("invalid content should fail");
+
+        assert!(matches!(
+            error,
+            ModelSetError::Parse { path, .. }
+                if path == Path::new("local-storage:model-set")
+        ));
     }
 
     #[test]

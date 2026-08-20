@@ -18,7 +18,7 @@ use tracing_subscriber::layer::SubscriberExt as _;
 use uuid::Uuid;
 
 use crate::model_set::{
-    EmbeddingRole, ReasoningEffort, parse_model_set_file, resolve_llm_backends,
+    EmbeddingRole, ModelSet, ReasoningEffort, parse_model_set_file, resolve_llm_backends,
     resolve_token_fields,
 };
 
@@ -31,7 +31,8 @@ pub struct ServerConfig {
     pub state_dir: PathBuf,
     pub agent_db_path: PathBuf,
     pub session_id: String,
-    pub llm_log_root: PathBuf,
+    /// Root for file-based LLM traces. `None` disables file trace output.
+    pub llm_log_root: Option<PathBuf>,
     pub cheap_backend: LlmBackendConfig,
     pub default_backend: LlmBackendConfig,
     pub premium_backend: LlmBackendConfig,
@@ -356,8 +357,139 @@ impl RuntimeModule {
 }
 
 impl ServerConfig {
+    /// Starts a configuration builder backed entirely by in-memory values.
+    pub fn builder(model_set: ModelSet) -> ServerConfigBuilder {
+        ServerConfigBuilder::new(model_set)
+    }
+
+    /// Builds a minimal configuration without reading configuration files.
+    pub fn from_memory(
+        model_set: ModelSet,
+        enabled_modules: impl IntoIterator<Item = RuntimeModule>,
+        participants: impl IntoIterator<Item = String>,
+        session_id: impl Into<String>,
+    ) -> anyhow::Result<Self> {
+        Self::builder(model_set)
+            .enabled_modules(enabled_modules)
+            .participants(participants)
+            .session_id(session_id)
+            .build()
+    }
+
     pub fn active_modules(&self) -> Vec<RuntimeModule> {
         self.boot_config.active_modules()
+    }
+}
+
+/// Builds [`ServerConfig`] without loading a model set or boot config from disk.
+#[derive(Debug, Clone)]
+pub struct ServerConfigBuilder {
+    model_set: ModelSet,
+    state_dir: PathBuf,
+    agent_db_path: Option<PathBuf>,
+    session_id: Option<String>,
+    llm_log_root: Option<PathBuf>,
+    boot_config: ServerBootConfig,
+    enabled_modules: Option<HashSet<RuntimeModule>>,
+    disabled_modules: Vec<RuntimeModule>,
+    participants: Vec<String>,
+    fresh_agent_db: bool,
+}
+
+impl ServerConfigBuilder {
+    pub fn new(model_set: ModelSet) -> Self {
+        Self {
+            model_set,
+            state_dir: PathBuf::from("."),
+            agent_db_path: None,
+            session_id: None,
+            llm_log_root: None,
+            boot_config: ServerBootConfig::default(),
+            enabled_modules: None,
+            disabled_modules: Vec::new(),
+            participants: Vec::new(),
+            fresh_agent_db: false,
+        }
+    }
+
+    pub fn state_dir(mut self, state_dir: impl Into<PathBuf>) -> Self {
+        self.state_dir = state_dir.into();
+        self
+    }
+
+    pub fn agent_db_path(mut self, agent_db_path: impl Into<PathBuf>) -> Self {
+        self.agent_db_path = Some(agent_db_path.into());
+        self
+    }
+
+    pub fn session_id(mut self, session_id: impl Into<String>) -> Self {
+        self.session_id = Some(session_id.into());
+        self
+    }
+
+    pub fn file_llm_trace_root(mut self, root: impl Into<PathBuf>) -> Self {
+        self.llm_log_root = Some(root.into());
+        self
+    }
+
+    pub fn disable_file_llm_trace(mut self) -> Self {
+        self.llm_log_root = None;
+        self
+    }
+
+    pub fn boot_config(mut self, boot_config: ServerBootConfig) -> Self {
+        self.boot_config = boot_config;
+        self
+    }
+
+    pub fn enabled_modules(mut self, modules: impl IntoIterator<Item = RuntimeModule>) -> Self {
+        self.enabled_modules = Some(modules.into_iter().collect());
+        self
+    }
+
+    pub fn disabled_modules(mut self, modules: impl IntoIterator<Item = RuntimeModule>) -> Self {
+        self.disabled_modules = modules.into_iter().collect();
+        self
+    }
+
+    pub fn participants(mut self, participants: impl IntoIterator<Item = String>) -> Self {
+        self.participants = participants.into_iter().collect();
+        self
+    }
+
+    pub fn fresh_agent_db(mut self, fresh: bool) -> Self {
+        self.fresh_agent_db = fresh;
+        self
+    }
+
+    pub fn build(mut self) -> anyhow::Result<ServerConfig> {
+        if let Some(enabled) = self.enabled_modules {
+            self.boot_config
+                .modules
+                .retain(|module| enabled.contains(&module.id));
+        }
+        self.boot_config.validate(Path::new("<memory>"))?;
+        let backends = resolve_llm_backends(&self.model_set)?;
+        let embedding_backend = resolve_embedding(&self.model_set.embedding)?;
+        let agent_db_path = self
+            .agent_db_path
+            .unwrap_or_else(|| self.state_dir.join(AGENT_DB_FILE));
+
+        Ok(ServerConfig {
+            state_dir: self.state_dir,
+            agent_db_path,
+            session_id: self.session_id.unwrap_or_else(default_server_session_id),
+            llm_log_root: self.llm_log_root,
+            cheap_backend: backends.cheap,
+            default_backend: backends.default,
+            premium_backend: backends.premium,
+            image_backend: backends.image,
+            embedding_backend,
+            boot_config: self.boot_config,
+            disabled_modules: self.disabled_modules,
+            participants: self.participants,
+            fresh_agent_db: self.fresh_agent_db,
+        })
     }
 }
 
@@ -863,7 +995,7 @@ pub fn load_server_config_from_options(options: ServerRunOptions) -> anyhow::Res
         state_dir: options.state_dir,
         agent_db_path,
         session_id,
-        llm_log_root: options.llm_log_root,
+        llm_log_root: Some(options.llm_log_root),
         cheap_backend,
         default_backend,
         premium_backend,
@@ -924,6 +1056,41 @@ pub fn install_lutum_trace_subscriber() -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn in_memory_builder_uses_values_without_loading_config_files() {
+        let model_set = crate::model_set::parse_model_set_str(
+            r#"
+models {
+  text { token = "local" model = "text" }
+}
+cheap-model = "text"
+default-model = "text"
+premium-model = "text"
+embedding {
+  token = "local"
+  model = "embed"
+  dimensions = 8
+}
+"#,
+            "local-storage:model-set",
+        )
+        .unwrap();
+
+        let config = ServerConfig::from_memory(
+            model_set,
+            [RuntimeModule::Sensory],
+            ["person".to_owned()],
+            "browser-session",
+        )
+        .unwrap();
+
+        assert_eq!(config.active_modules(), vec![RuntimeModule::Sensory]);
+        assert_eq!(config.participants, vec!["person"]);
+        assert_eq!(config.session_id, "browser-session");
+        assert_eq!(config.agent_db_path, PathBuf::from("./agent.db"));
+        assert_eq!(config.llm_log_root, None);
+    }
 
     #[test]
     fn load_server_boot_config_missing_file_uses_default_modules() {

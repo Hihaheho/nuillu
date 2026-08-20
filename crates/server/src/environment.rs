@@ -323,7 +323,7 @@ pub(super) async fn build_server_environment(
                 &config.image_backend,
                 &llm_concurrency_pool,
                 Some(llm_observer),
-                Some(server_llm_log_context(config)),
+                server_llm_log_context(config),
                 Some(db_trace_sink),
             )?,
         },
@@ -741,8 +741,11 @@ fn apply_generation_defaults(
     Ok(lutum)
 }
 
-pub fn server_llm_log_context(config: &ServerConfig) -> LlmLogContext {
-    LlmLogContext::new(config.llm_log_root.clone(), vec![config.session_id.clone()])
+pub fn server_llm_log_context(config: &ServerConfig) -> Option<LlmLogContext> {
+    config
+        .llm_log_root
+        .clone()
+        .map(|root| LlmLogContext::new(root, vec![config.session_id.clone()]))
 }
 
 #[derive(Clone, Copy)]
@@ -1010,7 +1013,7 @@ mod tests {
             state_dir: PathBuf::from(".tmp/server"),
             agent_db_path: PathBuf::from(".tmp/server/agent.db"),
             session_id: "session-1".to_string(),
-            llm_log_root: PathBuf::from("llm-logs"),
+            llm_log_root: Some(PathBuf::from("llm-logs")),
             cheap_backend: test_backend_config(),
             default_backend: test_backend_config(),
             premium_backend: test_backend_config(),
@@ -1022,7 +1025,7 @@ mod tests {
             fresh_agent_db: false,
         };
 
-        let context = server_llm_log_context(&config);
+        let context = server_llm_log_context(&config).unwrap();
 
         assert_eq!(context.root, PathBuf::from("llm-logs"));
         assert_eq!(context.namespace, vec!["session-1"]);

@@ -52,6 +52,24 @@ pub(super) async fn drive_server_until_shutdown(
         if visualizer.shutdown_requested() {
             break;
         }
+        if let Some(message) = visualizer.recv_command_timeout(SNAPSHOT_INTERVAL).await {
+            if handle_server_visualizer_message(
+                message,
+                visualizer,
+                tab_id,
+                scene,
+                module_settings,
+                action_affordances,
+                boot_config,
+                sensory,
+                env,
+                run_controller,
+            )
+            .await
+            {
+                break;
+            }
+        }
         while let Some(message) = visualizer.try_recv_command() {
             if handle_server_visualizer_message(
                 message,
@@ -74,7 +92,6 @@ pub(super) async fn drive_server_until_shutdown(
             break;
         }
         emit_visualizer_blackboard_snapshot(SERVER_TAB_ID, &env.blackboard, visualizer).await;
-        tokio::time::sleep(SNAPSHOT_INTERVAL).await;
     }
 }
 

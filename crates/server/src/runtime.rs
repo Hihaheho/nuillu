@@ -374,7 +374,6 @@ pub fn run_server_with_visualizer(config: ServerConfig) -> anyhow::Result<()> {
     let _ = port.recv();
 
     let (command_rx, event_tx) = port.into_channels();
-    send_visualizer_startup(&event_tx);
     run_server_on_current_thread(config, Vec::new(), event_tx, command_rx)
 }
 
@@ -392,7 +391,6 @@ pub fn spawn_server_runtime_with_module_registrars(
     let visualizer_messages = Broadcast::new(EVENT_BACKLOG_LIMIT);
     spawn_visualizer_message_pump(visualizer_rx, visualizer_messages.clone(), events.clone());
     let join = thread::spawn(move || {
-        send_visualizer_startup(&visualizer_tx);
         run_server_on_current_thread(config, registrars, visualizer_tx, command_rx)
     });
 
@@ -415,37 +413,12 @@ fn run_server_on_current_thread(
         .build()
         .context("build server tokio runtime")?;
     let local = LocalSet::new();
-    let mut visualizer = VisualizerHook::new(event_tx, command_rx);
-    let result =
-        runtime.block_on(local.run_until(run_server(config, &registrars, &mut visualizer)));
+    let visualizer = VisualizerHook::new(event_tx, command_rx);
+    let result = runtime.block_on(local.run_until(run_server(config, registrars, visualizer)));
     if let Err(error) = &result {
         eprintln!("nuillu-server runtime failed: {error:#}");
-        let tab_id = VisualizerTabId::new(SERVER_TAB_ID.to_string());
-        visualizer.send_event(VisualizerEvent::Log {
-            tab_id: tab_id.clone(),
-            message: format!("nuillu-server runtime failed: {error:#}"),
-        });
-        visualizer.send_event(VisualizerEvent::SetTabStatus {
-            tab_id,
-            status: TabStatus::Invalid,
-        });
     }
     result
-}
-
-fn send_visualizer_startup(events: &Sender<VisualizerServerMessage>) {
-    let tab_id = server_tab_id();
-    let _ = events.send(VisualizerServerMessage::hello());
-    let _ = events.send(VisualizerServerMessage::event(VisualizerEvent::OpenTab {
-        tab_id: tab_id.clone(),
-        title: SERVER_TITLE.to_string(),
-    }));
-    let _ = events.send(VisualizerServerMessage::event(
-        VisualizerEvent::SetTabStatus {
-            tab_id,
-            status: TabStatus::Running,
-        },
-    ));
 }
 
 fn server_tab_id() -> VisualizerTabId {
@@ -682,7 +655,45 @@ fn server_external_action_event_record(
     }
 }
 
-async fn run_server(
+/// Runs the server on the caller's current async executor.
+///
+/// This function does not create a thread, Tokio runtime, or `LocalSet`. The caller must run it
+/// in a local task context because server modules may contain non-`Send` state.
+pub async fn run_server(
+    config: ServerConfig,
+    registrars: Vec<Arc<dyn ServerModuleRegistrar>>,
+    mut visualizer: VisualizerHook,
+) -> anyhow::Result<()> {
+    send_visualizer_startup_to_hook(&visualizer);
+    let result = run_server_inner(config, &registrars, &mut visualizer).await;
+    if let Err(error) = &result {
+        let tab_id = server_tab_id();
+        visualizer.send_event(VisualizerEvent::Log {
+            tab_id: tab_id.clone(),
+            message: format!("nuillu-server runtime failed: {error:#}"),
+        });
+        visualizer.send_event(VisualizerEvent::SetTabStatus {
+            tab_id,
+            status: TabStatus::Invalid,
+        });
+    }
+    result
+}
+
+fn send_visualizer_startup_to_hook(visualizer: &VisualizerHook) {
+    let tab_id = server_tab_id();
+    visualizer.send_server_message(VisualizerServerMessage::hello());
+    visualizer.send_event(VisualizerEvent::OpenTab {
+        tab_id: tab_id.clone(),
+        title: SERVER_TITLE.to_string(),
+    });
+    visualizer.send_event(VisualizerEvent::SetTabStatus {
+        tab_id,
+        status: TabStatus::Running,
+    });
+}
+
+async fn run_server_inner(
     config: ServerConfig,
     registrars: &[Arc<dyn ServerModuleRegistrar>],
     visualizer: &mut VisualizerHook,
