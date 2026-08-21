@@ -69,12 +69,14 @@ impl OpenAiEmbedder {
 
         let endpoint = build_endpoint(base_url);
         let timeout = config.request_timeout.unwrap_or(DEFAULT_REQUEST_TIMEOUT);
-        let client = reqwest::Client::builder()
-            .timeout(timeout)
-            .build()
-            .map_err(|error| {
-                PortError::Backend(format!("failed to build reqwest client: {error}"))
-            })?;
+        let client = reqwest::Client::builder();
+        #[cfg(not(target_arch = "wasm32"))]
+        let client = client.timeout(timeout);
+        #[cfg(target_arch = "wasm32")]
+        let _ = timeout;
+        let client = client.build().map_err(|error| {
+            PortError::Backend(format!("failed to build reqwest client: {error}"))
+        })?;
 
         Ok(Self {
             client,

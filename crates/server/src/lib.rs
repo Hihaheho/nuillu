@@ -2,6 +2,7 @@ pub mod commands;
 pub mod config;
 pub mod environment;
 pub mod gui;
+#[cfg(feature = "libsql")]
 pub mod history;
 pub mod llm_db_trace;
 pub mod llm_observer;

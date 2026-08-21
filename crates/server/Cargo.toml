@@ -6,6 +6,15 @@ license.workspace = true
 repository.workspace = true
 publish.workspace = true
 
+[features]
+default = ["libsql"]
+libsql = ["dep:lutum-libsql-adapter"]
+
+[[bin]]
+name = "nuillu-server"
+path = "src/main.rs"
+required-features = ["libsql"]
+
 [dependencies]
 anyhow = { workspace = true }
 async-trait = { workspace = true }
@@ -16,7 +25,7 @@ eure-document = { workspace = true }
 eure-json = { workspace = true }
 futures = { workspace = true }
 lutum = { workspace = true }
-lutum-libsql-adapter = { workspace = true }
+lutum-libsql-adapter = { workspace = true, optional = true }
 lutum-openai = { workspace = true }
 lutum-trace = { workspace = true }
 nuillu-llm-trace-file = { workspace = true }

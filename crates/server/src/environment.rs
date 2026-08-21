@@ -1,15 +1,18 @@
-use std::{
-    cell::RefCell, collections::BTreeMap, fs, path::Path, rc::Rc, sync::Arc, time::Duration,
-};
+use std::{cell::RefCell, collections::BTreeMap, rc::Rc, sync::Arc, time::Duration};
+
+#[cfg(feature = "libsql")]
+use std::{fs, path::Path};
 
 use anyhow::Context as _;
 use async_trait::async_trait;
+#[cfg(feature = "libsql")]
 use chrono::Local;
 use lutum::{
     FrequencyPenalty, Lutum, MaxOutputTokens, ModelName, PresencePenalty, RawTelemetryConfig,
     RequestExtensions, Seed, SharedPoolBudgetManager, SharedPoolBudgetOptions, StopSequences,
     Temperature, TopK, TopP,
 };
+#[cfg(feature = "libsql")]
 use lutum_libsql_adapter::{LibsqlAgentStore, LibsqlAgentStoreConfig};
 use lutum_openai::{FeatureFlags, HttpClient, OpenAiAdapter, OpenAiReasoningEffort};
 use nuillu_blackboard::{AllocationLimits, Blackboard};
@@ -44,6 +47,7 @@ use super::runtime_event_log::{
     RuntimeEventLogWriter, runtime_event_log_path, runtime_event_message,
 };
 
+#[cfg(feature = "libsql")]
 const AGENT_DB_FILE: &str = "agent.db";
 
 pub(super) struct ServerEnvironment {
@@ -419,6 +423,7 @@ fn session_compaction_policy(config: &ServerConfig) -> SessionCompactionPolicy {
     )
 }
 
+#[cfg(feature = "libsql")]
 async fn connect_agent_store(config: &ServerConfig) -> anyhow::Result<Rc<dyn AgentStore>> {
     let (memory_embedder, memory_profile, memory_dimensions) =
         build_embedder(&config.embedding_backend)?;
@@ -451,6 +456,12 @@ async fn connect_agent_store(config: &ServerConfig) -> anyhow::Result<Rc<dyn Age
     Ok(Rc::new(store))
 }
 
+#[cfg(not(feature = "libsql"))]
+async fn connect_agent_store(_config: &ServerConfig) -> anyhow::Result<Rc<dyn AgentStore>> {
+    anyhow::bail!("nuillu-server was built without the `libsql` feature")
+}
+
+#[cfg(feature = "libsql")]
 #[derive(Debug, Clone, Copy)]
 enum AgentDbBackupFile {
     Main,
@@ -458,6 +469,7 @@ enum AgentDbBackupFile {
     Shm,
 }
 
+#[cfg(feature = "libsql")]
 impl AgentDbBackupFile {
     fn source_name(self) -> &'static str {
         match self {
@@ -476,12 +488,14 @@ impl AgentDbBackupFile {
     }
 }
 
+#[cfg(feature = "libsql")]
 #[derive(Debug)]
 struct AgentDbBackupSource {
     file: AgentDbBackupFile,
     path: std::path::PathBuf,
 }
 
+#[cfg(feature = "libsql")]
 fn backup_agent_db_with_timestamp(
     state_dir: &Path,
     timestamp: &str,
@@ -510,6 +524,7 @@ fn backup_agent_db_with_timestamp(
     )))
 }
 
+#[cfg(feature = "libsql")]
 fn agent_db_backup_sources(state_dir: &Path) -> Vec<AgentDbBackupSource> {
     [
         AgentDbBackupFile::Main,
@@ -524,6 +539,7 @@ fn agent_db_backup_sources(state_dir: &Path) -> Vec<AgentDbBackupSource> {
     .collect()
 }
 
+#[cfg(feature = "libsql")]
 fn next_agent_db_backup_suffix(state_dir: &Path, timestamp: &str) -> anyhow::Result<u32> {
     let mut suffix = 0_u32;
     loop {
@@ -542,6 +558,7 @@ fn next_agent_db_backup_suffix(state_dir: &Path, timestamp: &str) -> anyhow::Res
     }
 }
 
+#[cfg(feature = "libsql")]
 fn agent_db_backup_targets(
     state_dir: &Path,
     timestamp: &str,
@@ -557,6 +574,7 @@ fn agent_db_backup_targets(
     .collect()
 }
 
+#[cfg(feature = "libsql")]
 fn agent_db_backup_path(
     state_dir: &Path,
     timestamp: &str,
@@ -988,7 +1006,7 @@ impl UtteranceSink for ServerUtteranceSink {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "libsql"))]
 mod tests {
     use std::{
         collections::HashMap,

@@ -727,7 +727,7 @@ fn source_label(source: LlmObservationSource) -> &'static str {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "libsql"))]
 mod tests {
     use super::*;
 

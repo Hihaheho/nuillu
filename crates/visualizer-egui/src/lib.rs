@@ -52,14 +52,17 @@ pub use egui;
 pub use egui_hooks;
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
-use std::fs;
 use std::sync::Arc;
 use std::time::Instant;
 
 use egui_hooks::UseHookExt as _;
+#[cfg(feature = "system-fonts")]
 use font_kit::family_name::FamilyName;
+#[cfg(feature = "system-fonts")]
 use font_kit::handle::Handle;
+#[cfg(feature = "system-fonts")]
 use font_kit::properties::{Properties, Weight};
+#[cfg(feature = "system-fonts")]
 use font_kit::source::SystemSource;
 use i18n::{EguiI18nExt as _, LOCALE_PERSISTENCE_KEY};
 pub use i18n::{I18nArg, Locale, VisualizerUiResources, VisualizerUiResourcesBuilder};
@@ -68,7 +71,9 @@ pub use nuillu_visualizer_protocol::*;
 
 const NOTO_SANS_JP_FONT_KEY: &str = "noto-sans-jp";
 const NOTO_SANS_JP_FAMILY_NAME: &str = "Noto Sans JP";
+#[cfg(feature = "system-fonts")]
 const NOTO_SANS_JP_FONT_WEIGHT: Weight = Weight::MEDIUM;
+const NOTO_SANS_JP_FONT_WEIGHT_VALUE: f32 = 500.0;
 const THEME_PERSISTENCE_KEY: &str = "visualizer-theme";
 const ZOOM_FACTOR_PERSISTENCE_KEY: &str = "visualizer-zoom-factor";
 const DEFAULT_ZOOM_FACTOR: f32 = 1.0;
@@ -199,6 +204,11 @@ fn install_visualizer_fonts(ctx: &egui::Context) {
     };
 
     ctx.set_fonts(visualizer_font_definitions(font_data));
+}
+
+#[cfg(not(feature = "system-fonts"))]
+fn load_noto_sans_jp() -> Option<egui::FontData> {
+    None
 }
 
 fn install_visualizer_theme_styles(ctx: &egui::Context) {
@@ -368,6 +378,7 @@ fn visualizer_font_definitions(mut font_data: egui::FontData) -> egui::FontDefin
     fonts
 }
 
+#[cfg(feature = "system-fonts")]
 fn visualizer_font_properties() -> Properties {
     let mut properties = Properties::new();
     properties.weight(NOTO_SANS_JP_FONT_WEIGHT);
@@ -376,11 +387,15 @@ fn visualizer_font_properties() -> Properties {
 
 fn visualizer_font_tweak() -> egui::FontTweak {
     egui::FontTweak {
-        coords: egui::epaint::text::VariationCoords::new([(b"wght", NOTO_SANS_JP_FONT_WEIGHT.0)]),
+        coords: egui::epaint::text::VariationCoords::new([(
+            b"wght",
+            NOTO_SANS_JP_FONT_WEIGHT_VALUE,
+        )]),
         ..Default::default()
     }
 }
 
+#[cfg(feature = "system-fonts")]
 fn load_noto_sans_jp() -> Option<egui::FontData> {
     let handle = match SystemSource::new().select_best_match(
         &[FamilyName::Title(NOTO_SANS_JP_FAMILY_NAME.to_owned())],
@@ -395,7 +410,7 @@ fn load_noto_sans_jp() -> Option<egui::FontData> {
 
     let (bytes, font_index) = match handle {
         Handle::Memory { bytes, font_index } => (bytes.to_vec(), font_index),
-        Handle::Path { path, font_index } => match fs::read(&path) {
+        Handle::Path { path, font_index } => match std::fs::read(&path) {
             Ok(bytes) => (bytes, font_index),
             Err(error) => {
                 eprintln!(
@@ -2732,6 +2747,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "system-fonts")]
     #[test]
     fn visualizer_font_selection_requests_medium_weight() {
         assert_eq!(
