@@ -40,8 +40,8 @@ pub use runtime::{
     ServerAmbientSensorySnapshotRecord, ServerEvent, ServerExternalActionEventRecord,
     ServerExternalActionEventStatus, ServerLlmCall, ServerLlmCallSource,
     ServerOneShotSensoryInputRecord, ServerRuntimeHandle, ServerRuntimeStatus,
-    ServerUtteranceEventKind, ServerUtteranceEventRecord, run_server, run_server_with_visualizer,
-    spawn_server_runtime, spawn_server_runtime_with_module_registrars,
+    ServerUtteranceEventKind, ServerUtteranceEventRecord, run_server, run_server_with_native_timer,
+    run_server_with_visualizer, spawn_server_runtime, spawn_server_runtime_with_module_registrars,
 };
 pub use snapshot::{
     duration_millis_u64, linked_memory_record_view, memory_metadata_views, memory_rank_name,

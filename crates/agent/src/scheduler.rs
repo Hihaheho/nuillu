@@ -14,14 +14,14 @@ use nuillu_blackboard::{
 use nuillu_module::{
     ActivateCx, ActivationGateVote, AgentRuntimeControl, AllocatedModule, AllocatedModules,
     LlmBatchDebug, LlmRequestMetadata, LlmRequestSource, ModuleBatch, ModuleDependencies,
-    ModuleRunStatus, SelfWakePermitClaim, SessionCompactionRuntime, WakeClaim, ports::Clock,
+    ModuleRunStatus, SelfWakePermitClaim, SessionCompactionRuntime, WakeClaim,
+    ports::{Clock, Timer, TokioTimer},
     with_activation_llm_request_metadata,
 };
 use nuillu_types::{ModelTier, ModuleId, ModuleInstanceId, ReplicaIndex, builtin};
 use thiserror::Error;
 use tokio::sync::{oneshot, watch};
 use tokio::task::{JoinHandle, spawn_local};
-use tokio::time::{Instant, sleep, sleep_until};
 use tracing::{Instrument as _, instrument::WithSubscriber as _};
 
 use crate::kicks::{Kick, KickHandle, KickInbox};
@@ -199,7 +199,24 @@ pub async fn run(
     config: AgentEventLoopConfig,
     shutdown: impl Future<Output = ()>,
 ) -> Result<(), SchedulerError> {
-    run_controlled(modules, config, AgentRunControl::always_running(), shutdown).await
+    run_with_timer(modules, config, Rc::new(TokioTimer::new()), shutdown).await
+}
+
+/// Runs the agent with a host-provided monotonic timer.
+pub async fn run_with_timer(
+    modules: AllocatedModules,
+    config: AgentEventLoopConfig,
+    timer: Rc<dyn Timer>,
+    shutdown: impl Future<Output = ()>,
+) -> Result<(), SchedulerError> {
+    run_controlled_with_timer(
+        modules,
+        config,
+        AgentRunControl::always_running(),
+        timer,
+        shutdown,
+    )
+    .await
 }
 
 /// Run the agent event loop with an external Run/Stop control.
@@ -211,6 +228,24 @@ pub async fn run_controlled(
     modules: AllocatedModules,
     config: AgentEventLoopConfig,
     control: AgentRunControl,
+    shutdown: impl Future<Output = ()>,
+) -> Result<(), SchedulerError> {
+    run_controlled_with_timer(
+        modules,
+        config,
+        control,
+        Rc::new(TokioTimer::new()),
+        shutdown,
+    )
+    .await
+}
+
+/// Runs the controlled agent loop with a host-provided monotonic timer.
+pub async fn run_controlled_with_timer(
+    modules: AllocatedModules,
+    config: AgentEventLoopConfig,
+    control: AgentRunControl,
+    timer: Rc<dyn Timer>,
     shutdown: impl Future<Output = ()>,
 ) -> Result<(), SchedulerError> {
     let (runtime, modules, dependencies) = modules.into_parts_with_dependencies();
@@ -271,6 +306,7 @@ pub async fn run_controlled(
             &kick_handles,
             &dependency_targets,
             &mut zero_windows,
+            &timer,
             config,
             &parent,
             &subscriber,
@@ -279,7 +315,7 @@ pub async fn run_controlled(
     }
 
     let mut shutdown = pin!(shutdown);
-    let mut idle_since: Option<Instant> = None;
+    let mut idle_since: Option<Duration> = None;
     let mut idle_marker_sent = false;
     let mut observed_wake_sequence = runtime.wake_change_sequence();
 
@@ -291,13 +327,17 @@ pub async fn run_controlled(
         }
         let idle_now = running && is_idle(&active, &states);
         if idle_now {
-            idle_since.get_or_insert_with(Instant::now);
+            idle_since.get_or_insert_with(|| timer.elapsed());
         } else {
             idle_since = None;
             idle_marker_sent = false;
         }
-        let idle_deadline = if idle_now && !idle_marker_sent {
-            idle_since.map(|since| since + config.idle_threshold)
+        let idle_wait = if idle_now && !idle_marker_sent {
+            idle_since.map(|since| {
+                config
+                    .idle_threshold
+                    .saturating_sub(timer.elapsed().saturating_sub(since))
+            })
         } else {
             None
         };
@@ -326,6 +366,7 @@ pub async fn run_controlled(
                             &mut zero_windows,
                             &mut consecutive_failures,
                             control.is_running(),
+                            &timer,
                             config,
                             &parent,
                             &subscriber,
@@ -355,6 +396,7 @@ pub async fn run_controlled(
                                 &kick_handles,
                                 &dependency_targets,
                                 &mut zero_windows,
+                                &timer,
                                 config,
                                 &parent,
                                 &subscriber,
@@ -373,14 +415,14 @@ pub async fn run_controlled(
                 }
             },
             _ = async {
-                if let Some(deadline) = idle_deadline {
-                    sleep_until(deadline).await;
+                if let Some(wait) = idle_wait {
+                    timer.sleep(wait).await;
                 } else {
                     std::future::pending::<()>().await;
                 }
             } => {
                 let idle_for = idle_since
-                    .map(|since| Instant::now().saturating_duration_since(since))
+                    .map(|since| timer.elapsed().saturating_sub(since))
                     .unwrap_or(config.idle_threshold);
                 runtime.record_agentic_deadlock_marker(idle_for).await;
                 idle_marker_sent = true;
@@ -413,6 +455,7 @@ pub async fn run_controlled(
                         &kick_handles,
                         &dependency_targets,
                         &mut zero_windows,
+                        &timer,
                         config,
                         &parent,
                         &subscriber,
@@ -433,6 +476,7 @@ pub async fn run_controlled(
                     &kick_handles,
                     &dependency_targets,
                     &mut zero_windows,
+                    &timer,
                     config,
                     &parent,
                     &subscriber,
@@ -881,7 +925,7 @@ impl DependencyWait {
         }
     }
 
-    async fn wait(self) -> ModuleInstanceId {
+    async fn wait(self, timer: Rc<dyn Timer>) -> ModuleInstanceId {
         let owner = self.owner;
         match self.completion {
             DependencyWaitCompletion::Kick(completion) => {
@@ -901,6 +945,7 @@ impl DependencyWait {
                     sender,
                     activation_waiter,
                     idle_timeout,
+                    timer,
                 )
                 .await;
             }
@@ -916,13 +961,14 @@ async fn wait_for_inactive_dependency(
     sender: ModuleInstanceId,
     activation_waiter: Option<oneshot::Receiver<()>>,
     idle_timeout: Duration,
+    timer: Rc<dyn Timer>,
 ) {
     let mut activation = pin!(async move {
         if let Some(waiter) = activation_waiter {
             let _ = waiter.await;
         }
     });
-    let mut idle = pin!(sleep(idle_timeout));
+    let mut idle = timer.sleep(idle_timeout);
 
     tokio::select! {
         biased;
@@ -951,6 +997,7 @@ async fn refresh_active_and_schedule(
     kick_handles: &[KickHandle],
     dependency_targets: &DependencyTargets,
     zero_windows: &mut ZeroReplicaWindows,
+    timer: &Rc<dyn Timer>,
     config: AgentEventLoopConfig,
     parent: &tracing::Span,
     subscriber: &tracing::Dispatch,
@@ -1027,6 +1074,7 @@ async fn refresh_active_and_schedule(
                             owners[index].clone(),
                             activation_increase,
                             allocation_change,
+                            timer.clone(),
                             parent,
                             subscriber,
                         );
@@ -1047,6 +1095,7 @@ async fn refresh_active_and_schedule(
                             dependency_targets,
                             owners,
                             zero_windows,
+                            timer,
                             config,
                             parent,
                             subscriber,
@@ -1071,6 +1120,7 @@ async fn refresh_active_and_schedule(
                         dependency_targets,
                         owners,
                         zero_windows,
+                        timer,
                         config,
                         parent,
                         subscriber,
@@ -1157,6 +1207,7 @@ async fn refresh_active_and_schedule(
                         peer_contexts,
                         identity_memories,
                         core_policies,
+                        timer.clone(),
                         parent,
                         subscriber,
                     );
@@ -1171,6 +1222,7 @@ async fn refresh_active_and_schedule(
                         pending_kicks,
                         batch,
                         self_wake_activation_permit,
+                        timer,
                         config,
                         parent,
                         subscriber,
@@ -1254,6 +1306,7 @@ async fn refresh_active_and_schedule(
                     zero_window_waiter,
                     retry_after,
                     runtime.clock(),
+                    timer.clone(),
                     parent,
                     subscriber,
                 );
@@ -1319,6 +1372,7 @@ async fn handle_task_message(
     zero_windows: &mut ZeroReplicaWindows,
     consecutive_failures: &mut [u32],
     scheduling_enabled: bool,
+    timer: &Rc<dyn Timer>,
     config: AgentEventLoopConfig,
     parent: &tracing::Span,
     subscriber: &tracing::Dispatch,
@@ -1378,6 +1432,7 @@ async fn handle_task_message(
                         pending_kicks,
                         batch,
                         has_self_wake_permit_claim,
+                        timer,
                         config,
                         parent,
                         subscriber,
@@ -1451,6 +1506,7 @@ async fn handle_task_message(
                     dependency_targets,
                     owners,
                     zero_windows,
+                    timer,
                     config,
                     parent,
                     subscriber,
@@ -1573,6 +1629,7 @@ async fn handle_task_message(
                         peer_contexts,
                         identity_memories,
                         core_policies,
+                        timer.clone(),
                         parent,
                         subscriber,
                     );
@@ -1741,6 +1798,7 @@ async fn schedule_dependency_settle_or_next_batch(
     dependency_targets: &DependencyTargets,
     owners: &[ModuleInstanceId],
     zero_windows: &mut ZeroReplicaWindows,
+    timer: &Rc<dyn Timer>,
     config: AgentEventLoopConfig,
     parent: &tracing::Span,
     subscriber: &tracing::Dispatch,
@@ -1759,6 +1817,7 @@ async fn schedule_dependency_settle_or_next_batch(
             dependency_targets,
             owners,
             zero_windows,
+            timer,
             config,
             parent,
             subscriber,
@@ -1776,6 +1835,7 @@ async fn schedule_dependency_settle_or_next_batch(
             pending_kicks,
             wake_claim,
             config.dependency_idle_timeout,
+            timer.clone(),
             parent,
             subscriber,
         );
@@ -1795,6 +1855,7 @@ async fn schedule_dependency_settle_or_next_batch(
             completions,
             remaining_waves.saturating_sub(1),
             config.dependency_hard_timeout,
+            timer.clone(),
             parent,
             subscriber,
         );
@@ -1814,6 +1875,7 @@ async fn collect_dependency_settle_completions(
     dependency_targets: &DependencyTargets,
     owners: &[ModuleInstanceId],
     zero_windows: &mut ZeroReplicaWindows,
+    timer: &Rc<dyn Timer>,
     config: AgentEventLoopConfig,
     parent: &tracing::Span,
     subscriber: &tracing::Dispatch,
@@ -1851,6 +1913,7 @@ async fn collect_dependency_settle_completions(
                     states,
                     kick_inboxes,
                     kick_handles,
+                    timer,
                     config,
                     parent,
                     subscriber,
@@ -1897,6 +1960,7 @@ async fn schedule_stored_dependency_for_wake(
     states: &mut [ModuleState],
     kick_inboxes: &mut [Option<KickInbox>],
     kick_handles: &[KickHandle],
+    timer: &Rc<dyn Timer>,
     config: AgentEventLoopConfig,
     parent: &tracing::Span,
     subscriber: &tracing::Dispatch,
@@ -1935,6 +1999,7 @@ async fn schedule_stored_dependency_for_wake(
                 target_owner.clone(),
                 activation_increase,
                 allocation_change,
+                timer.clone(),
                 parent,
                 subscriber,
             );
@@ -1954,6 +2019,7 @@ async fn schedule_stored_dependency_for_wake(
         vec![kick],
         wake_claim,
         config.dependency_idle_timeout,
+        timer.clone(),
         parent,
         subscriber,
     );
@@ -1972,22 +2038,22 @@ fn spawn_dependency_settle_wait(
     completions: Vec<DependencyWait>,
     remaining_waves: u8,
     hard_timeout: Duration,
+    timer: Rc<dyn Timer>,
     parent: &tracing::Span,
     subscriber: &tracing::Dispatch,
 ) {
     tasks.push(spawn_local(
         async move {
-            let started = Instant::now();
+            let started = timer.elapsed();
             let mut remaining = completions
                 .iter()
                 .map(|completion| completion.owner.clone())
                 .collect::<Vec<_>>();
             let mut completions = completions
                 .into_iter()
-                .map(DependencyWait::wait)
+                .map(|completion| completion.wait(timer.clone()))
                 .collect::<FuturesUnordered<_>>();
-            let hard_deadline = sleep(hard_timeout);
-            tokio::pin!(hard_deadline);
+            let mut hard_deadline = timer.sleep(hard_timeout);
 
             while !completions.is_empty() {
                 tokio::select! {
@@ -1996,7 +2062,7 @@ fn spawn_dependency_settle_wait(
                         tracing::warn!(
                             dependent = %owner,
                             remaining_dependencies = ?remaining,
-                            elapsed_ms = started.elapsed().as_millis(),
+                            elapsed_ms = timer.elapsed().saturating_sub(started).as_millis(),
                             timeout_ms = hard_timeout.as_millis(),
                             reason = "dependency_settle_hard_timeout",
                             "dependency settle hard timeout; starting dependent without remaining dependencies"
@@ -2052,6 +2118,7 @@ async fn spawn_activation_gate_or_activate(
     pending_kicks: Vec<Kick>,
     batch: ModuleBatch,
     self_wake_activation_permit: bool,
+    timer: &Rc<dyn Timer>,
     config: AgentEventLoopConfig,
     parent: &tracing::Span,
     subscriber: &tracing::Dispatch,
@@ -2078,6 +2145,7 @@ async fn spawn_activation_gate_or_activate(
             peer_contexts,
             identity_memories,
             core_policies,
+            timer.clone(),
             parent,
             subscriber,
         );
@@ -2175,6 +2243,7 @@ fn spawn_failure_wait(
     zero_window_waiter: tokio::sync::oneshot::Receiver<()>,
     retry_after: Option<DateTime<Utc>>,
     clock: Rc<dyn Clock>,
+    timer: Rc<dyn Timer>,
     parent: &tracing::Span,
     subscriber: &tracing::Dispatch,
 ) {
@@ -2191,7 +2260,8 @@ fn spawn_failure_wait(
             let mut zero_window = pin!(zero_window_waiter);
             let mut retry_deadline = pin!(async move {
                 if let Some(deadline) = retry_after {
-                    clock.sleep_until(deadline).await;
+                    let remaining = (deadline - clock.now()).to_std().unwrap_or_default();
+                    timer.sleep(remaining).await;
                 } else {
                     std::future::pending::<()>().await;
                 }
@@ -2235,6 +2305,7 @@ fn spawn_next_batch(
     initial_pending_kicks: Vec<Kick>,
     wake_claim: Option<WakeClaim>,
     dependency_idle_timeout: Duration,
+    timer: Rc<dyn Timer>,
     parent: &tracing::Span,
     subscriber: &tracing::Dispatch,
 ) {
@@ -2276,7 +2347,7 @@ fn spawn_next_batch(
                                 kick_inbox_closed = true;
                             }
                         }
-                        _ = sleep(dependency_idle_timeout), if timeout_enabled => {
+                        _ = timer.sleep(dependency_idle_timeout), if timeout_enabled => {
                             for kick in pending_kicks.drain(..) {
                                 kick.notify_finish();
                             }
@@ -2323,6 +2394,7 @@ fn spawn_batch_throttle(
     owner: ModuleInstanceId,
     activation_increase: tokio::sync::oneshot::Receiver<()>,
     allocation_change: tokio::sync::oneshot::Receiver<()>,
+    timer: Rc<dyn Timer>,
     parent: &tracing::Span,
     subscriber: &tracing::Dispatch,
 ) {
@@ -2335,8 +2407,8 @@ fn spawn_batch_throttle(
             let mut record_event = true;
             let mut activation_increase = pin!(activation_increase);
             let mut allocation_change = pin!(allocation_change);
-            let deadline_sleep = clock.sleep_until(deadline);
-            let mut deadline_sleep = pin!(deadline_sleep);
+            let remaining = (deadline - clock.now()).to_std().unwrap_or_default();
+            let mut deadline_sleep = timer.sleep(remaining);
             let mut observed_wake_sequence = runtime.wake_change_sequence();
             if runtime.has_pending_self_wake_permit(&owner) {
                 record_event = false;
@@ -2419,12 +2491,13 @@ fn spawn_activate(
     peer_contexts: Vec<(ModuleId, Arc<str>)>,
     identity_memories: Vec<IdentityMemoryRecord>,
     core_policies: Vec<CorePolicyRecord>,
+    timer: Rc<dyn Timer>,
     parent: &tracing::Span,
     subscriber: &tracing::Dispatch,
 ) {
     tasks.push(spawn_local(
         async move {
-            let activation_started = Instant::now();
+            let activation_started = timer.elapsed();
             let (module, result) = activate_with_retries(
                 module,
                 &runtime,
@@ -2433,9 +2506,10 @@ fn spawn_activate(
                 &core_policies,
                 &batch,
                 config.max_activation_attempts,
+                timer.clone(),
             )
             .await;
-            let activation_elapsed = activation_started.elapsed();
+            let activation_elapsed = timer.elapsed().saturating_sub(activation_started);
             TaskMessage::Activate {
                 index,
                 module,
@@ -2488,6 +2562,7 @@ async fn activate_with_retries(
     core_policies: &[CorePolicyRecord],
     batch: &ModuleBatch,
     max_activation_attempts: u8,
+    timer: Rc<dyn Timer>,
 ) -> (AllocatedModule, Result<(), String>) {
     let module_owner = module.owner().clone();
     let max_attempts = u32::from(max_activation_attempts.max(1));
@@ -2532,7 +2607,7 @@ async fn activate_with_retries(
             replica = owner.replica.get(),
             activation_attempt,
         );
-        let attempt_started = Instant::now();
+        let attempt_started = timer.elapsed();
         let activation_result = with_activation_llm_request_metadata(
             activation_id,
             activation_attempt,
@@ -2540,7 +2615,7 @@ async fn activate_with_retries(
             module.activate(&cx, batch).instrument(activation_span),
         )
         .await;
-        let attempt_elapsed = attempt_started.elapsed();
+        let attempt_elapsed = timer.elapsed().saturating_sub(attempt_started);
         match activation_result {
             Ok(()) => {
                 runtime.record_module_activation_completed(
@@ -2625,6 +2700,7 @@ mod tests {
         ModuleDependencies, ModuleRegistrationSpec, ModuleRegistry, ModuleRegistryError,
         PersistedSessionSnapshot, RuntimeEvent, RuntimeEventSink, RuntimePolicy, SelfWake,
         SessionCompactionPolicy, SessionKey, SessionStore, StaticModule,
+        ports::{Timer, TokioTimer},
     };
     use nuillu_types::{
         MemoryContent, MemoryIndex, ModelTier, ModuleActivationId, ModuleId, ModuleInstanceId,
@@ -2759,6 +2835,10 @@ mod tests {
             dependency_idle_timeout: std::time::Duration::from_secs(2),
             dependency_hard_timeout: std::time::Duration::from_secs(10),
         }
+    }
+
+    fn test_timer() -> Rc<dyn Timer> {
+        Rc::new(TokioTimer::new())
     }
 
     fn echo_id() -> ModuleId {
@@ -6142,7 +6222,7 @@ mod tests {
             .await;
     }
 
-    #[tokio::test(flavor = "current_thread", start_paused = false)]
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn dependency_appends_cognition_before_dependent_builds_batch() {
         let local = LocalSet::new();
         local
@@ -6200,7 +6280,7 @@ mod tests {
                         ..test_config()
                     },
                     async move {
-                        tokio::time::timeout(Duration::from_millis(500), done_rx)
+                        tokio::time::timeout(Duration::from_secs(5), done_rx)
                             .await
                             .expect("speak should activate after dependency settles")
                             .expect("done sender dropped");
@@ -6217,7 +6297,7 @@ mod tests {
             .await;
     }
 
-    #[tokio::test(flavor = "current_thread", start_paused = false)]
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn dependency_chain_settles_two_waves_before_dependent_builds_batch() {
         let local = LocalSet::new();
         local
@@ -6285,7 +6365,7 @@ mod tests {
                         ..test_config()
                     },
                     async move {
-                        tokio::time::timeout(Duration::from_millis(500), done_rx)
+                        tokio::time::timeout(Duration::from_secs(5), done_rx)
                             .await
                             .expect("speak should activate after two settle waves")
                             .expect("done sender dropped");
@@ -6302,7 +6382,7 @@ mod tests {
             .await;
     }
 
-    #[tokio::test(flavor = "current_thread", start_paused = false)]
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn wake_delivered_while_claim_is_in_flight_remains_pending() {
         let local = LocalSet::new();
         local
@@ -6353,7 +6433,7 @@ mod tests {
                         .await
                         .expect("second wake should remain pending after first claim");
                     let _ = first_release_tx.send(());
-                    tokio::time::timeout(Duration::from_millis(500), done_rx)
+                    tokio::time::timeout(Duration::from_secs(5), done_rx)
                         .await
                         .expect("module should run a second batch for the second wake")
                         .expect("done sender dropped");
@@ -7184,6 +7264,7 @@ mod tests {
                     &dependency_targets,
                     &owners,
                     &mut zero_windows,
+                    &test_timer(),
                     test_config(),
                     &parent,
                     &subscriber,
@@ -7278,6 +7359,7 @@ mod tests {
                     &dependency_targets,
                     &owners,
                     &mut zero_windows,
+                    &test_timer(),
                     test_config(),
                     &parent,
                     &subscriber,
@@ -7545,6 +7627,7 @@ mod tests {
                     Vec::new(),
                     None,
                     Duration::from_secs(2),
+                    test_timer(),
                     &parent,
                     &subscriber,
                 );
@@ -7631,6 +7714,7 @@ mod tests {
                     Vec::new(),
                     None,
                     Duration::from_secs(2),
+                    test_timer(),
                     &parent,
                     &subscriber,
                 );
@@ -7666,6 +7750,7 @@ mod tests {
                     &mut zero_windows,
                     &mut consecutive_failures,
                     true,
+                    &test_timer(),
                     test_config(),
                     &parent,
                     &subscriber,
@@ -7785,6 +7870,7 @@ mod tests {
                     &dependency_targets,
                     &owners,
                     &mut zero_windows,
+                    &test_timer(),
                     test_config(),
                     &parent,
                     &subscriber,
@@ -7803,6 +7889,7 @@ mod tests {
                     completions,
                     0,
                     Duration::from_secs(10),
+                    test_timer(),
                     &parent,
                     &subscriber,
                 );
@@ -7882,6 +7969,7 @@ mod tests {
                     vec![super::DependencyWait::kick(owner, completion)],
                     0,
                     Duration::from_secs(10),
+                    test_timer(),
                     &parent,
                     &subscriber,
                 );
@@ -7992,6 +8080,7 @@ mod tests {
                     &dependency_targets,
                     &owners,
                     &mut zero_windows,
+                    &test_timer(),
                     test_config(),
                     &parent,
                     &subscriber,
@@ -8010,6 +8099,7 @@ mod tests {
                     completions,
                     0,
                     Duration::from_secs(3),
+                    test_timer(),
                     &parent,
                     &subscriber,
                 );
@@ -8083,6 +8173,7 @@ mod tests {
                     vec![super::DependencyWait::kick(dependency_owner, completion)],
                     0,
                     Duration::from_secs(10),
+                    test_timer(),
                     &parent,
                     &subscriber,
                 );
@@ -8163,6 +8254,7 @@ mod tests {
                     runtime.peer_contexts(),
                     runtime.identity_memories().await,
                     runtime.core_policies().await,
+                    test_timer(),
                     &parent,
                     &subscriber,
                 );
@@ -8200,6 +8292,7 @@ mod tests {
                     &mut zero_windows,
                     &mut consecutive_failures,
                     true,
+                    &test_timer(),
                     test_config(),
                     &parent,
                     &subscriber,
@@ -8259,6 +8352,7 @@ mod tests {
                     Vec::new(),
                     None,
                     Duration::from_secs(2),
+                    test_timer(),
                     &parent,
                     &subscriber,
                 );

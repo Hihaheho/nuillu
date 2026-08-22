@@ -2,6 +2,7 @@ use std::{
     collections::VecDeque,
     fs,
     net::TcpListener,
+    rc::Rc,
     sync::{
         Arc, Mutex,
         mpsc::{self, Receiver, Sender},
@@ -12,10 +13,13 @@ use std::{
 
 use anyhow::Context as _;
 use chrono::{DateTime, Utc};
-use nuillu_agent::{AgentEventLoopConfig, AgentRunController, run_controlled as run_agent};
+use nuillu_agent::{
+    AgentEventLoopConfig, AgentRunController, run_controlled_with_timer as run_agent,
+};
 use nuillu_blackboard::BlackboardCommand;
 use nuillu_module::{
     ActionAffordance, AmbientSensoryEntry, Participant, RuntimeEvent, SensoryInput,
+    ports::{Timer, TokioTimer},
 };
 use nuillu_visualizer_protocol::{
     AgentActionInvocationCompletion, EditableSceneStateView, ExternalActionEventRowView,
@@ -424,7 +428,12 @@ fn run_server_on_current_thread(
         .context("build server tokio runtime")?;
     let local = LocalSet::new();
     let visualizer = VisualizerHook::new(event_tx, command_rx);
-    let result = runtime.block_on(local.run_until(run_server(config, registrars, visualizer)));
+    let result = runtime.block_on(local.run_until(run_server(
+        config,
+        registrars,
+        visualizer,
+        Rc::new(TokioTimer::new()),
+    )));
     if let Err(error) = &result {
         eprintln!("nuillu-server runtime failed: {error:#}");
     }
@@ -669,13 +678,23 @@ fn server_external_action_event_record(
 ///
 /// This function does not create a thread, Tokio runtime, or `LocalSet`. The caller must run it
 /// in a local task context because server modules may contain non-`Send` state.
+pub async fn run_server_with_native_timer(
+    config: ServerConfig,
+    registrars: Vec<Arc<dyn ServerModuleRegistrar>>,
+    visualizer: VisualizerHook,
+) -> anyhow::Result<()> {
+    run_server(config, registrars, visualizer, Rc::new(TokioTimer::new())).await
+}
+
+/// Runs the server with timing supplied by the async host.
 pub async fn run_server(
     config: ServerConfig,
     registrars: Vec<Arc<dyn ServerModuleRegistrar>>,
     mut visualizer: VisualizerHook,
+    timer: Rc<dyn Timer>,
 ) -> anyhow::Result<()> {
     send_visualizer_startup_to_hook(&visualizer);
-    let result = run_server_inner(config, &registrars, &mut visualizer).await;
+    let result = run_server_inner(config, &registrars, &mut visualizer, timer).await;
     if let Err(error) = &result {
         let tab_id = server_tab_id();
         visualizer.send_event(VisualizerEvent::Log {
@@ -707,6 +726,7 @@ async fn run_server_inner(
     config: ServerConfig,
     registrars: &[Arc<dyn ServerModuleRegistrar>],
     visualizer: &mut VisualizerHook,
+    timer: Rc<dyn Timer>,
 ) -> anyhow::Result<()> {
     let tab_id = VisualizerTabId::new(SERVER_TAB_ID.to_string());
     visualizer.send_event(VisualizerEvent::Log {
@@ -731,6 +751,7 @@ async fn run_server_inner(
         &config,
         full_agent_allocation(&config.boot_config),
         visualizer.event_sender(),
+        timer.clone(),
     )
     .await?;
     let action_snapshot = env
@@ -786,7 +807,7 @@ async fn run_server_inner(
         apply_persisted_module_settings(&module_settings, visualizer, &tab_id, &env.blackboard)
             .await;
 
-        let run_started_at = Instant::now();
+        let run_started_at = timer.elapsed();
         let result = run_agent(
             allocated,
             AgentEventLoopConfig {
@@ -796,6 +817,7 @@ async fn run_server_inner(
                 dependency_hard_timeout: Duration::from_secs(10),
             },
             run_control.clone(),
+            timer.clone(),
             drive_server_until_shutdown(
                 visualizer,
                 &tab_id,
@@ -806,11 +828,12 @@ async fn run_server_inner(
                 &sensory,
                 &env,
                 &run_controller,
+                timer.as_ref(),
             ),
         )
         .await;
 
-        if run_started_at.elapsed() >= AGENT_RESTART_STABLE_AFTER {
+        if timer.elapsed().saturating_sub(run_started_at) >= AGENT_RESTART_STABLE_AFTER {
             restart_count = 0;
         }
         match result {
@@ -874,7 +897,9 @@ async fn run_server_inner(
         if visualizer.shutdown_requested() {
             break;
         }
-        tokio::time::sleep(agent_restart_delay(restart_count).unwrap_or_default()).await;
+        timer
+            .sleep(agent_restart_delay(restart_count).unwrap_or_default())
+            .await;
     }
     visualizer.send_event(VisualizerEvent::SetTabStatus {
         tab_id,

@@ -14,6 +14,8 @@
 //!
 //! [`CapabilityProviders`]: crate::CapabilityProviders
 
+use std::{future::Future, pin::Pin, time::Duration};
+
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use nuillu_blackboard::CognitionLogEntry;
@@ -77,6 +79,68 @@ pub trait Clock {
     async fn sleep_for(&self, duration: std::time::Duration) {
         let deadline = self.now() + chrono::Duration::from_std(duration).unwrap_or_default();
         self.sleep_until(deadline).await;
+    }
+}
+
+/// Monotonic time and asynchronous sleeping supplied by the runtime host.
+///
+/// Keeping this separate from [`Clock`] lets wasm hosts drive waits from the
+/// JavaScript event loop while retaining wall-clock timestamps for durable
+/// records.
+pub trait Timer {
+    /// Sleeps for `duration`.
+    fn sleep(&self, duration: Duration) -> Pin<Box<dyn Future<Output = ()> + 'static>>;
+
+    /// Monotonic time since this timer was created.
+    fn elapsed(&self) -> Duration;
+}
+
+/// Returned when [`timeout`] reaches its deadline before the wrapped future.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("deadline elapsed")]
+pub struct Elapsed;
+
+/// Awaits `future` until it completes or the timer reaches `duration`.
+pub async fn timeout<F: Future>(
+    timer: &dyn Timer,
+    duration: Duration,
+    future: F,
+) -> Result<F::Output, Elapsed> {
+    let future = Box::pin(future);
+    let sleep = timer.sleep(duration);
+    match futures::future::select(future, sleep).await {
+        futures::future::Either::Left((output, _)) => Ok(output),
+        futures::future::Either::Right(((), _)) => Err(Elapsed),
+    }
+}
+
+/// Native timer backed by Tokio's time driver.
+#[derive(Debug, Clone)]
+pub struct TokioTimer {
+    started_at: tokio::time::Instant,
+}
+
+impl TokioTimer {
+    pub fn new() -> Self {
+        Self {
+            started_at: tokio::time::Instant::now(),
+        }
+    }
+}
+
+impl Default for TokioTimer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Timer for TokioTimer {
+    fn sleep(&self, duration: Duration) -> Pin<Box<dyn Future<Output = ()> + 'static>> {
+        Box::pin(tokio::time::sleep(duration))
+    }
+
+    fn elapsed(&self) -> Duration {
+        self.started_at.elapsed()
     }
 }
 

@@ -53,7 +53,6 @@ pub use egui_hooks;
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::Arc;
-use std::time::Instant;
 
 use egui_hooks::UseHookExt as _;
 #[cfg(feature = "system-fonts")]
@@ -1197,7 +1196,8 @@ pub struct RuntimeTab {
     memos_module_filter: module_filter::ModuleFilterState,
     llm_turns_module_filter: module_filter::ModuleFilterState,
     resource_monitor_module_filter: module_filter::ModuleFilterState,
-    resource_monitor_started_at: Instant,
+    resource_monitor_started_at: Option<f64>,
+    resource_monitor_now: f64,
     action_affordances: Vec<ActionAffordance>,
 }
 
@@ -1256,12 +1256,16 @@ impl RuntimeTab {
             memos_module_filter: module_filter::ModuleFilterState::default(),
             llm_turns_module_filter: module_filter::ModuleFilterState::default(),
             resource_monitor_module_filter: module_filter::ModuleFilterState::default(),
-            resource_monitor_started_at: Instant::now(),
+            resource_monitor_started_at: None,
+            resource_monitor_now: 0.0,
             action_affordances: Vec::new(),
         }
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, messages: &mut Vec<VisualizerClientMessage>) {
+        let now = ui.input(|input| input.time);
+        self.resource_monitor_started_at.get_or_insert(now);
+        self.resource_monitor_now = now;
         match self.view_mode {
             RuntimeTabViewMode::Simplified => self.simplified_ui(ui, messages),
             RuntimeTabViewMode::Windowed => self.windows_ui(ui, messages),
@@ -1927,7 +1931,9 @@ impl RuntimeTab {
     }
 
     fn resource_monitor_elapsed_secs(&self) -> f64 {
-        self.resource_monitor_started_at.elapsed().as_secs_f64()
+        self.resource_monitor_started_at
+            .map(|started_at| (self.resource_monitor_now - started_at).max(0.0))
+            .unwrap_or(0.0)
     }
 
     fn push_log(&mut self, message: String) {

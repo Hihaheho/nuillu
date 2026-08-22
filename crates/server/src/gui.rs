@@ -4,6 +4,7 @@ use std::{
 };
 
 use futures::{StreamExt as _, channel::mpsc as async_mpsc};
+use nuillu_module::ports::{Timer, TokioTimer, timeout as timer_timeout};
 use nuillu_visualizer_protocol::{
     VisualizerAction, VisualizerClientMessage, VisualizerEvent, VisualizerServerMessage,
 };
@@ -175,6 +176,16 @@ impl VisualizerHook {
         &mut self,
         timeout: Duration,
     ) -> Option<VisualizerClientMessage> {
+        self.recv_command_timeout_with_timer(&TokioTimer::new(), timeout)
+            .await
+    }
+
+    /// Waits for a command using the host-provided timer.
+    pub async fn recv_command_timeout_with_timer(
+        &mut self,
+        timer: &dyn Timer,
+        timeout: Duration,
+    ) -> Option<VisualizerClientMessage> {
         match &mut self.commands {
             CommandReceiver::Sync(receiver) => match receiver.try_recv() {
                 Ok(message) => Some(message),
@@ -183,12 +194,12 @@ impl VisualizerHook {
                     None
                 }
                 Err(std::sync::mpsc::TryRecvError::Empty) => {
-                    tokio::time::sleep(timeout).await;
+                    timer.sleep(timeout).await;
                     self.try_recv_command()
                 }
             },
             CommandReceiver::Async(receiver) => {
-                match tokio::time::timeout(timeout, receiver.next()).await {
+                match timer_timeout(timer, timeout, receiver.next()).await {
                     Ok(Some(message)) => Some(message),
                     Ok(None) => {
                         self.shutdown_requested = true;

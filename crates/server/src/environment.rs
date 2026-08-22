@@ -18,7 +18,9 @@ use lutum_openai::{FeatureFlags, HttpClient, OpenAiAdapter, OpenAiReasoningEffor
 use nuillu_blackboard::{AllocationLimits, Blackboard};
 use nuillu_llm_trace_file::{FileLlmTraceSink, LlmLogContext};
 use nuillu_memory::{MemoryCapabilities, MemoryStore};
-use nuillu_module::ports::{Clock, Embedder, PortError, SystemClock};
+use nuillu_module::ports::{
+    Clock, Embedder, PortError, SystemClock, Timer, timeout as timer_timeout,
+};
 use nuillu_module::{
     CapabilityProviderConfig, CapabilityProviderPorts, CapabilityProviderRuntime,
     CapabilityProviders, ExternalActionExecutor, ExternalActionInvocation,
@@ -78,6 +80,7 @@ pub(super) struct ServerExternalActionState {
     visualizer: VisualizerEventSink,
     store: Rc<dyn ExternalActionEventStore>,
     clock: Rc<dyn Clock>,
+    timer: Rc<dyn Timer>,
     pending: RefCell<BTreeMap<String, PendingExternalActionInvocation>>,
     next_invocation: RefCell<u64>,
 }
@@ -89,6 +92,7 @@ impl ServerExternalActionState {
         visualizer: VisualizerEventSink,
         store: Rc<dyn ExternalActionEventStore>,
         clock: Rc<dyn Clock>,
+        timer: Rc<dyn Timer>,
     ) -> Self {
         Self {
             server_session_id,
@@ -96,6 +100,7 @@ impl ServerExternalActionState {
             visualizer,
             store,
             clock,
+            timer,
             pending: RefCell::new(BTreeMap::new()),
             next_invocation: RefCell::new(0),
         }
@@ -216,7 +221,7 @@ impl ExternalActionExecutor for ServerExternalActionState {
                 },
             });
 
-        match tokio::time::timeout(Duration::from_secs(30), receiver).await {
+        match timer_timeout(self.timer.as_ref(), Duration::from_secs(30), receiver).await {
             Ok(Ok(result)) => Ok(result),
             Ok(Err(_)) => {
                 let result = ExternalActionInvocationResult {
@@ -255,6 +260,7 @@ pub(super) async fn build_server_environment(
     config: &ServerConfig,
     allocation: nuillu_blackboard::ResourceAllocation,
     visualizer: VisualizerEventSink,
+    timer: Rc<dyn Timer>,
 ) -> anyhow::Result<ServerEnvironment> {
     let blackboard = Blackboard::with_allocation(allocation);
     let runtime_event_log_path = runtime_event_log_path(&config.state_dir, &config.session_id);
@@ -312,6 +318,7 @@ pub(super) async fn build_server_environment(
         visualizer.clone(),
         external_action_event_store.clone(),
         clock.clone(),
+        timer,
     ));
     let llm_concurrency_pool = LlmConcurrencyPool::default();
     emit_startup_progress(&visualizer, "building runtime capabilities");
@@ -1256,6 +1263,7 @@ mod tests {
                     crate::gui::VisualizerEventSink::new(events_tx),
                     Rc::new(store.clone()),
                     clock,
+                    Rc::new(nuillu_module::ports::TokioTimer::new()),
                 ));
 
                 let invoke_state = state.clone();

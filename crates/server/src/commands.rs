@@ -8,6 +8,7 @@ use nuillu_blackboard::{
 use nuillu_memory::{LinkedMemoryQuery, MemoryLinkDirection, MemoryLinkRelation, MemoryQuery};
 use nuillu_module::{
     ActionAffordance, AmbientSensoryEntry, SensoryInput, SensoryInputMailbox, SensoryModality,
+    ports::Timer,
 };
 use nuillu_storage::{
     AmbientSensorySnapshotRecord, ExternalActionEventRecord, ExternalActionEventStatus,
@@ -46,13 +47,17 @@ pub(super) async fn drive_server_until_shutdown(
     sensory: &SensoryInputMailbox,
     env: &ServerEnvironment,
     run_controller: &AgentRunController,
+    timer: &dyn Timer,
 ) {
     publish_scene_snapshot(scene, sensory, visualizer, tab_id, env).await;
     loop {
         if visualizer.shutdown_requested() {
             break;
         }
-        if let Some(message) = visualizer.recv_command_timeout(SNAPSHOT_INTERVAL).await {
+        if let Some(message) = visualizer
+            .recv_command_timeout_with_timer(timer, SNAPSHOT_INTERVAL)
+            .await
+        {
             if handle_server_visualizer_message(
                 message,
                 visualizer,
