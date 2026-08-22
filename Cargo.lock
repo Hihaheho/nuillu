@@ -3539,6 +3539,7 @@ dependencies = [
  "eure-json",
  "futures",
  "lutum",
+ "lutum-in-memory-adapter",
  "lutum-libsql-adapter",
  "lutum-openai",
  "lutum-trace",

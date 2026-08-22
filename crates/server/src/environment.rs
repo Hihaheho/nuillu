@@ -12,6 +12,7 @@ use lutum::{
     RequestExtensions, Seed, SharedPoolBudgetManager, SharedPoolBudgetOptions, StopSequences,
     Temperature, TopK, TopP,
 };
+use lutum_in_memory_adapter::InMemoryAgentStore;
 #[cfg(feature = "libsql")]
 use lutum_libsql_adapter::{LibsqlAgentStore, LibsqlAgentStoreConfig};
 use lutum_openai::{FeatureFlags, HttpClient, OpenAiAdapter, OpenAiReasoningEffort};
@@ -30,10 +31,12 @@ use nuillu_module::{
 use nuillu_openai_embedding_adapter::{OpenAiEmbedder, OpenAiEmbedderConfig};
 use nuillu_reward::PolicyCapabilities;
 use nuillu_speak::{Utterance, UtteranceAbort, UtteranceDelta, UtteranceSink};
+#[cfg(feature = "libsql")]
+use nuillu_storage::AgentStore;
 use nuillu_storage::{
-    AgentStore, AmbientSensorySnapshotStore, EmbeddingProfile, ExternalActionEventStore,
-    LlmTranscriptStore, NewExternalActionEvent, NewUtteranceEvent, OneShotSensoryInputStore,
-    UtteranceEventKind, UtteranceEventStore,
+    AmbientSensorySnapshotStore, EmbeddingProfile, ExternalActionEventStore, LlmTranscriptStore,
+    NewExternalActionEvent, NewUtteranceEvent, OneShotSensoryInputStore, UtteranceEventKind,
+    UtteranceEventStore,
 };
 use nuillu_visualizer_protocol::{
     AgentActionInvocationCompletion, AgentActionInvocationRequest, VisualizerEvent, VisualizerTabId,
@@ -44,10 +47,15 @@ use super::config::{EmbeddingBackendConfig, LlmBackendConfig, LlmGenerationConfi
 use super::gui::VisualizerEventSink;
 use super::llm_db_trace::DbLlmTraceSink;
 use super::llm_observer::VisualizerLlmObserver;
-use super::memory_seed::seed_memory_from_state_dir;
-use super::runtime_event_log::{
-    RuntimeEventLogWriter, runtime_event_log_path, runtime_event_message,
-};
+#[cfg(feature = "libsql")]
+use super::memory_seed::FileMemorySeedPort;
+use super::ports::{NoopMemorySeed, NoopRuntimeEventLog, RuntimeEventLogPort, ServerHostPorts};
+use super::runtime_event_log::runtime_event_message;
+#[cfg(feature = "libsql")]
+use super::runtime_event_log::{FileRuntimeEventLog, runtime_event_log_path};
+#[cfg(feature = "libsql")]
+use super::state::FileServerStatePort;
+use super::state::InMemoryServerStatePort;
 
 #[cfg(feature = "libsql")]
 const AGENT_DB_FILE: &str = "agent.db";
@@ -258,33 +266,16 @@ impl ExternalActionExecutor for ServerExternalActionState {
 
 pub(super) async fn build_server_environment(
     config: &ServerConfig,
+    host_ports: &ServerHostPorts,
     allocation: nuillu_blackboard::ResourceAllocation,
     visualizer: VisualizerEventSink,
     timer: Rc<dyn Timer>,
 ) -> anyhow::Result<ServerEnvironment> {
     let blackboard = Blackboard::with_allocation(allocation);
-    let runtime_event_log_path = runtime_event_log_path(&config.state_dir, &config.session_id);
-    let runtime_event_log = RuntimeEventLogWriter::open(
-        runtime_event_log_path,
-        config.session_id.clone(),
-        SERVER_TAB_ID.to_string(),
-    )
-    .with_context(|| {
-        format!(
-            "open runtime event log under {}",
-            config.state_dir.display()
-        )
-    })?;
-    eprintln!(
-        "nuillu-server runtime-event-log path={}",
-        runtime_event_log.path().display()
-    );
-    emit_startup_progress(&visualizer, "connecting agent store");
     let clock: Rc<dyn Clock> = Rc::new(SystemClock);
     let visualizer_for_events = visualizer.clone();
     let llm_observer = VisualizerLlmObserver::new(SERVER_TAB_ID.to_string(), visualizer.clone());
-    let agent_store = connect_agent_store(config).await?;
-    emit_startup_progress(&visualizer, "agent store connected");
+    let agent_store = host_ports.agent_store().clone();
     let one_shot_sensory_input_store = agent_store.one_shot_sensory_input_store();
     let ambient_sensory_snapshot_store = agent_store.ambient_sensory_snapshot_store();
     let utterance_event_store = agent_store.utterance_event_store();
@@ -308,7 +299,7 @@ pub(super) async fn build_server_environment(
     let event_sink = Rc::new(ServerRuntimeEventSink::new(
         SERVER_TAB_ID.to_string(),
         visualizer_for_events,
-        runtime_event_log,
+        host_ports.runtime_event_log().clone(),
         llm_observer.clone(),
         db_trace_sink.clone(),
     ));
@@ -355,7 +346,9 @@ pub(super) async fn build_server_environment(
         Vec::new(),
     );
     emit_startup_progress(&visualizer, "seeding startup memories");
-    let seeded_memories = seed_memory_from_state_dir(&config.state_dir, &memory_caps)
+    let seeded_memories = host_ports
+        .memory_seed()
+        .seed(&memory_caps)
         .await
         .context("seed startup memories")?;
     if seeded_memories > 0 {
@@ -396,6 +389,61 @@ pub(super) async fn build_server_environment(
         external_action_event_store,
         external_actions,
     })
+}
+
+#[cfg(feature = "libsql")]
+pub(crate) async fn build_native_host_ports(
+    config: &ServerConfig,
+) -> anyhow::Result<ServerHostPorts> {
+    let runtime_event_log_path = runtime_event_log_path(&config.state_dir, &config.session_id);
+    let runtime_event_log = FileRuntimeEventLog::open(
+        runtime_event_log_path,
+        config.session_id.clone(),
+        SERVER_TAB_ID.to_string(),
+    )
+    .with_context(|| {
+        format!(
+            "open runtime event log under {}",
+            config.state_dir.display()
+        )
+    })?;
+    eprintln!(
+        "nuillu-server runtime-event-log path={}",
+        runtime_event_log.path().display()
+    );
+    let agent_store = connect_agent_store(config).await?;
+    Ok(ServerHostPorts::new(
+        Rc::new(FileServerStatePort::new(config.state_dir.clone())),
+        agent_store,
+        Rc::new(runtime_event_log),
+        Rc::new(FileMemorySeedPort::new(config.state_dir.clone())),
+    ))
+}
+
+#[cfg(not(feature = "libsql"))]
+pub(crate) async fn build_native_host_ports(
+    _config: &ServerConfig,
+) -> anyhow::Result<ServerHostPorts> {
+    anyhow::bail!("nuillu-server was built without the `libsql` feature")
+}
+
+/// Builds browser-friendly host ports without opening files or a libSQL database.
+pub fn build_in_memory_host_ports(config: &ServerConfig) -> anyhow::Result<ServerHostPorts> {
+    let (memory_embedder, memory_profile, _) = build_embedder(&config.embedding_backend)?;
+    let (policy_embedder, policy_profile, _) = build_embedder(&config.embedding_backend)?;
+    let agent_store = InMemoryAgentStore::new(
+        memory_profile,
+        memory_embedder.into(),
+        policy_profile,
+        policy_embedder.into(),
+    )
+    .map_err(|error| anyhow::anyhow!("build in-memory agent store: {error}"))?;
+    Ok(ServerHostPorts::new(
+        Rc::new(InMemoryServerStatePort::new()),
+        Rc::new(agent_store),
+        Rc::new(NoopRuntimeEventLog),
+        Rc::new(NoopMemorySeed),
+    ))
 }
 
 fn emit_startup_progress(visualizer: &VisualizerEventSink, message: impl Into<String>) {
@@ -461,11 +509,6 @@ async fn connect_agent_store(config: &ServerConfig) -> anyhow::Result<Rc<dyn Age
     .await
     .context("connect libsql agent store")?;
     Ok(Rc::new(store))
-}
-
-#[cfg(not(feature = "libsql"))]
-async fn connect_agent_store(_config: &ServerConfig) -> anyhow::Result<Rc<dyn AgentStore>> {
-    anyhow::bail!("nuillu-server was built without the `libsql` feature")
 }
 
 #[cfg(feature = "libsql")]
@@ -849,7 +892,7 @@ async fn configured_reasoning_effort(
 struct ServerRuntimeEventSink {
     tab_id: String,
     visualizer: VisualizerEventSink,
-    runtime_event_log: RuntimeEventLogWriter,
+    runtime_event_log: Rc<dyn RuntimeEventLogPort>,
     llm_observer: VisualizerLlmObserver,
     db_trace_sink: DbLlmTraceSink,
 }
@@ -858,7 +901,7 @@ impl ServerRuntimeEventSink {
     fn new(
         tab_id: String,
         visualizer: VisualizerEventSink,
-        runtime_event_log: RuntimeEventLogWriter,
+        runtime_event_log: Rc<dyn RuntimeEventLogPort>,
         llm_observer: VisualizerLlmObserver,
         db_trace_sink: DbLlmTraceSink,
     ) -> Self {
@@ -899,15 +942,13 @@ impl RuntimeEventSink for ServerRuntimeEventSink {
         let message = runtime_event_message(&self.tab_id, &event);
         eprintln!("{message}");
         if let Err(error) = self.runtime_event_log.append(&message, &event) {
-            tracing::warn!(
-                path = %self.runtime_event_log.path().display(),
-                ?error,
-                "failed to append runtime event log"
-            );
+            let destination = self
+                .runtime_event_log
+                .destination()
+                .unwrap_or_else(|| "<disabled>".to_string());
+            tracing::warn!(%destination, ?error, "failed to append runtime event log");
             eprintln!(
-                "nuillu-server runtime-event-log-write-failed path={} error={}",
-                self.runtime_event_log.path().display(),
-                error
+                "nuillu-server runtime-event-log-write-failed destination={destination} error={error}"
             );
         }
         self.visualizer.send(VisualizerEvent::RuntimeEvent {

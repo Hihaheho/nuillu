@@ -1,10 +1,12 @@
 use std::{
+    cell::RefCell,
     collections::BTreeMap,
     fs,
     path::{Path, PathBuf},
 };
 
 use anyhow::Context as _;
+use async_trait::async_trait;
 use nuillu_module::{ActionAffordance, Participant};
 use nuillu_visualizer_protocol::{
     AmbientSensoryRowView, DerivedAmbientSensoryRowView, EditableSceneStateView,
@@ -12,6 +14,13 @@ use nuillu_visualizer_protocol::{
     SceneRowKind, SceneRowView, SceneSoundRowView, SceneStateView, derive_scene_ambient,
 };
 use serde::{Deserialize, Serialize};
+
+use crate::ports::ServerStatePort;
+
+const SCENE_STATE_FILE: &str = "scene-state.json";
+const LEGACY_AMBIENT_FILE: &str = "ambient-sensory.json";
+const MODULE_SETTINGS_FILE: &str = "module-settings.json";
+const ACTION_AFFORDANCES_FILE: &str = "action-affordances.json";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct ModuleSettingsFile {
@@ -23,27 +32,206 @@ struct ActionAffordancesFile {
     affordances: Vec<ActionAffordance>,
 }
 
-#[derive(Debug)]
-pub(super) struct ActionAffordanceState {
-    path: PathBuf,
-    affordances: BTreeMap<String, ActionAffordance>,
+#[derive(Debug, Clone)]
+pub struct FileServerStatePort {
+    state_dir: PathBuf,
 }
 
-impl ActionAffordanceState {
-    pub(super) fn load(path: PathBuf) -> anyhow::Result<Self> {
+impl FileServerStatePort {
+    pub fn new(state_dir: impl Into<PathBuf>) -> Self {
+        Self {
+            state_dir: state_dir.into(),
+        }
+    }
+
+    fn path(&self, file: &str) -> PathBuf {
+        self.state_dir.join(file)
+    }
+}
+
+#[async_trait(?Send)]
+impl ServerStatePort for FileServerStatePort {
+    async fn load_scene(
+        &self,
+        seed_participants: &[String],
+    ) -> anyhow::Result<EditableSceneStateView> {
+        let path = self.path(SCENE_STATE_FILE);
+        if path.exists() {
+            let text = fs::read_to_string(&path)
+                .with_context(|| format!("read scene state from {}", path.display()))?;
+            return serde_json::from_str(&text)
+                .with_context(|| format!("parse scene state from {}", path.display()));
+        }
+
+        let mut state = initial_scene_state(seed_participants);
+        let legacy_path = self.path(LEGACY_AMBIENT_FILE);
+        for row in load_legacy_ambient_rows(&legacy_path)?
+            .into_iter()
+            .filter(|row| !row.disabled && !row.content.trim().is_empty())
+        {
+            let id = next_scene_id(&state, SceneRowKind::Atmosphere);
+            state.atmosphere.push(SceneAtmosphereRowView {
+                id,
+                aspect: "other".to_string(),
+                description: legacy_atmosphere_description(&row),
+            });
+        }
+        Ok(state)
+    }
+
+    async fn save_scene(&self, state: &EditableSceneStateView) -> anyhow::Result<()> {
+        write_json(self.path(SCENE_STATE_FILE), state, "scene state")
+    }
+
+    async fn load_module_settings(&self) -> anyhow::Result<Vec<ModuleSettingsView>> {
+        let path = self.path(MODULE_SETTINGS_FILE);
         if !path.exists() {
-            return Ok(Self::from_affordances(path, Vec::new()));
+            return Ok(Vec::new());
+        }
+        let text = fs::read_to_string(&path)
+            .with_context(|| format!("read module settings from {}", path.display()))?;
+        let file: ModuleSettingsFile = serde_json::from_str(&text)
+            .with_context(|| format!("parse module settings from {}", path.display()))?;
+        Ok(file.modules)
+    }
+
+    async fn save_module_settings(&self, settings: &[ModuleSettingsView]) -> anyhow::Result<()> {
+        write_json(
+            self.path(MODULE_SETTINGS_FILE),
+            &ModuleSettingsFile {
+                modules: settings.to_vec(),
+            },
+            "module settings",
+        )
+    }
+
+    async fn load_action_affordances(&self) -> anyhow::Result<Vec<ActionAffordance>> {
+        let path = self.path(ACTION_AFFORDANCES_FILE);
+        if !path.exists() {
+            return Ok(Vec::new());
         }
         let text = fs::read_to_string(&path)
             .with_context(|| format!("read action affordances from {}", path.display()))?;
         let file: ActionAffordancesFile = serde_json::from_str(&text)
             .with_context(|| format!("parse action affordances from {}", path.display()))?;
-        Ok(Self::from_affordances(path, file.affordances))
+        Ok(file.affordances)
     }
 
-    fn from_affordances(path: PathBuf, affordances: Vec<ActionAffordance>) -> Self {
+    async fn save_action_affordances(
+        &self,
+        affordances: &[ActionAffordance],
+    ) -> anyhow::Result<()> {
+        write_json(
+            self.path(ACTION_AFFORDANCES_FILE),
+            &ActionAffordancesFile {
+                affordances: affordances.to_vec(),
+            },
+            "action affordances",
+        )
+    }
+}
+
+#[derive(Debug, Default)]
+pub struct InMemoryServerStatePort {
+    scene: RefCell<Option<EditableSceneStateView>>,
+    module_settings: RefCell<Vec<ModuleSettingsView>>,
+    action_affordances: RefCell<Vec<ActionAffordance>>,
+}
+
+impl InMemoryServerStatePort {
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
+#[async_trait(?Send)]
+impl ServerStatePort for InMemoryServerStatePort {
+    async fn load_scene(
+        &self,
+        seed_participants: &[String],
+    ) -> anyhow::Result<EditableSceneStateView> {
+        Ok(self
+            .scene
+            .borrow()
+            .clone()
+            .unwrap_or_else(|| initial_scene_state(seed_participants)))
+    }
+
+    async fn save_scene(&self, state: &EditableSceneStateView) -> anyhow::Result<()> {
+        self.scene.replace(Some(state.clone()));
+        Ok(())
+    }
+
+    async fn load_module_settings(&self) -> anyhow::Result<Vec<ModuleSettingsView>> {
+        Ok(self.module_settings.borrow().clone())
+    }
+
+    async fn save_module_settings(&self, settings: &[ModuleSettingsView]) -> anyhow::Result<()> {
+        self.module_settings.replace(settings.to_vec());
+        Ok(())
+    }
+
+    async fn load_action_affordances(&self) -> anyhow::Result<Vec<ActionAffordance>> {
+        Ok(self.action_affordances.borrow().clone())
+    }
+
+    async fn save_action_affordances(
+        &self,
+        affordances: &[ActionAffordance],
+    ) -> anyhow::Result<()> {
+        self.action_affordances.replace(affordances.to_vec());
+        Ok(())
+    }
+}
+
+fn write_json(path: PathBuf, value: &impl Serialize, label: &str) -> anyhow::Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("create {label} dir {}", parent.display()))?;
+    }
+    let text = serde_json::to_string_pretty(value)?;
+    fs::write(&path, text).with_context(|| format!("write {label} to {}", path.display()))
+}
+
+fn initial_scene_state(seed_participants: &[String]) -> EditableSceneStateView {
+    EditableSceneStateView {
+        people: seed_participants
+            .iter()
+            .filter_map(|name| {
+                let name = name.trim();
+                (!name.is_empty()).then(|| name.to_owned())
+            })
+            .enumerate()
+            .map(|(index, name)| ScenePersonRowView {
+                id: format!("person-{}", index + 1),
+                name,
+                direction: String::new(),
+                distance: String::new(),
+                state: String::new(),
+            })
+            .collect(),
+        ..EditableSceneStateView::default()
+    }
+}
+
+fn next_scene_id(state: &EditableSceneStateView, kind: SceneRowKind) -> String {
+    SceneState::from_file(state.clone()).next_id(kind)
+}
+
+#[derive(Debug)]
+pub(super) struct ActionAffordanceState {
+    affordances: BTreeMap<String, ActionAffordance>,
+}
+
+impl ActionAffordanceState {
+    pub(super) async fn load(port: &dyn ServerStatePort) -> anyhow::Result<Self> {
+        Ok(Self::from_affordances(
+            port.load_action_affordances().await?,
+        ))
+    }
+
+    fn from_affordances(affordances: Vec<ActionAffordance>) -> Self {
         Self {
-            path,
             affordances: affordances
                 .into_iter()
                 .map(|affordance| (affordance.id.clone(), affordance))
@@ -51,16 +239,8 @@ impl ActionAffordanceState {
         }
     }
 
-    pub(super) fn save(&self) -> anyhow::Result<()> {
-        if let Some(parent) = self.path.parent() {
-            fs::create_dir_all(parent)
-                .with_context(|| format!("create action affordance dir {}", parent.display()))?;
-        }
-        let text = serde_json::to_string_pretty(&ActionAffordancesFile {
-            affordances: self.affordances(),
-        })?;
-        fs::write(&self.path, text)
-            .with_context(|| format!("write action affordances to {}", self.path.display()))
+    pub(super) async fn save(&self, port: &dyn ServerStatePort) -> anyhow::Result<()> {
+        port.save_action_affordances(&self.affordances()).await
     }
 
     pub(super) fn replace(&mut self, affordances: Vec<ActionAffordance>) {
@@ -77,42 +257,24 @@ impl ActionAffordanceState {
 
 #[derive(Debug)]
 pub(super) struct ModuleSettingsState {
-    path: PathBuf,
     modules: BTreeMap<String, ModuleSettingsView>,
 }
 
 impl ModuleSettingsState {
-    pub(super) fn load(path: PathBuf) -> anyhow::Result<Self> {
-        if !path.exists() {
-            return Ok(Self {
-                path,
-                modules: BTreeMap::new(),
-            });
-        }
-        let text = fs::read_to_string(&path)
-            .with_context(|| format!("read module settings from {}", path.display()))?;
-        let file: ModuleSettingsFile = serde_json::from_str(&text)
-            .with_context(|| format!("parse module settings from {}", path.display()))?;
+    pub(super) async fn load(port: &dyn ServerStatePort) -> anyhow::Result<Self> {
         Ok(Self {
-            path,
-            modules: file
-                .modules
+            modules: port
+                .load_module_settings()
+                .await?
                 .into_iter()
                 .map(|settings| (settings.module.clone(), settings))
                 .collect(),
         })
     }
 
-    pub(super) fn save(&self) -> anyhow::Result<()> {
-        if let Some(parent) = self.path.parent() {
-            fs::create_dir_all(parent)
-                .with_context(|| format!("create module settings dir {}", parent.display()))?;
-        }
-        let text = serde_json::to_string_pretty(&ModuleSettingsFile {
-            modules: self.modules.values().cloned().collect(),
-        })?;
-        fs::write(&self.path, text)
-            .with_context(|| format!("write module settings to {}", self.path.display()))
+    pub(super) async fn save(&self, port: &dyn ServerStatePort) -> anyhow::Result<()> {
+        port.save_module_settings(&self.modules.values().cloned().collect::<Vec<_>>())
+            .await
     }
 
     pub(super) fn upsert(&mut self, settings: ModuleSettingsView) {
@@ -142,7 +304,6 @@ fn load_legacy_ambient_rows(path: &Path) -> anyhow::Result<Vec<AmbientSensoryRow
 
 #[derive(Debug)]
 pub(super) struct SceneState {
-    path: PathBuf,
     people: Vec<ScenePersonRowView>,
     objects: Vec<SceneObjectRowView>,
     sounds: Vec<SceneSoundRowView>,
@@ -150,51 +311,15 @@ pub(super) struct SceneState {
 }
 
 impl SceneState {
-    pub(super) fn load(
-        path: PathBuf,
-        legacy_ambient_path: &Path,
+    pub(super) async fn load(
+        port: &dyn ServerStatePort,
         seed_participants: &[String],
     ) -> anyhow::Result<Self> {
-        if path.exists() {
-            let text = fs::read_to_string(&path)
-                .with_context(|| format!("read scene state from {}", path.display()))?;
-            let file: EditableSceneStateView = serde_json::from_str(&text)
-                .with_context(|| format!("parse scene state from {}", path.display()))?;
-            return Ok(Self::from_file(path, file));
-        }
-
-        let mut state = Self::from_file(path, EditableSceneStateView::default());
-        for name in seed_participants {
-            if !name.trim().is_empty() {
-                let id = state.next_id(SceneRowKind::Person);
-                state.people.push(ScenePersonRowView {
-                    id,
-                    name: name.trim().to_string(),
-                    direction: String::new(),
-                    distance: String::new(),
-                    state: String::new(),
-                });
-            }
-        }
-        if legacy_ambient_path.exists() {
-            for row in load_legacy_ambient_rows(legacy_ambient_path)?
-                .into_iter()
-                .filter(|row| !row.disabled && !row.content.trim().is_empty())
-            {
-                let id = state.next_id(SceneRowKind::Atmosphere);
-                state.atmosphere.push(SceneAtmosphereRowView {
-                    id,
-                    aspect: "other".to_string(),
-                    description: legacy_atmosphere_description(&row),
-                });
-            }
-        }
-        Ok(state)
+        Ok(Self::from_file(port.load_scene(seed_participants).await?))
     }
 
-    fn from_file(path: PathBuf, file: EditableSceneStateView) -> Self {
+    fn from_file(file: EditableSceneStateView) -> Self {
         Self {
-            path,
             people: file.people,
             objects: file.objects,
             sounds: file.sounds,
@@ -202,14 +327,8 @@ impl SceneState {
         }
     }
 
-    pub(super) fn save(&self) -> anyhow::Result<()> {
-        if let Some(parent) = self.path.parent() {
-            fs::create_dir_all(parent)
-                .with_context(|| format!("create scene state dir {}", parent.display()))?;
-        }
-        let text = serde_json::to_string_pretty(&self.editable_view())?;
-        fs::write(&self.path, text)
-            .with_context(|| format!("write scene state to {}", self.path.display()))
+    pub(super) async fn save(&self, port: &dyn ServerStatePort) -> anyhow::Result<()> {
+        port.save_scene(&self.editable_view()).await
     }
 
     pub(super) fn view(&self) -> SceneStateView {
@@ -422,14 +541,37 @@ fn legacy_modality_aspect(modality: &str) -> String {
 mod tests {
     use super::*;
 
-    #[test]
-    fn action_affordance_state_loads_empty_and_round_trips() {
-        let path = PathBuf::from(format!(
-            ".tmp/action-affordances-{}.json",
-            uuid::Uuid::now_v7()
-        ));
+    #[tokio::test(flavor = "current_thread")]
+    async fn in_memory_state_port_round_trips_typed_state() {
+        let port = InMemoryServerStatePort::new();
+        let scene = port.load_scene(&["Pibi".to_string()]).await.unwrap();
+        let affordance = ActionAffordance {
+            id: "clock".to_string(),
+            label: "Clock".to_string(),
+            description: "Check the current time.".to_string(),
+            use_when: "when time matters".to_string(),
+            effect: "The host reports the current time.".to_string(),
+            input_schema: serde_json::json!({"type": "object"}),
+        };
 
-        let mut state = ActionAffordanceState::load(path.clone()).unwrap();
+        port.save_scene(&scene).await.unwrap();
+        port.save_action_affordances(std::slice::from_ref(&affordance))
+            .await
+            .unwrap();
+
+        assert_eq!(port.load_scene(&["Koro".to_string()]).await.unwrap(), scene);
+        assert_eq!(
+            port.load_action_affordances().await.unwrap(),
+            vec![affordance]
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn action_affordance_state_loads_empty_and_round_trips() {
+        let root = PathBuf::from(format!(".tmp/action-affordances-{}", uuid::Uuid::now_v7()));
+        let port = FileServerStatePort::new(root);
+
+        let mut state = ActionAffordanceState::load(&port).await.unwrap();
         assert_eq!(
             state
                 .affordances()
@@ -447,9 +589,9 @@ mod tests {
             effect: "The host reports the current time as sensory input.".to_string(),
             input_schema: serde_json::json!({"type": "object"}),
         }]);
-        state.save().unwrap();
+        state.save(&port).await.unwrap();
 
-        let reloaded = ActionAffordanceState::load(path).unwrap();
+        let reloaded = ActionAffordanceState::load(&port).await.unwrap();
         assert_eq!(
             reloaded
                 .affordances()
@@ -462,37 +604,34 @@ mod tests {
 
     #[test]
     fn scene_state_derives_people_objects_sounds_and_atmosphere() {
-        let state = SceneState::from_file(
-            PathBuf::from(".tmp/test-scene-state.json"),
-            EditableSceneStateView {
-                people: vec![ScenePersonRowView {
-                    id: "person-1".to_string(),
-                    name: "Pibi".to_string(),
-                    direction: "front".to_string(),
-                    distance: "2m".to_string(),
-                    state: "watching Nui".to_string(),
-                }],
-                objects: vec![SceneObjectRowView {
-                    id: "object-1".to_string(),
-                    name: "bowl".to_string(),
-                    direction: "left".to_string(),
-                    distance: String::new(),
-                    visual_description: "red food bowl".to_string(),
-                    sound_description: "soft rattling".to_string(),
-                }],
-                sounds: vec![SceneSoundRowView {
-                    id: "sound-1".to_string(),
-                    direction: "behind".to_string(),
-                    distance: "far".to_string(),
-                    description: "rain tapping".to_string(),
-                }],
-                atmosphere: vec![SceneAtmosphereRowView {
-                    id: "atmosphere-1".to_string(),
-                    aspect: "smell".to_string(),
-                    description: "wet stone smell".to_string(),
-                }],
-            },
-        );
+        let state = SceneState::from_file(EditableSceneStateView {
+            people: vec![ScenePersonRowView {
+                id: "person-1".to_string(),
+                name: "Pibi".to_string(),
+                direction: "front".to_string(),
+                distance: "2m".to_string(),
+                state: "watching Nui".to_string(),
+            }],
+            objects: vec![SceneObjectRowView {
+                id: "object-1".to_string(),
+                name: "bowl".to_string(),
+                direction: "left".to_string(),
+                distance: String::new(),
+                visual_description: "red food bowl".to_string(),
+                sound_description: "soft rattling".to_string(),
+            }],
+            sounds: vec![SceneSoundRowView {
+                id: "sound-1".to_string(),
+                direction: "behind".to_string(),
+                distance: "far".to_string(),
+                description: "rain tapping".to_string(),
+            }],
+            atmosphere: vec![SceneAtmosphereRowView {
+                id: "atmosphere-1".to_string(),
+                aspect: "smell".to_string(),
+                description: "wet stone smell".to_string(),
+            }],
+        });
 
         assert_eq!(
             state.derived_ambient(),
@@ -528,28 +667,25 @@ mod tests {
 
     #[test]
     fn scene_state_participants_skip_empty_names() {
-        let state = SceneState::from_file(
-            PathBuf::from(".tmp/test-scene-state.json"),
-            EditableSceneStateView {
-                people: vec![
-                    ScenePersonRowView {
-                        id: "person-1".to_string(),
-                        name: "Pibi".to_string(),
-                        direction: String::new(),
-                        distance: String::new(),
-                        state: String::new(),
-                    },
-                    ScenePersonRowView {
-                        id: "person-2".to_string(),
-                        name: " ".to_string(),
-                        direction: String::new(),
-                        distance: String::new(),
-                        state: String::new(),
-                    },
-                ],
-                ..EditableSceneStateView::default()
-            },
-        );
+        let state = SceneState::from_file(EditableSceneStateView {
+            people: vec![
+                ScenePersonRowView {
+                    id: "person-1".to_string(),
+                    name: "Pibi".to_string(),
+                    direction: String::new(),
+                    distance: String::new(),
+                    state: String::new(),
+                },
+                ScenePersonRowView {
+                    id: "person-2".to_string(),
+                    name: " ".to_string(),
+                    direction: String::new(),
+                    distance: String::new(),
+                    state: String::new(),
+                },
+            ],
+            ..EditableSceneStateView::default()
+        });
 
         assert_eq!(
             state
@@ -561,14 +697,13 @@ mod tests {
         );
     }
 
-    #[test]
-    fn scene_state_load_imports_legacy_ambient_once_and_persists() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn scene_state_load_imports_legacy_ambient_once_and_persists() {
         let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../../.tmp")
             .join(format!("scene-state-{}", uuid::Uuid::new_v4()));
         fs::create_dir_all(&root).expect("create test state dir");
         let legacy_path = root.join("ambient-sensory.json");
-        let scene_path = root.join("scene-state.json");
         fs::write(
             &legacy_path,
             serde_json::to_string_pretty(&AmbientRowsFile {
@@ -583,7 +718,9 @@ mod tests {
         )
         .expect("write legacy rows");
 
-        let state = SceneState::load(scene_path.clone(), &legacy_path, &["Pibi".to_string()])
+        let port = FileServerStatePort::new(root);
+        let state = SceneState::load(&port, &["Pibi".to_string()])
+            .await
             .expect("load imported scene state");
 
         assert_eq!(state.view().people[0].name, "Pibi");
@@ -592,8 +729,9 @@ mod tests {
             "smell: wet stone smell"
         );
 
-        state.save().expect("save imported scene state");
-        let loaded = SceneState::load(scene_path, &legacy_path, &["Koro".to_string()])
+        state.save(&port).await.expect("save imported scene state");
+        let loaded = SceneState::load(&port, &["Koro".to_string()])
+            .await
             .expect("reload scene state");
 
         assert_eq!(

@@ -8,6 +8,7 @@ pub mod llm_db_trace;
 pub mod llm_observer;
 mod memory_seed;
 pub mod model_set;
+pub mod ports;
 pub mod registry;
 pub mod runtime;
 mod runtime_event_log;
@@ -24,26 +25,35 @@ pub use config::{
     load_server_config_from_options,
 };
 pub use environment::{
-    build_embedder, build_embedder_with_api_key, build_lutum, build_lutum_with_api_key,
-    build_lutum_with_http_client, build_model_handle, build_tiers, server_llm_log_context,
+    build_embedder, build_embedder_with_api_key, build_in_memory_host_ports, build_lutum,
+    build_lutum_with_api_key, build_lutum_with_http_client, build_model_handle, build_tiers,
+    server_llm_log_context,
 };
 pub use gui::{VisualizerEventSink, VisualizerHook, VisualizerServerMessageReceiverExt};
 pub use llm_observer::VisualizerLlmObserver;
+pub use memory_seed::FileMemorySeedPort;
 pub use model_set::{
     EmbeddingRole, ModelDefinition, ModelSet, ModelSetError, ModelSetFile, ReasoningEffort,
     ResolvedLlmBackends, TierBinding, model_concurrency_from_backends, parse_model_set_file,
     parse_model_set_str, resolve_llm_backends, resolve_token_fields,
 };
 pub use nuillu_llm_trace_file::{FileLlmTraceSink, LlmLogContext};
+pub use ports::{
+    MemorySeedPort, NoopMemorySeed, NoopRuntimeEventLog, RuntimeEventLogPort, ServerHostPorts,
+    ServerStatePort,
+};
 pub use registry::ServerModuleRegistrar;
 pub use runtime::{
     ServerAmbientSensorySnapshotRecord, ServerEvent, ServerExternalActionEventRecord,
     ServerExternalActionEventStatus, ServerLlmCall, ServerLlmCallSource,
     ServerOneShotSensoryInputRecord, ServerRuntimeHandle, ServerRuntimeStatus,
-    ServerUtteranceEventKind, ServerUtteranceEventRecord, run_server, run_server_with_native_timer,
-    run_server_with_visualizer, spawn_server_runtime, spawn_server_runtime_with_module_registrars,
+    ServerUtteranceEventKind, ServerUtteranceEventRecord, run_server, run_server_with_host_ports,
+    run_server_with_native_timer, run_server_with_visualizer, spawn_server_runtime,
+    spawn_server_runtime_with_module_registrars,
 };
+pub use runtime_event_log::FileRuntimeEventLog;
 pub use snapshot::{
     duration_millis_u64, linked_memory_record_view, memory_metadata_views, memory_rank_name,
     memory_record_view, module_policy_views, zero_replica_window_view,
 };
+pub use state::{FileServerStatePort, InMemoryServerStatePort};

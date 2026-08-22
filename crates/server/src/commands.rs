@@ -28,6 +28,7 @@ use crate::config::ServerBootConfig;
 use crate::environment::ServerEnvironment;
 use crate::gui::VisualizerHook;
 use crate::llm_db_trace::{emit_persisted_llm_transcripts, transcript_turn_view_from_record};
+use crate::ports::ServerStatePort;
 use crate::runtime::{SERVER_TITLE, set_runtime_running};
 use crate::snapshot::{
     emit_visualizer_blackboard_snapshot, linked_memory_record_view, memory_record_view,
@@ -43,6 +44,7 @@ pub(super) async fn drive_server_until_shutdown(
     scene: &mut SceneState,
     module_settings: &mut ModuleSettingsState,
     action_affordances: &mut ActionAffordanceState,
+    state_port: &dyn ServerStatePort,
     boot_config: &ServerBootConfig,
     sensory: &SensoryInputMailbox,
     env: &ServerEnvironment,
@@ -65,6 +67,7 @@ pub(super) async fn drive_server_until_shutdown(
                 scene,
                 module_settings,
                 action_affordances,
+                state_port,
                 boot_config,
                 sensory,
                 env,
@@ -83,6 +86,7 @@ pub(super) async fn drive_server_until_shutdown(
                 scene,
                 module_settings,
                 action_affordances,
+                state_port,
                 boot_config,
                 sensory,
                 env,
@@ -108,6 +112,7 @@ async fn handle_server_visualizer_message(
     scene: &mut SceneState,
     module_settings: &mut ModuleSettingsState,
     action_affordances: &mut ActionAffordanceState,
+    state_port: &dyn ServerStatePort,
     boot_config: &ServerBootConfig,
     sensory: &SensoryInputMailbox,
     env: &ServerEnvironment,
@@ -184,6 +189,7 @@ async fn handle_server_visualizer_message(
             scene.create_legacy_ambient(modality, content, disabled);
             persist_and_emit_scene(
                 scene,
+                state_port,
                 visualizer,
                 tab_id,
                 sensory,
@@ -200,6 +206,7 @@ async fn handle_server_visualizer_message(
             scene.update_legacy_ambient(row);
             persist_and_emit_scene(
                 scene,
+                state_port,
                 visualizer,
                 tab_id,
                 sensory,
@@ -216,6 +223,7 @@ async fn handle_server_visualizer_message(
             scene.remove_legacy_ambient(&row_id);
             persist_and_emit_scene(
                 scene,
+                state_port,
                 visualizer,
                 tab_id,
                 sensory,
@@ -232,6 +240,7 @@ async fn handle_server_visualizer_message(
             scene.create(kind);
             persist_and_emit_scene(
                 scene,
+                state_port,
                 visualizer,
                 tab_id,
                 sensory,
@@ -248,6 +257,7 @@ async fn handle_server_visualizer_message(
             scene.update(row);
             persist_and_emit_scene(
                 scene,
+                state_port,
                 visualizer,
                 tab_id,
                 sensory,
@@ -265,6 +275,7 @@ async fn handle_server_visualizer_message(
             scene.remove(kind, &row_id);
             persist_and_emit_scene(
                 scene,
+                state_port,
                 visualizer,
                 tab_id,
                 sensory,
@@ -281,6 +292,7 @@ async fn handle_server_visualizer_message(
             scene.replace(state);
             persist_and_emit_scene(
                 scene,
+                state_port,
                 visualizer,
                 tab_id,
                 sensory,
@@ -323,7 +335,7 @@ async fn handle_server_visualizer_message(
             .await
             {
                 module_settings.upsert(settings);
-                if let Err(error) = module_settings.save() {
+                if let Err(error) = module_settings.save(state_port).await {
                     visualizer.send_event(VisualizerEvent::Log {
                         tab_id: tab_id.clone(),
                         message: format!("failed to save module settings: {error}"),
@@ -338,6 +350,7 @@ async fn handle_server_visualizer_message(
         } if command_tab == *tab_id => {
             apply_action_affordance_set(
                 action_affordances,
+                state_port,
                 boot_config,
                 affordances,
                 visualizer,
@@ -366,7 +379,7 @@ async fn handle_server_visualizer_message(
             match set_merged_action_affordances(base.clone(), boot_config, env).await {
                 Ok(snapshot) => {
                     action_affordances.replace(base);
-                    if let Err(error) = action_affordances.save() {
+                    if let Err(error) = action_affordances.save(state_port).await {
                         visualizer.send_event(VisualizerEvent::Log {
                             tab_id: tab_id.clone(),
                             message: format!("failed to save action affordances: {error}"),
@@ -390,7 +403,7 @@ async fn handle_server_visualizer_message(
             match set_merged_action_affordances(base.clone(), boot_config, env).await {
                 Ok(snapshot) => {
                     action_affordances.replace(base);
-                    if let Err(error) = action_affordances.save() {
+                    if let Err(error) = action_affordances.save(state_port).await {
                         visualizer.send_event(VisualizerEvent::Log {
                             tab_id: tab_id.clone(),
                             message: format!("failed to save action affordances: {error}"),
@@ -652,6 +665,7 @@ async fn emit_current_visualizer_snapshot(
 
 async fn apply_action_affordance_set(
     action_affordances: &mut ActionAffordanceState,
+    state_port: &dyn ServerStatePort,
     boot_config: &ServerBootConfig,
     affordances: Vec<ActionAffordance>,
     visualizer: &VisualizerHook,
@@ -668,7 +682,7 @@ async fn apply_action_affordance_set(
     match set_merged_action_affordances(affordances.clone(), boot_config, env).await {
         Ok(snapshot) => {
             action_affordances.replace(affordances);
-            if let Err(error) = action_affordances.save() {
+            if let Err(error) = action_affordances.save(state_port).await {
                 visualizer.send_event(VisualizerEvent::Log {
                     tab_id: tab_id.clone(),
                     message: format!("failed to save action affordances: {error}"),
@@ -940,13 +954,14 @@ async fn set_module_disabled(
 
 async fn persist_and_emit_scene(
     scene: &SceneState,
+    state_port: &dyn ServerStatePort,
     visualizer: &mut VisualizerHook,
     tab_id: &VisualizerTabId,
     sensory: &SensoryInputMailbox,
     env: &ServerEnvironment,
     publish_snapshot: bool,
 ) {
-    if let Err(error) = scene.save() {
+    if let Err(error) = scene.save(state_port).await {
         visualizer.send_event(VisualizerEvent::Log {
             tab_id: tab_id.clone(),
             message: format!("failed to save scene state: {error}"),

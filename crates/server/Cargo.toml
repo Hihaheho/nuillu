@@ -25,6 +25,7 @@ eure-document = { workspace = true }
 eure-json = { workspace = true }
 futures = { workspace = true }
 lutum = { workspace = true }
+lutum-in-memory-adapter = { workspace = true }
 lutum-libsql-adapter = { workspace = true, optional = true }
 lutum-openai = { workspace = true }
 lutum-trace = { workspace = true }

@@ -7,16 +7,18 @@ use chrono::{DateTime, Utc};
 use nuillu_module::RuntimeEvent;
 use serde::Serialize;
 
+use crate::ports::RuntimeEventLogPort;
+
 #[derive(Debug)]
-pub(crate) struct RuntimeEventLogWriter {
+pub struct FileRuntimeEventLog {
     path: PathBuf,
     session_id: String,
     tab_id: String,
     file: Mutex<File>,
 }
 
-impl RuntimeEventLogWriter {
-    pub(crate) fn open(path: PathBuf, session_id: String, tab_id: String) -> io::Result<Self> {
+impl FileRuntimeEventLog {
+    pub fn open(path: PathBuf, session_id: String, tab_id: String) -> io::Result<Self> {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
@@ -29,11 +31,11 @@ impl RuntimeEventLogWriter {
         })
     }
 
-    pub(crate) fn path(&self) -> &Path {
+    pub fn path(&self) -> &Path {
         &self.path
     }
 
-    pub(crate) fn append(&self, message: &str, event: &RuntimeEvent) -> io::Result<()> {
+    fn append_record(&self, message: &str, event: &RuntimeEvent) -> io::Result<()> {
         let record = runtime_event_log_record(&self.session_id, &self.tab_id, message, event);
         let mut file = self
             .file
@@ -42,6 +44,16 @@ impl RuntimeEventLogWriter {
         serde_json::to_writer(&mut *file, &record).map_err(io::Error::other)?;
         file.write_all(b"\n")?;
         file.flush()
+    }
+}
+
+impl RuntimeEventLogPort for FileRuntimeEventLog {
+    fn append(&self, message: &str, event: &RuntimeEvent) -> anyhow::Result<()> {
+        self.append_record(message, event).map_err(Into::into)
+    }
+
+    fn destination(&self) -> Option<String> {
+        Some(self.path.display().to_string())
     }
 }
 
@@ -54,6 +66,7 @@ struct RuntimeEventLogRecord {
     event: serde_json::Value,
 }
 
+#[cfg(feature = "libsql")]
 pub(crate) fn runtime_event_log_path(state_dir: &Path, session_id: &str) -> PathBuf {
     state_dir
         .join("logs")
@@ -200,7 +213,8 @@ mod tests {
     use nuillu_module::RuntimeEvent;
     use nuillu_types::{ModelTier, ModuleActivationId, ModuleInstanceId, ReplicaIndex, builtin};
 
-    use super::{RuntimeEventLogWriter, runtime_event_log_record_at, runtime_event_message};
+    use super::{FileRuntimeEventLog, runtime_event_log_record_at, runtime_event_message};
+    use crate::ports::RuntimeEventLogPort as _;
 
     static NEXT_TEST_DIR: AtomicU64 = AtomicU64::new(0);
 
@@ -299,12 +313,9 @@ mod tests {
     fn runtime_event_writer_appends_jsonl_records() {
         let dir = runtime_event_path_for_test();
         let path = dir.join("runtime-events.jsonl");
-        let writer = RuntimeEventLogWriter::open(
-            path.clone(),
-            "session-1".to_string(),
-            "server".to_string(),
-        )
-        .unwrap();
+        let writer =
+            FileRuntimeEventLog::open(path.clone(), "session-1".to_string(), "server".to_string())
+                .unwrap();
         let owner = ModuleInstanceId::new(builtin::sensory(), ReplicaIndex::ZERO);
         let first = RuntimeEvent::MemoUpdated {
             sequence: 1,

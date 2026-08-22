@@ -36,9 +36,10 @@ use crate::commands::{
     emit_recent_activity_rows, emit_scene_state,
 };
 use crate::config::ServerConfig;
-use crate::environment::build_server_environment;
+use crate::environment::{build_native_host_ports, build_server_environment};
 use crate::gui::VisualizerHook;
 use crate::llm_db_trace::emit_persisted_llm_transcripts;
+use crate::ports::ServerHostPorts;
 use crate::registry::{
     ServerModuleRegistrar, apply_server_module_registrars, full_agent_allocation, server_registry,
 };
@@ -690,11 +691,23 @@ pub async fn run_server_with_native_timer(
 pub async fn run_server(
     config: ServerConfig,
     registrars: Vec<Arc<dyn ServerModuleRegistrar>>,
-    mut visualizer: VisualizerHook,
+    visualizer: VisualizerHook,
     timer: Rc<dyn Timer>,
 ) -> anyhow::Result<()> {
+    let host_ports = build_native_host_ports(&config).await?;
+    run_server_with_host_ports(config, registrars, visualizer, timer, host_ports).await
+}
+
+/// Runs the server with all host-owned state and persistence ports supplied by the caller.
+pub async fn run_server_with_host_ports(
+    config: ServerConfig,
+    registrars: Vec<Arc<dyn ServerModuleRegistrar>>,
+    mut visualizer: VisualizerHook,
+    timer: Rc<dyn Timer>,
+    host_ports: ServerHostPorts,
+) -> anyhow::Result<()> {
     send_visualizer_startup_to_hook(&visualizer);
-    let result = run_server_inner(config, &registrars, &mut visualizer, timer).await;
+    let result = run_server_inner(config, &registrars, &mut visualizer, timer, host_ports).await;
     if let Err(error) = &result {
         let tab_id = server_tab_id();
         visualizer.send_event(VisualizerEvent::Log {
@@ -727,28 +740,24 @@ async fn run_server_inner(
     registrars: &[Arc<dyn ServerModuleRegistrar>],
     visualizer: &mut VisualizerHook,
     timer: Rc<dyn Timer>,
+    host_ports: ServerHostPorts,
 ) -> anyhow::Result<()> {
     let tab_id = VisualizerTabId::new(SERVER_TAB_ID.to_string());
     visualizer.send_event(VisualizerEvent::Log {
         tab_id: tab_id.clone(),
         message: format!("nuillu-server session_id={}", config.session_id),
     });
-    let legacy_ambient_path = config.state_dir.join("ambient-sensory.json");
-    let mut scene = SceneState::load(
-        config.state_dir.join("scene-state.json"),
-        &legacy_ambient_path,
-        &config.participants,
-    )?;
-    scene.save()?;
-    let mut module_settings =
-        ModuleSettingsState::load(config.state_dir.join("module-settings.json"))?;
-    let mut action_affordances =
-        ActionAffordanceState::load(config.state_dir.join("action-affordances.json"))?;
-    action_affordances.save()?;
+    let state_port = host_ports.state().clone();
+    let mut scene = SceneState::load(state_port.as_ref(), &config.participants).await?;
+    scene.save(state_port.as_ref()).await?;
+    let mut module_settings = ModuleSettingsState::load(state_port.as_ref()).await?;
+    let mut action_affordances = ActionAffordanceState::load(state_port.as_ref()).await?;
+    action_affordances.save(state_port.as_ref()).await?;
 
     let active_modules = config.active_modules();
     let env = build_server_environment(
         &config,
+        &host_ports,
         full_agent_allocation(&config.boot_config),
         visualizer.event_sender(),
         timer.clone(),
@@ -824,6 +833,7 @@ async fn run_server_inner(
                 &mut scene,
                 &mut module_settings,
                 &mut action_affordances,
+                state_port.as_ref(),
                 &config.boot_config,
                 &sensory,
                 &env,

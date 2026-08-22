@@ -10,9 +10,31 @@ use eure::{FromEure, value::Text};
 use nuillu_memory::{MemoryCapabilities, MemoryConcept, MemoryKind, MemoryTag, NewMemory};
 use nuillu_types::{MemoryContent, MemoryIndex, MemoryRank};
 
+use crate::ports::MemorySeedPort;
+
 const MEMORY_SEED_DIR: &str = "memory-seeds";
 const DEFAULT_TRANSIENT_MEMORY_DECAY_SECS: i64 = 86_400;
 const DURABLE_MEMORY_DECAY_SECS: i64 = 0;
+
+#[derive(Debug, Clone)]
+pub struct FileMemorySeedPort {
+    state_dir: PathBuf,
+}
+
+impl FileMemorySeedPort {
+    pub fn new(state_dir: impl Into<PathBuf>) -> Self {
+        Self {
+            state_dir: state_dir.into(),
+        }
+    }
+}
+
+#[async_trait::async_trait(?Send)]
+impl MemorySeedPort for FileMemorySeedPort {
+    async fn seed(&self, memory: &MemoryCapabilities) -> anyhow::Result<usize> {
+        seed_memory_from_state_dir(&self.state_dir, memory).await
+    }
+}
 
 #[derive(Debug, Clone, FromEure)]
 #[eure(crate = ::eure::document, rename_all = "kebab-case")]
