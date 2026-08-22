@@ -44,12 +44,10 @@ pub use ports::{
 };
 pub use registry::ServerModuleRegistrar;
 pub use runtime::{
-    ServerAmbientSensorySnapshotRecord, ServerEvent, ServerExternalActionEventRecord,
-    ServerExternalActionEventStatus, ServerLlmCall, ServerLlmCallSource,
+    Server, ServerAmbientSensorySnapshotRecord, ServerEvent, ServerExternalActionEventRecord,
+    ServerExternalActionEventStatus, ServerHost, ServerLlmCall, ServerLlmCallSource,
     ServerOneShotSensoryInputRecord, ServerRuntimeHandle, ServerRuntimeStatus,
-    ServerUtteranceEventKind, ServerUtteranceEventRecord, run_server, run_server_with_host_ports,
-    run_server_with_native_timer, run_server_with_visualizer, spawn_server_runtime,
-    spawn_server_runtime_with_module_registrars,
+    ServerUtteranceEventKind, ServerUtteranceEventRecord,
 };
 pub use runtime_event_log::FileRuntimeEventLog;
 pub use snapshot::{

@@ -6,8 +6,8 @@ use std::{
 
 use clap::{Args as ClapArgs, Parser};
 use nuillu_server::{
-    RuntimeModule, ServerRunOptions, install_lutum_trace_subscriber,
-    load_server_config_from_options, spawn_server_runtime,
+    RuntimeModule, Server, ServerRunOptions, install_lutum_trace_subscriber,
+    load_server_config_from_options,
 };
 use nuillu_visualizer_egui::{Visualizer, VisualizerConfig};
 use nuillu_visualizer_protocol::{
@@ -26,7 +26,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         (server_messages, client_messages, None)
     } else {
         let config = load_server_config_from_options(args.server.into_options())?;
-        let runtime = spawn_server_runtime(config)?;
+        let runtime = Server::new(config).spawn()?;
         let (server_messages, client_messages) = runtime.visualizer_channels();
         (server_messages, client_messages, Some(runtime))
     };

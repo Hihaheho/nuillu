@@ -51,6 +51,141 @@ const EVENT_BACKLOG_LIMIT: usize = 512;
 const AGENT_RESTART_LIMIT: u64 = 5;
 const AGENT_RESTART_STABLE_AFTER: Duration = Duration::from_secs(30);
 
+/// A configured nuillu server.
+///
+/// Constructing the server is separate from choosing how it is hosted: [`Server::listen`]
+/// connects to an external visualizer, [`Server::spawn`] embeds it on a dedicated thread, and
+/// [`Server::run`] lets an async host supply all runtime capabilities directly.
+pub struct Server {
+    config: ServerConfig,
+    registrars: Vec<Arc<dyn ServerModuleRegistrar>>,
+}
+
+/// Capabilities owned by an async server host.
+pub struct ServerHost {
+    visualizer: VisualizerHook,
+    timer: Rc<dyn Timer>,
+    ports: ServerHostPorts,
+}
+
+impl ServerHost {
+    pub fn new(visualizer: VisualizerHook, timer: Rc<dyn Timer>, ports: ServerHostPorts) -> Self {
+        Self {
+            visualizer,
+            timer,
+            ports,
+        }
+    }
+}
+
+impl Server {
+    pub fn new(config: ServerConfig) -> Self {
+        Self {
+            config,
+            registrars: Vec::new(),
+        }
+    }
+
+    /// Adds host-provided module registrars.
+    pub fn module_registrars(
+        mut self,
+        registrars: impl IntoIterator<Item = Arc<dyn ServerModuleRegistrar>>,
+    ) -> Self {
+        self.registrars.extend(registrars);
+        self
+    }
+
+    /// Waits for an external visualizer connection, then runs on the current thread.
+    pub fn listen(self) -> anyhow::Result<()> {
+        fs::create_dir_all(&self.config.state_dir)
+            .with_context(|| format!("create state dir {}", self.config.state_dir.display()))?;
+        let listener =
+            TcpListener::bind(("127.0.0.1", 0)).context("bind visualizer RPC listener")?;
+        let addr = listener
+            .local_addr()
+            .context("read visualizer RPC listener address")?;
+        eprintln!("nuillu-server visualizer RPC listening on {addr}");
+        let (stream, _) = listener
+            .accept()
+            .context("accept visualizer RPC connection")?;
+        eprintln!("visualizer RPC connected");
+        let port = VisualizerServerPort::from_stream(stream).context("open visualizer RPC port")?;
+        port.send(VisualizerServerMessage::hello())
+            .context("send visualizer protocol hello")?;
+        let _ = port.recv();
+
+        let (command_rx, event_tx) = port.into_channels();
+        self.run_on_current_thread(event_tx, command_rx)
+    }
+
+    /// Runs the server on a dedicated thread and returns its control handle.
+    pub fn spawn(self) -> anyhow::Result<ServerRuntimeHandle> {
+        let (command_tx, command_rx) = mpsc::channel();
+        let (visualizer_tx, visualizer_rx) = mpsc::channel();
+        let events = Broadcast::new(EVENT_BACKLOG_LIMIT);
+        let visualizer_messages = Broadcast::new(EVENT_BACKLOG_LIMIT);
+        spawn_visualizer_message_pump(visualizer_rx, visualizer_messages.clone(), events.clone());
+        let join = thread::spawn(move || self.run_on_current_thread(visualizer_tx, command_rx));
+
+        Ok(ServerRuntimeHandle {
+            commands: command_tx,
+            events,
+            visualizer_messages,
+            join: Arc::new(Mutex::new(Some(join))),
+        })
+    }
+
+    /// Runs on the caller's current local async executor using host-supplied capabilities.
+    ///
+    /// This does not create a thread, Tokio runtime, or `LocalSet`. Server modules may contain
+    /// non-`Send` state, so the caller must provide a local task context.
+    pub async fn run(self, host: ServerHost) -> anyhow::Result<()> {
+        let ServerHost {
+            mut visualizer,
+            timer,
+            ports,
+        } = host;
+        send_visualizer_startup_to_hook(&visualizer);
+        let result =
+            run_server_inner(self.config, &self.registrars, &mut visualizer, timer, ports).await;
+        if let Err(error) = &result {
+            let tab_id = server_tab_id();
+            visualizer.send_event(VisualizerEvent::Log {
+                tab_id: tab_id.clone(),
+                message: format!("nuillu-server runtime failed: {error:#}"),
+            });
+            visualizer.send_event(VisualizerEvent::SetTabStatus {
+                tab_id,
+                status: TabStatus::Invalid,
+            });
+        }
+        result
+    }
+
+    fn run_on_current_thread(
+        self,
+        event_tx: Sender<VisualizerServerMessage>,
+        command_rx: Receiver<VisualizerClientMessage>,
+    ) -> anyhow::Result<()> {
+        let runtime = Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .context("build server tokio runtime")?;
+        let local = LocalSet::new();
+        let visualizer = VisualizerHook::new(event_tx, command_rx);
+        let timer = Rc::new(TokioTimer::new());
+        let result = runtime.block_on(local.run_until(async move {
+            let host_ports = build_native_host_ports(&self.config).await?;
+            self.run(ServerHost::new(visualizer, timer, host_ports))
+                .await
+        }));
+        if let Err(error) = &result {
+            eprintln!("nuillu-server runtime failed: {error:#}");
+        }
+        result
+    }
+}
+
 #[derive(Clone)]
 pub struct ServerRuntimeHandle {
     commands: Sender<VisualizerClientMessage>,
@@ -371,76 +506,6 @@ pub struct ServerExternalActionEventRecord {
     pub updated_at: DateTime<Utc>,
 }
 
-pub fn run_server_with_visualizer(config: ServerConfig) -> anyhow::Result<()> {
-    fs::create_dir_all(&config.state_dir)
-        .with_context(|| format!("create state dir {}", config.state_dir.display()))?;
-    let listener = TcpListener::bind(("127.0.0.1", 0)).context("bind visualizer RPC listener")?;
-    let addr = listener
-        .local_addr()
-        .context("read visualizer RPC listener address")?;
-    eprintln!("nuillu-server visualizer RPC listening on {addr}");
-    let (stream, _) = listener
-        .accept()
-        .context("accept visualizer RPC connection")?;
-    eprintln!("visualizer RPC connected");
-    let port = VisualizerServerPort::from_stream(stream).context("open visualizer RPC port")?;
-    port.send(VisualizerServerMessage::hello())
-        .context("send visualizer protocol hello")?;
-    let _ = port.recv();
-
-    let (command_rx, event_tx) = port.into_channels();
-    run_server_on_current_thread(config, Vec::new(), event_tx, command_rx)
-}
-
-pub fn spawn_server_runtime(config: ServerConfig) -> anyhow::Result<ServerRuntimeHandle> {
-    spawn_server_runtime_with_module_registrars(config, Vec::new())
-}
-
-pub fn spawn_server_runtime_with_module_registrars(
-    config: ServerConfig,
-    registrars: Vec<Arc<dyn ServerModuleRegistrar>>,
-) -> anyhow::Result<ServerRuntimeHandle> {
-    let (command_tx, command_rx) = mpsc::channel();
-    let (visualizer_tx, visualizer_rx) = mpsc::channel();
-    let events = Broadcast::new(EVENT_BACKLOG_LIMIT);
-    let visualizer_messages = Broadcast::new(EVENT_BACKLOG_LIMIT);
-    spawn_visualizer_message_pump(visualizer_rx, visualizer_messages.clone(), events.clone());
-    let join = thread::spawn(move || {
-        run_server_on_current_thread(config, registrars, visualizer_tx, command_rx)
-    });
-
-    Ok(ServerRuntimeHandle {
-        commands: command_tx,
-        events,
-        visualizer_messages,
-        join: Arc::new(Mutex::new(Some(join))),
-    })
-}
-
-fn run_server_on_current_thread(
-    config: ServerConfig,
-    registrars: Vec<Arc<dyn ServerModuleRegistrar>>,
-    event_tx: Sender<VisualizerServerMessage>,
-    command_rx: Receiver<VisualizerClientMessage>,
-) -> anyhow::Result<()> {
-    let runtime = Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .context("build server tokio runtime")?;
-    let local = LocalSet::new();
-    let visualizer = VisualizerHook::new(event_tx, command_rx);
-    let result = runtime.block_on(local.run_until(run_server(
-        config,
-        registrars,
-        visualizer,
-        Rc::new(TokioTimer::new()),
-    )));
-    if let Err(error) = &result {
-        eprintln!("nuillu-server runtime failed: {error:#}");
-    }
-    result
-}
-
 fn server_tab_id() -> VisualizerTabId {
     VisualizerTabId::new(SERVER_TAB_ID.to_string())
 }
@@ -673,53 +738,6 @@ fn server_external_action_event_record(
         created_at: row.created_at,
         updated_at: row.updated_at,
     }
-}
-
-/// Runs the server on the caller's current async executor.
-///
-/// This function does not create a thread, Tokio runtime, or `LocalSet`. The caller must run it
-/// in a local task context because server modules may contain non-`Send` state.
-pub async fn run_server_with_native_timer(
-    config: ServerConfig,
-    registrars: Vec<Arc<dyn ServerModuleRegistrar>>,
-    visualizer: VisualizerHook,
-) -> anyhow::Result<()> {
-    run_server(config, registrars, visualizer, Rc::new(TokioTimer::new())).await
-}
-
-/// Runs the server with timing supplied by the async host.
-pub async fn run_server(
-    config: ServerConfig,
-    registrars: Vec<Arc<dyn ServerModuleRegistrar>>,
-    visualizer: VisualizerHook,
-    timer: Rc<dyn Timer>,
-) -> anyhow::Result<()> {
-    let host_ports = build_native_host_ports(&config).await?;
-    run_server_with_host_ports(config, registrars, visualizer, timer, host_ports).await
-}
-
-/// Runs the server with all host-owned state and persistence ports supplied by the caller.
-pub async fn run_server_with_host_ports(
-    config: ServerConfig,
-    registrars: Vec<Arc<dyn ServerModuleRegistrar>>,
-    mut visualizer: VisualizerHook,
-    timer: Rc<dyn Timer>,
-    host_ports: ServerHostPorts,
-) -> anyhow::Result<()> {
-    send_visualizer_startup_to_hook(&visualizer);
-    let result = run_server_inner(config, &registrars, &mut visualizer, timer, host_ports).await;
-    if let Err(error) = &result {
-        let tab_id = server_tab_id();
-        visualizer.send_event(VisualizerEvent::Log {
-            tab_id: tab_id.clone(),
-            message: format!("nuillu-server runtime failed: {error:#}"),
-        });
-        visualizer.send_event(VisualizerEvent::SetTabStatus {
-            tab_id,
-            status: TabStatus::Invalid,
-        });
-    }
-    result
 }
 
 fn send_visualizer_startup_to_hook(visualizer: &VisualizerHook) {

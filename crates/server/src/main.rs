@@ -4,9 +4,9 @@ use std::path::{Path, PathBuf};
 use anyhow::Context as _;
 use clap::{Args as ClapArgs, Parser, Subcommand, ValueEnum};
 use nuillu_server::{
-    RuntimeModule, ServerRunOptions,
+    RuntimeModule, Server, ServerRunOptions,
     history::{export_conversation_history, render_conversation_history_markdown},
-    install_lutum_trace_subscriber, load_server_config_from_options, run_server_with_visualizer,
+    install_lutum_trace_subscriber, load_server_config_from_options,
 };
 
 const AGENT_DB_FILE: &str = "agent.db";
@@ -112,7 +112,7 @@ fn main() -> anyhow::Result<()> {
 }
 
 fn run_server(args: RunArgs) -> anyhow::Result<()> {
-    run_server_with_visualizer(load_server_config_from_options(ServerRunOptions {
+    Server::new(load_server_config_from_options(ServerRunOptions {
         state_dir: args.state,
         run_id: args.run_id,
         session_id: args.session_id,
@@ -123,6 +123,7 @@ fn run_server(args: RunArgs) -> anyhow::Result<()> {
         fresh_agent_db: args.fresh_agent_db,
         agent_db: args.agent_db,
     })?)
+    .listen()
     .context("run nuillu server")
 }
 
