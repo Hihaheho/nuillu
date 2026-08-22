@@ -1,3 +1,4 @@
+use std::rc::Rc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -13,6 +14,7 @@ use nuillu_module::{
     LlmAccess, LlmContextWindow, MemoUpdatedInbox, Module, SessionAutoCompaction,
     SessionCompactionConfig, SessionCompactionProtectedPrefix, ensure_persistent_session_seeded,
     format_bounded_cognition_log_batch, format_bounded_memo_log_batch, format_policy_system_prompt,
+    ports::Timer,
 };
 use nuillu_types::builtin;
 use schemars::JsonSchema;
@@ -172,6 +174,7 @@ pub struct InteroceptionModule {
     last_seen_cognition_index: Option<u64>,
     last_total_remember_tokens: Option<u32>,
     last_activity_at: Option<DateTime<Utc>>,
+    timer: Rc<dyn Timer>,
 }
 
 impl InteroceptionModule {
@@ -183,6 +186,7 @@ impl InteroceptionModule {
         interoception: InteroceptiveWriter,
         llm: LlmAccess,
         session: Session,
+        timer: Rc<dyn Timer>,
     ) -> Self {
         Self {
             memo_updates,
@@ -196,6 +200,7 @@ impl InteroceptionModule {
             last_seen_cognition_index: None,
             last_total_remember_tokens: None,
             last_activity_at: None,
+            timer,
         }
     }
 
@@ -308,7 +313,7 @@ impl InteroceptionModule {
                 let _ = update?;
                 true
             }
-            _ = tokio::time::sleep(PERIODIC_WAKEUP) => false,
+            _ = self.timer.sleep(PERIODIC_WAKEUP) => false,
         };
         affect_candidate |= !self.memo_updates.take_ready_items()?.items.is_empty();
         affect_candidate |= !self.cognition_updates.take_ready_items()?.items.is_empty();
@@ -1181,6 +1186,7 @@ mod tests {
                             .with_tier(nuillu_types::ModelTier::Cheap)
                             .with_auto_compaction(session_auto_compaction())
                             .await?,
+                        caps.timer(),
                     ))
                 },
             )

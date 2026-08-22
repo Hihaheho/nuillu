@@ -8,8 +8,11 @@ use std::{
         mpsc::{self, Receiver, Sender},
     },
     thread::{self, JoinHandle},
-    time::{Duration, Instant},
+    time::Duration,
 };
+
+#[cfg(not(target_arch = "wasm32"))]
+use std::time::Instant;
 
 use anyhow::Context as _;
 use chrono::{DateTime, Utc};
@@ -323,6 +326,7 @@ impl ServerRuntimeHandle {
             .map_err(|panic| anyhow::anyhow!("server runtime thread panicked: {panic:?}"))?
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn join_timeout(&self, timeout: Duration) -> anyhow::Result<bool> {
         let deadline = Instant::now() + timeout;
         loop {

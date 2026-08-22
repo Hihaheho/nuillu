@@ -1,10 +1,12 @@
-use std::time::Duration;
+use std::{rc::Rc, time::Duration};
 
 use anyhow::Result;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use nuillu_blackboard::{AllocationCommand, AllocationEffectLevel, InteroceptiveState};
-use nuillu_module::{AllocationWriter, InteroceptiveReader, InteroceptiveUpdatedInbox, Module};
+use nuillu_module::{
+    AllocationWriter, InteroceptiveReader, InteroceptiveUpdatedInbox, Module, ports::Timer,
+};
 use nuillu_types::{ModuleId, builtin};
 
 const PERIODIC_WAKEUP: Duration = Duration::from_secs(1);
@@ -30,6 +32,7 @@ pub struct HomeostasisModule {
     phase: HomeostaticPhase,
     last_phase_entered_at: Option<DateTime<Utc>>,
     last_emitted_suppression: Option<AllocationEffectLevel>,
+    timer: Rc<dyn Timer>,
 }
 
 impl HomeostasisModule {
@@ -37,6 +40,7 @@ impl HomeostasisModule {
         interoception_updates: InteroceptiveUpdatedInbox,
         interoception: InteroceptiveReader,
         allocation: AllocationWriter,
+        timer: Rc<dyn Timer>,
     ) -> Self {
         Self {
             interoception_updates,
@@ -45,6 +49,7 @@ impl HomeostasisModule {
             phase: HomeostaticPhase::Wake,
             last_phase_entered_at: None,
             last_emitted_suppression: None,
+            timer,
         }
     }
 
@@ -89,7 +94,7 @@ impl HomeostasisModule {
             update = self.interoception_updates.next_item() => {
                 let _ = update?;
             }
-            _ = tokio::time::sleep(PERIODIC_WAKEUP) => {}
+            _ = self.timer.sleep(PERIODIC_WAKEUP) => {}
         }
         let _ = self.interoception_updates.take_ready_items()?;
         Ok(())

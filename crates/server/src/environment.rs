@@ -309,7 +309,7 @@ pub(super) async fn build_server_environment(
         visualizer.clone(),
         external_action_event_store.clone(),
         clock.clone(),
-        timer,
+        timer.clone(),
     ));
     let llm_concurrency_pool = LlmConcurrencyPool::default();
     emit_startup_progress(&visualizer, "building runtime capabilities");
@@ -330,6 +330,7 @@ pub(super) async fn build_server_environment(
             )?,
         },
         runtime: CapabilityProviderRuntime {
+            timer,
             event_sink,
             policy: server_runtime_policy(config),
             session_store,

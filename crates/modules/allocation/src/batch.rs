@@ -2,7 +2,6 @@ use std::time::Duration;
 
 use anyhow::Result;
 use nuillu_module::AttentionControlRequest;
-use tokio::time::Instant;
 
 use crate::AllocationModule;
 
@@ -59,19 +58,19 @@ impl AllocationModule {
                 break;
             }
 
-            let started = Instant::now();
+            let started = self.timer.elapsed();
             tokio::select! {
                 update = self.updates.next_item() => {
                     let _ = update?;
-                    waited += std::cmp::min(started.elapsed(), wait_for);
+                    waited += std::cmp::min(self.timer.elapsed().saturating_sub(started), wait_for);
                     let _ = self.collect_ready_events_into_batch(batch)?;
                 }
                 request = self.requests.next_item() => {
                     batch.requests.push(request?.body);
-                    waited += std::cmp::min(started.elapsed(), wait_for);
+                    waited += std::cmp::min(self.timer.elapsed().saturating_sub(started), wait_for);
                     let _ = self.collect_ready_events_into_batch(batch)?;
                 }
-                _ = tokio::time::sleep(wait_for) => {
+                _ = self.timer.sleep(wait_for) => {
                     waited += wait_for;
                     let ready = self.collect_ready_events_into_batch(batch)?;
                     if ready.is_empty() {
@@ -213,6 +212,7 @@ mod tests {
                                     .with_tier(nuillu_types::ModelTier::Default)
                                     .with_auto_compaction(crate::session_auto_compaction())
                                     .await?,
+                                caps.timer(),
                             )
                             .with_batch_config(batching),
                             recorder,

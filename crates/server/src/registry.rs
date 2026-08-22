@@ -102,6 +102,7 @@ fn register_server_module(
                     caps.memo(),
                     caps.scene_reader(),
                     caps.clock(),
+                    caps.timer(),
                     caps.llm("one-shot").with_tier(one_shot_tier).into(),
                     caps.session("one-shot")
                         .with_tier(one_shot_tier)
@@ -148,6 +149,7 @@ fn register_server_module(
                         .with_tier(main_tier)
                         .with_auto_compaction(nuillu_allocation::session_auto_compaction())
                         .await?,
+                    caps.timer(),
                 ))
             })
         }
@@ -268,6 +270,7 @@ fn register_server_module(
                             .with_tier(main_tier)
                             .with_auto_compaction(nuillu_memory::session_auto_compaction())
                             .await?,
+                        caps.timer(),
                     ))
                 }
             })
@@ -332,6 +335,7 @@ fn register_server_module(
                         .with_tier(main_tier)
                         .with_auto_compaction(nuillu_interoception::session_auto_compaction())
                         .await?,
+                    caps.timer(),
                 ))
             })
         }
@@ -346,6 +350,7 @@ fn register_server_module(
                 caps.interoception_updated_inbox(),
                 caps.interoception_reader(),
                 caps.allocation_writer(drive_modules, suppressed),
+                caps.timer(),
             ))
         }),
         RuntimeModule::Policy => {

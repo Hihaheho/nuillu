@@ -5,6 +5,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use lutum::{Session, TextStepOutcomeWithTools, ToolResult};
+use nuillu_module::ports::Timer;
 use nuillu_module::{
     BlackboardReader, CognitionLogEntryRecord, CognitionLogReader, CognitionLogUpdatedInbox,
     LlmAccess, LlmContextWindow, MemoLogRecord, MemoUpdatedInbox, MemoryMetadataReader, Module,
@@ -16,7 +17,6 @@ use nuillu_module::{
 use nuillu_types::{MemoryIndex, MemoryRank};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use tokio::time::Instant;
 
 use crate::store::{
     MemoryConcept, MemoryDeleter, MemoryKind, MemoryRecord, MemoryRetriever, MemoryTag,
@@ -181,6 +181,7 @@ pub struct MemoryModule {
     session: Session,
     system_prompt: std::sync::OnceLock<String>,
     batching: MemoryBatchConfig,
+    timer: std::rc::Rc<dyn Timer>,
 }
 
 #[derive(Clone, Debug)]
@@ -204,6 +205,7 @@ impl MemoryModule {
         memory_retriever: MemoryRetriever,
         llm: LlmAccess,
         session: Session,
+        timer: std::rc::Rc<dyn Timer>,
     ) -> Self {
         Self {
             owner: nuillu_types::ModuleId::new(<Self as nuillu_module::StaticModule>::id())
@@ -218,6 +220,7 @@ impl MemoryModule {
             memory_retriever,
             llm,
             session,
+            timer,
             system_prompt: std::sync::OnceLock::new(),
             batching: MemoryBatchConfig::default(),
         }
@@ -701,19 +704,19 @@ impl MemoryModule {
                 break;
             }
 
-            let started = Instant::now();
+            let started = self.timer.elapsed();
             tokio::select! {
                 update = self.memo_updates.next_item() => {
                     let _ = update?;
-                    waited += std::cmp::min(started.elapsed(), wait_for);
+                    waited += std::cmp::min(self.timer.elapsed().saturating_sub(started), wait_for);
                     let _ = self.collect_ready_events()?;
                 }
                 update = self.cognition_updates.next_item() => {
                     let _ = update?;
-                    waited += std::cmp::min(started.elapsed(), wait_for);
+                    waited += std::cmp::min(self.timer.elapsed().saturating_sub(started), wait_for);
                     let _ = self.collect_ready_events()?;
                 }
-                _ = tokio::time::sleep(wait_for) => {
+                _ = self.timer.sleep(wait_for) => {
                     waited += wait_for;
                     let ready = self.collect_ready_events()?;
                     if ready.is_empty() {
@@ -1143,6 +1146,7 @@ mod tests {
                                     .with_tier(nuillu_types::ModelTier::Cheap)
                                     .with_auto_compaction(session_auto_compaction())
                                     .await?,
+                                caps.timer(),
                             )
                             .with_batch_config(batching),
                             recorder,
@@ -1188,6 +1192,7 @@ mod tests {
                                 .with_tier(nuillu_types::ModelTier::Cheap)
                                 .with_auto_compaction(session_auto_compaction())
                                 .await?,
+                            caps.timer(),
                         ))
                     }
                 },

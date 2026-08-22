@@ -1,4 +1,4 @@
-use std::borrow::Cow;
+use std::{borrow::Cow, rc::Rc};
 
 use anyhow::{Context, Result};
 use async_trait::async_trait;
@@ -11,7 +11,7 @@ use nuillu_module::{
     SessionAutoCompaction, SessionCompactionConfig, SessionCompactionProtectedPrefix,
     ensure_persistent_session_seeded, format_bounded_cognition_log_batch_with_format,
     format_bounded_memo_log_batch_with_format, format_current_allocation_state,
-    format_memory_trace_inventory, format_stuckness, memory_rank_counts,
+    format_memory_trace_inventory, format_stuckness, memory_rank_counts, ports::Timer,
 };
 use nuillu_types::ModuleId;
 use schemars::{JsonSchema, Schema, SchemaGenerator};
@@ -265,6 +265,7 @@ pub struct AllocationModule {
     allocation_writer: AllocationWriter,
     llm: LlmAccess,
     session: Session,
+    timer: Rc<dyn Timer>,
     batching: batch::AttentionControlBatchConfig,
     system_prompt: std::sync::OnceLock<String>,
 }
@@ -281,6 +282,7 @@ impl AllocationModule {
         allocation_writer: AllocationWriter,
         llm: LlmAccess,
         session: Session,
+        timer: Rc<dyn Timer>,
     ) -> Self {
         Self {
             owner: ModuleId::new(<Self as nuillu_module::StaticModule>::id())
@@ -294,6 +296,7 @@ impl AllocationModule {
             allocation_writer,
             llm,
             session,
+            timer,
             batching: batch::AttentionControlBatchConfig::default(),
             system_prompt: std::sync::OnceLock::new(),
         }
@@ -893,6 +896,7 @@ mod tests {
                             .with_tier(nuillu_types::ModelTier::Default)
                             .with_auto_compaction(session_auto_compaction())
                             .await?,
+                        caps.timer(),
                     ));
                     Ok(AllocationStub)
                 }
@@ -969,6 +973,7 @@ mod tests {
                                 .with_tier(nuillu_types::ModelTier::Default)
                                 .with_auto_compaction(session_auto_compaction())
                                 .await?,
+                            caps.timer(),
                         ));
                         Ok(AllocationStub)
                     }

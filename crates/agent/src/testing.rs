@@ -1,13 +1,16 @@
 //! Test fixtures shared by `#[cfg(test)] mod tests` blocks in this crate.
 
+use std::future::Future;
+use std::pin::Pin;
 use std::rc::Rc;
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use lutum::{Lutum, MockLlmAdapter, SharedPoolBudgetManager, SharedPoolBudgetOptions};
 use nuillu_blackboard::Blackboard;
-use nuillu_module::ports::{Clock, NoopCognitionLogRepository, SystemClock};
+use nuillu_module::ports::{Clock, NoopCognitionLogRepository, SystemClock, Timer, TokioTimer};
 use nuillu_module::{
     CapabilityProviderConfig, CapabilityProviderPorts, CapabilityProviderRuntime,
     CapabilityProviders, LutumTiers, RuntimeEventSink, RuntimePolicy, SessionStore,
@@ -17,6 +20,18 @@ use nuillu_module::{
 /// immediately. Period deadlines and idle timers don't block test
 /// wall-clock time.
 struct InstantSleepClock;
+
+struct InstantTimer;
+
+impl Timer for InstantTimer {
+    fn sleep(&self, _duration: Duration) -> Pin<Box<dyn Future<Output = ()> + 'static>> {
+        Box::pin(std::future::ready(()))
+    }
+
+    fn elapsed(&self) -> Duration {
+        Duration::ZERO
+    }
+}
 
 #[async_trait(?Send)]
 impl Clock for InstantSleepClock {
@@ -32,6 +47,7 @@ pub(crate) fn test_caps(blackboard: Blackboard) -> CapabilityProviders {
         blackboard,
         RuntimePolicy::default(),
         Rc::new(InstantSleepClock),
+        Rc::new(InstantTimer),
     )
 }
 
@@ -39,14 +55,24 @@ pub(crate) fn test_caps(blackboard: Blackboard) -> CapabilityProviders {
 /// test specifically asserts that period deadlines block long enough to
 /// coalesce subsequent work.
 pub(crate) fn test_caps_with_real_clock(blackboard: Blackboard) -> CapabilityProviders {
-    test_caps_inner(blackboard, RuntimePolicy::default(), Rc::new(SystemClock))
+    test_caps_inner(
+        blackboard,
+        RuntimePolicy::default(),
+        Rc::new(SystemClock),
+        Rc::new(TokioTimer::new()),
+    )
 }
 
 pub(crate) fn test_caps_with_policy(
     blackboard: Blackboard,
     policy: RuntimePolicy,
 ) -> CapabilityProviders {
-    test_caps_inner(blackboard, policy, Rc::new(InstantSleepClock))
+    test_caps_inner(
+        blackboard,
+        policy,
+        Rc::new(InstantSleepClock),
+        Rc::new(InstantTimer),
+    )
 }
 
 pub(crate) fn test_caps_with_event_sink(
@@ -56,6 +82,7 @@ pub(crate) fn test_caps_with_event_sink(
     test_caps_inner_with_runtime(
         blackboard,
         CapabilityProviderRuntime {
+            timer: Rc::new(InstantTimer),
             event_sink,
             ..CapabilityProviderRuntime::default()
         },
@@ -70,6 +97,7 @@ pub(crate) fn test_caps_with_session_store(
     test_caps_inner_with_runtime(
         blackboard,
         CapabilityProviderRuntime {
+            timer: Rc::new(InstantTimer),
             session_store,
             ..CapabilityProviderRuntime::default()
         },
@@ -81,10 +109,12 @@ fn test_caps_inner(
     blackboard: Blackboard,
     policy: RuntimePolicy,
     clock: Rc<dyn Clock>,
+    timer: Rc<dyn Timer>,
 ) -> CapabilityProviders {
     test_caps_inner_with_runtime(
         blackboard,
         CapabilityProviderRuntime {
+            timer,
             policy,
             ..CapabilityProviderRuntime::default()
         },

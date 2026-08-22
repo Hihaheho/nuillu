@@ -9,11 +9,11 @@ use lutum::{MessageContent, ModelInputItem, Session, TextStepOutcomeWithTools, T
 use nuillu_module::{
     AmbientSensoryEntry, LlmAccess, Memo, Module, SceneReader, SensoryInput, SensoryInputInbox,
     SensoryModality, SessionAutoCompaction, SessionCompactionConfig,
-    SessionCompactionProtectedPrefix, ensure_persistent_session_seeded, ports::Clock,
+    SessionCompactionProtectedPrefix, ensure_persistent_session_seeded,
+    ports::{Clock, Timer},
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use tokio::time::Instant;
 
 const ONE_SHOT_SYSTEM_PROMPT: &str = r#"You are the one-shot sensory noise filter.
 You receive one-shot sensory events from the environment. A one-shot event is an individual event
@@ -130,6 +130,7 @@ pub struct SensoryModule {
     memo: Memo,
     scene: SceneReader,
     clock: Rc<dyn Clock>,
+    timer: Rc<dyn Timer>,
     llm: LlmAccess,
     one_shot_session: Session,
     ambient_session: Session,
@@ -237,6 +238,7 @@ impl SensoryModule {
         memo: Memo,
         scene: SceneReader,
         clock: Rc<dyn Clock>,
+        timer: Rc<dyn Timer>,
         llm: LlmAccess,
         one_shot_session: Session,
         ambient_session: Session,
@@ -249,6 +251,7 @@ impl SensoryModule {
             memo,
             scene,
             clock,
+            timer,
             llm,
             one_shot_session,
             ambient_session,
@@ -853,14 +856,14 @@ impl SensoryModule {
                 break;
             }
 
-            let started = Instant::now();
+            let started = self.timer.elapsed();
             tokio::select! {
                 input = self.inbox.next_item() => {
                     batch.inputs.push(input?.body);
-                    waited += std::cmp::min(started.elapsed(), wait_for);
+                    waited += std::cmp::min(self.timer.elapsed().saturating_sub(started), wait_for);
                     let _ = self.collect_ready_events_into_batch(batch)?;
                 }
-                _ = tokio::time::sleep(wait_for) => {
+                _ = self.timer.sleep(wait_for) => {
                     waited += wait_for;
                     let ready = self.collect_ready_events_into_batch(batch)?;
                     if ready.inputs == 0 {
@@ -1485,6 +1488,7 @@ mod tests {
                             caps.memo(),
                             caps.scene_reader(),
                             caps.clock(),
+                            caps.timer(),
                             caps.llm("one-shot")
                                 .with_tier(nuillu_types::ModelTier::Cheap)
                                 .into(),

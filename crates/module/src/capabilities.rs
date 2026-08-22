@@ -19,7 +19,7 @@ use nuillu_types::{
 
 use crate::activation_gate::ActivationGateHub;
 use crate::channels::{Topic, TopicPolicy, WakeClaim, WakeRegistry};
-use crate::ports::{Clock, CognitionLogRepository, PortError};
+use crate::ports::{Clock, CognitionLogRepository, PortError, Timer, TokioTimer};
 use crate::readers::RoleReaderCursors;
 use crate::runtime_events::{NoopRuntimeEventSink, RuntimeEventEmitter, RuntimeEventSink};
 use crate::runtime_policy::RuntimePolicy;
@@ -241,6 +241,7 @@ struct CapabilityProvidersInner {
     activation_gates: ActivationGateHub,
     cognition_log_port: Rc<dyn CognitionLogRepository>,
     clock: Rc<dyn Clock>,
+    timer: Rc<dyn Timer>,
     time_division: TimeDivision,
     tiers: LutumTiers,
     runtime_events: RuntimeEventEmitter,
@@ -398,6 +399,7 @@ pub struct CapabilityProviderPorts {
 /// Runtime policy and observation hooks layered on top of the boot ports.
 #[derive(Clone)]
 pub struct CapabilityProviderRuntime {
+    pub timer: Rc<dyn Timer>,
     pub event_sink: Rc<dyn RuntimeEventSink>,
     pub policy: RuntimePolicy,
     pub session_store: Rc<dyn SessionStore>,
@@ -409,6 +411,7 @@ pub struct CapabilityProviderRuntime {
 impl Default for CapabilityProviderRuntime {
     fn default() -> Self {
         Self {
+            timer: Rc::new(TokioTimer::new()),
             event_sink: Rc::new(NoopRuntimeEventSink),
             policy: RuntimePolicy::default(),
             session_store: Rc::new(NoopSessionStore),
@@ -445,6 +448,7 @@ impl CapabilityProviders {
             tiers,
         } = ports;
         let CapabilityProviderRuntime {
+            timer,
             event_sink,
             policy,
             session_store,
@@ -501,6 +505,7 @@ impl CapabilityProviders {
                 blackboard,
                 cognition_log_port,
                 clock,
+                timer,
                 time_division: TimeDivision::default(),
                 tiers,
                 runtime_events,
@@ -1347,6 +1352,10 @@ impl ModuleCapabilityFactory {
 
     pub fn clock(&self) -> Rc<dyn Clock> {
         self.root.clock()
+    }
+
+    pub fn timer(&self) -> Rc<dyn Timer> {
+        self.root.inner.timer.clone()
     }
 
     pub fn time_division(&self) -> TimeDivision {
