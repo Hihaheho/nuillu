@@ -148,7 +148,7 @@ impl Server {
             timer,
             ports,
         } = host;
-        send_visualizer_startup_to_hook(&visualizer);
+        send_visualizer_startup_to_hook(&visualizer, self.config.start_paused);
         let result =
             run_server_inner(self.config, &self.registrars, &mut visualizer, timer, ports).await;
         if let Err(error) = &result {
@@ -744,7 +744,7 @@ fn server_external_action_event_record(
     }
 }
 
-fn send_visualizer_startup_to_hook(visualizer: &VisualizerHook) {
+fn send_visualizer_startup_to_hook(visualizer: &VisualizerHook, start_paused: bool) {
     let tab_id = server_tab_id();
     visualizer.send_server_message(VisualizerServerMessage::hello());
     visualizer.send_event(VisualizerEvent::OpenTab {
@@ -753,7 +753,11 @@ fn send_visualizer_startup_to_hook(visualizer: &VisualizerHook) {
     });
     visualizer.send_event(VisualizerEvent::SetTabStatus {
         tab_id,
-        status: TabStatus::Running,
+        status: if start_paused {
+            TabStatus::Stopped
+        } else {
+            TabStatus::Running
+        },
     });
 }
 
@@ -822,8 +826,12 @@ async fn run_server_inner(
     .await;
 
     let sensory = env.caps.host_io().sensory_input_mailbox();
-    let (run_controller, run_control) = AgentRunController::new();
-    set_runtime_running(visualizer, &tab_id, &run_controller, true);
+    let (run_controller, run_control) = if config.start_paused {
+        AgentRunController::new_paused()
+    } else {
+        AgentRunController::new()
+    };
+    set_runtime_running(visualizer, &tab_id, &run_controller, !config.start_paused);
     let mut restart_count = 0_u64;
     loop {
         let mut registry = server_registry(
@@ -1243,6 +1251,26 @@ mod tests {
             VisualizerServerMessage::OfferAction { action }
                 if action.id == stop_runtime_action_id(&tab_id)
                     && action.kind == VisualizerActionKind::StopRuntime
+        ));
+    }
+
+    #[test]
+    fn visualizer_startup_status_matches_initial_run_state() {
+        let (event_tx, event_rx) = mpsc::channel();
+        let (_command_tx, command_rx) = mpsc::channel::<VisualizerClientMessage>();
+        let visualizer = VisualizerHook::new(event_tx, command_rx);
+
+        send_visualizer_startup_to_hook(&visualizer, true);
+
+        let messages = event_rx.try_iter().collect::<Vec<_>>();
+        assert!(matches!(
+            &messages[2],
+            VisualizerServerMessage::Event {
+                event: VisualizerEvent::SetTabStatus {
+                    status: TabStatus::Stopped,
+                    ..
+                }
+            }
         ));
     }
 }

@@ -42,6 +42,8 @@ pub struct ServerConfig {
     pub disabled_modules: Vec<RuntimeModule>,
     pub participants: Vec<String>,
     pub fresh_agent_db: bool,
+    /// Starts the agent stopped, without activating modules, until Run or sensory input resumes it.
+    pub start_paused: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -396,6 +398,7 @@ pub struct ServerConfigBuilder {
     disabled_modules: Vec<RuntimeModule>,
     participants: Vec<String>,
     fresh_agent_db: bool,
+    start_paused: bool,
 }
 
 impl ServerConfigBuilder {
@@ -411,6 +414,7 @@ impl ServerConfigBuilder {
             disabled_modules: Vec::new(),
             participants: Vec::new(),
             fresh_agent_db: false,
+            start_paused: false,
         }
     }
 
@@ -464,6 +468,14 @@ impl ServerConfigBuilder {
         self
     }
 
+    /// Chooses whether the agent starts stopped instead of running immediately.
+    ///
+    /// A stopped agent resumes when the host invokes Run or publishes sensory input.
+    pub fn start_paused(mut self, start_paused: bool) -> Self {
+        self.start_paused = start_paused;
+        self
+    }
+
     pub fn build(mut self) -> anyhow::Result<ServerConfig> {
         if let Some(enabled) = self.enabled_modules {
             self.boot_config
@@ -491,6 +503,7 @@ impl ServerConfigBuilder {
             disabled_modules: self.disabled_modules,
             participants: self.participants,
             fresh_agent_db: self.fresh_agent_db,
+            start_paused: self.start_paused,
         })
     }
 }
@@ -1007,6 +1020,7 @@ pub fn load_server_config_from_options(options: ServerRunOptions) -> anyhow::Res
         disabled_modules: options.disabled_modules,
         participants: options.participants,
         fresh_agent_db: options.fresh_agent_db,
+        start_paused: false,
     })
 }
 
@@ -1092,6 +1106,35 @@ embedding {
         assert_eq!(config.session_id, "browser-session");
         assert_eq!(config.agent_db_path, PathBuf::from("./agent.db"));
         assert_eq!(config.llm_log_root, None);
+        assert!(!config.start_paused);
+    }
+
+    #[test]
+    fn in_memory_builder_can_start_paused() {
+        let model_set = crate::model_set::parse_model_set_str(
+            r#"
+models {
+  text { token = "local" model = "text" }
+}
+cheap-model = "text"
+default-model = "text"
+premium-model = "text"
+embedding {
+  token = "local"
+  model = "embed"
+  dimensions = 8
+}
+"#,
+            "local-storage:model-set",
+        )
+        .unwrap();
+
+        let config = ServerConfig::builder(model_set)
+            .start_paused(true)
+            .build()
+            .unwrap();
+
+        assert!(config.start_paused);
     }
 
     #[test]

@@ -70,8 +70,22 @@ pub struct AgentRunController {
 
 impl AgentRunController {
     pub fn new() -> (Self, AgentRunControl) {
-        let (sender, receiver) = watch::channel(AgentRunMode::Running);
-        let running = Arc::new(AtomicBool::new(true));
+        Self::with_running(true)
+    }
+
+    /// Creates run control that does not activate modules until it is resumed.
+    pub fn new_paused() -> (Self, AgentRunControl) {
+        Self::with_running(false)
+    }
+
+    fn with_running(running: bool) -> (Self, AgentRunControl) {
+        let mode = if running {
+            AgentRunMode::Running
+        } else {
+            AgentRunMode::Paused
+        };
+        let (sender, receiver) = watch::channel(mode);
+        let running = Arc::new(AtomicBool::new(running));
         let requests = Arc::new(Mutex::new(VecDeque::new()));
         (
             Self {
@@ -2713,6 +2727,19 @@ mod tests {
         test_caps, test_caps_with_event_sink, test_caps_with_policy, test_caps_with_real_clock,
         test_caps_with_session_store,
     };
+
+    #[test]
+    fn run_controller_can_start_paused() {
+        let (controller, control) = super::AgentRunController::new_paused();
+
+        assert!(!controller.is_running());
+        assert!(!control.is_running());
+
+        controller.resume();
+
+        assert!(controller.is_running());
+        assert!(control.is_running());
+    }
 
     #[derive(Clone, Default)]
     struct RecordingRuntimeEventSink {
