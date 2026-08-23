@@ -199,6 +199,7 @@ module-config-cap = cap { $capacity }
 module-config-zero-window = Zero window
 module-config-period = period
 
+scene-settings = Scene settings
 scene-people = People
 scene-objects = Objects
 scene-sounds = Sounds

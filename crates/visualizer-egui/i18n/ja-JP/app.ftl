@@ -198,6 +198,7 @@ module-config-cap = 上限 { $capacity }
 module-config-zero-window = ゼロレプリカ時の定期起動
 module-config-period = 周期
 
+scene-settings = シーン設定
 scene-people = 人
 scene-objects = オブジェクト
 scene-sounds = 音

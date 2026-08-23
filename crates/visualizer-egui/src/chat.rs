@@ -837,18 +837,23 @@ pub fn ui(
     let composer_height = SCENE_COMPOSER_HEIGHT;
     let content_height = (height - composer_height - SCENE_ROW_GAP * 2.0).max(1.0);
     let config_height = scene_config_height(height, content_height);
-    let activity_height = (content_height - config_height).max(1.0);
 
-    ui.allocate_ui_with_layout(
-        egui::vec2(width, config_height),
-        egui::Layout::top_down(egui::Align::Min),
-        |ui| {
-            egui::ScrollArea::vertical()
-                .id_salt("scene-config-scroll")
-                .show(ui, |ui| scene_config_ui(ui, tab_id, state, messages));
-        },
-    );
+    egui::CollapsingHeader::new(ui.ctx().tr("scene-settings"))
+        .id_salt(("scene-settings", tab_id.as_str()))
+        .default_open(true)
+        .show(ui, |ui| {
+            ui.allocate_ui_with_layout(
+                egui::vec2(width, config_height),
+                egui::Layout::top_down(egui::Align::Min),
+                |ui| {
+                    egui::ScrollArea::vertical()
+                        .id_salt("scene-config-scroll")
+                        .show(ui, |ui| scene_config_ui(ui, tab_id, state, messages));
+                },
+            );
+        });
     ui.add_space(SCENE_ROW_GAP);
+    let activity_height = (ui.available_height() - composer_height - SCENE_ROW_GAP).max(1.0);
     ui.allocate_ui_with_layout(
         egui::vec2(width, activity_height),
         egui::Layout::top_down(egui::Align::Min),
