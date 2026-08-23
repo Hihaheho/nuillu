@@ -260,7 +260,8 @@ impl VisualizerHook {
                         message: "eval case is no longer running".to_string(),
                     });
                 }
-                VisualizerCommand::CreateAmbientSensoryRow { tab_id, .. }
+                VisualizerCommand::RequestSnapshot { tab_id }
+                | VisualizerCommand::CreateAmbientSensoryRow { tab_id, .. }
                 | VisualizerCommand::UpdateAmbientSensoryRow { tab_id, .. }
                 | VisualizerCommand::RemoveAmbientSensoryRow { tab_id, .. }
                 | VisualizerCommand::CreateSceneRow { tab_id, .. }
