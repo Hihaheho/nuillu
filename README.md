@@ -57,6 +57,21 @@ For each locale, user resources override the built-in `include_str!` resource;
 later calls to `add_ftl` have higher priority. Japanese then falls back to the
 combined English resources for keys that remain missing.
 
+Hosts can also construct the menu bar and mix built-in controls with arbitrary
+egui widgets. `Visualizer::show(ui)` keeps the default menu bar.
+
+```rust
+let response = visualizer.show_with_menu_bar(ui, |ui, menu| {
+    menu.tabs(ui);
+    ui.separator();
+    if ui.button("Host action").clicked() {
+        menu.emit(VisualizerClientMessage::hello());
+    }
+    menu.view_menu(ui);
+    menu.offered_actions(ui);
+});
+```
+
 `nuillu-server` remains available for headless/runtime use and can be connected to by a visualizer with `--host`.
 
 ## License

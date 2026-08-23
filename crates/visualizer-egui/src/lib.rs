@@ -15,6 +15,26 @@
 //! }
 //! ```
 //!
+//! Hosts can replace the default menu bar while reusing any of its built-in
+//! controls:
+//!
+//! ```no_run
+//! # use nuillu_visualizer_egui::{egui, Visualizer, VisualizerClientMessage};
+//! # fn render(visualizer: &mut Visualizer, ui: &mut egui::Ui) -> Vec<VisualizerClientMessage> {
+//! visualizer
+//!     .show_with_menu_bar(ui, |ui, menu| {
+//!         menu.tabs(ui);
+//!         ui.separator();
+//!         if ui.button("Host action").clicked() {
+//!             menu.emit(VisualizerClientMessage::hello());
+//!         }
+//!         menu.view_menu(ui);
+//!         menu.offered_actions(ui);
+//!     })
+//!     .into_messages()
+//! # }
+//! ```
+//!
 //! A host can layer its own FTL over the embedded translations. The host may
 //! provide the source with its own `include_str!` or load it at runtime.
 //!
@@ -652,9 +672,181 @@ fn tr_tab_title(ctx: &egui::Context, key: &str, title: &str) -> String {
     ctx.tr_args(key, &[("title", I18nArg::from(title))])
 }
 
+/// Controls available while constructing a visualizer menu bar.
+///
+/// The host owns the layout and may freely mix these controls with arbitrary
+/// egui widgets. Protocol messages emitted here are returned by the enclosing
+/// [`Visualizer::show_with_menu_bar`] call.
+pub struct VisualizerMenuBar<'a> {
+    state: &'a mut VisualizerState,
+    messages: &'a mut Vec<VisualizerClientMessage>,
+    locale: Locale,
+    theme: VisualizerTheme,
+    zoom_factor: f32,
+    zoom_percent_input: &'a mut String,
+    zoom_percent_input_dirty: &'a mut bool,
+    zoom_percent_input_focused: &'a mut bool,
+    next_locale: &'a mut Option<Locale>,
+    next_theme: &'a mut Option<VisualizerTheme>,
+    next_zoom_factor: &'a mut Option<f32>,
+}
+
+impl VisualizerMenuBar<'_> {
+    /// Renders the menu bar used by [`Visualizer::show`].
+    pub fn default_ui(&mut self, ui: &mut egui::Ui) {
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            self.theme_toggle(ui);
+            self.language_toggle(ui);
+            ui.allocate_ui_with_layout(
+                egui::vec2(176.0, ui.spacing().interact_size.y),
+                egui::Layout::left_to_right(egui::Align::Center),
+                |ui| self.zoom_control(ui),
+            );
+            ui.horizontal_wrapped(|ui| {
+                self.tabs(ui);
+                self.view_menu(ui);
+                self.offered_actions(ui);
+                self.connection_status(ui);
+            });
+        });
+    }
+
+    /// Renders the runtime tab selectors.
+    pub fn tabs(&mut self, ui: &mut egui::Ui) {
+        let mut selected = None;
+        for tab in self.state.tabs.values() {
+            let is_selected = self.state.selected.as_ref() == Some(&tab.id);
+            let label = format!("{} {}", tab_status_icon(tab.status), tab.title);
+            if ui.selectable_label(is_selected, label).clicked() {
+                selected = Some(tab.id.clone());
+            }
+        }
+        if let Some(selected) = selected {
+            self.state.selected = Some(selected);
+        }
+    }
+
+    /// Renders the selected runtime tab's View menu.
+    pub fn view_menu(&mut self, ui: &mut egui::Ui) {
+        let tab_id = self
+            .state
+            .selected
+            .clone()
+            .or_else(|| self.state.tabs.keys().next().cloned());
+        if let Some(tab_id) = tab_id
+            && let Some(tab) = self.state.tabs.get_mut(&tab_id)
+        {
+            tab.view_menu(ui);
+        } else {
+            ui.menu_button(ui.ctx().tr("menu-view"), |ui| {
+                ui.label(ui.ctx().tr("menu-no-runtime-windows"));
+            });
+        }
+    }
+
+    /// Renders actions currently offered by the connected runtime.
+    pub fn offered_actions(&mut self, ui: &mut egui::Ui) {
+        for action in self.state.visible_actions() {
+            if ui.button(&action.label).clicked() {
+                self.invoke_action(action.id);
+            }
+        }
+    }
+
+    /// Renders the disconnected status, when applicable.
+    pub fn connection_status(&mut self, ui: &mut egui::Ui) {
+        if self.state.disconnected {
+            ui.colored_label(
+                ui.visuals().error_fg_color,
+                ui.ctx().tr("status-eval-disconnected"),
+            );
+        }
+    }
+
+    /// Renders the light/dark theme toggle.
+    pub fn theme_toggle(&mut self, ui: &mut egui::Ui) {
+        if let Some(theme) = render_theme_toggle(ui, self.theme) {
+            *self.next_theme = Some(theme);
+        }
+    }
+
+    /// Renders the locale toggle.
+    pub fn language_toggle(&mut self, ui: &mut egui::Ui) {
+        if let Some(locale) = render_language_toggle(ui, self.locale) {
+            *self.next_locale = Some(locale);
+        }
+    }
+
+    /// Renders the zoom label, input, and adjustment buttons.
+    pub fn zoom_control(&mut self, ui: &mut egui::Ui) {
+        let outcome = render_zoom_control(
+            ui,
+            self.zoom_factor,
+            self.zoom_percent_input,
+            self.zoom_percent_input_dirty,
+        );
+        *self.next_zoom_factor = outcome.next_zoom_factor;
+        *self.zoom_percent_input_focused = outcome.input_focused;
+    }
+
+    /// Returns the selected tab, or the first available tab if no selection has
+    /// been established yet.
+    pub fn selected_tab_id(&self) -> Option<&VisualizerTabId> {
+        self.state
+            .selected
+            .as_ref()
+            .or_else(|| self.state.tabs.keys().next())
+    }
+
+    /// Selects an existing runtime tab, returning whether it was found.
+    pub fn select_tab(&mut self, tab_id: &VisualizerTabId) -> bool {
+        if !self.state.tabs.contains_key(tab_id) {
+            return false;
+        }
+        self.state.selected = Some(tab_id.clone());
+        true
+    }
+
+    /// Returns the actions visible for the current tab.
+    pub fn visible_actions(&self) -> Vec<VisualizerAction> {
+        self.state.visible_actions()
+    }
+
+    /// Queues invocation of an action offered by the runtime.
+    pub fn invoke_action(&mut self, action_id: impl Into<String>) {
+        self.emit(VisualizerClientMessage::InvokeAction {
+            action_id: action_id.into(),
+        });
+    }
+
+    /// Adds an arbitrary protocol message to this frame's response.
+    pub fn emit(&mut self, message: VisualizerClientMessage) {
+        self.messages.push(message);
+    }
+
+    /// Reports whether the visualizer transport is disconnected.
+    pub fn is_disconnected(&self) -> bool {
+        self.state.disconnected
+    }
+}
+
 impl Visualizer {
     /// Renders one frame and returns protocol messages requested by user interaction.
     pub fn show(&mut self, ui: &mut egui::Ui) -> VisualizerResponse {
+        self.show_with_menu_bar(ui, |ui, menu| menu.default_ui(ui))
+    }
+
+    /// Renders one frame with a host-defined menu bar.
+    ///
+    /// The callback controls all contents of the visualizer's top panel. It may
+    /// combine arbitrary egui widgets with the reusable controls on
+    /// [`VisualizerMenuBar`]. Passing an empty callback hides all menu contents
+    /// while keeping the visualizer's central content visible.
+    pub fn show_with_menu_bar(
+        &mut self,
+        ui: &mut egui::Ui,
+        add_menu_bar: impl FnOnce(&mut egui::Ui, &mut VisualizerMenuBar<'_>),
+    ) -> VisualizerResponse {
         if !self.initialized {
             if self.config.install_fonts {
                 install_visualizer_fonts(ui.ctx());
@@ -667,11 +859,18 @@ impl Visualizer {
         }
 
         let mut messages = std::mem::take(&mut self.pending_messages);
-        ui.push_id(self.id, |ui| self.show_contents(ui, &mut messages));
+        ui.push_id(self.id, |ui| {
+            self.show_contents(ui, &mut messages, add_menu_bar)
+        });
         VisualizerResponse { messages }
     }
 
-    fn show_contents(&mut self, ui: &mut egui::Ui, messages: &mut Vec<VisualizerClientMessage>) {
+    fn show_contents(
+        &mut self,
+        ui: &mut egui::Ui,
+        messages: &mut Vec<VisualizerClientMessage>,
+        add_menu_bar: impl FnOnce(&mut egui::Ui, &mut VisualizerMenuBar<'_>),
+    ) {
         let default_locale = self.config.default_locale;
         let persisted_locale = ui.use_persisted_state(|| default_locale, LOCALE_PERSISTENCE_KEY);
         let locale = *persisted_locale;
@@ -706,60 +905,20 @@ impl Visualizer {
         let mut next_theme = None;
         let mut next_zoom_factor = None;
         egui::Panel::top(ui.id().with("nuillu-visualizer-tabs")).show_inside(ui, |ui| {
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                next_theme = render_theme_toggle(ui, theme);
-                next_locale = render_language_toggle(ui, locale);
-                ui.allocate_ui_with_layout(
-                    egui::vec2(176.0, ui.spacing().interact_size.y),
-                    egui::Layout::left_to_right(egui::Align::Center),
-                    |ui| {
-                        let outcome = render_zoom_control(
-                            ui,
-                            zoom_factor,
-                            &mut self.zoom_percent_input,
-                            &mut self.zoom_percent_input_dirty,
-                        );
-                        next_zoom_factor = outcome.next_zoom_factor;
-                        self.zoom_percent_input_focused = outcome.input_focused;
-                    },
-                );
-                ui.horizontal_wrapped(|ui| {
-                    for tab in self.state.tabs.values() {
-                        let selected = self.state.selected.as_ref() == Some(&tab.id);
-                        let label = format!("{} {}", tab_status_icon(tab.status), tab.title);
-                        if ui.selectable_label(selected, label).clicked() {
-                            self.state.selected = Some(tab.id.clone());
-                        }
-                    }
-                    let view_tab_id = self
-                        .state
-                        .selected
-                        .clone()
-                        .or_else(|| self.state.tabs.keys().next().cloned());
-                    if let Some(tab_id) = view_tab_id {
-                        if let Some(tab) = self.state.tabs.get_mut(&tab_id) {
-                            tab.view_menu(ui);
-                        }
-                    } else {
-                        ui.menu_button(ui.ctx().tr("menu-view"), |ui| {
-                            ui.label(ui.ctx().tr("menu-no-runtime-windows"));
-                        });
-                    }
-                    for action in self.state.visible_actions() {
-                        if ui.button(&action.label).clicked() {
-                            messages.push(VisualizerClientMessage::InvokeAction {
-                                action_id: action.id.clone(),
-                            });
-                        }
-                    }
-                    if self.state.disconnected {
-                        ui.colored_label(
-                            ui.visuals().error_fg_color,
-                            ui.ctx().tr("status-eval-disconnected"),
-                        );
-                    }
-                });
-            });
+            let mut menu = VisualizerMenuBar {
+                state: &mut self.state,
+                messages,
+                locale,
+                theme,
+                zoom_factor,
+                zoom_percent_input: &mut self.zoom_percent_input,
+                zoom_percent_input_dirty: &mut self.zoom_percent_input_dirty,
+                zoom_percent_input_focused: &mut self.zoom_percent_input_focused,
+                next_locale: &mut next_locale,
+                next_theme: &mut next_theme,
+                next_zoom_factor: &mut next_zoom_factor,
+            };
+            add_menu_bar(ui, &mut menu);
         });
         if let Some(locale) = next_locale {
             persisted_locale.set_next(locale);
@@ -2070,6 +2229,40 @@ mod tests {
             .install(&ctx, visualizer.config.default_locale);
 
         assert_eq!(ctx.tr("menu-zoom"), "Host zoom");
+    }
+
+    #[test]
+    fn custom_menu_bar_can_mix_egui_and_visualizer_controls() {
+        let mut visualizer = Visualizer::new(egui::Id::new("custom-menu"));
+        let tab_id = VisualizerTabId::new("case-1");
+        visualizer.state.apply(VisualizerEvent::OpenTab {
+            tab_id: tab_id.clone(),
+            title: "Case 1".to_string(),
+        });
+        let mut response = None;
+        let mut callback_called = false;
+        let ctx = egui::Context::default();
+
+        let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+            response = Some(visualizer.show_with_menu_bar(ui, |ui, menu| {
+                callback_called = true;
+                assert_eq!(menu.selected_tab_id(), Some(&tab_id));
+                assert!(!menu.is_disconnected());
+                ui.label("Host control");
+                menu.tabs(ui);
+                menu.emit(VisualizerClientMessage::hello());
+            }));
+        });
+
+        assert!(callback_called);
+        let messages = response.expect("visualizer response").into_messages();
+        assert_eq!(messages.len(), 1);
+        assert!(matches!(
+            messages.as_slice(),
+            [VisualizerClientMessage::Hello {
+                version: VISUALIZER_PROTOCOL_VERSION
+            }]
+        ));
     }
 
     #[test]
