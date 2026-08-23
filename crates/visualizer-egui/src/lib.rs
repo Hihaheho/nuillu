@@ -131,15 +131,20 @@ impl VisualizerConfig {
     }
 }
 
-/// Outbound protocol messages produced by the component for a visualizer frame.
+/// Outbound events produced by the component for a visualizer frame.
 #[derive(Debug, Default)]
 pub struct VisualizerResponse {
     pub messages: Vec<VisualizerClientMessage>,
+    /// The locale selected through the visualizer UI during this frame.
+    ///
+    /// Changes made through [`Visualizer::set_locale`] are host inputs and are
+    /// not reported back through this field.
+    pub locale_changed: Option<Locale>,
 }
 
 impl VisualizerResponse {
     pub fn is_empty(&self) -> bool {
-        self.messages.is_empty()
+        self.messages.is_empty() && self.locale_changed.is_none()
     }
 
     pub fn into_messages(self) -> Vec<VisualizerClientMessage> {
@@ -159,6 +164,7 @@ pub struct Visualizer {
     zoom_percent_input_dirty: bool,
     zoom_percent_input_focused: bool,
     pending_messages: Vec<VisualizerClientMessage>,
+    pending_locale: Option<Locale>,
     state: VisualizerState,
 }
 
@@ -189,12 +195,28 @@ impl Visualizer {
             zoom_percent_input_dirty: false,
             zoom_percent_input_focused: false,
             pending_messages: Vec::new(),
+            pending_locale: None,
             state: VisualizerState::default(),
         }
     }
 
     pub fn state(&self) -> &VisualizerState {
         &self.state
+    }
+
+    /// Returns the locale currently used by the visualizer.
+    pub fn locale(&self) -> Locale {
+        self.current_locale
+    }
+
+    /// Selects the locale to use from the next visualizer frame onward.
+    ///
+    /// The selection is also written to the visualizer's egui persistence
+    /// state on the next call to [`Self::show`] or
+    /// [`Self::show_with_menu_bar`].
+    pub fn set_locale(&mut self, locale: Locale) {
+        self.current_locale = locale;
+        self.pending_locale = Some(locale);
     }
 
     pub fn apply_server_message(&mut self, message: VisualizerServerMessage) {
@@ -854,15 +876,18 @@ impl Visualizer {
             if self.config.install_theme_styles {
                 install_visualizer_theme_styles(ui.ctx());
             }
-            self.install_locale(ui.ctx(), self.config.default_locale);
+            self.install_locale(ui.ctx(), self.current_locale);
             self.initialized = true;
         }
 
         let mut messages = std::mem::take(&mut self.pending_messages);
-        ui.push_id(self.id, |ui| {
+        let locale_changed = ui.push_id(self.id, |ui| {
             self.show_contents(ui, &mut messages, add_menu_bar)
         });
-        VisualizerResponse { messages }
+        VisualizerResponse {
+            messages,
+            locale_changed: locale_changed.inner,
+        }
     }
 
     fn show_contents(
@@ -870,10 +895,15 @@ impl Visualizer {
         ui: &mut egui::Ui,
         messages: &mut Vec<VisualizerClientMessage>,
         add_menu_bar: impl FnOnce(&mut egui::Ui, &mut VisualizerMenuBar<'_>),
-    ) {
+    ) -> Option<Locale> {
         let default_locale = self.config.default_locale;
         let persisted_locale = ui.use_persisted_state(|| default_locale, LOCALE_PERSISTENCE_KEY);
-        let locale = *persisted_locale;
+        let locale = if let Some(locale) = self.pending_locale.take() {
+            persisted_locale.set_next(locale);
+            locale
+        } else {
+            *persisted_locale
+        };
         self.install_locale(ui.ctx(), locale);
         let initial_theme = default_visualizer_theme(ui.ctx());
         let persisted_theme = ui.use_persisted_state(|| initial_theme, THEME_PERSISTENCE_KEY);
@@ -959,6 +989,8 @@ impl Visualizer {
                 });
             }
         });
+
+        next_locale
     }
 }
 
@@ -2229,6 +2261,35 @@ mod tests {
             .install(&ctx, visualizer.config.default_locale);
 
         assert_eq!(ctx.tr("menu-zoom"), "Host zoom");
+    }
+
+    #[test]
+    fn host_can_set_and_read_visualizer_locale() {
+        let mut visualizer = Visualizer::new(egui::Id::new("host-locale"));
+        visualizer.set_locale(Locale::EnUs);
+        assert_eq!(visualizer.locale(), Locale::EnUs);
+
+        let ctx = egui::Context::default();
+        let mut response = None;
+        let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+            response = Some(visualizer.show_with_menu_bar(ui, |_, _| {}));
+        });
+
+        let response = response.expect("visualizer response");
+        assert_eq!(visualizer.locale(), Locale::EnUs);
+        assert_eq!(ctx.tr("menu-zoom"), "Zoom");
+        assert_eq!(response.locale_changed, None);
+        assert!(response.is_empty());
+    }
+
+    #[test]
+    fn locale_change_counts_as_a_visualizer_response_event() {
+        let response = VisualizerResponse {
+            locale_changed: Some(Locale::EnUs),
+            ..VisualizerResponse::default()
+        };
+
+        assert!(!response.is_empty());
     }
 
     #[test]
