@@ -840,7 +840,7 @@ pub fn ui(
 
     egui::CollapsingHeader::new(ui.ctx().tr("scene-settings"))
         .id_salt(("scene-settings", tab_id.as_str()))
-        .default_open(true)
+        .default_open(false)
         .show(ui, |ui| {
             ui.allocate_ui_with_layout(
                 egui::vec2(width, config_height),
@@ -874,6 +874,7 @@ const SCENE_ROW_GAP: f32 = 6.0;
 const SCENE_COMPOSER_SPEAKER_WIDTH: f32 = 150.0;
 const SCENE_COMPOSER_SEND_WIDTH: f32 = 64.0;
 const SCENE_COMPOSER_MESSAGE_MIN_WIDTH: f32 = 96.0;
+const SCENE_SEND_BUTTON_FILL: egui::Color32 = egui::Color32::from_rgb(9, 105, 218);
 
 fn scene_config_height(available_height: f32, content_height: f32) -> f32 {
     let max_config = (content_height * 0.62).max(1.0);
@@ -1252,10 +1253,18 @@ fn person_message_composer_ui(
         let send_label = ui.ctx().tr("scene-send");
         send_requested |= ui
             .add_enabled_ui(has_people, |ui| {
-                ui.add_sized(
-                    [SCENE_COMPOSER_SEND_WIDTH, FIELD_HEIGHT],
-                    egui::Button::new(send_label.as_str()),
-                )
+                let icon_id = ui.id().with(("scene-send-icon", tab_id.as_str()));
+                let icon = egui::Atom::custom(icon_id, egui::vec2(10.0, 10.0));
+                let label = egui::RichText::new(send_label.as_str()).color(egui::Color32::WHITE);
+                let response = egui::Button::new((icon, label))
+                    .gap(4.0)
+                    .fill(SCENE_SEND_BUTTON_FILL)
+                    .min_size(egui::vec2(SCENE_COMPOSER_SEND_WIDTH, FIELD_HEIGHT))
+                    .atom_ui(ui);
+                if let Some(icon_rect) = response.rect(icon_id) {
+                    paint_send_icon(ui, icon_rect);
+                }
+                response.response
             })
             .inner
             .clicked();
@@ -1273,6 +1282,19 @@ fn person_message_composer_ui(
     }
 
     message_response
+}
+
+fn paint_send_icon(ui: &egui::Ui, rect: egui::Rect) {
+    let center = rect.center();
+    ui.painter().add(egui::Shape::convex_polygon(
+        vec![
+            egui::pos2(center.x - 4.0, center.y - 5.0),
+            egui::pos2(center.x + 6.0, center.y),
+            egui::pos2(center.x - 4.0, center.y + 5.0),
+        ],
+        egui::Color32::WHITE,
+        egui::Stroke::NONE,
+    ));
 }
 
 fn composer_message_input_width(row_width: f32, item_spacing: f32) -> f32 {

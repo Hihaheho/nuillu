@@ -362,6 +362,14 @@ fn render_module_activity_plot(
 
 pub fn render_interoception_plot(ui: &mut egui::Ui, state: &ResourceMonitorState, now_secs: f64) {
     ui.strong(ui.ctx().tr("resource-monitor-interoception"));
+    render_interoception_plot_contents(ui, state, now_secs);
+}
+
+pub fn render_interoception_plot_contents(
+    ui: &mut egui::Ui,
+    state: &ResourceMonitorState,
+    now_secs: f64,
+) {
     ui.label(ui.ctx().tr("resource-monitor-interoception-help"));
     let lines = [
         (

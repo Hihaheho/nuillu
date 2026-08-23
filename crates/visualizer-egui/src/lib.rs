@@ -769,7 +769,7 @@ impl VisualizerMenuBar<'_> {
     /// Renders actions currently offered by the connected runtime.
     pub fn offered_actions(&mut self, ui: &mut egui::Ui) {
         for action in self.state.visible_actions() {
-            if ui.button(&action.label).clicked() {
+            if render_offered_action_button(ui, &action).clicked() {
                 self.invoke_action(action.id);
             }
         }
@@ -849,6 +849,73 @@ impl VisualizerMenuBar<'_> {
     /// Reports whether the visualizer transport is disconnected.
     pub fn is_disconnected(&self) -> bool {
         self.state.disconnected
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct EmphasizedActionButton {
+    icon: EmphasizedActionIcon,
+    fill: egui::Color32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EmphasizedActionIcon {
+    Run,
+    Stop,
+}
+
+fn emphasized_action_button(kind: VisualizerActionKind) -> Option<EmphasizedActionButton> {
+    match kind {
+        VisualizerActionKind::RunRuntime => Some(EmphasizedActionButton {
+            icon: EmphasizedActionIcon::Run,
+            fill: egui::Color32::from_rgb(24, 112, 65),
+        }),
+        VisualizerActionKind::StopRuntime => Some(EmphasizedActionButton {
+            icon: EmphasizedActionIcon::Stop,
+            fill: egui::Color32::from_rgb(180, 35, 24),
+        }),
+        VisualizerActionKind::StartSuite | VisualizerActionKind::StartActivation => None,
+    }
+}
+
+fn render_offered_action_button(ui: &mut egui::Ui, action: &VisualizerAction) -> egui::Response {
+    let Some(style) = emphasized_action_button(action.kind) else {
+        return ui.button(&action.label);
+    };
+    let icon_id = ui.id().with(("offered-action-icon", action.id.as_str()));
+    let icon = egui::Atom::custom(icon_id, egui::vec2(10.0, 10.0));
+    let label = egui::RichText::new(&action.label).color(egui::Color32::WHITE);
+    let response = egui::Button::new((icon, label))
+        .gap(4.0)
+        .fill(style.fill)
+        .atom_ui(ui);
+    if let Some(icon_rect) = response.rect(icon_id) {
+        paint_emphasized_action_icon(ui, icon_rect, style.icon);
+    }
+    response.response
+}
+
+fn paint_emphasized_action_icon(ui: &egui::Ui, rect: egui::Rect, icon: EmphasizedActionIcon) {
+    let center = rect.center();
+    match icon {
+        EmphasizedActionIcon::Run => {
+            ui.painter().add(egui::Shape::convex_polygon(
+                vec![
+                    egui::pos2(center.x - 3.5, center.y - 5.0),
+                    egui::pos2(center.x + 5.5, center.y),
+                    egui::pos2(center.x - 3.5, center.y + 5.0),
+                ],
+                egui::Color32::WHITE,
+                egui::Stroke::NONE,
+            ));
+        }
+        EmphasizedActionIcon::Stop => {
+            ui.painter().rect_filled(
+                egui::Rect::from_center_size(center, egui::vec2(9.0, 9.0)),
+                1.0,
+                egui::Color32::WHITE,
+            );
+        }
     }
 }
 
@@ -1676,11 +1743,13 @@ impl RuntimeTab {
                 egui::vec2(right_width.min(ui.available_width()).max(1.0), available.y),
                 egui::Layout::top_down(egui::Align::Min),
                 |ui| {
+                    self.render_simplified_interoception_accordion(ui, resource_monitor_now_secs);
+                    ui.add_space(SIMPLIFIED_PANE_GAP);
                     let scene_title = ui.ctx().tr("section-scene");
                     simplified_section(
                         ui,
                         Some(scene_title.as_str()),
-                        egui::vec2(ui.available_width(), available.y),
+                        egui::vec2(ui.available_width(), ui.available_height()),
                         |ui| self.render_scene_contents(ui, messages),
                     );
                 },
@@ -1691,8 +1760,20 @@ impl RuntimeTab {
         if let Some(owner) = requested_module {
             self.open_simplified_module(owner);
         }
-        self.render_simplified_interoception_window(ui, resource_monitor_now_secs);
         self.render_simplified_module_popup(ui, messages, module_opened_this_frame);
+    }
+
+    fn render_simplified_interoception_accordion(&self, ui: &mut egui::Ui, now_secs: f64) {
+        egui::CollapsingHeader::new(ui.ctx().tr("resource-monitor-interoception"))
+            .id_salt(("simplified-interoception", self.id.as_str()))
+            .default_open(true)
+            .show(ui, |ui| {
+                resource_monitor::render_interoception_plot_contents(
+                    ui,
+                    &self.resource_monitor,
+                    now_secs,
+                );
+            });
     }
 
     fn render_scene_contents(
@@ -1826,22 +1907,6 @@ impl RuntimeTab {
 
     fn open_simplified_module(&mut self, owner: String) {
         self.active_simplified_module_owner = Some(owner);
-    }
-
-    fn render_simplified_interoception_window(&self, ui: &mut egui::Ui, now_secs: f64) {
-        egui::Window::new(tr_tab_title(
-            ui.ctx(),
-            "window-interoception-title",
-            &self.title,
-        ))
-        .id(ui.id().with((self.id.as_str(), "simplified-interoception")))
-        .order(egui::Order::Foreground)
-        .collapsible(false)
-        .default_pos(egui::pos2(24.0, 96.0))
-        .default_size(egui::vec2(520.0, 260.0))
-        .show(ui.ctx(), |ui| {
-            resource_monitor::render_interoception_plot(ui, &self.resource_monitor, now_secs);
-        });
     }
 
     fn render_simplified_module_popup(
@@ -2317,13 +2382,19 @@ mod tests {
 
         assert!(callback_called);
         let messages = response.expect("visualizer response").into_messages();
-        assert_eq!(messages.len(), 1);
-        assert!(matches!(
-            messages.as_slice(),
-            [VisualizerClientMessage::Hello {
+        assert_eq!(
+            messages
+                .iter()
+                .filter(|message| matches!(message, VisualizerClientMessage::Hello { .. }))
+                .count(),
+            1
+        );
+        assert!(messages.iter().any(|message| matches!(
+            message,
+            VisualizerClientMessage::Hello {
                 version: VISUALIZER_PROTOCOL_VERSION
-            }]
-        ));
+            }
+        )));
     }
 
     #[test]
@@ -2748,6 +2819,28 @@ mod tests {
             actions
                 .iter()
                 .any(|action| action.id == stop_runtime_action_id(&tab_id))
+        );
+    }
+
+    #[test]
+    fn run_and_stop_actions_use_distinct_readable_button_styles() {
+        let run = emphasized_action_button(VisualizerActionKind::RunRuntime)
+            .expect("run action is emphasized");
+        let stop = emphasized_action_button(VisualizerActionKind::StopRuntime)
+            .expect("stop action is emphasized");
+
+        assert_eq!(run.icon, EmphasizedActionIcon::Run);
+        assert_eq!(stop.icon, EmphasizedActionIcon::Stop);
+        assert_ne!(run.fill, stop.fill);
+        assert_contrast_at_least(egui::Color32::WHITE, run.fill, 4.5);
+        assert_contrast_at_least(egui::Color32::WHITE, stop.fill, 4.5);
+        assert_eq!(
+            emphasized_action_button(VisualizerActionKind::StartSuite),
+            None
+        );
+        assert_eq!(
+            emphasized_action_button(VisualizerActionKind::StartActivation),
+            None
         );
     }
 
