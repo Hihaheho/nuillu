@@ -60,6 +60,8 @@ pub struct ModelSet {
 #[eure(crate = ::eure::document, rename_all = "kebab-case")]
 pub struct ModelDefinition {
     #[eure(default)]
+    pub fallback: Option<String>,
+    #[eure(default)]
     pub endpoint: Option<String>,
     #[eure(default)]
     pub base_url: Option<String>,
@@ -264,9 +266,7 @@ pub fn resolve_llm_backends(model_set: &ModelSet) -> anyhow::Result<ResolvedLlmB
         .into_iter()
         .chain(judge.as_ref())
     {
-        model_concurrency
-            .entry(backend.model_key.clone())
-            .or_insert(backend.max_concurrent_llm_calls);
+        insert_model_concurrency(&mut model_concurrency, backend);
     }
 
     Ok(ResolvedLlmBackends {
@@ -284,11 +284,21 @@ pub fn model_concurrency_from_backends(
 ) -> BTreeMap<String, Option<NonZeroUsize>> {
     let mut model_concurrency = BTreeMap::new();
     for backend in backends {
-        model_concurrency
-            .entry(backend.model_key)
-            .or_insert(backend.max_concurrent_llm_calls);
+        insert_model_concurrency(&mut model_concurrency, &backend);
     }
     model_concurrency
+}
+
+fn insert_model_concurrency(
+    model_concurrency: &mut BTreeMap<String, Option<NonZeroUsize>>,
+    backend: &LlmBackendConfig,
+) {
+    model_concurrency
+        .entry(backend.model_key.clone())
+        .or_insert(backend.max_concurrent_llm_calls);
+    for fallback in &backend.fallbacks {
+        insert_model_concurrency(model_concurrency, fallback);
+    }
 }
 
 fn resolve_tier(
@@ -314,9 +324,37 @@ fn resolve_tier(
     };
 
     let binding = binding.expect("resolved above");
-    let definition = models
+    let mut backend =
+        resolve_model_backend(label, &binding.model, &binding, models, global_compaction)?;
+    let mut visited = std::collections::HashSet::from([binding.model.as_str()]);
+    let mut fallback_key = models
         .get(&binding.model)
-        .ok_or_else(|| anyhow::anyhow!("{label} references unknown model `{}`", binding.model))?;
+        .and_then(|definition| definition.fallback.as_deref());
+    while let Some(model_key) = fallback_key {
+        if !visited.insert(model_key) {
+            anyhow::bail!("{label} fallback chain contains a cycle at `{model_key}`");
+        }
+        let fallback =
+            resolve_model_backend(label, model_key, &binding, models, global_compaction)?;
+        fallback_key = models
+            .get(model_key)
+            .and_then(|definition| definition.fallback.as_deref());
+        backend.fallbacks.push(fallback);
+    }
+
+    Ok(Some(backend))
+}
+
+fn resolve_model_backend(
+    label: &str,
+    model_key: &str,
+    binding: &TierBinding,
+    models: &HashMap<String, ModelDefinition>,
+    global_compaction: Option<u64>,
+) -> anyhow::Result<LlmBackendConfig> {
+    let definition = models
+        .get(model_key)
+        .ok_or_else(|| anyhow::anyhow!("{label} references unknown model `{model_key}`"))?;
     let endpoint = definition
         .endpoint()
         .unwrap_or(DEFAULT_OPENAI_COMPAT_ENDPOINT)
@@ -330,7 +368,7 @@ fn resolve_tier(
     let api_model = definition
         .model
         .as_deref()
-        .ok_or_else(|| anyhow::anyhow!("models.{}.model must be set", binding.model))?
+        .ok_or_else(|| anyhow::anyhow!("models.{model_key}.model must be set"))?
         .to_string();
     let reasoning_effort = binding.reasoning_effort.or(definition.reasoning_effort);
     let generation = resolve_generation_config(&binding.generation, &definition.generation);
@@ -338,7 +376,7 @@ fn resolve_tier(
     if use_responses_api && generation.top_k.is_some() {
         anyhow::bail!(
             "{label} uses Responses API model `{}` with top-k",
-            binding.model
+            model_key
         );
     }
     let compaction_input_token_threshold = binding
@@ -347,8 +385,8 @@ fn resolve_tier(
         .or(global_compaction)
         .unwrap_or(DEFAULT_SESSION_COMPACTION_INPUT_TOKEN_THRESHOLD);
 
-    Ok(Some(LlmBackendConfig {
-        model_key: binding.model,
+    Ok(LlmBackendConfig {
+        model_key: model_key.to_string(),
         endpoint,
         token,
         model: api_model,
@@ -358,7 +396,8 @@ fn resolve_tier(
         use_responses_api,
         compaction_input_token_threshold,
         max_concurrent_llm_calls: definition.max_concurrent_llm_calls(),
-    }))
+        fallbacks: Vec::new(),
+    })
 }
 
 fn resolve_generation_config(
@@ -442,6 +481,7 @@ fn validate_model_set(path: &Path, model_set: &ModelSet) -> Result<(), ModelSetE
     for (name, definition) in &model_set.models {
         validate_model_definition(path, name, definition)?;
     }
+    validate_fallback_chains(path, &model_set.models)?;
     validate_tier_binding(
         path,
         TierRole::Judge,
@@ -486,6 +526,11 @@ fn validate_model_definition(
     definition: &ModelDefinition,
 ) -> Result<(), ModelSetError> {
     let prefix = format!("models.{name}");
+    validate_optional_text(
+        path,
+        &format!("{prefix}.fallback"),
+        definition.fallback.as_deref(),
+    )?;
     if definition.endpoint.is_some() && definition.base_url.is_some() {
         return Err(ModelSetError::Validation {
             path: path.to_path_buf(),
@@ -541,6 +586,42 @@ fn validate_model_definition(
                 "{prefix}.compaction-input-token-threshold must be greater than zero when set"
             ),
         });
+    }
+    Ok(())
+}
+
+fn validate_fallback_chains(
+    path: &Path,
+    models: &HashMap<String, ModelDefinition>,
+) -> Result<(), ModelSetError> {
+    for model_key in models.keys() {
+        let mut visited = std::collections::HashSet::new();
+        let mut current = model_key.as_str();
+        loop {
+            if !visited.insert(current.to_string()) {
+                return Err(ModelSetError::Validation {
+                    path: path.to_path_buf(),
+                    message: format!(
+                        "fallback chain from models.{model_key} contains a cycle at `{current}`"
+                    ),
+                });
+            }
+            let definition = models
+                .get(current)
+                .expect("current fallback model was validated before advancing");
+            let Some(fallback) = definition.fallback.as_deref() else {
+                break;
+            };
+            if !models.contains_key(fallback) {
+                return Err(ModelSetError::Validation {
+                    path: path.to_path_buf(),
+                    message: format!(
+                        "models.{current}.fallback references unknown model `{fallback}`"
+                    ),
+                });
+            }
+            current = fallback;
+        }
     }
     Ok(())
 }
@@ -682,20 +763,23 @@ fn validate_responses_top_k(
     let Some(model_key) = model_ref else {
         return Ok(());
     };
-    let Some(definition) = models.get(model_key) else {
-        return Ok(());
-    };
-    if definition.use_responses_api != Some(true) {
-        return Ok(());
-    }
-    let resolved_top_k = binding
-        .and_then(|binding| binding.generation.top_k)
-        .or(definition.generation.top_k);
-    if resolved_top_k.is_some() {
-        return Err(ModelSetError::Validation {
-            path: path.to_path_buf(),
-            message: format!("{label} uses Responses API model `{model_key}` with top-k"),
-        });
+    let mut current = Some(model_key);
+    while let Some(current_key) = current {
+        let Some(definition) = models.get(current_key) else {
+            return Ok(());
+        };
+        if definition.use_responses_api == Some(true) {
+            let resolved_top_k = binding
+                .and_then(|binding| binding.generation.top_k)
+                .or(definition.generation.top_k);
+            if resolved_top_k.is_some() {
+                return Err(ModelSetError::Validation {
+                    path: path.to_path_buf(),
+                    message: format!("{label} uses Responses API model `{current_key}` with top-k"),
+                });
+            }
+        }
+        current = definition.fallback.as_deref();
     }
     Ok(())
 }
@@ -802,6 +886,83 @@ premium-model = "gemma4"
             resolved.model_concurrency.get("gemma4"),
             Some(&NonZeroUsize::new(4))
         );
+    }
+
+    #[test]
+    fn resolves_model_fallback_chain() {
+        let model_set = parse_model_set(
+            r#"
+models {
+  gemma4-e2b {
+    token = "primary"
+    model = "gemma4:e2b"
+    fallback: gemma4-e4b
+    max-concurrent-llm-calls = 2
+  }
+  gemma4-e4b {
+    endpoint = "http://localhost:8081/v1"
+    token = "fallback"
+    model = "gemma4:e4b"
+    max-concurrent-llm-calls = 4
+  }
+}
+cheap-model = "gemma4-e2b"
+default-model = "gemma4-e2b"
+premium-model = "gemma4-e2b"
+"#,
+        )
+        .unwrap();
+
+        let resolved = resolve_llm_backends(&model_set).unwrap();
+        assert_eq!(resolved.cheap.model_key, "gemma4-e2b");
+        assert_eq!(resolved.cheap.fallbacks.len(), 1);
+        assert_eq!(resolved.cheap.fallbacks[0].model_key, "gemma4-e4b");
+        assert_eq!(resolved.cheap.fallbacks[0].model, "gemma4:e4b");
+        assert_eq!(resolved.cheap.fallbacks[0].token, "fallback");
+        assert_eq!(
+            resolved.model_concurrency,
+            BTreeMap::from([
+                ("gemma4-e2b".to_string(), NonZeroUsize::new(2)),
+                ("gemma4-e4b".to_string(), NonZeroUsize::new(4)),
+            ])
+        );
+    }
+
+    #[test]
+    fn rejects_unknown_fallback_model() {
+        let error = parse_model_set(
+            r#"
+models {
+  primary { model = "primary" fallback = "missing" }
+}
+"#,
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            ModelSetError::Validation { message, .. }
+                if message.contains("models.primary.fallback references unknown model `missing`")
+        ));
+    }
+
+    #[test]
+    fn rejects_fallback_cycle() {
+        let error = parse_model_set(
+            r#"
+models {
+  primary { model = "primary" fallback = "secondary" }
+  secondary { model = "secondary" fallback = "primary" }
+}
+"#,
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            ModelSetError::Validation { message, .. }
+                if message.contains("fallback chain") && message.contains("contains a cycle")
+        ));
     }
 
     #[test]

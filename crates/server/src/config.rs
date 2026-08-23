@@ -69,6 +69,8 @@ pub struct LlmBackendConfig {
     pub use_responses_api: bool,
     pub compaction_input_token_threshold: u64,
     pub max_concurrent_llm_calls: Option<NonZeroUsize>,
+    /// Ordered model backends tried after a provider request failure.
+    pub fallbacks: Vec<LlmBackendConfig>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, FromEure)]

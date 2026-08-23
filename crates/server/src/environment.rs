@@ -8,9 +8,10 @@ use async_trait::async_trait;
 #[cfg(feature = "libsql")]
 use chrono::Local;
 use lutum::{
-    FrequencyPenalty, Lutum, MaxOutputTokens, ModelName, PresencePenalty, RawTelemetryConfig,
-    RequestExtensions, Seed, SharedPoolBudgetManager, SharedPoolBudgetOptions, StopSequences,
-    Temperature, TopK, TopP,
+    AdapterStructuredTurn, AdapterTextTurn, AgentError, ErasedStructuredTurnEventStream,
+    ErasedTextTurnEventStream, FrequencyPenalty, Lutum, MaxOutputTokens, ModelInput, ModelName,
+    PresencePenalty, RawTelemetryConfig, RequestExtensions, Seed, SharedPoolBudgetManager,
+    SharedPoolBudgetOptions, StopSequences, Temperature, TopK, TopP, TurnAdapter,
 };
 use lutum_in_memory_adapter::InMemoryAgentStore;
 #[cfg(feature = "libsql")]
@@ -709,7 +710,14 @@ fn build_tier_handle(
     file_trace_sink: Option<FileLlmTraceSink>,
     db_trace_sink: Option<DbLlmTraceSink>,
 ) -> anyhow::Result<LlmTierHandle> {
-    let lutum = build_lutum_with_file_trace(config, llm_observer, file_trace_sink, db_trace_sink)?;
+    let lutum = build_lutum_from_adapter(
+        config,
+        OpenAiAdapter::new(config.token.clone()),
+        llm_observer,
+        file_trace_sink,
+        db_trace_sink,
+        Some(pool),
+    )?;
     let concurrency = pool.limiter_for(&config.model_key, config.max_concurrent_llm_calls);
     Ok(LlmTierHandle::new(
         lutum,
@@ -751,6 +759,7 @@ pub fn build_lutum_with_api_key(
         llm_observer,
         None,
         None,
+        None,
     )
 }
 
@@ -765,6 +774,7 @@ pub fn build_lutum_with_http_client(
         config,
         OpenAiAdapter::new_with_http_client(api_key, http_client),
         llm_observer,
+        None,
         None,
         None,
     )
@@ -782,6 +792,7 @@ pub fn build_lutum_with_file_trace(
         llm_observer,
         file_trace_sink,
         db_trace_sink,
+        None,
     )
 }
 
@@ -791,19 +802,28 @@ fn build_lutum_from_adapter(
     llm_observer: Option<VisualizerLlmObserver>,
     file_trace_sink: Option<FileLlmTraceSink>,
     db_trace_sink: Option<DbLlmTraceSink>,
+    fallback_pool: Option<&LlmConcurrencyPool>,
 ) -> anyhow::Result<Lutum> {
-    let feature_flags = FeatureFlags::OPENAI
-        .with_top_k(config.generation.top_k.is_some() && !config.use_responses_api);
-    let adapter = adapter
-        .with_base_url(config.endpoint.clone())
-        .with_default_model(ModelName::new(&config.model)?)
-        .with_feature_flags(feature_flags)
-        .with_resolve_reasoning_effort(ConfiguredReasoningEffort);
-    let adapter = if config.use_responses_api {
-        adapter
-    } else {
-        adapter.with_chat_completions()
-    };
+    let mut adapters = Vec::with_capacity(1 + config.fallbacks.len());
+    adapters.push(FallbackAdapterEntry {
+        model_key: Arc::from(config.model_key.as_str()),
+        adapter: Arc::new(configure_openai_adapter(config, adapter)?),
+        concurrency: None,
+    });
+    for fallback in &config.fallbacks {
+        adapters.push(FallbackAdapterEntry {
+            model_key: Arc::from(fallback.model_key.as_str()),
+            adapter: Arc::new(configure_openai_adapter(
+                fallback,
+                OpenAiAdapter::new(fallback.token.clone()),
+            )?),
+            concurrency: fallback_pool.map(|pool| {
+                pool.limiter_for(&fallback.model_key, fallback.max_concurrent_llm_calls)
+            }),
+        });
+    }
+    let adapter = FallbackTurnAdapter { adapters };
+
     let mut lutum = Lutum::new(
         Arc::new(adapter),
         SharedPoolBudgetManager::new(SharedPoolBudgetOptions::default()),
@@ -825,6 +845,142 @@ fn build_lutum_from_adapter(
         }
         None => lutum,
     })
+}
+
+fn configure_openai_adapter(
+    config: &LlmBackendConfig,
+    adapter: OpenAiAdapter,
+) -> anyhow::Result<OpenAiAdapter> {
+    let feature_flags = FeatureFlags::OPENAI
+        .with_top_k(config.generation.top_k.is_some() && !config.use_responses_api);
+    let adapter = adapter
+        .with_base_url(config.endpoint.clone())
+        .with_default_model(ModelName::new(&config.model)?)
+        .with_feature_flags(feature_flags)
+        .with_resolve_reasoning_effort(ConfiguredReasoningEffort);
+    let adapter = if config.use_responses_api {
+        adapter
+    } else {
+        adapter.with_chat_completions()
+    };
+    Ok(adapter)
+}
+
+struct FallbackAdapterEntry {
+    model_key: Arc<str>,
+    adapter: Arc<dyn TurnAdapter>,
+    concurrency: Option<nuillu_module::LlmConcurrencyLimiter>,
+}
+
+struct FallbackTurnAdapter {
+    adapters: Vec<FallbackAdapterEntry>,
+}
+
+impl FallbackTurnAdapter {
+    async fn try_text_turn(
+        &self,
+        input: ModelInput,
+        turn: AdapterTextTurn,
+    ) -> Result<ErasedTextTurnEventStream, AgentError> {
+        for (index, entry) in self.adapters.iter().enumerate() {
+            let permit = match &entry.concurrency {
+                Some(concurrency) => concurrency.acquire().await,
+                None => None,
+            };
+            match entry.adapter.text_turn(input.clone(), turn.clone()).await {
+                Ok(stream) => {
+                    let stream = futures::stream::unfold(
+                        (stream, permit),
+                        |(mut stream, permit)| async move {
+                            futures::StreamExt::next(&mut stream)
+                                .await
+                                .map(|item| (item, (stream, permit)))
+                        },
+                    );
+                    return Ok(Box::pin(stream));
+                }
+                Err(error)
+                    if error.request_failure().is_some() && index + 1 < self.adapters.len() =>
+                {
+                    let next = &self.adapters[index + 1];
+                    let failure = error.request_failure().expect("matched request failure");
+                    tracing::warn!(
+                        model = %entry.model_key,
+                        fallback_model = %next.model_key,
+                        kind = ?failure.kind,
+                        status = failure.status,
+                        "LLM request failed; trying fallback model"
+                    );
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        unreachable!("fallback adapter always contains at least the primary model")
+    }
+
+    async fn try_structured_turn(
+        &self,
+        input: ModelInput,
+        turn: AdapterStructuredTurn,
+    ) -> Result<ErasedStructuredTurnEventStream, AgentError> {
+        for (index, entry) in self.adapters.iter().enumerate() {
+            let permit = match &entry.concurrency {
+                Some(concurrency) => concurrency.acquire().await,
+                None => None,
+            };
+            match entry
+                .adapter
+                .structured_turn(input.clone(), turn.clone())
+                .await
+            {
+                Ok(stream) => {
+                    let stream = futures::stream::unfold(
+                        (stream, permit),
+                        |(mut stream, permit)| async move {
+                            futures::StreamExt::next(&mut stream)
+                                .await
+                                .map(|item| (item, (stream, permit)))
+                        },
+                    );
+                    return Ok(Box::pin(stream));
+                }
+                Err(error)
+                    if error.request_failure().is_some() && index + 1 < self.adapters.len() =>
+                {
+                    let next = &self.adapters[index + 1];
+                    let failure = error.request_failure().expect("matched request failure");
+                    tracing::warn!(
+                        model = %entry.model_key,
+                        fallback_model = %next.model_key,
+                        kind = ?failure.kind,
+                        status = failure.status,
+                        "LLM request failed; trying fallback model"
+                    );
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        unreachable!("fallback adapter always contains at least the primary model")
+    }
+}
+
+#[async_trait]
+impl TurnAdapter for FallbackTurnAdapter {
+    async fn text_turn(
+        &self,
+        input: ModelInput,
+        turn: AdapterTextTurn,
+    ) -> Result<ErasedTextTurnEventStream, AgentError> {
+        self.try_text_turn(input, turn).await
+    }
+
+    async fn structured_turn(
+        &self,
+        input: ModelInput,
+        turn: AdapterStructuredTurn,
+    ) -> Result<ErasedStructuredTurnEventStream, AgentError> {
+        self.try_structured_turn(input, turn).await
+    }
 }
 
 fn apply_generation_defaults(
@@ -1067,6 +1223,10 @@ mod tests {
         },
     };
 
+    use lutum::{
+        AdapterToolChoice, AdapterTurnConfig, GenerationParams, MockError, MockLlmAdapter,
+        MockTextScenario, RequestFailureKind,
+    };
     use nuillu_blackboard::{ActivationRatio, Bpm, ModulePolicy, linear_ratio_fn};
     use nuillu_types::{ModuleId, ModuleInstanceId, ReplicaCapRange, ReplicaIndex, builtin};
     use nuillu_visualizer_protocol::{ExternalActionEventStatusView, VisualizerServerMessage};
@@ -1098,7 +1258,49 @@ mod tests {
             use_responses_api: false,
             compaction_input_token_threshold: 16_000,
             max_concurrent_llm_calls: None,
+            fallbacks: Vec::new(),
         }
+    }
+
+    #[tokio::test]
+    async fn request_failure_uses_next_fallback_adapter() {
+        let primary = MockLlmAdapter::new().with_text_scenario(MockTextScenario::start_error(
+            MockError::Request {
+                kind: RequestFailureKind::RateLimit,
+                status: Some(429),
+                retry_after: None,
+                message: "rate limited".to_string(),
+            },
+        ));
+        let fallback =
+            MockLlmAdapter::new().with_text_scenario(MockTextScenario::events(Vec::new()));
+        let adapter = FallbackTurnAdapter {
+            adapters: vec![
+                FallbackAdapterEntry {
+                    model_key: Arc::from("primary"),
+                    adapter: Arc::new(primary),
+                    concurrency: None,
+                },
+                FallbackAdapterEntry {
+                    model_key: Arc::from("fallback"),
+                    adapter: Arc::new(fallback),
+                    concurrency: None,
+                },
+            ],
+        };
+        let turn = AdapterTextTurn {
+            config: AdapterTurnConfig {
+                generation: GenerationParams::default(),
+                tools: Vec::new(),
+                tool_choice: AdapterToolChoice::None,
+            },
+            extensions: Arc::new(RequestExtensions::new()),
+        };
+
+        let _stream = adapter
+            .text_turn(ModelInput::new().user("hello"), turn)
+            .await
+            .expect("429 should use the fallback adapter");
     }
 
     #[derive(Debug, Clone)]

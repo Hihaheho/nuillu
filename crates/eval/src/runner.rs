@@ -7430,6 +7430,7 @@ mod tests {
             use_responses_api: false,
             compaction_input_token_threshold: 16_000,
             max_concurrent_llm_calls: None,
+            fallbacks: Vec::new(),
         }
     }
 

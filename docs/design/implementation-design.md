@@ -791,6 +791,18 @@ External action tool results are deliberately acknowledgement-only. If the actio
 
 `LlmAccess::lutum()` returns a `lutum::Lutum` for the holder instance's configured tier. Replica identity controls ownership and gating; allocation controls activation priority and derived scheduling, not model-tier or module-specific instructions. Modules build their own `Session` and choose the concrete turn shape (`structured_turn`, `text_turn().tools()`, etc.). The capability layer deliberately does not impose a shared session or agent-loop abstraction.
 
+A model definition may name another definition with `fallback`. Provider request failures, including HTTP 429, server-status, authentication/client-status, and transport failures, advance through that chain before the error reaches the module. Each fallback uses its own endpoint, token, API mode, model name, and model-scoped concurrency limit. The already-resolved turn input and generation parameters are preserved. Unknown fallback names and cycles are rejected while loading the model set.
+
+```eure
+models {
+  gemma4-e2b {
+    model = "gemma4:e2b"
+    fallback = "gemma4-e4b"
+  }
+  gemma4-e4b { model = "gemma4:e4b" }
+}
+```
+
 Tool loops are written directly by each module so tool availability, round limits, result commits, and memo-writing remain local to the module role.
 
 ### When to use `.collect()` vs `.stream()`
