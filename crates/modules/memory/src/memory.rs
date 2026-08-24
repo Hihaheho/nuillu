@@ -41,6 +41,11 @@ use skip_memory only for empty bookkeeping, prompt/tool/schema/debug details, or
 preserved without new context, because ordinary inserts begin as short-term traces and low-salience
 traces can decay instead of becoming longer-lived memory. You may reject, normalize, merge, and
 deduplicate observations.
+Do not preserve transient progress or absence claims such as "has not answered yet", "is waiting",
+"is still deciding", or "no response so far" merely because they are true inside an in-flight
+interaction. Preserve them only when the waiting, omission, unresolved commitment, or interruption
+is itself a concrete experience worth remembering. Prefer the settled interaction or durable
+decision when both transient and completed evidence are available.
 insert_memory always writes short-term memory; later access, compaction, or other memory-system
 mechanisms may change rank outside this tool. When calling insert_memory, prefer kinds episode,
 statement, reflection, hypothesis, dream, procedure, or plan. Concepts and tags are simple name

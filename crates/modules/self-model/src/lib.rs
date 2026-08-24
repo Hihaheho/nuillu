@@ -12,23 +12,30 @@ use nuillu_types::builtin;
 mod batch;
 pub use batch::NextBatch as SelfModelBatch;
 
-const SYSTEM_PROMPT: &str = r#"Update an agent's self-model memo from its recent history.
+const SYSTEM_PROMPT: &str = r#"Maintain an agent's current embodied and mental self-model.
 You will receive working notes, first-person attention experiences, self-related remembered facts,
-and a request for the next self-model memo. Infer what this agent should next believe about itself.
-Use loaded identity memories and self-related notes as the agent's own identity and abilities. Write
-established self-facts in the agent's first-person voice. Do not identify as the underlying model,
-provider, runtime, or an outside observer of the agent.
-Stable self-knowledge may be present in remembered facts, but do not claim direct access to raw
-hidden memories.
-Write the memo as free-form prose. Preserve the current self-description and every explicit
-question/answer, but do not encode the memo as JSON, YAML, a code block, or any fixed schema."#;
+and a request for the next self-model memo. Integrate only evidence about the agent's own body or
+form, abilities and limitations, interoceptive or affective condition, attention, intention,
+uncertainty, agency, and other current mental state.
+Use loaded identity memories and self-related notes as the agent's own embodied identity and
+abilities. Write established self-state in the agent's first-person voice. Do not identify as the
+underlying model, provider, runtime, or an outside observer of the agent. Stable self-knowledge may
+be present in remembered facts, but do not claim direct access to raw hidden memories.
+Do not recap dialogue, external events, another person's state, prior utterances, retrieved-memory
+provenance, poems, or action history unless that evidence directly changes the agent's current body,
+capability, affect, attention, intention, uncertainty, or agency. Integrate and replace superseded
+self-state instead of appending a chronology or preserving every question and answer.
+Write one concise free-form prose snapshot. Do not encode the memo as JSON, YAML, a code block, or
+any fixed schema. Write nothing when there is no concrete change or clarification to embodied or
+mental self-state."#;
 
 const COMPACTED_SELF_MODEL_SESSION_PREFIX: &str = "Compacted self-model session history:";
 const MEMO_CONTEXT_WINDOW: LlmContextWindow = LlmContextWindow::new(8, 1_200, 4_800);
 const COGNITION_CONTEXT_WINDOW: LlmContextWindow = LlmContextWindow::new(8, 600, 3_000);
-const SESSION_COMPACTION_FOCUS: &str = r#"Preserve self-descriptions, self-model questions and
-answers, memo-log facts about the agent, attention-schema first-person cognition, uncertainty, and
-corrections."#;
+const SESSION_COMPACTION_FOCUS: &str = r#"Preserve the latest embodied identity, abilities and
+limitations, interoceptive and affective condition, attention, intention, uncertainty, agency, and
+corrections. Do not preserve dialogue or event chronology except where it directly changes that
+current self-state."#;
 
 pub fn session_auto_compaction() -> SessionAutoCompaction {
     SessionAutoCompaction::new(
@@ -118,7 +125,7 @@ impl SelfModelModule {
                 COGNITION_CONTEXT_WINDOW,
             );
             self.session.push_user(
-                "Update the next self-model memo from the current self-relevant working notes and attention-schema cognition. Write nothing if there is no concrete self-related evidence.",
+                "Update the concise embodied and mental self-state snapshot from current self-relevant working notes and attention-schema cognition. Do not recap the conversation. Write nothing if there is no concrete change or clarification to body, capability, affect, attention, intention, uncertainty, or agency.",
             );
             let result = self
                 .session
@@ -174,10 +181,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn prompt_frames_self_model_as_agent_history_task() {
-        assert!(SYSTEM_PROMPT.contains("agent's self-model memo"));
+    fn prompt_limits_self_model_to_embodied_and_mental_state() {
+        assert!(SYSTEM_PROMPT.contains("embodied and mental self-model"));
         assert!(SYSTEM_PROMPT.contains("agent's first-person voice"));
         assert!(SYSTEM_PROMPT.contains("underlying model"));
+        assert!(SYSTEM_PROMPT.contains("Do not recap dialogue"));
+        assert!(SYSTEM_PROMPT.contains("instead of appending a chronology"));
         assert!(!SYSTEM_PROMPT.contains("You are the self-model module"));
         assert!(!SYSTEM_PROMPT.contains("allocation"));
     }

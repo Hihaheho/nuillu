@@ -46,6 +46,18 @@ wiring, migrations, prompts, or public boot APIs.
     `emotion` are copied from the current interoceptive state when a memory is
     written. They are not truth labels, not current emotion, and not later
     reinterpretation of the memory.
+12. **Recall has separate semantic and operational projections** - Query-memory
+    keeps indexes, ranks, concepts, operational tags, link metadata, and
+    storage-time affect in typed/session state. Its cognitive memo plaintext
+    contains only recalled semantic evidence needed in awareness; numeric
+    arousal/valence, tags, ids, and retrieval plumbing do not enter cognition as
+    prose.
+13. **Ingest rejects incidental in-flight state semantically** - Version or
+    elapsed-time checks cannot generally prove an LLM-produced recollection stale
+    while modules run concurrently. The memory gate rejects transient
+    absence/progress claims such as "not answered yet" or "still waiting" unless
+    that unresolved state is itself a concrete experience worth preserving, and
+    prefers the settled interaction when both are available.
 
 ---
 

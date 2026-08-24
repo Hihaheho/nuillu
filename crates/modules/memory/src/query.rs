@@ -22,10 +22,12 @@ use crate::store::{
 const SYSTEM_PROMPT: &str = r#"You are the query-memory module.
 Retrieve memory evidence. Memory is not a fact table and retrieval must not decide current truth.
 Each activation has two possible LLM tool-call stages.
-First, plan retrieval by calling plan_memory_queries exactly once with a concrete main_query and
-optional sub_queries. Query-memory exists to attempt recall; do not plan a no-op or explain that no
-memory is needed. The runtime will handle search misses, already-memoed evidence, and rejected
-evidence without writing a memo.
+First, decide semantically whether recall would clarify the current cognition. Call
+plan_memory_queries exactly once with a concrete main_query and optional sub_queries when retrieval
+is useful. Call skip_memory_query exactly once when current cognition is already self-contained and
+memory would add no relevant evidence. Do not use keyword heuristics as a substitute for this
+decision. The runtime will handle search misses, already-memoed evidence, and rejected evidence
+without writing a memo.
 Search for concrete requested facts, proper nouns, species/body/peer/world terms, route rules, and
 needed_fact phrases. Do not search for generic phrases such as "useful memory context" when a
 concrete question is available.
@@ -46,9 +48,11 @@ const PLANNED_SEARCH_LIMIT: usize = 8;
 const SESSION_COMPACTION_FOCUS: &str = r#"Preserve memo evidence, query requests, memory search
 arguments, useful memory hits, rejected broad searches, and allocation/cognition context that future
 retrieval should remember."#;
-const QUERY_PLAN_INSTRUCTION: &str = r#"Output instruction: call plan_memory_queries exactly once.
-Use main_query for the best concrete memory search. Use sub_queries only for distinct alternate
-terms or facets, up to two strings. main_query must be nonblank. Do not write plain assistant text."#;
+const QUERY_PLAN_INSTRUCTION: &str = r#"Output instruction: call exactly one tool.
+Call plan_memory_queries when recall would clarify current cognition. Use main_query for the best
+concrete memory search and sub_queries only for distinct alternate terms or facets, up to two
+strings; main_query must be nonblank. Call skip_memory_query when no recalled evidence is needed for
+the current cognition. Do not write plain assistant text."#;
 const EVIDENCE_SELECTION_INSTRUCTION: &str = r#"Return structured evidence selection only.
 Select up to three exact memory index strings from the fresh evidence candidates above in selected_indexes.
 Return an empty selected_indexes array only when no candidate is usable; runtime may apply
@@ -169,6 +173,17 @@ pub struct PlanMemoryQueriesOutput {
     pub message: String,
 }
 
+#[lutum::tool_input(name = "skip_memory_query", output = SkipMemoryQueryOutput)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct SkipMemoryQueryArgs {
+    pub reason: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct SkipMemoryQueryOutput {
+    pub skipped: bool,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct SelectMemoryEvidenceArgs {
     #[serde(default)]
@@ -187,6 +202,7 @@ pub struct SelectMemoryEvidenceOutput {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema, lutum::Toolset)]
 pub enum QueryMemoryPlanTools {
     PlanMemoryQueries(PlanMemoryQueriesArgs),
+    SkipMemoryQuery(SkipMemoryQueryArgs),
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -435,8 +451,11 @@ impl QueryMemoryModule {
             .session
             .text_turn()
             .tools::<QueryMemoryPlanTools>()
-            .available_tools([QueryMemoryPlanToolsSelector::PlanMemoryQueries])
-            .require_tool(QueryMemoryPlanToolsSelector::PlanMemoryQueries)
+            .available_tools([
+                QueryMemoryPlanToolsSelector::PlanMemoryQueries,
+                QueryMemoryPlanToolsSelector::SkipMemoryQuery,
+            ])
+            .require_any_tool()
             .max_output_tokens(TOOL_TURN_MAX_OUTPUT_TOKENS)
             .collect_staged_controlled_with(
                 &lutum,
@@ -447,7 +466,7 @@ impl QueryMemoryModule {
 
         match outcome {
             StagedTextStepOutcomeWithTools::Finished(_) => {
-                bail!("query-memory planner finished without plan_memory_queries tool call")
+                bail!("query-memory planner finished without a required tool call")
             }
             StagedTextStepOutcomeWithTools::FinishedNoOutput(_) => {
                 bail!("query-memory planner finished with no output")
@@ -457,11 +476,27 @@ impl QueryMemoryModule {
                 nuillu_module::emit_trace_tool_calls(&round.tool_calls);
                 if round.tool_calls.len() != 1 {
                     bail!(
-                        "query-memory planner must call plan_memory_queries exactly once, got {} calls",
+                        "query-memory planner must call exactly one decision tool, got {} calls",
                         round.tool_calls.len()
                     );
                 }
-                let QueryMemoryPlanToolsCall::PlanMemoryQueries(call) = round.tool_calls[0].clone();
+                let QueryMemoryPlanToolsCall::PlanMemoryQueries(call) = round.tool_calls[0].clone()
+                else {
+                    let QueryMemoryPlanToolsCall::SkipMemoryQuery(call) =
+                        round.tool_calls[0].clone()
+                    else {
+                        unreachable!("query-memory plan toolset has exactly two variants")
+                    };
+                    let result = call
+                        .complete(SkipMemoryQueryOutput { skipped: true })
+                        .context("complete skip_memory_query tool call")?;
+                    round
+                        .commit(&mut self.session, [result])
+                        .context("commit query-memory skip round")?;
+                    cx.compact_and_save(&mut self.session, planner_usage)
+                        .await?;
+                    return Ok(());
+                };
                 let planned_searches = normalize_plan(call.input.clone())?;
 
                 let retrieval = self
@@ -1119,12 +1154,7 @@ fn hit_contents(hits: &[QueryMemoryHit]) -> String {
     for hit in hits {
         let content = hit.content.trim();
         if !content.is_empty() && !contents.iter().any(|item: &String| item.ends_with(content)) {
-            contents.push(format_memory_with_affect(
-                content,
-                hit.affect_arousal,
-                hit.valence,
-                &hit.emotion,
-            ));
+            contents.push(content.to_owned());
         }
     }
     contents.join("\n\n")
@@ -1135,40 +1165,10 @@ fn linked_hit_contents(hits: &[QueryMemoryLinkedHit]) -> String {
     for hit in hits {
         let content = hit.content.trim();
         if !content.is_empty() && !contents.iter().any(|item| item.ends_with(content)) {
-            contents.push(format!(
-                "[{:?} {:?} {} -> {}] {}",
-                hit.link.relation,
-                hit.link.freeform_relation,
-                hit.link.from_memory,
-                hit.link.to_memory,
-                format_memory_with_affect(content, hit.affect_arousal, hit.valence, &hit.emotion)
-            ));
+            contents.push(content.to_owned());
         }
     }
     contents.join("\n\n")
-}
-
-fn format_memory_with_affect(
-    content: &str,
-    affect_arousal: f32,
-    valence: f32,
-    emotion: &str,
-) -> String {
-    let emotion = emotion.trim();
-    if emotion.is_empty() && affect_arousal == 0.0 && valence == 0.0 {
-        return content.to_owned();
-    }
-    format!(
-        "[stored affect: arousal {:.2}, valence {:.2}, emotion {}] {}",
-        affect_arousal,
-        valence,
-        if emotion.is_empty() {
-            "unknown"
-        } else {
-            emotion
-        },
-        content
-    )
 }
 
 fn render_memo(
@@ -1496,6 +1496,15 @@ mod tests {
         )
     }
 
+    fn skip_scenario(reason: &str) -> MockTextScenario {
+        tool_scenario(
+            "query-memory-skip",
+            "call-skip",
+            "skip_memory_query",
+            serde_json::json!({ "reason": reason }),
+        )
+    }
+
     fn filter_scenario(selected_indexes: Vec<&str>) -> MockStructuredScenario {
         let json = serde_json::json!({
             "selected_indexes": selected_indexes,
@@ -1729,9 +1738,9 @@ mod tests {
                 kind: MemoryKind::Statement,
                 concepts: vec![],
                 tags: vec![],
-                affect_arousal: 0.0,
-                valence: 0.0,
-                emotion: String::new(),
+                affect_arousal: 0.83,
+                valence: -0.25,
+                emotion: "uneasy".to_owned(),
                 linked_neighbor_count: 0,
             }],
             &[],
@@ -1740,6 +1749,9 @@ mod tests {
         assert!(memo.starts_with("Retrieved memory evidence:\nA concrete remembered rule."));
         assert!(!memo.contains("Query intent:"));
         assert!(!memo.contains("Search queries:"));
+        assert!(!memo.contains("stored affect"));
+        assert!(!memo.contains("arousal"));
+        assert!(!memo.contains("uneasy"));
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -1784,6 +1796,33 @@ mod tests {
                 run_query_memory_once(&blackboard, &caps, &mut module, &lutum)
                     .await
                     .expect("search miss activation should succeed");
+
+                assert_eq!(adapter.text_inputs().len(), 1);
+                assert!(query_memory_memos(&blackboard).await.is_empty());
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn semantic_skip_avoids_search_and_writes_no_memo() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let adapter = Arc::new(CapturingAdapter::new(
+                    MockLlmAdapter::new()
+                        .with_text_scenario(skip_scenario("Current cognition is self-contained.")),
+                ));
+                let store = Rc::new(QueryMemoryTestStore::default());
+                store.records.borrow_mut().push(record(
+                    "unused-memory",
+                    "This record should not be searched or surfaced.",
+                ));
+                let (blackboard, caps, memory_caps, lutum) =
+                    test_caps_with_adapter(adapter.clone(), store);
+                let mut module = build_query_module(&caps, memory_caps).await;
+
+                run_query_memory_once(&blackboard, &caps, &mut module, &lutum)
+                    .await
+                    .expect("semantic skip should complete without retrieval");
 
                 assert_eq!(adapter.text_inputs().len(), 1);
                 assert!(query_memory_memos(&blackboard).await.is_empty());
@@ -2160,7 +2199,7 @@ mod tests {
                 let err = run_query_memory_once(&blackboard, &caps, &mut module, &lutum)
                     .await
                     .expect_err("multiple planner tool calls should fail activation");
-                assert!(err.to_string().contains("exactly once"));
+                assert!(err.to_string().contains("exactly one decision tool"));
                 assert!(query_memory_memos(&blackboard).await.is_empty());
             })
             .await;

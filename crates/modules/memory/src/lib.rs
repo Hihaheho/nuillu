@@ -53,7 +53,8 @@ pub use query::{
     QueryMemoryHit, QueryMemoryLinkedHit, QueryMemoryMemo, QueryMemoryMemoHit,
     QueryMemoryMemoLinkedHit, QueryMemoryMemoSearch, QueryMemoryModule, QueryMemoryPlanTools,
     QueryMemoryPlanToolsCall, QueryMemoryPlanToolsSelector, SelectMemoryEvidenceArgs,
-    SelectMemoryEvidenceOutput, query_session_auto_compaction,
+    SelectMemoryEvidenceOutput, SkipMemoryQueryArgs, SkipMemoryQueryOutput,
+    query_session_auto_compaction,
 };
 pub use store::{
     IndexedMemory, LinkedMemoryQuery, LinkedMemoryRecord, MemoryAssociator, MemoryCompactor,

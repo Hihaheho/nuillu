@@ -30,6 +30,11 @@ This document is the implementation source of truth. It describes the desired ar
 19. **Memory and learning are distinct reinforcement substrates** — Memory preserves *what happened* and is reinforced by **access**: rank rises when entries are read or queried, and this rule is owned by `MemoryStore` rather than by any module. Learning preserves *what worked* and *what failed* through a TD-0 (temporal-difference, one-step lookbehind, no discount) credit-assignment loop. `policy` is a read-only advisor/proposer: it searches stored policies by vector search over the `trigger` field only, synthesizes new `(trigger, behavior)` candidates when needed, predicts each candidate's current `predicted_expected_reward`, writes ordinary advice to its memo, and writes a structured `PolicyConsiderationPayload` through a reward-crate custom capability. `reward` settles custom-evicted policy considerations, aggregates the 6-source `ObservedReward`, computes `td_error = observed_scalar − predicted_expected_reward`, inserts credited synthetic candidates, and applies value, expected-reward, confidence, and reward-token deltas through the reward-owned `PolicyUpserter`. Rank crosses tiers only as a derived consequence of value × reward-tokens. Policies and memories never share a store, a rank enum, or a strengthening rule. The retrieval module that surfaces memories is named `query-memory`.
 20. **Interoception and homeostasis are separate** — `interoception` owns the canonical internal-state estimate: `wake_arousal`, `nrem_pressure`, `rem_pressure`, `affect_arousal`, `valence`, and untyped `emotion`. `homeostasis` reads that state and regulates allocation, but it does not estimate internal state. There is no separate `emotion` module in v1.
 21. **Memory records carry storage-time affect context** — `MemoryWriter` and `MemoryCompactor` stamp new records with the current `InteroceptiveState` affect fields (`affect_arousal`, `valence`, `emotion`). These fields are storage-time context, not truth labels and not later reinterpretation.
+22. **Cognitive routing includes endogenous outcomes** — A cognitive memo is eligible evidence for cognition-gate, not a synonym for external input and not an already-admitted cognition-log entry. Completed speech, host-observed semantic action outcomes, recall, and embodied/mental changes may be cognitive so independently activated modules can synchronize around what the agent itself did. Execution acknowledgements and storage/retrieval metadata remain private or typed; cognitive plaintext contains the semantic consequence only.
+23. **Persistent sessions are context, not disposable request envelopes** — Module sessions deliberately retain successful assistant tool calls, tool results, and relevant prior decisions. This history supports provider KV-cache reuse, stable tool-use behavior, and in-context learning. Modules append only new bounded evidence plus ephemeral current state; they do not rebuild the entire session on every activation. Compaction preserves useful interaction structure and is a context-window operation, not a reason to discard tool transcripts merely because a short run crosses a small token threshold.
+24. **Whether recall is useful is a semantic decision** — Query-memory wakes from admitted cognition while allocation controls whether it is active. Rust may coalesce wake signals and exclude evidence already surfaced, but it must not pretend that keyword rules can decide whether memory would clarify the current cognition. The query-memory planning turn must be able to choose either a concrete retrieval plan or an explicit semantic no-retrieval decision; only the latter avoids search and evidence-selection work for that activation.
+25. **Memory ingest gates durable relevance, not scheduler freshness** — A concurrent cognitive system cannot generally determine from version numbers alone that an LLM-produced memory statement is semantically stale. The memory LLM gate decides whether evidence is worth preserving and should reject incidental in-flight progress/absence claims such as "has not answered yet" or "is still waiting" unless that unresolved state is itself the remembered event. When both are available, prefer the settled interaction or durable decision.
+26. **Self-model is an embodied and mental-state snapshot** — Self-model integrates the agent's body/form, abilities and limitations, interoceptive and affective condition, attention, intention, uncertainty, and agency. It does not preserve a conversation transcript, action chronology, poem history, or every question and answer. New output integrates and replaces superseded self-state instead of appending a recap.
 
 ---
 
@@ -587,9 +592,10 @@ Capabilities: `MemoUpdatedInbox`, `BlackboardReader`, `AllocationReader`, `Cogni
 Reads unread cognitive memo records, then appends concise, novel,
 currently relevant events to this replica's cognition log. It advances through non-cognitive memo
 updates without forming a batch. It has no `Memo` capability; its only durable output is the
-cognition log. If exactly one total candidate is pending, including retry-pending candidates, it
-promotes that memo's trimmed plaintext directly without an LLM call. When two or more candidates are
-pending, it uses the LLM gate. When promoting sensory memo content, cognition-gate is the only place
+cognition log. When the pending candidate set fits entirely within the current awareness capacity,
+it promotes the already cognition-safe plaintext directly without an LLM ranking call. When
+candidates exceed that capacity, it uses the LLM gate to rank admission and noise. When promoting
+sensory memo content, cognition-gate is the only place
 that applies time-division rounding: it converts the detailed memo age into the bucket/tag from
 `configs/time-division.eure` before writing the cognition log event.
 
@@ -601,6 +607,11 @@ is gating: selecting which cognitive memo candidate becomes admitted cognitive e
 Capabilities: `MemoUpdatedInbox`, `AttentionControlRequestInbox`, `BlackboardReader`, `CognitionLogReader`, `AllocationReader`, `InteroceptiveReader`, `AllocationWriter`, `Memo`, `LlmAccess`.
 
 Wakes on memo updates, excluding its own memo writes, and internal `AttentionControlRequest` bids. It reads unread memo-log entries into a persistent `Session`, plus current attention-control requests, memory metadata, cognition-log set, effective allocation, interoceptive state, and registry cap metadata. It writes this controller replica's allocation proposal; the runtime averages active proposals into the effective allocation.
+
+The free-form `memo` inside `reprioritize_modules` is private controller reasoning retained in the
+allocation session tool transcript so later allocation turns can remain coherent. It is not written
+to the shared module memo log or cognition log. Its natural-language detail is therefore a private
+context-quality/cost concern, not cognitive-surface pollution.
 
 The controller prompt receives a registry-derived JSON Schema. The schema enumerates known module ids and exposes exactly `memo` and `priority_module_ids`. Runtime maps priority positions through the current activation table; active replicas are derived later from the target module's policy.
 
@@ -620,6 +631,11 @@ Its tool surface is mixed:
 - `hold_actions` clears Action's previous speak allocation effect.
 - `sleep` is a built-in one-shot action. It validates sleep-ready interoception, patches interoception into NREM pressure, and lets Homeostasis react through `InteroceptiveUpdated`.
 - External dynamic tools come from the live host/visualizer affordance registry. Each affordance has a stable tool name, JSON Schema, label, description, `use_when`, and effect text. Action invokes the host handler and commits only an acknowledgement/error tool result; semantic effects return later through sensory input or scene changes.
+
+The returned semantic effect may become a sensory cognitive candidate even though the agent caused
+it. Self-caused outcomes are still world evidence and are required for cross-module synchronization.
+The acknowledgement in Action's tool transcript is not promoted as a substitute for that observed
+outcome.
 
 Poet is not a module. It is a third-party external action affordance supplied by the visualizer/host with a schema such as `{ "poem": "string" }`.
 
@@ -651,9 +667,13 @@ must be labeled as imagined/hypothetical/fictional/possible in the appended cogn
 
 Capabilities: `CognitionLogUpdatedInbox`, `BlackboardReader` for memo-log/context reads, `CognitionLogReader`, `Memo`, `LlmAccess`.
 
-Maintains a current self-description by integrating attention-schema attention-experience memos or
-their promoted cognition-log entries, relevant module memo logs, and self-related knowledge that query
-modules surface from memory. Non-empty
+Maintains a concise current embodied and mental-state snapshot by integrating attention-schema
+attention-experience memos or their promoted cognition-log entries, relevant module memo logs, and
+self-related knowledge that query modules surface from memory. Its scope is the agent's body/form,
+abilities and limitations, interoceptive and affective condition, attention, intention, uncertainty,
+and agency. It must not recap dialogue, external-event chronology, prior utterances, poems, or action
+history unless they directly change one of those self-state dimensions. Each update integrates and
+replaces superseded state rather than appending a chronology. Non-empty
 output is appended to this replica's cognitive memo log, which is memo-authoritative for self-model
 answers.
 
@@ -663,11 +683,16 @@ Stable self-knowledge belongs in memory and is surfaced through query-module mem
 
 Capabilities: `CognitionLogUpdatedInbox`, `BlackboardReader`, `MemorySearcher`, `Memo`, `LlmAccess`.
 
-Handles memory retrieval (vector-memory/RAG backed in v1). Cognition-log updates wake it to retrieve
-memory relevant to the current cognitive surface. It does not handle self-referential or self-model integration,
+Handles memory retrieval (vector-memory/RAG backed in v1). Cognition-log updates wake it to consider
+memory relevant to the current cognitive surface. Whether retrieval would clarify that surface is a
+semantic decision: the planning turn may either issue concrete memory searches or explicitly decline
+retrieval for the activation. Deterministic code may coalesce wakes and remove evidence already
+surfaced, but must not replace this semantic gate with keyword heuristics. It does not handle self-referential or self-model integration,
 and does not query the policy store. Output is appended to this replica's cognitive memo log, and
-those plaintext entries contain only retrieved or linked memory evidence copied from query results.
-Query intent and search bookkeeping stay in typed/session state. Reads count as memory access; rank
+those plaintext entries contain only retrieved or linked semantic memory evidence copied from query
+results. Storage tags, rank, indexes, link ids, numeric arousal/valence, and retrieval bookkeeping
+stay in typed payload/session state and are not rendered into cognitive plaintext. Query intent and
+search bookkeeping stay in typed/session state. Reads count as memory access; rank
 elevation is applied by `MemoryStore` and is not module-visible.
 
 ### Query Agentic
@@ -680,7 +705,7 @@ Handles read-only file-search retrieval. Cognition-log updates wake it. Its file
 
 Capabilities: `CognitionLogEvictedInbox`, `MemoryMetadataReader`, `MemoryWriter`, `LlmAccess`.
 
-Decides whether useful information should be preserved and inserts memory entries. Cognition-log evictions are the wake path. Memo-log entries are non-conscious working traces and are not valid direct memory-ingest evidence; memory writes must be grounded in cognition-log evidence. The memory module evaluates evicted cognition-log entries with memory metadata available for deduplication. It may reject, normalize, deduplicate, or merge candidates, and only persists records that the LLM chooses to write through `insert_memory`. The `insert_memory` tool accepts only content, kind, concepts, and tags. Every ordinary memory-module write is inserted as `MemoryRank::ShortTerm` with runtime-stamped decay and occurrence time. Concepts and tags are name newtypes serialized as simple string arrays. `MemoryWriter` stamps the current `InteroceptiveState` affect fields onto each new record before storage.
+Decides whether useful information should be preserved and inserts memory entries. Cognition-log evictions are the wake path. Memo-log entries are non-conscious working traces and are not valid direct memory-ingest evidence; memory writes must be grounded in cognition-log evidence. The memory module evaluates evicted cognition-log entries with memory metadata available for deduplication. It may reject, normalize, deduplicate, or merge candidates, and only persists records that the LLM chooses to write through `insert_memory`. The semantic gate rejects incidental in-flight progress/absence claims such as "has not answered yet" or "is still waiting" unless the unresolved state itself is a concrete experience worth remembering; when both are present it prefers the settled interaction or durable decision. The `insert_memory` tool accepts only content, kind, concepts, and tags. Every ordinary memory-module write is inserted as `MemoryRank::ShortTerm` with runtime-stamped decay and occurrence time. Concepts and tags are name newtypes serialized as simple string arrays. `MemoryWriter` stamps the current `InteroceptiveState` affect fields onto each new record before storage.
 
 ### Memory Compaction
 
@@ -790,6 +815,14 @@ External action tool results are deliberately acknowledgement-only. If the actio
 ## 5. Lutum Integration
 
 `LlmAccess::lutum()` returns a `lutum::Lutum` for the holder instance's configured tier. Replica identity controls ownership and gating; allocation controls activation priority and derived scheduling, not model-tier or module-specific instructions. Modules build their own `Session` and choose the concrete turn shape (`structured_turn`, `text_turn().tools()`, etc.). The capability layer deliberately does not impose a shared session or agent-loop abstraction.
+
+Successful module sessions are persistent by design. Prior assistant tool calls and committed tool
+results remain in the session because they teach the model the established tool-use pattern, carry
+module-local decisions forward, and permit prefix/KV-cache reuse. Each activation appends bounded
+unread evidence and uses ephemeral messages for replaceable current snapshots. Reconstructing a
+fresh full prompt every activation is not the default optimization: it loses learned interaction
+history and usually defeats stable prefix caching. Auto-compaction is reserved for actual context
+pressure and must preserve the tool-call/result structure needed for later correct tool use.
 
 A model definition may name another definition with `fallback`. Provider request failures, including HTTP 429, server-status, authentication/client-status, and transport failures, advance through that chain before the error reaches the module. Each fallback uses its own endpoint, token, API mode, model name, and model-scoped concurrency limit. The already-resolved turn input and generation parameters are preserved. Unknown fallback names and cycles are rejected while loading the model set.
 

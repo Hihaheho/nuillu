@@ -40,10 +40,26 @@ context. Memo content is free-form prose on the shared workspace surface, not JS
 data, or a structured data exchange channel. The `cognitive` flag is metadata for routing and is not
 rendered into prompt text. Channel messages are transient activation signals and are not persisted.
 
+`cognitive` means **eligible for admission to shared awareness**, not "external" and not "already
+admitted." Endogenous evidence can be cognitive: what the agent just said, the semantic outcome of
+its own action, a recalled memory, or a change in its embodied/mental condition may need to become
+available to other faculties. Cognition-gate remains the admission boundary. This feedback is how
+independently activated modules synchronize around the agent's own behavior; removing it would leave
+the rest of the mind unaware of what the agent did. Tool acknowledgements, request ids, schema
+fields, search indexes, tags, storage ranks, numeric affect metadata, and other execution plumbing
+are not themselves cognitive evidence. Keep those in typed payloads, private sessions, repositories,
+or non-cognitive memos while rendering only their semantic consequence into cognitive plaintext.
+
 External input and output sit at the boundary of cognition:
 
 - **sensory input** is the only external/app-facing input; it enters through a typed `SensoryInput` channel and is normalized by the sensory module into memo-log entries,
 - **speech output** leaves through a speak/action capability and is mirrored into the speak module's memo log.
+
+External action calls follow the same distinction. The action module commits acknowledgement-only
+tool results to its private tool transcript. A host-observed semantic outcome returns through sensory
+input or scene state and may become a cognitive memo candidate. For example, "the poem was recorded"
+or "the object moved" can be conscious evidence; the raw invocation acknowledgement and arguments
+are not substitutes for observing that outcome.
 
 Overt speech is modeled as a motor/action gate, not as a direct cognition-log writer. The `speak`
 module may emit only from the admitted cognition log; it does not read memo logs directly and does
