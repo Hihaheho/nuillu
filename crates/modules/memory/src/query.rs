@@ -5,7 +5,7 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use lutum::{ModelInput, Session, StagedTextStepOutcomeWithTools, StructuredTurnOutcome};
 use nuillu_module::{
-    BlackboardReader, CognitionLogUpdatedInbox, LlmAccess, LlmContextWindow, Module,
+    BlackboardReader, CognitionLogUpdatedInbox, LlmAccess, LlmContextWindow, MemoLogRecord, Module,
     SessionAutoCompaction, SessionCompactionConfig, SessionCompactionProtectedPrefix, TypedMemo,
     ensure_persistent_session_seeded, format_memory_trace_inventory, memory_rank_counts,
     push_formatted_memo_log_batch, render_memory_for_llm,
@@ -291,6 +291,7 @@ pub struct QueryMemoryModule {
     llm: LlmAccess,
     session: Session,
     system_prompt: std::sync::OnceLock<String>,
+    last_contextualized_memo_index: Option<u64>,
 }
 
 impl QueryMemoryModule {
@@ -315,6 +316,7 @@ impl QueryMemoryModule {
             llm,
             session,
             system_prompt: std::sync::OnceLock::new(),
+            last_contextualized_memo_index: None,
         }
     }
 
@@ -389,6 +391,28 @@ impl QueryMemoryModule {
             .collect()
     }
 
+    async fn take_unread_own_memo_logs(&mut self) -> Vec<MemoLogRecord> {
+        let records = self.memo.recent_logs().await;
+        let unread = records
+            .iter()
+            .filter(|record| {
+                self.last_contextualized_memo_index
+                    .is_none_or(|index| record.index > index)
+            })
+            .map(|record| MemoLogRecord {
+                owner: record.owner.clone(),
+                index: record.index,
+                written_at: record.written_at,
+                content: record.content.clone(),
+                cognitive: record.cognitive,
+            })
+            .collect::<Vec<_>>();
+        if let Some(index) = records.last().map(|record| record.index) {
+            self.last_contextualized_memo_index = Some(index);
+        }
+        unread
+    }
+
     async fn filter_recent_memo_evidence(
         &self,
         mut retrieval: QueryMemoryRetrieval,
@@ -426,7 +450,8 @@ impl QueryMemoryModule {
     ) -> Result<()> {
         let requests = vec![self.activation_request().await];
         self.ensure_session_seeded(cx);
-        let unread_memo_logs = self.blackboard.unread_memo_logs().await;
+        let mut unread_memo_logs = self.blackboard.unread_memo_logs().await;
+        unread_memo_logs.extend(self.take_unread_own_memo_logs().await);
         let prior_query_memory_searches = self.prior_query_memory_searches().await;
         let rank_counts = self
             .blackboard

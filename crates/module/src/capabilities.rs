@@ -1250,9 +1250,9 @@ impl ModuleCapabilityFactory {
     }
 
     pub fn blackboard_reader(&self) -> BlackboardReader {
-        BlackboardReader::new_for_role(
+        BlackboardReader::new_for_owner_with_role_cursors(
             self.root.inner.blackboard.clone(),
-            self.owner.module.clone(),
+            self.owner.clone(),
             self.root.inner.role_reader_cursors.clone(),
         )
     }
@@ -2893,6 +2893,7 @@ mod tests {
         let cognition_gate = scoped(&caps, builtin::cognition_gate(), 0);
         let sensory = scoped(&caps, builtin::sensory(), 0);
         let mut inbox = cognition_gate.memo_updated_inbox();
+        let reader = cognition_gate.blackboard_reader();
 
         cognition_gate.memo().write("own memo").await;
         sensory.memo().write("sensory memo").await;
@@ -2901,6 +2902,16 @@ mod tests {
         assert_eq!(event.sender.module, builtin::sensory());
         assert_eq!(event.body.owner.module, builtin::sensory());
         assert!(inbox.take_ready_items().unwrap().items.is_empty());
+
+        let unread = reader.unread_memo_logs().await;
+        assert_eq!(
+            unread
+                .iter()
+                .map(|record| (record.owner.clone(), record.content.as_str()))
+                .collect::<Vec<_>>(),
+            vec![(event.sender, "sensory memo")]
+        );
+        assert!(reader.unread_memo_logs().await.is_empty());
     }
 
     #[tokio::test]

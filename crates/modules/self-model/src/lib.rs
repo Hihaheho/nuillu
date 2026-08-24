@@ -2,12 +2,10 @@ use anyhow::{Context, Result};
 use async_trait::async_trait;
 use lutum::Session;
 use nuillu_module::{
-    BlackboardReader, CognitionLogReader, CognitionLogUpdatedInbox, LlmAccess, LlmContextWindow,
-    Memo, Module, SessionAutoCompaction, SessionCompactionConfig, SessionCompactionProtectedPrefix,
-    ensure_persistent_session_seeded, push_formatted_cognition_log_batch,
-    push_formatted_memo_log_batch,
+    BlackboardReader, LlmAccess, LlmContextWindow, Memo, MemoUpdatedInbox, Module,
+    SessionAutoCompaction, SessionCompactionConfig, SessionCompactionProtectedPrefix,
+    ensure_persistent_session_seeded, push_formatted_memo_log_batch,
 };
-use nuillu_types::builtin;
 
 mod batch;
 pub use batch::NextBatch as SelfModelBatch;
@@ -31,7 +29,6 @@ mental self-state."#;
 
 const COMPACTED_SELF_MODEL_SESSION_PREFIX: &str = "Compacted self-model session history:";
 const MEMO_CONTEXT_WINDOW: LlmContextWindow = LlmContextWindow::new(8, 1_200, 4_800);
-const COGNITION_CONTEXT_WINDOW: LlmContextWindow = LlmContextWindow::new(8, 600, 3_000);
 const SESSION_COMPACTION_FOCUS: &str = r#"Preserve the latest embodied identity, abilities and
 limitations, interoceptive and affective condition, attention, intention, uncertainty, agency, and
 corrections. Do not preserve dialogue or event chronology except where it directly changes that
@@ -47,9 +44,8 @@ pub fn session_auto_compaction() -> SessionAutoCompaction {
 }
 
 pub struct SelfModelModule {
-    cognition_updates: CognitionLogUpdatedInbox,
+    memo_updates: MemoUpdatedInbox,
     blackboard: BlackboardReader,
-    cognition_log: CognitionLogReader,
     memo: Memo,
     llm: LlmAccess,
     session: Session,
@@ -58,17 +54,15 @@ pub struct SelfModelModule {
 
 impl SelfModelModule {
     pub fn new(
-        cognition_updates: CognitionLogUpdatedInbox,
+        memo_updates: MemoUpdatedInbox,
         blackboard: BlackboardReader,
-        cognition_log: CognitionLogReader,
         memo: Memo,
         llm: LlmAccess,
         session: Session,
     ) -> Self {
         Self {
-            cognition_updates,
+            memo_updates,
             blackboard,
-            cognition_log,
             memo,
             llm,
             session,
@@ -97,15 +91,8 @@ impl SelfModelModule {
         &mut self,
         cx: &nuillu_module::ActivateCx<'_>,
     ) -> Result<()> {
-        let attention_schema_cognition = self
-            .cognition_log
-            .unread_events()
-            .await
-            .into_iter()
-            .filter(|record| record.source.module == builtin::attention_schema())
-            .collect::<Vec<_>>();
         let unread_memo_logs = self.blackboard.unread_memo_logs().await;
-        if attention_schema_cognition.is_empty() && unread_memo_logs.is_empty() {
+        if unread_memo_logs.is_empty() {
             return Ok(());
         }
 
@@ -118,14 +105,8 @@ impl SelfModelModule {
                 cx.now(),
                 MEMO_CONTEXT_WINDOW,
             );
-            push_formatted_cognition_log_batch(
-                &mut self.session,
-                &attention_schema_cognition,
-                cx.now(),
-                COGNITION_CONTEXT_WINDOW,
-            );
             self.session.push_user(
-                "Update the concise embodied and mental self-state snapshot from current self-relevant working notes and attention-schema cognition. Do not recap the conversation. Write nothing if there is no concrete change or clarification to body, capability, affect, attention, intention, uncertainty, or agency.",
+                "Update the concise embodied and mental self-state snapshot from current self-relevant working notes. Do not recap the conversation. Write nothing if there is no concrete change or clarification to body, capability, affect, attention, intention, uncertainty, or agency.",
             );
             let result = self
                 .session
@@ -169,7 +150,7 @@ impl Module for SelfModelModule {
         cx: &nuillu_module::ActivateCx<'_>,
         batch: &Self::Batch,
     ) -> Result<()> {
-        if batch.cognition_updated {
+        if batch.memo_updated {
             self.update_from_current_context(cx).await?;
         }
         Ok(())

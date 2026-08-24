@@ -5210,7 +5210,7 @@ fn register_eval_module(
                 )
                 .expect("eval module registration should be unique")
         }
-        // On-demand: fires on cognition-log updates and reads current context.
+        // On-demand: fires on peer memo updates and reads current memo context.
         EvalModule::SelfModel => {
             let main_tier = eval_session_tier(module, "main");
             registry
@@ -5219,9 +5219,8 @@ fn register_eval_module(
                     replica_hard_cap,
                     move |caps| async move {
                         Ok(nuillu_self_model::SelfModelModule::new(
-                            caps.cognition_log_updated_inbox(),
+                            caps.memo_updated_inbox(),
                             caps.blackboard_reader(),
-                            caps.cognition_log_reader(),
                             caps.memo(),
                             caps.llm("main").with_tier(main_tier).into(),
                             caps.session("main")

@@ -217,9 +217,8 @@ fn register_server_module(
             let main_tier = spec.session_tier("main");
             registry.register_server(spec, move |caps| async move {
                 Ok(nuillu_self_model::SelfModelModule::new(
-                    caps.cognition_log_updated_inbox(),
+                    caps.memo_updated_inbox(),
                     caps.blackboard_reader(),
-                    caps.cognition_log_reader(),
                     caps.memo(),
                     caps.llm("main").with_tier(main_tier).into(),
                     caps.session("main")

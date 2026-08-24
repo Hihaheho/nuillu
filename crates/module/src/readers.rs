@@ -58,6 +58,7 @@ impl RoleReaderCursors {
 #[derive(Clone)]
 pub struct BlackboardReader {
     blackboard: Blackboard,
+    owner: Option<ModuleInstanceId>,
     last_seen_memo_indices: Arc<Mutex<MemoCursor>>,
     role_cursors: Option<(ModuleId, RoleReaderCursors)>,
 }
@@ -66,20 +67,22 @@ impl BlackboardReader {
     pub(crate) fn new(blackboard: Blackboard) -> Self {
         Self {
             blackboard,
+            owner: None,
             last_seen_memo_indices: Arc::new(Mutex::new(HashMap::new())),
             role_cursors: None,
         }
     }
 
-    pub(crate) fn new_for_role(
+    pub(crate) fn new_for_owner_with_role_cursors(
         blackboard: Blackboard,
-        role: ModuleId,
+        owner: ModuleInstanceId,
         role_cursors: RoleReaderCursors,
     ) -> Self {
         Self {
             blackboard,
+            owner: Some(owner.clone()),
             last_seen_memo_indices: Arc::new(Mutex::new(HashMap::new())),
-            role_cursors: Some((role, role_cursors)),
+            role_cursors: Some((owner.module, role_cursors)),
         }
     }
 
@@ -90,7 +93,8 @@ impl BlackboardReader {
     }
 
     pub async fn recent_memo_logs(&self) -> Vec<MemoLogRecord> {
-        self.blackboard.read(|bb| bb.recent_memo_logs()).await
+        let records = self.blackboard.read(|bb| bb.recent_memo_logs()).await;
+        self.filter_memo_records(records)
     }
 
     pub async fn unread_memo_logs(&self) -> Vec<MemoLogRecord> {
@@ -135,7 +139,20 @@ impl BlackboardReader {
             advance_memo_cursor(&mut cursor, &records);
             records
         };
-        records.into_iter().filter(include).collect()
+        self.filter_memo_records(records)
+            .into_iter()
+            .filter(include)
+            .collect()
+    }
+
+    fn filter_memo_records(&self, records: Vec<MemoLogRecord>) -> Vec<MemoLogRecord> {
+        let Some(owner) = &self.owner else {
+            return records;
+        };
+        records
+            .into_iter()
+            .filter(|record| record.owner != *owner)
+            .collect()
     }
 }
 
@@ -460,6 +477,52 @@ mod tests {
                 .map(|record| (record.index, record.content.as_str()))
                 .collect::<Vec<_>>(),
             vec![(1, "second")]
+        );
+    }
+
+    #[tokio::test]
+    async fn scoped_blackboard_reader_filters_self_memos_and_advances_their_cursor() {
+        let blackboard = Blackboard::default();
+        let self_owner = ModuleInstanceId::new(builtin::self_model(), ReplicaIndex::ZERO);
+        let sensory = ModuleInstanceId::new(builtin::sensory(), ReplicaIndex::ZERO);
+        let reader = BlackboardReader::new_for_owner_with_role_cursors(
+            blackboard.clone(),
+            self_owner.clone(),
+            RoleReaderCursors::default(),
+        );
+
+        blackboard
+            .update_memo(
+                self_owner,
+                "previous self-model".into(),
+                Utc.timestamp_opt(0, 0).unwrap(),
+            )
+            .await;
+        blackboard
+            .update_memo(
+                sensory.clone(),
+                "new sensory evidence".into(),
+                Utc.timestamp_opt(1, 0).unwrap(),
+            )
+            .await;
+
+        let unread = reader.unread_memo_logs().await;
+        assert_eq!(
+            unread
+                .iter()
+                .map(|record| (record.owner.clone(), record.content.as_str()))
+                .collect::<Vec<_>>(),
+            vec![(sensory.clone(), "new sensory evidence")]
+        );
+        assert!(reader.unread_memo_logs().await.is_empty());
+
+        let recent = reader.recent_memo_logs().await;
+        assert_eq!(
+            recent
+                .iter()
+                .map(|record| (record.owner.clone(), record.content.as_str()))
+                .collect::<Vec<_>>(),
+            vec![(sensory, "new sensory evidence")]
         );
     }
 

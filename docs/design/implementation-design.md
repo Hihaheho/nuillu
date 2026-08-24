@@ -51,7 +51,7 @@ crates/
     allocation/     # cognition log -> resource allocation
     attention-schema/         # source-blind cognitive memo/cognition deltas -> first-person attention memos
     interpreter/              # cognition log -> interpretation/hypothesis/story-seed cognition-log entries
-    self-model/               # attention-schema cognition log + memo logs -> self-model memo logs
+    self-model/               # peer memo logs -> self-model memo logs
     query-memory/             # blackboard/vector memory RAG -> query-memory memo logs
     memory/                   # blackboard snapshot -> memory inserts (access-reinforced; rank elevation owned by MemoryStore)
     memory-compaction/        # memory metadata/content -> merges
@@ -380,7 +380,7 @@ Rules:
 Module conventions:
 - Memo-update modules, such as allocation, collapse multiple ready memo updates into one wake activation and reread the blackboard as source of truth. Allocation also waits a bounded silent window so near-simultaneous memo wakes and attention-control requests share one allocation decision. `MemoUpdatedInbox` drops self-sent updates so a module cannot wake itself by writing its own memo.
 - Cognition-log-update modules, such as attention-schema, interpreter, predict, and surprise, collapse multiple ready cognition-log updates into one wake activation and reread the cognition log as source of truth. `CognitionLogUpdatedInbox` drops self-sent updates so a module cannot wake itself by appending to its own cognition log.
-- Query and self-model modules no longer receive explicit request payloads. They wake from cognition-log updates and write memo-authoritative results using blackboard context.
+- Query and self-model modules no longer receive explicit request payloads. Query-memory wakes from cognition-log updates; self-model wakes from peer memo updates. Both write memo-authoritative results using their permitted context.
 - Memory wakes from cognition-log eviction events. Evicted cognition entries are work-carrying payloads and are collected with a bounded silent window before the LLM turn. Memo-log entries are not valid direct memory evidence.
 - Policy wakes from memo and cognition-log updates, then writes ordinary memo advice and a structured policy-consideration payload through a reward-crate custom capability.
 - Memory-compaction, memory-association, dreaming, and policy-compaction wake from `InteroceptiveUpdated`, letting homeostasis update activation priority before they run.
@@ -395,6 +395,8 @@ Module-owned durable state is keyed internally by `ModuleInstanceId`.
 Memos:
 - `Memo::write` replaces only the holder instance's memo.
 - `BlackboardInner` stores `HashMap<ModuleInstanceId, String>`.
+- A scoped `BlackboardReader`'s memo-log helpers exclude records owned by the holder instance. Their cursors still advance across those records, so a later peer update cannot reintroduce a previously written self memo. The general `read` closure remains a wide blackboard view.
+- A module that intentionally needs its own memo history reads it explicitly through its owner-stamped `Memo` or `TypedMemo`; it does not depend on self records leaking through the scoped blackboard memo-log helpers.
 - Reader helpers provide exact-instance reads for capabilities and grouped module reads for prompts/eval.
 - Singleton serialization keeps the old shape: a module with one active memo appears as `"query-memory": "<memo>"`, not `"query-memory[0]"`.
 - Multi-replica serialization groups entries by module and includes `replica` only when there is more than one memo for that module.
@@ -665,15 +667,19 @@ must be labeled as imagined/hypothetical/fictional/possible in the appended cogn
 
 ### Self Model
 
-Capabilities: `CognitionLogUpdatedInbox`, `BlackboardReader` for memo-log/context reads, `CognitionLogReader`, `Memo`, `LlmAccess`.
+Capabilities: `MemoUpdatedInbox`, `BlackboardReader` for peer memo-log/context reads, `Memo`, `LlmAccess`.
 
 Maintains a concise current embodied and mental-state snapshot by integrating attention-schema
-attention-experience memos or their promoted cognition-log entries, relevant module memo logs, and
-self-related knowledge that query modules surface from memory. Its scope is the agent's body/form,
-abilities and limitations, interoceptive and affective condition, attention, intention, uncertainty,
-and agency. It must not recap dialogue, external-event chronology, prior utterances, poems, or action
-history unless they directly change one of those self-state dimensions. Each update integrates and
-replaces superseded state rather than appending a chronology. Non-empty
+attention-experience memos, relevant module memo logs, and self-related knowledge that query modules
+surface from memory. It does not read the cognition log. `MemoUpdatedInbox` excludes self-sent wake
+signals, and the scoped blackboard reader's memo-log helper excludes the holder instance's own memo
+records while advancing past them, so a later peer wake cannot feed the previous self-model memo
+back as new input.
+Its scope is the agent's body/form, abilities and limitations, interoceptive and affective
+condition, attention, intention, uncertainty, and agency. It must not recap dialogue,
+external-event chronology, prior utterances, poems, or action history unless they directly change
+one of those self-state dimensions. Each update integrates and replaces superseded state rather
+than appending a chronology. Non-empty
 output is appended to this replica's cognitive memo log, which is memo-authoritative for self-model
 answers.
 
@@ -681,7 +687,13 @@ Stable self-knowledge belongs in memory and is surfaced through query-module mem
 
 ### Query Memory
 
-Capabilities: `CognitionLogUpdatedInbox`, `BlackboardReader`, `MemorySearcher`, `Memo`, `LlmAccess`.
+Capabilities: `CognitionLogUpdatedInbox`, `BlackboardReader`, `MemorySearcher`,
+`TypedMemo<QueryMemoryMemo>`, `LlmAccess`.
+
+The scoped blackboard memo-log helpers provide peer context and exclude query-memory's own memo
+records. Query-memory explicitly reads newly retained typed records from its owner-stamped
+`TypedMemo<QueryMemoryMemo>` when prior surfaced evidence must remain in its persistent planner
+context.
 
 Handles memory retrieval (vector-memory/RAG backed in v1). Cognition-log updates wake it to consider
 memory relevant to the current cognitive surface. Whether retrieval would clarify that surface is a
@@ -954,8 +966,8 @@ This keeps realistic artifacts observable without adding request/response correl
 | Cognition-log writes cannot wake controller directly | cognition-log appends publish `CognitionLogUpdated`, which the controller does not receive |
 | Allocation writes are role-bound | boot-time wiring grants `AllocationWriter` to allocation for cognitive/support proposals, to action only for `speak`, and to homeostasis for interoceptive sleep/REM drive and action suppression; runtime computes effective allocation |
 | Attention schema models attention only | it receives memo and cognition-log wake capabilities, blackboard/cognition-log read capabilities, `Memo`, and `LlmAccess`, not `AllocationReader`, `CognitionWriter`, attention-control inbox, `AllocationWriter`, or memory capabilities |
-| Self-model handles self-report | self-model receives `CognitionLogUpdatedInbox`, reads current memo/cognition context, and writes self-model answers to its own memo |
-| Self-model is not raw memory retrieval | stable self-knowledge is surfaced through query memo logs; self-model integrates that knowledge with attention-schema attention-experience memos or promoted cognition-log entries and current memo-log context |
+| Self-model handles self-report | self-model receives `MemoUpdatedInbox`, reads peer memo context through a self-filtering scoped reader, and writes self-model answers to its own memo |
+| Self-model is not raw memory retrieval | stable self-knowledge is surfaced through query memo logs; self-model integrates that knowledge with attention-schema attention-experience memos and current peer memo-log context |
 | Query memory is memory/RAG only | it receives `MemorySearcher`, not policy or self-model capabilities |
 | Policy is read-only against the policy store | it receives `PolicySearcher` and `PolicyConsiderationWriter`, not a policy-store insert/reinforce path |
 | Policy vector search is trigger-only | `PolicySearcher` performs similarity over the `trigger` embedding; `behavior`, `value`, `expected_reward`, and `confidence` are never used as search keys |

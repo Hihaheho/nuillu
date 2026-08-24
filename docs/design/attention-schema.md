@@ -203,7 +203,7 @@ than racing ahead of late evidence memos or newly generated inner interpretation
 | allocation | ✓ | ✓ | ✓ | ✓ | — | ✓ | `MemoUpdatedInbox`, `AttentionControlRequestInbox`, `InteroceptiveReader`, `AllocationWriter` |
 | attention-schema | ✓ | ✓ | — | ✓ | — | ✓ | `MemoUpdatedInbox`, `CognitionLogUpdatedInbox` |
 | interpreter | — | ✓ | — | — | — | ✓ | `CognitionLogUpdatedInbox`, `CognitionWriter` |
-| self-model | ✓ | ✓ | ✓ | ✓ | — | ✓ | `CognitionLogUpdatedInbox` |
+| self-model | ✓ | — | ✓ | ✓ | — | ✓ | `MemoUpdatedInbox` |
 | query-memory | ✓ | — | ✓ | ✓ | — | ✓ | `CognitionLogUpdatedInbox`, `MemorySearcher` |
 | memory | — | — | ✓ | — | — | ✓ | `CognitionLogEvictedInbox`, `MemoryMetadataReader`, `MemoryWriter` |
 | memory-compaction | ✓ | — | ✓ | — | — | ✓ | `InteroceptiveUpdatedInbox`, `MemoryCompactor` |
@@ -220,7 +220,7 @@ Notable absences:
 
 - The attention schema module has no self-model inbox, allocation-read/write path, cognition-log-write path, or memory-write path. Its durable output is limited to first-person attention experience entries in its cognitive memo log.
 - The interpreter module has no memo, blackboard, allocation-read/write path, or memory path. Its durable output is limited to concise interpretation, hypothesis, analogy, or story-seed entries derived only from the admitted cognition log.
-- The self-model module integrates self-related current context, but has no cognition-log-write, allocation-write, or memory-write path.
+- The self-model module wakes from peer memo updates and integrates self-related memo context. It has no cognition-log read/write, allocation-write, or memory-write path. Its scoped blackboard reader's memo-log helpers exclude its own memo records while advancing past them.
 - Query modules wake from cognition-log updates, not direct requests, and do not perform self-model integration.
 - The sensory module is the app-facing observation boundary; it cannot write cognition-log entries, publish work requests, or emit utterances.
 - The speak module is the app-facing output boundary; it cannot read blackboard memo logs or allocation priority state, and cannot write cognition-log entries, allocation, memory, or attention-control requests.
