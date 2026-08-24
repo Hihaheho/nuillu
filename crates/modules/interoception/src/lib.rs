@@ -723,7 +723,7 @@ mod tests {
         RawTextTurnEvent, SharedPoolBudgetManager, SharedPoolBudgetOptions, TurnAdapter, Usage,
     };
     use nuillu_blackboard::{Blackboard, Bpm, linear_ratio_fn};
-    use nuillu_module::ports::{NoopCognitionLogRepository, SystemClock};
+    use nuillu_module::ports::{FixedClock, NoopCognitionLogRepository, SystemClock};
     use nuillu_module::{
         CapabilityProviderPorts, CapabilityProviders, LlmConcurrencyLimiter, LutumTiers,
         ModuleRegistry, SessionCompactionPolicy, SessionCompactionRuntime,
@@ -1220,7 +1220,7 @@ mod tests {
                 ModelTier::Cheap,
                 SessionCompactionPolicy::default(),
             ),
-            now,
+            Rc::new(FixedClock::new(now)),
         )
     }
 

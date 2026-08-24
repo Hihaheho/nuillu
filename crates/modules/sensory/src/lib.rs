@@ -1200,7 +1200,7 @@ mod tests {
     use nuillu_blackboard::{
         ActivationRatio, Blackboard, BlackboardCommand, Bpm, ResourceAllocation, linear_ratio_fn,
     };
-    use nuillu_module::ports::{NoopCognitionLogRepository, SystemClock};
+    use nuillu_module::ports::{FixedClock, NoopCognitionLogRepository, SystemClock};
     use nuillu_module::{
         CapabilityProviderConfig, CapabilityProviderPorts, CapabilityProviderRuntime,
         CapabilityProviders, LutumTiers, ModuleRegistry, Participant, RuntimePolicy,
@@ -1556,7 +1556,7 @@ mod tests {
                 nuillu_types::ModelTier::Cheap,
                 SessionCompactionPolicy::default(),
             ),
-            now,
+            Rc::new(FixedClock::new(now)),
         )
     }
 

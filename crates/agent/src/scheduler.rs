@@ -2608,7 +2608,7 @@ async fn activate_with_retries(
                     ModelTier::Default,
                     runtime.session_compaction_policy(),
                 ),
-                runtime.clock().now(),
+                runtime.clock(),
             ),
             owner.clone(),
         );

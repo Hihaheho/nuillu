@@ -408,7 +408,7 @@ mod tests {
         SharedPoolBudgetManager, SharedPoolBudgetOptions, Usage,
     };
     use nuillu_blackboard::{Blackboard, BlackboardCommand, Bpm, MemoryMetaPatch, ModulePolicy};
-    use nuillu_module::ports::{NoopCognitionLogRepository, PortError, SystemClock};
+    use nuillu_module::ports::{FixedClock, NoopCognitionLogRepository, PortError, SystemClock};
     use nuillu_module::{
         ActivateCx, CapabilityProviderConfig, CapabilityProviderPorts, CapabilityProviderRuntime,
         CapabilityProviders, InteroceptiveUpdated, LlmConcurrencyLimiter, LutumTiers,
@@ -478,7 +478,7 @@ mod tests {
                 ModelTier::Cheap,
                 SessionCompactionPolicy::default(),
             ),
-            now,
+            Rc::new(FixedClock::new(now)),
         )
     }
 

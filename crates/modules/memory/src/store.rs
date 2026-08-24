@@ -988,19 +988,7 @@ mod tests {
     use std::{cell::RefCell, collections::BTreeMap};
 
     use super::*;
-    use nuillu_module::ports::Clock;
-
-    #[derive(Debug)]
-    struct FixedClock(DateTime<Utc>);
-
-    #[async_trait(?Send)]
-    impl Clock for FixedClock {
-        fn now(&self) -> DateTime<Utc> {
-            self.0
-        }
-
-        async fn sleep_until(&self, _deadline: DateTime<Utc>) {}
-    }
+    use nuillu_module::ports::FixedClock;
 
     #[derive(Clone)]
     struct StaticMemoryStore {
@@ -1371,7 +1359,7 @@ mod tests {
             Rc::new(store.clone()),
             Vec::new(),
             blackboard,
-            Rc::new(FixedClock(now)),
+            Rc::new(FixedClock::new(now)),
         );
 
         let record = writer
@@ -1407,7 +1395,7 @@ mod tests {
             Rc::new(store.clone()),
             Vec::new(),
             blackboard,
-            Rc::new(FixedClock(now)),
+            Rc::new(FixedClock::new(now)),
         );
 
         let record = writer
@@ -1446,7 +1434,7 @@ mod tests {
             Rc::new(store.clone()),
             Vec::new(),
             blackboard,
-            Rc::new(FixedClock(now)),
+            Rc::new(FixedClock::new(now)),
         );
 
         let record = writer
@@ -1504,7 +1492,7 @@ mod tests {
             Rc::new(store.clone()),
             Vec::new(),
             blackboard.clone(),
-            Rc::new(FixedClock(now)),
+            Rc::new(FixedClock::new(now)),
         );
 
         let record = writer
@@ -1558,7 +1546,7 @@ mod tests {
             Rc::new(store.clone()),
             Vec::new(),
             blackboard,
-            Rc::new(FixedClock(now)),
+            Rc::new(FixedClock::new(now)),
         );
 
         let source = MemoryIndex::new("source-memory");
@@ -1594,7 +1582,7 @@ mod tests {
                 record: record.clone(),
             }),
             blackboard.clone(),
-            Rc::new(FixedClock(record.stored_at)),
+            Rc::new(FixedClock::new(record.stored_at)),
         );
 
         let hits = retriever.search("alpha", 1).await.unwrap();
@@ -1617,7 +1605,7 @@ mod tests {
                 record: record.clone(),
             }),
             blackboard.clone(),
-            Rc::new(FixedClock(now)),
+            Rc::new(FixedClock::new(now)),
         );
         let target = MemoryUsageTarget::from(&record);
 

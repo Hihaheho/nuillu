@@ -276,7 +276,7 @@ mod tests {
     use nuillu_blackboard::{
         Blackboard, BlackboardCommand, Bpm, CognitionLogEntry, CognitionLogOrigin, ModulePolicy,
     };
-    use nuillu_module::ports::{NoopCognitionLogRepository, SystemClock};
+    use nuillu_module::ports::{FixedClock, NoopCognitionLogRepository, SystemClock};
     use nuillu_module::{
         CapabilityProviderPorts, CapabilityProviders, CognitionLogUpdated, LlmConcurrencyLimiter,
         LutumTiers, ModuleRegistry, SessionCompactionPolicy, SessionCompactionRuntime,
@@ -330,7 +330,7 @@ mod tests {
                 ModelTier::Cheap,
                 SessionCompactionPolicy::default(),
             ),
-            now,
+            Rc::new(FixedClock::new(now)),
         )
     }
 

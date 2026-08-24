@@ -414,11 +414,7 @@ impl MemoryModule {
         inserted_this_activation: &HashSet<MemoryIndex>,
     ) -> Result<()> {
         let candidates = self
-            .related_memory_candidates_for_new_memory(
-                new_memory,
-                cx.now(),
-                inserted_this_activation,
-            )
+            .related_memory_candidates_for_new_memory(new_memory, cx, inserted_this_activation)
             .await?;
         if candidates.is_empty() {
             return Ok(());
@@ -535,7 +531,7 @@ impl MemoryModule {
     async fn related_memory_candidates_for_new_memory(
         &self,
         new_memory: &MemoryRecord,
-        now: chrono::DateTime<chrono::Utc>,
+        cx: &nuillu_module::ActivateCx<'_>,
         excluded_indexes: &HashSet<MemoryIndex>,
     ) -> Result<Vec<RelatedMemoryCandidate>> {
         let mut seen = HashSet::new();
@@ -548,6 +544,7 @@ impl MemoryModule {
             .search(new_memory.content.as_str(), search_limit)
             .await
             .context("search related memory candidates")?;
+        let now = cx.now();
         for hit in hits {
             if excluded_indexes.contains(&hit.index) || !seen.insert(hit.index.clone()) {
                 continue;
@@ -788,7 +785,7 @@ mod tests {
         RawTextTurnEvent, SharedPoolBudgetManager, SharedPoolBudgetOptions, TurnAdapter, Usage,
     };
     use nuillu_blackboard::{ActivationRatio, Blackboard, Bpm, ModulePolicy, linear_ratio_fn};
-    use nuillu_module::ports::{NoopCognitionLogRepository, PortError, SystemClock};
+    use nuillu_module::ports::{FixedClock, NoopCognitionLogRepository, PortError, SystemClock};
     use nuillu_module::{
         CapabilityProviderPorts, CapabilityProviders, CognitionLogUpdated, LlmConcurrencyLimiter,
         LutumTiers, MemoUpdated, ModuleRegistry, SessionCompactionPolicy, SessionCompactionRuntime,
@@ -1093,7 +1090,7 @@ mod tests {
                 ModelTier::Cheap,
                 SessionCompactionPolicy::default(),
             ),
-            now,
+            Rc::new(FixedClock::new(now)),
         )
     }
 

@@ -1359,7 +1359,7 @@ mod tests {
             &identity_memories,
             &[],
             compaction,
-            SystemClock.now(),
+            Rc::new(SystemClock),
         );
 
         source_memo
@@ -1410,7 +1410,7 @@ mod tests {
             &identity_memories,
             &[],
             compaction,
-            SystemClock.now(),
+            Rc::new(SystemClock),
         );
 
         source_memo.write("Speech needs a response.").await;
@@ -1447,7 +1447,7 @@ mod tests {
             &identity_memories,
             &[],
             compaction,
-            SystemClock.now(),
+            Rc::new(SystemClock),
         );
         let requests = [AttentionControlRequest::new("answer after checking memory")];
 
@@ -1553,7 +1553,7 @@ mod tests {
             &identity_memories,
             &[],
             compaction.clone(),
-            SystemClock.now(),
+            Rc::new(SystemClock),
         );
 
         fixture.source_memo.write("sensory memo A").await;

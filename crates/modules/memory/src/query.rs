@@ -525,7 +525,7 @@ impl QueryMemoryModule {
                 let planned_searches = normalize_plan(call.input.clone())?;
 
                 let retrieval = self
-                    .execute_planned_searches(&planned_searches, cx.now())
+                    .execute_planned_searches(&planned_searches, cx)
                     .await
                     .context("execute planned memory searches")?;
                 let had_any_evidence = retrieval.has_evidence();
@@ -615,7 +615,7 @@ impl QueryMemoryModule {
     async fn execute_planned_searches(
         &self,
         searches: &[PlannedMemorySearch],
-        now: DateTime<Utc>,
+        cx: &nuillu_module::ActivateCx<'_>,
     ) -> Result<QueryMemoryRetrieval> {
         let mut retrieval = QueryMemoryRetrieval::default();
         let mut seen_hits = HashSet::new();
@@ -628,7 +628,7 @@ impl QueryMemoryModule {
                         query: search.query.clone(),
                         limit: search.limit,
                     },
-                    now,
+                    cx,
                 )
                 .await
                 .context("run planned memory search")?;
@@ -668,7 +668,7 @@ impl QueryMemoryModule {
                     FetchLinkedMemoriesArgs {
                         memory_indexes: linked_seed_indexes,
                     },
-                    now,
+                    cx,
                 )
                 .await
                 .context("fetch linked memories for planned search")?;
@@ -859,7 +859,7 @@ impl QueryMemoryModule {
     async fn search_memory(
         &self,
         args: SearchMemoryArgs,
-        now: DateTime<Utc>,
+        cx: &nuillu_module::ActivateCx<'_>,
     ) -> Result<SearchMemoryOutput> {
         let limit = args.limit.clamp(1, 16);
         let records = self
@@ -867,6 +867,7 @@ impl QueryMemoryModule {
             .search(&args.query, limit)
             .await
             .context("search memory")?;
+        let now = cx.now();
         let mut hits = Vec::with_capacity(records.len());
         for record in records {
             let linked_neighbor_count = self
@@ -902,7 +903,7 @@ impl QueryMemoryModule {
     async fn fetch_linked_memories(
         &self,
         args: FetchLinkedMemoriesArgs,
-        now: DateTime<Utc>,
+        cx: &nuillu_module::ActivateCx<'_>,
     ) -> Result<FetchLinkedMemoriesOutput> {
         let records = self
             .linked_memory
@@ -915,6 +916,7 @@ impl QueryMemoryModule {
             })
             .await
             .context("fetch linked memory")?;
+        let now = cx.now();
         Ok(FetchLinkedMemoriesOutput {
             hits: records
                 .into_iter()
@@ -1298,7 +1300,9 @@ mod tests {
     use nuillu_blackboard::{
         ActivationRatio, Blackboard, Bpm, ModulePolicy, TypedMemoLogRecord, linear_ratio_fn,
     };
-    use nuillu_module::ports::{NoopCognitionLogRepository, PortError, SystemClock};
+    use nuillu_module::ports::{
+        Clock, FixedClock, NoopCognitionLogRepository, PortError, SystemClock,
+    };
     use nuillu_module::{
         CapabilityProviderPorts, CapabilityProviders, CognitionLogUpdated, LlmConcurrencyLimiter,
         LutumTiers, ModuleRegistry, SessionCompactionPolicy, SessionCompactionRuntime,
@@ -1363,6 +1367,17 @@ mod tests {
         records: RefCell<Vec<MemoryRecord>>,
         linked_records: RefCell<Vec<LinkedMemoryRecord>>,
         next_index: Cell<u64>,
+    }
+
+    struct MutableClock(Cell<DateTime<Utc>>);
+
+    #[async_trait(?Send)]
+    impl Clock for MutableClock {
+        fn now(&self) -> DateTime<Utc> {
+            self.0.get()
+        }
+
+        async fn sleep_until(&self, _deadline: DateTime<Utc>) {}
     }
 
     #[async_trait(?Send)]
@@ -1655,6 +1670,13 @@ mod tests {
     }
 
     fn activate_cx(lutum: &Lutum) -> nuillu_module::ActivateCx<'static> {
+        activate_cx_with_clock(lutum, Rc::new(FixedClock::new(test_now())))
+    }
+
+    fn activate_cx_with_clock(
+        lutum: &Lutum,
+        clock: Rc<dyn Clock>,
+    ) -> nuillu_module::ActivateCx<'static> {
         nuillu_module::ActivateCx::new(
             &[],
             &[],
@@ -1665,7 +1687,7 @@ mod tests {
                 ModelTier::Cheap,
                 SessionCompactionPolicy::default(),
             ),
-            test_now(),
+            clock,
         )
     }
 
@@ -1777,6 +1799,67 @@ mod tests {
         assert!(!memo.contains("stored affect"));
         assert!(!memo.contains("arousal"));
         assert!(!memo.contains("uneasy"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn search_renders_memory_against_live_time_not_activation_start() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let adapter = Arc::new(CapturingAdapter::new(
+                    MockLlmAdapter::new()
+                        .with_text_scenario(plan_scenario(
+                            "during activation",
+                            serde_json::json!([]),
+                        ))
+                        .with_structured_scenario(filter_scenario(vec!["during-activation"])),
+                ));
+                let store = Rc::new(QueryMemoryTestStore::default());
+                let activation_started_at = test_now();
+                let retrieval_time = activation_started_at + chrono::Duration::seconds(40);
+                let mut memory = record(
+                    "during-activation",
+                    "created while the activation was waiting",
+                );
+                memory.occurred_at = Some(retrieval_time);
+                memory.stored_at = retrieval_time;
+                store.records.borrow_mut().push(memory);
+                let (blackboard, caps, memory_caps, lutum) =
+                    test_caps_with_adapter(adapter, store);
+                let mut module = build_query_module(&caps, memory_caps).await;
+                let source = ModuleInstanceId::new(builtin::cognition_gate(), ReplicaIndex::ZERO);
+                blackboard
+                    .append_cognition_log(
+                        source.clone(),
+                        nuillu_blackboard::CognitionLogEntry {
+                            at: activation_started_at,
+                            text: "Recall what happened during this activation.".to_owned(),
+                            origin: nuillu_blackboard::CognitionLogOrigin::direct(source.clone()),
+                        },
+                    )
+                    .await;
+                caps.internal_harness_io()
+                    .cognition_log_updated_mailbox()
+                    .publish(CognitionLogUpdated::EntryAppended { source })
+                    .await
+                    .unwrap();
+                let batch = module.next_batch().await.unwrap();
+                let clock = Rc::new(MutableClock(Cell::new(activation_started_at)));
+                let cx = activate_cx_with_clock(&lutum, clock.clone());
+
+                clock.0.set(retrieval_time);
+                module.activate(&cx, &batch).await.unwrap();
+
+                let memos = query_memory_memos(&blackboard).await;
+                assert_eq!(memos.len(), 1);
+                assert_eq!(
+                    memos[0].content,
+                    format!(
+                        "Retrieved memory evidence:\n<now occurred-at=\"{}\">\ncreated while the activation was waiting\n</now>",
+                        retrieval_time.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+                    )
+                );
+            })
+            .await;
     }
 
     #[tokio::test(flavor = "current_thread")]

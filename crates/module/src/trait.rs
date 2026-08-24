@@ -10,7 +10,7 @@ use lutum::{Session, Usage};
 use nuillu_blackboard::{CorePolicyRecord, IdentityMemoryRecord};
 use nuillu_types::{ModuleId, ModuleInstanceId};
 
-use crate::ports::PortError;
+use crate::ports::{Clock, PortError};
 use crate::runtime_events::{NoopRuntimeEventSink, RuntimeEventEmitter};
 use crate::session::{
     NoopSessionStore, SessionCheckpointError, SessionStore, persistent_session_metadata,
@@ -31,7 +31,7 @@ pub struct ActivateCx<'a> {
     session_store: Rc<dyn SessionStore>,
     runtime_events: RuntimeEventEmitter,
     owner: Option<ModuleInstanceId>,
-    now: DateTime<Utc>,
+    clock: Rc<dyn Clock>,
 }
 
 impl<'a> ActivateCx<'a> {
@@ -40,7 +40,7 @@ impl<'a> ActivateCx<'a> {
         identity_memories: &'a [IdentityMemoryRecord],
         core_policies: &'a [CorePolicyRecord],
         session_compaction: SessionCompactionRuntime,
-        now: DateTime<Utc>,
+        clock: Rc<dyn Clock>,
     ) -> Self {
         Self {
             peer_contexts,
@@ -50,7 +50,7 @@ impl<'a> ActivateCx<'a> {
             session_store: Rc::new(NoopSessionStore),
             runtime_events: RuntimeEventEmitter::new(Rc::new(NoopRuntimeEventSink)),
             owner: None,
-            now,
+            clock,
         }
     }
 
@@ -108,8 +108,9 @@ impl<'a> ActivateCx<'a> {
         &self.session_compaction
     }
 
+    /// Current injected wall-clock time at the instant of this call.
     pub fn now(&self) -> DateTime<Utc> {
-        self.now
+        self.clock.now()
     }
 
     pub async fn compact_and_save(
@@ -314,5 +315,53 @@ where
             .downcast_ref::<M::Batch>()
             .ok_or_else(|| anyhow!("module batch type mismatch"))?;
         Module::activate(self, cx, batch).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::cell::Cell;
+
+    use chrono::TimeZone as _;
+    use nuillu_types::ModelTier;
+
+    use super::*;
+    use crate::{LlmConcurrencyLimiter, SessionCompactionPolicy};
+
+    struct MutableClock(Cell<DateTime<Utc>>);
+
+    #[async_trait(?Send)]
+    impl Clock for MutableClock {
+        fn now(&self) -> DateTime<Utc> {
+            self.0.get()
+        }
+
+        async fn sleep_until(&self, _deadline: DateTime<Utc>) {}
+    }
+
+    fn compaction_runtime() -> SessionCompactionRuntime {
+        SessionCompactionRuntime::new(
+            lutum::Lutum::new(
+                Arc::new(lutum::MockLlmAdapter::new()),
+                lutum::SharedPoolBudgetManager::new(lutum::SharedPoolBudgetOptions::default()),
+            ),
+            LlmConcurrencyLimiter::new(None),
+            ModelTier::Cheap,
+            SessionCompactionPolicy::default(),
+        )
+    }
+
+    #[test]
+    fn now_tracks_the_live_clock_instead_of_the_activation_start() {
+        let started_at = Utc.with_ymd_and_hms(2026, 8, 24, 14, 11, 23).unwrap();
+        let later = Utc.with_ymd_and_hms(2026, 8, 24, 14, 12, 3).unwrap();
+        let clock = Rc::new(MutableClock(Cell::new(started_at)));
+        let cx = ActivateCx::new(&[], &[], &[], compaction_runtime(), clock.clone());
+
+        assert_eq!(cx.now(), started_at);
+
+        clock.0.set(later);
+
+        assert_eq!(cx.now(), later);
     }
 }

@@ -166,6 +166,26 @@ impl Clock for SystemClock {
     }
 }
 
+/// Clock frozen at a fixed instant, with sleeps returning immediately. Use it
+/// where an activation must observe a scripted timestamp instead of wall time.
+#[derive(Debug, Clone, Copy)]
+pub struct FixedClock(DateTime<Utc>);
+
+impl FixedClock {
+    pub fn new(now: DateTime<Utc>) -> Self {
+        Self(now)
+    }
+}
+
+#[async_trait(?Send)]
+impl Clock for FixedClock {
+    fn now(&self) -> DateTime<Utc> {
+        self.0
+    }
+
+    async fn sleep_until(&self, _deadline: DateTime<Utc>) {}
+}
+
 /// Cognition-log repository that discards appends and reports no history.
 #[derive(Debug, Default)]
 pub struct NoopCognitionLogRepository;

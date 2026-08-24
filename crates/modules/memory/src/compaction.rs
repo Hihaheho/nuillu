@@ -546,7 +546,7 @@ mod tests {
         Blackboard, BlackboardCommand, Bpm, MemoryMetaPatch, MemoryMetadata, ModulePolicy,
         linear_ratio_fn,
     };
-    use nuillu_module::ports::{NoopCognitionLogRepository, PortError, SystemClock};
+    use nuillu_module::ports::{FixedClock, NoopCognitionLogRepository, PortError, SystemClock};
     use nuillu_module::{
         ActivateCx, CapabilityProviderPorts, CapabilityProviders, InteroceptiveUpdated,
         LlmConcurrencyLimiter, LutumTiers, ModuleRegistry, SessionCompactionPolicy,
@@ -826,7 +826,7 @@ mod tests {
                 ModelTier::Default,
                 SessionCompactionPolicy::default(),
             ),
-            now,
+            Rc::new(FixedClock::new(now)),
         )
     }
 

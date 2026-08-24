@@ -392,7 +392,7 @@ mod tests {
     use chrono::{TimeZone, Utc};
     use lutum::{Lutum, MockLlmAdapter, SharedPoolBudgetManager, SharedPoolBudgetOptions};
     use nuillu_blackboard::{Blackboard, Bpm, ModulePolicy, linear_ratio_fn};
-    use nuillu_module::ports::{NoopCognitionLogRepository, PortError, SystemClock};
+    use nuillu_module::ports::{FixedClock, NoopCognitionLogRepository, PortError, SystemClock};
     use nuillu_module::{
         ActivateCx, CapabilityProviderConfig, CapabilityProviderPorts, CapabilityProviderRuntime,
         CapabilityProviders, InteroceptiveUpdated, LlmConcurrencyLimiter, LutumTiers,
@@ -462,7 +462,7 @@ mod tests {
                 ModelTier::Cheap,
                 SessionCompactionPolicy::default(),
             ),
-            now,
+            Rc::new(FixedClock::new(now)),
         )
     }
 

@@ -883,7 +883,7 @@ mod tests {
         RawStructuredTurnEvent, SharedPoolBudgetManager, SharedPoolBudgetOptions, TurnAdapter,
         Usage,
     };
-    use nuillu_module::ports::SystemClock;
+    use nuillu_module::ports::{FixedClock, SystemClock};
     use nuillu_module::{
         CapabilityProviderPorts, CapabilityProviders, LlmConcurrencyLimiter, LutumTiers,
         ModuleRegistry, SessionCompactionPolicy, SessionCompactionRuntime,
@@ -1050,7 +1050,13 @@ mod tests {
         lutum: &Lutum,
         now: chrono::DateTime<chrono::Utc>,
     ) -> nuillu_module::ActivateCx<'static> {
-        nuillu_module::ActivateCx::new(&[], &[], &[], compaction_runtime(lutum), now)
+        nuillu_module::ActivateCx::new(
+            &[],
+            &[],
+            &[],
+            compaction_runtime(lutum),
+            Rc::new(FixedClock::new(now)),
+        )
     }
 
     fn all_input_text(input: &ModelInput) -> String {

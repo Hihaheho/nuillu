@@ -710,7 +710,7 @@ mod tests {
     };
     use nuillu_blackboard::Blackboard;
     use nuillu_blackboard::IdentityMemoryRecord;
-    use nuillu_module::ports::SystemClock;
+    use nuillu_module::ports::{FixedClock, SystemClock};
     use nuillu_module::{
         CapabilityProviderPorts, CapabilityProviders, LlmConcurrencyLimiter, LutumTiers,
         ModuleRegistry, SessionCompactionPolicy, SessionCompactionRuntime,
@@ -1004,7 +1004,13 @@ mod tests {
         lutum: &Lutum,
         now: chrono::DateTime<chrono::Utc>,
     ) -> nuillu_module::ActivateCx<'static> {
-        nuillu_module::ActivateCx::new(&[], &[], &[], compaction_runtime(lutum), now)
+        nuillu_module::ActivateCx::new(
+            &[],
+            &[],
+            &[],
+            compaction_runtime(lutum),
+            Rc::new(FixedClock::new(now)),
+        )
     }
 
     fn activate_cx_with_identity<'a>(
@@ -1012,7 +1018,13 @@ mod tests {
         now: chrono::DateTime<chrono::Utc>,
         identity_memories: &'a [IdentityMemoryRecord],
     ) -> nuillu_module::ActivateCx<'a> {
-        nuillu_module::ActivateCx::new(&[], identity_memories, &[], compaction_runtime(lutum), now)
+        nuillu_module::ActivateCx::new(
+            &[],
+            identity_memories,
+            &[],
+            compaction_runtime(lutum),
+            Rc::new(FixedClock::new(now)),
+        )
     }
 
     fn all_input_text(input: &ModelInput) -> String {

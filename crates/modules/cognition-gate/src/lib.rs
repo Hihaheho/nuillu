@@ -1314,7 +1314,7 @@ mod tests {
             &identity_memories,
             &[],
             compaction_runtime(&lutum),
-            SystemClock.now(),
+            Rc::new(SystemClock),
         );
         fixture
             .gate
@@ -1375,7 +1375,7 @@ mod tests {
             &identity_memories,
             &[],
             compaction_runtime(&lutum),
-            SystemClock.now(),
+            Rc::new(SystemClock),
         );
         fixture
             .gate
@@ -1427,7 +1427,7 @@ mod tests {
             &identity_memories,
             &[],
             compaction_runtime(&lutum),
-            SystemClock.now(),
+            Rc::new(SystemClock),
         );
 
         let batch = batch_from_candidates(&candidates);
@@ -1577,7 +1577,7 @@ mod tests {
             &identity_memories,
             &[],
             compaction_runtime(&lutum),
-            SystemClock.now(),
+            Rc::new(SystemClock),
         );
 
         let batch = next_gate_batch(&mut fixture).await;
@@ -1613,7 +1613,7 @@ mod tests {
             &identity_memories,
             &[],
             compaction_runtime(&lutum),
-            SystemClock.now(),
+            Rc::new(SystemClock),
         );
 
         let batch = next_gate_batch(&mut fixture).await;
@@ -1659,7 +1659,7 @@ mod tests {
             &identity_memories,
             &[],
             compaction_runtime(&lutum),
-            SystemClock.now(),
+            Rc::new(SystemClock),
         );
 
         let batch = CognitionGateBatch {
@@ -1708,7 +1708,7 @@ mod tests {
             &identity_memories,
             &[],
             compaction_runtime(&lutum),
-            SystemClock.now(),
+            Rc::new(SystemClock),
         );
         let err = fixture
             .gate
@@ -1925,7 +1925,7 @@ mod tests {
             &identity_memories,
             &[],
             compaction_runtime(&lutum),
-            SystemClock.now(),
+            Rc::new(SystemClock),
         );
         let batch = batch_from_candidates(&candidates);
         fixture.gate.activate(&cx, &batch).await.unwrap();
@@ -1967,7 +1967,7 @@ mod tests {
             &identity_memories,
             &[],
             compaction_runtime(&lutum),
-            SystemClock.now(),
+            Rc::new(SystemClock),
         );
         fixture
             .gate
@@ -2015,7 +2015,7 @@ mod tests {
             &identity_memories,
             &[],
             compaction_runtime(&lutum),
-            SystemClock.now(),
+            Rc::new(SystemClock),
         );
         let batch = batch_from_candidates(&candidates);
         fixture.gate.activate(&cx, &batch).await.unwrap();
@@ -2052,7 +2052,7 @@ mod tests {
             &identity_memories,
             &[],
             compaction_runtime(&lutum),
-            SystemClock.now(),
+            Rc::new(SystemClock),
         );
         let batch = batch_from_candidates(&candidates);
         fixture.gate.activate(&cx, &batch).await.unwrap();
@@ -2099,7 +2099,7 @@ mod tests {
             &identity_memories,
             &[],
             compaction_runtime(&lutum),
-            SystemClock.now(),
+            Rc::new(SystemClock),
         );
 
         fixture
@@ -2182,7 +2182,7 @@ mod tests {
             &identity_memories,
             &[],
             compaction_runtime(&lutum),
-            SystemClock.now(),
+            Rc::new(SystemClock),
         );
 
         fixture
@@ -2252,7 +2252,7 @@ mod tests {
             &identity_memories,
             &[],
             compaction_runtime(&lutum),
-            SystemClock.now(),
+            Rc::new(SystemClock),
         );
         let batch = batch_from_candidates(&candidates);
         fixture.gate.activate(&cx, &batch).await.unwrap();
@@ -2295,7 +2295,7 @@ mod tests {
             &identity_memories,
             &[],
             compaction_runtime(&lutum),
-            SystemClock.now(),
+            Rc::new(SystemClock),
         );
 
         let batch = batch_from_candidates(&candidates);
@@ -2386,7 +2386,7 @@ mod tests {
             &identity_memories,
             &[],
             compaction_runtime(&lutum),
-            SystemClock.now(),
+            Rc::new(SystemClock),
         );
 
         let first_batch = batch_from_candidates(&candidates[..4]);
@@ -2460,7 +2460,7 @@ mod tests {
             &identity_memories,
             &[],
             compaction_runtime(&lutum),
-            SystemClock.now(),
+            Rc::new(SystemClock),
         );
 
         let first_batch = batch_from_candidates(&first_candidates);
@@ -2657,7 +2657,7 @@ mod tests {
             &identity_memories,
             &[],
             compaction_runtime(&lutum),
-            SystemClock.now(),
+            Rc::new(SystemClock),
         );
 
         let batch = batch_from_candidates(&candidates);

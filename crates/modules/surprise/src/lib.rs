@@ -662,7 +662,7 @@ mod tests {
                 nuillu_types::ModelTier::Cheap,
                 SessionCompactionPolicy::default(),
             ),
-            SystemClock.now(),
+            Rc::new(SystemClock),
         )
     }
 

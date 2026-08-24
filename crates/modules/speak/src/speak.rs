@@ -660,7 +660,9 @@ mod tests {
         ActivationRatio, Blackboard, BlackboardCommand, CognitionLogEntry, CognitionLogOrigin,
         IdentityMemoryRecord, ResourceAllocation,
     };
-    use nuillu_module::ports::{Clock, NoopCognitionLogRepository, PortError, SystemClock};
+    use nuillu_module::ports::{
+        Clock, FixedClock, NoopCognitionLogRepository, PortError, SystemClock,
+    };
     use nuillu_module::{
         CapabilityProviderPorts, CapabilityProviders, CognitionLogUpdated, LutumTiers,
         ModuleRegistry, Participant,
@@ -1038,7 +1040,7 @@ mod tests {
                 nuillu_types::ModelTier::Cheap,
                 policy,
             ),
-            now,
+            Rc::new(FixedClock::new(now)),
         )
     }
 
@@ -1473,7 +1475,6 @@ mod tests {
             occurred_at: None,
         }];
         let compaction_lutum = module.planning_llm.lutum().await;
-        let clock = SystemClock;
         let cx = nuillu_module::ActivateCx::new(
             &catalog,
             &identity_memories,
@@ -1484,7 +1485,7 @@ mod tests {
                 nuillu_types::ModelTier::Cheap,
                 nuillu_module::SessionCompactionPolicy::default(),
             ),
-            clock.now(),
+            Rc::new(SystemClock),
         );
         SpeakModule::activate(&mut module, &cx, &batch)
             .await

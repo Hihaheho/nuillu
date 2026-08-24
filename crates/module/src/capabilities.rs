@@ -2724,7 +2724,7 @@ mod tests {
         );
         let runtime = caps.runtime_control();
         let cx = runtime.with_session_checkpoint_runtime(
-            crate::ActivateCx::new(&[], &[], &[], compaction, Utc::now()),
+            crate::ActivateCx::new(&[], &[], &[], compaction, Rc::new(SystemClock)),
             owner.clone(),
         );
 
@@ -2790,7 +2790,7 @@ mod tests {
         );
         let runtime = caps.runtime_control();
         let cx = runtime.with_session_checkpoint_runtime(
-            crate::ActivateCx::new(&[], &[], &[], compaction, Utc::now()),
+            crate::ActivateCx::new(&[], &[], &[], compaction, Rc::new(SystemClock)),
             owner.clone(),
         );
 
@@ -2830,7 +2830,7 @@ mod tests {
                 ModelTier::Cheap,
                 SessionCompactionPolicy::default(),
             ),
-            Utc::now(),
+            Rc::new(SystemClock),
         )
         .with_session_checkpoint_runtime(
             Rc::new(NoopSessionStore),
