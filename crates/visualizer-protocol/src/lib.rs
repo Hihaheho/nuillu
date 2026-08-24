@@ -77,7 +77,7 @@ impl VisualizerServerMessage {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum VisualizerClientMessage {
     Hello { version: u32 },
@@ -294,7 +294,7 @@ pub enum VisualizerEvent {
     },
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum VisualizerCommand {
     /// Re-emits the authoritative UI state for a tab after a worker or view restart.
     RequestSnapshot {
@@ -581,7 +581,7 @@ pub enum TabStatus {
     Stopped,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OneShotSensoryInput {
     pub modality: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]

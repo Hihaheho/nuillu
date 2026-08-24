@@ -2383,18 +2383,19 @@ mod tests {
         assert!(callback_called);
         let messages = response.expect("visualizer response").into_messages();
         assert_eq!(
-            messages
-                .iter()
-                .filter(|message| matches!(message, VisualizerClientMessage::Hello { .. }))
-                .count(),
-            1
+            messages,
+            vec![
+                VisualizerClientMessage::hello(),
+                VisualizerClientMessage::Command {
+                    command: VisualizerCommand::LoadMemoryRecords {
+                        tab_id: tab_id.clone(),
+                        scope: MemoryRecordScope::Latest,
+                        offset: 0,
+                        limit: crate::memories::MAIN_CHUNK_SIZE,
+                    },
+                },
+            ]
         );
-        assert!(messages.iter().any(|message| matches!(
-            message,
-            VisualizerClientMessage::Hello {
-                version: VISUALIZER_PROTOCOL_VERSION
-            }
-        )));
     }
 
     #[test]

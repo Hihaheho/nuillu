@@ -8,7 +8,7 @@ use crate::{
     time::format_jst_datetime,
 };
 
-const MAIN_CHUNK_SIZE: usize = 50;
+pub(crate) const MAIN_CHUNK_SIZE: usize = 50;
 const LINKED_CHUNK_SIZE: usize = 32;
 const LOAD_MORE_THRESHOLD_PX: f32 = 300.0;
 const LATEST_REFRESH_INTERVAL_SECS: f64 = 5.0;
