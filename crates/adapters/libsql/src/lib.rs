@@ -19,7 +19,10 @@ pub use nuillu_module::ports::Embedder;
 use nuillu_module::{
     AllocationStore, MemoLogRepository, PersistedAllocationSnapshot, PersistedMemoLogEntry,
     PersistedSessionSnapshot, SessionKey, SessionStore,
-    ports::{CognitionLogRepository, PersistedCognitionLogEntry, PortError},
+    ports::{
+        CognitionLogRepository, PersistedCognitionLogEntry, PersistedCognitionLogPageEntry,
+        PortError,
+    },
 };
 use nuillu_reward::{
     IndexedPolicy, NewPolicy, PolicyQuery, PolicyRecord, PolicySearchHit, PolicyStore,
@@ -563,6 +566,59 @@ impl CognitionLogRepository for LibsqlCognitionLogRepository {
             let origin_replica: i64 = row.get(5).map_err(map_libsql_error)?;
             let origin_memo_index: Option<i64> = row.get(6).map_err(map_libsql_error)?;
             entries.push(PersistedCognitionLogEntry {
+                source: module_instance_from_row(owner_module, owner_replica)?,
+                entry: CognitionLogEntry {
+                    at: datetime_from_millis("cognition log occurred_at", occurred_at_ms)?,
+                    text,
+                    origin: cognition_origin_from_row(
+                        origin_module,
+                        origin_replica,
+                        origin_memo_index,
+                    )?,
+                },
+            });
+        }
+        Ok(entries)
+    }
+
+    async fn page_desc(
+        &self,
+        offset: usize,
+        limit: usize,
+    ) -> Result<Vec<PersistedCognitionLogPageEntry>, PortError> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT id,
+                        owner_module,
+                        owner_replica,
+                        occurred_at_ms,
+                        text,
+                        COALESCE(origin_module, owner_module),
+                        COALESCE(origin_replica, owner_replica),
+                        origin_memo_index
+                   FROM cognition_log_entries
+                  ORDER BY id DESC
+                  LIMIT ?1 OFFSET ?2",
+                params![limit_to_i64(limit), limit_to_i64(offset)],
+            )
+            .await
+            .map_err(map_libsql_error)?;
+        let mut entries = Vec::new();
+        while let Some(row) = rows.next().await.map_err(map_libsql_error)? {
+            let id: i64 = row.get(0).map_err(map_libsql_error)?;
+            let owner_module: String = row.get(1).map_err(map_libsql_error)?;
+            let owner_replica: i64 = row.get(2).map_err(map_libsql_error)?;
+            let occurred_at_ms: i64 = row.get(3).map_err(map_libsql_error)?;
+            let text: String = row.get(4).map_err(map_libsql_error)?;
+            let origin_module: String = row.get(5).map_err(map_libsql_error)?;
+            let origin_replica: i64 = row.get(6).map_err(map_libsql_error)?;
+            let origin_memo_index: Option<i64> = row.get(7).map_err(map_libsql_error)?;
+            entries.push(PersistedCognitionLogPageEntry {
+                id,
                 source: module_instance_from_row(owner_module, owner_replica)?,
                 entry: CognitionLogEntry {
                     at: datetime_from_millis("cognition log occurred_at", occurred_at_ms)?,
@@ -6111,6 +6167,15 @@ mod tests {
                 (owner_a.clone(), owner_a, "third")
             ]
         );
+
+        let page = repo.page_desc(1, 2).await.unwrap();
+        assert_eq!(
+            page.iter()
+                .map(|record| record.entry.text.as_str())
+                .collect::<Vec<_>>(),
+            vec!["second", "first"]
+        );
+        assert!(page[0].id > page[1].id);
     }
 
     #[tokio::test]

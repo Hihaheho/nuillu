@@ -18,7 +18,7 @@ use nuillu_module::{ActionAffordance, AmbientSensoryEntry, RuntimeEvent, Sensory
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use thiserror::Error;
 
-pub const VISUALIZER_PROTOCOL_VERSION: u32 = 5;
+pub const VISUALIZER_PROTOCOL_VERSION: u32 = 6;
 pub const START_SUITE_ACTION_ID: &str = "suite:start";
 
 pub fn start_activation_action_id(tab_id: &VisualizerTabId) -> String {
@@ -207,6 +207,12 @@ pub enum VisualizerEvent {
         tab_id: VisualizerTabId,
         snapshot: BlackboardSnapshot,
     },
+    CognitionLogEntriesLoaded {
+        tab_id: VisualizerTabId,
+        offset: usize,
+        entries: Vec<PersistedCognitionEntryView>,
+        has_more: bool,
+    },
     MemoryRecordsLoaded {
         tab_id: VisualizerTabId,
         scope: MemoryRecordScope,
@@ -379,6 +385,11 @@ pub enum VisualizerCommand {
         limit: usize,
     },
     LoadLlmTranscriptTurns {
+        tab_id: VisualizerTabId,
+        offset: usize,
+        limit: usize,
+    },
+    LoadCognitionLogEntries {
         tab_id: VisualizerTabId,
         offset: usize,
         limit: usize,
@@ -1056,6 +1067,15 @@ pub struct CognitionLogView {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CognitionEntryView {
+    pub at: DateTime<Utc>,
+    pub origin: String,
+    pub text: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PersistedCognitionEntryView {
+    pub id: i64,
+    pub source: String,
     pub at: DateTime<Utc>,
     pub origin: String,
     pub text: String,
@@ -1847,6 +1867,13 @@ mod tests {
                 limit: 25,
             },
         };
+        let cognition_command = VisualizerClientMessage::Command {
+            command: VisualizerCommand::LoadCognitionLogEntries {
+                tab_id: tab_id.clone(),
+                offset: 600,
+                limit: 100,
+            },
+        };
 
         let actual: VisualizerClientMessage =
             serde_json::from_str(&serde_json::to_string(&activity_command).unwrap()).unwrap();
@@ -1856,6 +1883,18 @@ mod tests {
                 command: VisualizerCommand::LoadActivityRows {
                     offset: 200,
                     limit: 50,
+                    ..
+                },
+            }
+        ));
+        let actual: VisualizerClientMessage =
+            serde_json::from_str(&serde_json::to_string(&cognition_command).unwrap()).unwrap();
+        assert!(matches!(
+            actual,
+            VisualizerClientMessage::Command {
+                command: VisualizerCommand::LoadCognitionLogEntries {
+                    offset: 600,
+                    limit: 100,
                     ..
                 },
             }
@@ -1889,6 +1928,19 @@ mod tests {
                 turns: Vec::new(),
                 has_more: false,
             });
+        let cognition_event =
+            VisualizerServerMessage::event(VisualizerEvent::CognitionLogEntriesLoaded {
+                tab_id: VisualizerTabId::new("live"),
+                offset: 600,
+                entries: vec![PersistedCognitionEntryView {
+                    id: 42,
+                    source: "cognition-gate".to_owned(),
+                    at: Utc::now(),
+                    origin: "sensory".to_owned(),
+                    text: "noticed movement".to_owned(),
+                }],
+                has_more: true,
+            });
 
         let actual: VisualizerServerMessage =
             serde_json::from_str(&serde_json::to_string(&activity_event).unwrap()).unwrap();
@@ -1901,6 +1953,19 @@ mod tests {
                     ..
                 },
             }
+        ));
+        let actual: VisualizerServerMessage =
+            serde_json::from_str(&serde_json::to_string(&cognition_event).unwrap()).unwrap();
+        assert!(matches!(
+            actual,
+            VisualizerServerMessage::Event {
+                event: VisualizerEvent::CognitionLogEntriesLoaded {
+                    offset: 600,
+                    entries,
+                    has_more: true,
+                    ..
+                },
+            } if entries.len() == 1 && entries[0].id == 42
         ));
         let actual: VisualizerServerMessage =
             serde_json::from_str(&serde_json::to_string(&transcript_event).unwrap()).unwrap();

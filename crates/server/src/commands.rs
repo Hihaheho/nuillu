@@ -18,9 +18,10 @@ use nuillu_storage::{
 use nuillu_types::{MemoryIndex, ModuleId, ModuleInstanceId, ReplicaCapRange, ReplicaIndex};
 use nuillu_visualizer_protocol::{
     AmbientSensorySnapshotRowView, ExternalActionEventRowView, ExternalActionEventStatusView,
-    MemoryRecordScope, ModuleSettingsView, OneShotSensoryInputRowView, UtteranceEventKindView,
-    UtteranceEventRowView, VisualizerClientMessage, VisualizerCommand, VisualizerEvent,
-    VisualizerTabId, ZeroReplicaWindowView, run_runtime_action_id, stop_runtime_action_id,
+    MemoryRecordScope, ModuleSettingsView, OneShotSensoryInputRowView, PersistedCognitionEntryView,
+    UtteranceEventKindView, UtteranceEventRowView, VisualizerClientMessage, VisualizerCommand,
+    VisualizerEvent, VisualizerTabId, ZeroReplicaWindowView, run_runtime_action_id,
+    stop_runtime_action_id,
 };
 
 use crate::SERVER_TAB_ID;
@@ -529,6 +530,29 @@ async fn handle_server_visualizer_message(
             }
             false
         }
+        VisualizerCommand::LoadCognitionLogEntries {
+            tab_id: command_tab,
+            offset,
+            limit,
+        } if command_tab == *tab_id => {
+            match load_cognition_log_entries(env, offset, limit).await {
+                Ok((entries, has_more)) => {
+                    visualizer.send_event(VisualizerEvent::CognitionLogEntriesLoaded {
+                        tab_id: tab_id.clone(),
+                        offset,
+                        entries,
+                        has_more,
+                    });
+                }
+                Err(error) => {
+                    visualizer.send_event(VisualizerEvent::Log {
+                        tab_id: tab_id.clone(),
+                        message: format!("failed to load cognition log entries: {error}"),
+                    });
+                }
+            }
+            false
+        }
         VisualizerCommand::LoadMemoryRecords {
             tab_id: command_tab,
             scope,
@@ -766,6 +790,34 @@ async fn load_memory_records(
     let (records, has_more) = trim_chunk(records, limit);
     Ok((
         records.into_iter().map(memory_record_view).collect(),
+        has_more,
+    ))
+}
+
+async fn load_cognition_log_entries(
+    env: &ServerEnvironment,
+    offset: usize,
+    limit: usize,
+) -> anyhow::Result<(Vec<PersistedCognitionEntryView>, bool)> {
+    if limit == 0 {
+        return Ok((Vec::new(), false));
+    }
+    let records = env
+        .cognition_log_repository
+        .page_desc(offset, limit.saturating_add(1))
+        .await?;
+    let (records, has_more) = trim_chunk(records, limit);
+    Ok((
+        records
+            .into_iter()
+            .map(|record| PersistedCognitionEntryView {
+                id: record.id,
+                source: record.source.to_string(),
+                at: record.entry.at,
+                origin: record.entry.origin.owner.to_string(),
+                text: record.entry.text,
+            })
+            .collect(),
         has_more,
     ))
 }

@@ -48,6 +48,14 @@ pub struct PersistedCognitionLogEntry {
     pub entry: CognitionLogEntry,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct PersistedCognitionLogPageEntry {
+    /// Repository-local, monotonically increasing identity.
+    pub id: i64,
+    pub source: ModuleInstanceId,
+    pub entry: CognitionLogEntry,
+}
+
 #[async_trait(?Send)]
 pub trait CognitionLogRepository {
     async fn append(
@@ -61,6 +69,28 @@ pub trait CognitionLogRepository {
         from: DateTime<Utc>,
     ) -> Result<Vec<CognitionLogEntry>, PortError>;
     async fn recent(&self, limit: usize) -> Result<Vec<PersistedCognitionLogEntry>, PortError>;
+    /// Returns newest-first history for visualizer-style incremental loading.
+    async fn page_desc(
+        &self,
+        offset: usize,
+        limit: usize,
+    ) -> Result<Vec<PersistedCognitionLogPageEntry>, PortError> {
+        let requested = offset.saturating_add(limit);
+        let mut entries = self.recent(requested).await?;
+        entries.reverse();
+        Ok(entries
+            .into_iter()
+            .skip(offset)
+            .take(limit)
+            .enumerate()
+            .map(|(index, record)| PersistedCognitionLogPageEntry {
+                id: -i64::try_from(offset.saturating_add(index).saturating_add(1))
+                    .unwrap_or(i64::MAX),
+                source: record.source,
+                entry: record.entry,
+            })
+            .collect())
+    }
 }
 
 /// Time source plus sleep. Indirected so tests can fully inject time —

@@ -1351,7 +1351,18 @@ impl VisualizerState {
                 let tab = self.tab_mut(tab_id);
                 tab.record_snapshot_for_monitor(&snapshot);
                 modules::apply_blackboard_snapshot(&mut tab.modules, &snapshot);
+                tab.cognition.observe_snapshot(&snapshot.cognition_logs);
                 tab.blackboard = snapshot;
+            }
+            VisualizerEvent::CognitionLogEntriesLoaded {
+                tab_id,
+                offset,
+                entries,
+                has_more,
+            } => {
+                self.tab_mut(tab_id)
+                    .cognition
+                    .apply_page(offset, entries, has_more);
             }
             VisualizerEvent::MemoryRecordsLoaded {
                 tab_id,
@@ -1441,6 +1452,7 @@ pub struct RuntimeTab {
     active_simplified_module_owner: Option<String>,
     scene: chat::SceneUiState,
     blackboard: BlackboardSnapshot,
+    cognition: cognition::CognitionState,
     memories: memories::MemoriesState,
     modules: modules::ModulesState,
     llm_transcript_history: modules::LlmTranscriptHistoryState,
@@ -1501,6 +1513,7 @@ impl RuntimeTab {
             active_simplified_module_owner: None,
             scene: chat::SceneUiState::default(),
             blackboard: BlackboardSnapshot::default(),
+            cognition: cognition::CognitionState::default(),
             memories: memories::MemoriesState::default(),
             modules: modules::ModulesState::default(),
             llm_transcript_history: modules::LlmTranscriptHistoryState::default(),
@@ -1725,7 +1738,7 @@ impl RuntimeTab {
                             ui,
                             None,
                             egui::vec2(column_width, lower_height),
-                            |ui| self.render_simplified_cognition_pane_contents(ui),
+                            |ui| self.render_simplified_cognition_pane_contents(ui, messages),
                         );
                         ui.add_space(SIMPLIFIED_PANE_GAP);
                         simplified_section(
@@ -1792,7 +1805,11 @@ impl RuntimeTab {
         memories::ui(ui, &self.id, &mut self.memories, messages);
     }
 
-    fn render_simplified_cognition_pane_contents(&mut self, ui: &mut egui::Ui) {
+    fn render_simplified_cognition_pane_contents(
+        &mut self,
+        ui: &mut egui::Ui,
+        messages: &mut Vec<VisualizerClientMessage>,
+    ) {
         ui.horizontal_wrapped(|ui| {
             if ui
                 .selectable_label(
@@ -1816,7 +1833,9 @@ impl RuntimeTab {
         ui.separator();
 
         match self.simplified_cognition_pane_tab {
-            SimplifiedCognitionPaneTab::CognitionLog => self.render_cognition_contents(ui),
+            SimplifiedCognitionPaneTab::CognitionLog => {
+                self.render_cognition_contents(ui, "simplified", messages)
+            }
             SimplifiedCognitionPaneTab::Memo => {
                 let memo_filter_modules = self.memo_filter_modules();
                 memos::ui(
@@ -1829,8 +1848,13 @@ impl RuntimeTab {
         }
     }
 
-    fn render_cognition_contents(&self, ui: &mut egui::Ui) {
-        cognition::ui(ui, &self.blackboard.cognition_logs);
+    fn render_cognition_contents(
+        &mut self,
+        ui: &mut egui::Ui,
+        id_salt: &str,
+        messages: &mut Vec<VisualizerClientMessage>,
+    ) {
+        cognition::ui(ui, id_salt, &self.id, &mut self.cognition, messages);
     }
 
     fn render_modules_overview_contents(
@@ -2050,7 +2074,9 @@ impl RuntimeTab {
             .open_override(window_requests.remove(&cognition_id))
             .default_pos(1384.0, 636.0)
             .default_size(560.0, 360.0)
-            .show(ui, |ui| self.render_cognition_contents(ui));
+            .show(ui, |ui| {
+                self.render_cognition_contents(ui, "window", messages)
+            });
         self.record_window_open(cognition_id, open);
 
         let errors_id = self.errors_window_id();
@@ -2386,6 +2412,13 @@ mod tests {
             messages,
             vec![
                 VisualizerClientMessage::hello(),
+                VisualizerClientMessage::Command {
+                    command: VisualizerCommand::LoadCognitionLogEntries {
+                        tab_id: tab_id.clone(),
+                        offset: 0,
+                        limit: crate::cognition::COGNITION_CHUNK_SIZE,
+                    },
+                },
                 VisualizerClientMessage::Command {
                     command: VisualizerCommand::LoadMemoryRecords {
                         tab_id: tab_id.clone(),

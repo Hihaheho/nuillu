@@ -29,7 +29,7 @@ use nuillu_memory::{
     LinkedMemoryQuery, MemoryCapabilities, MemoryLinkDirection, MemoryLinkRelation, MemoryQuery,
     MemoryRecord, MemoryStore, NewMemoryLink,
 };
-use nuillu_module::ports::{Clock, PortError, SystemClock};
+use nuillu_module::ports::{Clock, CognitionLogRepository, PortError, SystemClock};
 use nuillu_module::{
     AmbientSensoryEntry, CapabilityProviderConfig, CapabilityProviderPorts,
     CapabilityProviderRuntime, CapabilityProviders, CognitionLogUpdated, ExternalActionExecutor,
@@ -47,10 +47,10 @@ use nuillu_types::{
 use nuillu_visualizer_protocol::{
     AllocationView, BlackboardSnapshot, CognitionEntryView, CognitionLogView, InteroceptionView,
     MemoView, MemoryMetadataView, MemoryRecordScope, MemoryRecordView, ModuleSettingsView,
-    ModuleStatusView, TabStatus, UtteranceDeltaView, UtteranceProgressView, UtteranceView,
-    VisualizerAction, VisualizerClientMessage, VisualizerCommand, VisualizerErrorView,
-    VisualizerEvent, VisualizerServerMessage, VisualizerTabId, ZeroReplicaWindowView,
-    start_activation_action_id,
+    ModuleStatusView, PersistedCognitionEntryView, TabStatus, UtteranceDeltaView,
+    UtteranceProgressView, UtteranceView, VisualizerAction, VisualizerClientMessage,
+    VisualizerCommand, VisualizerErrorView, VisualizerEvent, VisualizerServerMessage,
+    VisualizerTabId, ZeroReplicaWindowView, start_activation_action_id,
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -279,7 +279,8 @@ impl VisualizerHook {
                 | VisualizerCommand::CompleteAgentActionInvocation { tab_id, .. }
                 | VisualizerCommand::ResetModuleSessionHistory { tab_id, .. }
                 | VisualizerCommand::LoadActivityRows { tab_id, .. }
-                | VisualizerCommand::LoadLlmTranscriptTurns { tab_id, .. } => {
+                | VisualizerCommand::LoadLlmTranscriptTurns { tab_id, .. }
+                | VisualizerCommand::LoadCognitionLogEntries { tab_id, .. } => {
                     self.send_event(VisualizerEvent::Log {
                         tab_id,
                         message: "eval case is no longer running".to_string(),
@@ -2015,6 +2016,7 @@ async fn execute_full_agent_case(
     let events = env.events.clone();
     let clock = env.clock.clone();
     let memory = env.memory.clone();
+    let cognition_log_repository = env.cognition_log_repository.clone();
     let utterances = env.utterances.clone();
     let allocation_blackboard = env.blackboard.clone();
     let allow_empty_output = case.allow_empty_output;
@@ -2116,6 +2118,7 @@ async fn execute_full_agent_case(
                         Some(&sensory),
                         &allocation_blackboard,
                         memory.as_ref(),
+                        cognition_log_repository.as_ref(),
                         clock.as_ref(),
                     )
                     .await;
@@ -2394,6 +2397,7 @@ async fn execute_module_case(
     let blackboard = env.blackboard.clone();
     let utterances = env.utterances.clone();
     let memory = env.memory.clone();
+    let cognition_log_repository = env.cognition_log_repository.clone();
     let policy_store = env.policy_store.clone();
     let policy_caps_for_loop = env.policy_caps.clone();
     let memory_baseline_for_loop = memory_baseline.clone();
@@ -2456,6 +2460,7 @@ async fn execute_module_case(
                         None,
                         &blackboard,
                         memory.as_ref(),
+                        cognition_log_repository.as_ref(),
                         clock.as_ref(),
                     )
                     .await;
@@ -4033,6 +4038,7 @@ async fn handle_visualizer_commands(
     sensory: Option<&SensoryInputMailbox>,
     blackboard: &Blackboard,
     memory: &dyn MemoryStore,
+    cognition_log_repository: &dyn CognitionLogRepository,
     clock: &dyn Clock,
 ) -> VisualizerCommandOutcome {
     let mut outcome = VisualizerCommandOutcome::default();
@@ -4126,6 +4132,32 @@ async fn handle_visualizer_commands(
                     scope: scope_for_event,
                     offset,
                     records,
+                    has_more,
+                });
+            }
+            VisualizerCommand::LoadCognitionLogEntries {
+                tab_id,
+                offset,
+                limit,
+            } if tab_id.as_str() == case_id => {
+                let records = cognition_log_repository
+                    .page_desc(offset, limit.saturating_add(1))
+                    .await
+                    .unwrap_or_default();
+                let (records, has_more) = trim_visualizer_chunk(records, limit);
+                visualizer.send_event(VisualizerEvent::CognitionLogEntriesLoaded {
+                    tab_id,
+                    offset,
+                    entries: records
+                        .into_iter()
+                        .map(|record| PersistedCognitionEntryView {
+                            id: record.id,
+                            source: record.source.to_string(),
+                            at: record.entry.at,
+                            origin: record.entry.origin.owner.to_string(),
+                            text: record.entry.text,
+                        })
+                        .collect(),
                     has_more,
                 });
             }
@@ -4398,6 +4430,7 @@ pub(crate) struct EvalEnvironment {
     pub(crate) blackboard: Blackboard,
     pub(crate) caps: CapabilityProviders,
     pub(crate) memory: Rc<dyn MemoryStore>,
+    pub(crate) cognition_log_repository: Rc<dyn CognitionLogRepository>,
     pub(crate) policy_store: Rc<dyn PolicyStore>,
     pub(crate) memory_caps: MemoryCapabilities,
     pub(crate) policy_caps: PolicyCapabilities,
@@ -4480,7 +4513,8 @@ pub(crate) async fn build_eval_environment(
     let agent_store = connect_agent_store(output_dir, config).await?;
     let memory: Rc<dyn MemoryStore> = Rc::new(agent_store.memory_store());
     let policy_store: Rc<dyn PolicyStore> = Rc::new(agent_store.policy_store());
-    let cognition_log_repository = Rc::new(agent_store.cognition_log_repository());
+    let cognition_log_repository: Rc<dyn CognitionLogRepository> =
+        Rc::new(agent_store.cognition_log_repository());
     let memory_caps = MemoryCapabilities::new(
         blackboard.clone(),
         clock.clone(),
@@ -4550,7 +4584,7 @@ pub(crate) async fn build_eval_environment(
     let caps = CapabilityProviders::new(CapabilityProviderConfig {
         ports: CapabilityProviderPorts {
             blackboard: blackboard.clone(),
-            cognition_log_port: cognition_log_repository,
+            cognition_log_port: cognition_log_repository.clone(),
             clock: clock.clone(),
             tiers,
         },
@@ -4567,6 +4601,7 @@ pub(crate) async fn build_eval_environment(
         blackboard,
         caps,
         memory,
+        cognition_log_repository,
         policy_store,
         memory_caps,
         policy_caps,

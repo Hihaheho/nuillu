@@ -21,7 +21,8 @@ use nuillu_blackboard::{AllocationLimits, Blackboard};
 use nuillu_llm_trace_file::{FileLlmTraceSink, LlmLogContext};
 use nuillu_memory::{MemoryCapabilities, MemoryStore};
 use nuillu_module::ports::{
-    Clock, Embedder, PortError, SystemClock, Timer, timeout as timer_timeout,
+    Clock, CognitionLogRepository, Embedder, PortError, SystemClock, Timer,
+    timeout as timer_timeout,
 };
 use nuillu_module::{
     CapabilityProviderConfig, CapabilityProviderPorts, CapabilityProviderRuntime,
@@ -68,6 +69,7 @@ pub(super) struct ServerEnvironment {
     pub(super) memory: Rc<dyn MemoryStore>,
     pub(super) memory_caps: MemoryCapabilities,
     pub(super) policy_caps: PolicyCapabilities,
+    pub(super) cognition_log_repository: Rc<dyn CognitionLogRepository>,
     pub(super) clock: Rc<dyn Clock>,
     pub(super) utterance_sink: Rc<dyn UtteranceSink>,
     pub(super) llm_transcript_store: Arc<dyn LlmTranscriptStore>,
@@ -317,7 +319,7 @@ pub(super) async fn build_server_environment(
     let caps = CapabilityProviders::new(CapabilityProviderConfig {
         ports: CapabilityProviderPorts {
             blackboard: blackboard.clone(),
-            cognition_log_port: cognition_log_repository,
+            cognition_log_port: cognition_log_repository.clone(),
             clock: clock.clone(),
             tiers: build_tiers(
                 &config.cheap_backend,
@@ -382,6 +384,7 @@ pub(super) async fn build_server_environment(
         memory,
         memory_caps,
         policy_caps,
+        cognition_log_repository,
         clock,
         utterance_sink,
         llm_transcript_store,
