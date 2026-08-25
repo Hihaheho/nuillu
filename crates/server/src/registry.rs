@@ -79,6 +79,10 @@ impl ServerRegistryExt for ModuleRegistry {
         for group in &spec.groups {
             registration = registration.in_group(group.module_group_id());
         }
+        if let Some(sources) = &spec.memo_sources {
+            registration =
+                registration.with_memo_sources(sources.iter().map(|source| source.module_id()));
+        }
         self.register(registration, builder)
             .expect("server module registration should be unique")
     }

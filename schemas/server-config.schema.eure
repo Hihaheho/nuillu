@@ -61,6 +61,8 @@ groups = [`$types.module-group`]
 groups.$optional = true
 depends-on = [`$types.runtime-module`]
 depends-on.$optional = true
+memo-sources = [`$types.runtime-module`]
+memo-sources.$optional = true
 sessions = [`$types.server-module-session`]
 sessions.$optional = true
 

@@ -159,6 +159,11 @@ pub struct ServerModuleSpec {
     pub groups: Vec<ServerModuleGroup>,
     #[eure(default)]
     pub depends_on: Vec<RuntimeModule>,
+    /// Module roles whose memo updates this module observes. Omitting the key
+    /// keeps the default of every role; an explicit empty list subscribes to
+    /// none. Every listed role must also be registered in this config.
+    #[eure(default)]
+    pub memo_sources: Option<Vec<RuntimeModule>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, FromEure)]
@@ -557,6 +562,30 @@ impl ServerBootConfig {
                 );
             }
             module.validate(path)?;
+        }
+        for module in &self.modules {
+            let Some(sources) = &module.memo_sources else {
+                continue;
+            };
+            let mut seen_sources = HashSet::new();
+            for source in sources {
+                if !seen_sources.insert(*source) {
+                    anyhow::bail!(
+                        "server config {} declares memo source {} for module {} more than once",
+                        path.display(),
+                        source.as_str(),
+                        module.id.as_str()
+                    );
+                }
+                if !seen.contains(source) {
+                    anyhow::bail!(
+                        "server config {} declares unknown memo source {} for module {}",
+                        path.display(),
+                        source.as_str(),
+                        module.id.as_str()
+                    );
+                }
+            }
         }
         validate_config_actions(&self.action_affordances(), path)?;
         Ok(())
@@ -982,6 +1011,7 @@ fn module_spec<const G: usize, const D: usize>(
         sessions: Vec::new(),
         groups: groups.to_vec(),
         depends_on: depends_on.to_vec(),
+        memo_sources: None,
     }
 }
 
@@ -1180,6 +1210,7 @@ activation-table = [1.0, 0.5]
   initial-activation = 0.0
   groups = ["voluntary", "sleep-suppressed"]
   depends-on = ["cognition-gate"]
+  memo-sources = ["sensory"]
 
   @ sessions[] {
     key = "planning"
@@ -1211,6 +1242,57 @@ activation-table = [1.0, 0.5]
         assert_eq!(
             config.modules[1].depends_on,
             vec![RuntimeModule::CognitionGate]
+        );
+        assert_eq!(
+            config.modules[1].memo_sources,
+            Some(vec![RuntimeModule::Sensory])
+        );
+        assert_eq!(config.modules[0].memo_sources, None);
+    }
+
+    #[test]
+    fn parse_server_boot_config_preserves_empty_memo_sources() {
+        let config = parse_server_boot_config_content(
+            r#"
+@ modules[] {
+  id = "self-model"
+  replica-min = 0
+  replica-max = 1
+  bpm-min = 3.0
+  bpm-max = 6.0
+  initial-activation = 0.0
+  memo-sources = []
+}
+"#,
+            Path::new(".tmp/server/config.eure"),
+        )
+        .unwrap();
+
+        assert_eq!(config.modules[0].memo_sources, Some(Vec::new()));
+    }
+
+    #[test]
+    fn parse_server_boot_config_rejects_unknown_memo_source() {
+        let error = parse_server_boot_config_content(
+            r#"
+@ modules[] {
+  id = "self-model"
+  replica-min = 0
+  replica-max = 1
+  bpm-min = 3.0
+  bpm-max = 6.0
+  initial-activation = 0.0
+  memo-sources = ["query-memory"]
+}
+"#,
+            Path::new(".tmp/server/config.eure"),
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(
+            error.contains("unknown memo source query-memory for module self-model"),
+            "{error}"
         );
     }
 

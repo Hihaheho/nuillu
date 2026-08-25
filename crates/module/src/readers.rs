@@ -17,6 +17,8 @@ use nuillu_blackboard::{
 };
 use nuillu_types::{MemoryIndex, ModuleId, ModuleInstanceId};
 
+use crate::MemoSubscription;
+
 type MemoCursor = HashMap<ModuleInstanceId, u64>;
 type SharedMemoCursor = Rc<tokio::sync::Mutex<MemoCursor>>;
 type SharedCognitionCursor = Rc<tokio::sync::Mutex<Option<u64>>>;
@@ -61,6 +63,7 @@ pub struct BlackboardReader {
     owner: Option<ModuleInstanceId>,
     last_seen_memo_indices: Arc<Mutex<MemoCursor>>,
     role_cursors: Option<(ModuleId, RoleReaderCursors)>,
+    memo_subscription: MemoSubscription,
 }
 
 impl BlackboardReader {
@@ -70,6 +73,7 @@ impl BlackboardReader {
             owner: None,
             last_seen_memo_indices: Arc::new(Mutex::new(HashMap::new())),
             role_cursors: None,
+            memo_subscription: MemoSubscription::All,
         }
     }
 
@@ -77,12 +81,14 @@ impl BlackboardReader {
         blackboard: Blackboard,
         owner: ModuleInstanceId,
         role_cursors: RoleReaderCursors,
+        memo_subscription: MemoSubscription,
     ) -> Self {
         Self {
             blackboard,
             owner: Some(owner.clone()),
             last_seen_memo_indices: Arc::new(Mutex::new(HashMap::new())),
             role_cursors: Some((owner.module, role_cursors)),
+            memo_subscription,
         }
     }
 
@@ -151,7 +157,9 @@ impl BlackboardReader {
         };
         records
             .into_iter()
-            .filter(|record| record.owner != *owner)
+            .filter(|record| {
+                record.owner != *owner && self.memo_subscription.accepts(&record.owner.module)
+            })
             .collect()
     }
 }
@@ -489,6 +497,7 @@ mod tests {
             blackboard.clone(),
             self_owner.clone(),
             RoleReaderCursors::default(),
+            MemoSubscription::All,
         );
 
         blackboard
@@ -523,6 +532,54 @@ mod tests {
                 .map(|record| (record.owner.clone(), record.content.as_str()))
                 .collect::<Vec<_>>(),
             vec![(sensory, "new sensory evidence")]
+        );
+    }
+
+    #[tokio::test]
+    async fn scoped_blackboard_reader_filters_memo_sources_from_unread_and_recent() {
+        let blackboard = Blackboard::default();
+        let self_owner = ModuleInstanceId::new(builtin::self_model(), ReplicaIndex::ZERO);
+        let sensory = ModuleInstanceId::new(builtin::sensory(), ReplicaIndex::ZERO);
+        let query_memory = ModuleInstanceId::new(builtin::query_memory(), ReplicaIndex::ZERO);
+        let reader = BlackboardReader::new_for_owner_with_role_cursors(
+            blackboard.clone(),
+            self_owner,
+            RoleReaderCursors::default(),
+            MemoSubscription::only([builtin::query_memory()]),
+        );
+
+        blackboard
+            .update_memo(
+                sensory,
+                "current external scene".into(),
+                Utc.timestamp_opt(0, 0).unwrap(),
+            )
+            .await;
+        blackboard
+            .update_memo(
+                query_memory.clone(),
+                "retrieved identity evidence".into(),
+                Utc.timestamp_opt(1, 0).unwrap(),
+            )
+            .await;
+
+        let unread = reader.unread_memo_logs().await;
+        assert_eq!(
+            unread
+                .iter()
+                .map(|record| (record.owner.clone(), record.content.as_str()))
+                .collect::<Vec<_>>(),
+            vec![(query_memory.clone(), "retrieved identity evidence")]
+        );
+        assert!(reader.unread_memo_logs().await.is_empty());
+        assert_eq!(
+            reader
+                .recent_memo_logs()
+                .await
+                .into_iter()
+                .map(|record| record.owner)
+                .collect::<Vec<_>>(),
+            vec![query_memory]
         );
     }
 

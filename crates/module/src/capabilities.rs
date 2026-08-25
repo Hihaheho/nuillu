@@ -39,11 +39,11 @@ use crate::{
     CognitionLogUpdatedInbox, CognitionLogUpdatedMailbox, CognitionWriter, ExternalActionExecutor,
     ExternalActionInvoker, InteroceptionRuntimePolicy, InteroceptiveReader, InteroceptiveUpdated,
     InteroceptiveUpdatedInbox, InteroceptiveUpdatedMailbox, InteroceptiveWriter, LlmAccess, Memo,
-    MemoLogEvictedInbox, MemoLogEvictedMailbox, MemoLogRepository, MemoUpdated, MemoUpdatedInbox,
-    MemoUpdatedMailbox, MemoryMetadataReader, Module, ModuleBatch, ModuleStatusReader,
-    NoopAllocationStore, NoopExternalActionExecutor, NoopMemoLogRepository, PersistedMemoLogEntry,
-    SensoryInput, SensoryInputInbox, SensoryInputMailbox, SessionCompactionPolicy, StaticModule,
-    TimeDivision, TopicInbox, TopicMailbox, TypedMemo,
+    MemoLogEvictedInbox, MemoLogEvictedMailbox, MemoLogRepository, MemoSubscription, MemoUpdated,
+    MemoUpdatedInbox, MemoUpdatedMailbox, MemoryMetadataReader, Module, ModuleBatch,
+    ModuleStatusReader, NoopAllocationStore, NoopExternalActionExecutor, NoopMemoLogRepository,
+    PersistedMemoLogEntry, SensoryInput, SensoryInputInbox, SensoryInputMailbox,
+    SessionCompactionPolicy, StaticModule, TimeDivision, TopicInbox, TopicMailbox, TypedMemo,
 };
 
 /// Immutable boot-time description of one registered module role.
@@ -56,6 +56,7 @@ pub struct ModuleRegistrationSpec {
     initial_activation: ActivationRatio,
     groups: BTreeSet<ModuleGroupId>,
     dependencies: Vec<ModuleId>,
+    memo_subscription: MemoSubscription,
 }
 
 impl ModuleRegistrationSpec {
@@ -73,6 +74,7 @@ impl ModuleRegistrationSpec {
             initial_activation,
             groups: BTreeSet::new(),
             dependencies: Vec::new(),
+            memo_subscription: MemoSubscription::All,
         }
     }
 
@@ -114,6 +116,11 @@ impl ModuleRegistrationSpec {
         self
     }
 
+    pub fn with_memo_sources(mut self, sources: impl IntoIterator<Item = ModuleId>) -> Self {
+        self.memo_subscription = MemoSubscription::only(sources);
+        self
+    }
+
     pub fn module(&self) -> &ModuleId {
         &self.module
     }
@@ -141,6 +148,10 @@ impl ModuleRegistrationSpec {
     pub fn dependencies(&self) -> &[ModuleId] {
         &self.dependencies
     }
+
+    pub fn memo_subscription(&self) -> &MemoSubscription {
+        &self.memo_subscription
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -154,6 +165,7 @@ struct ModuleCatalogEntry {
     bpm_range_bits: (u64, u64),
     activation_curve_bits: [(u64, u64); 3],
     zero_replica_window: ZeroReplicaWindowPolicy,
+    memo_subscription: MemoSubscription,
 }
 
 /// Immutable catalog of the module roles registered in one agent environment.
@@ -193,6 +205,7 @@ impl ModuleCatalog {
                         curve_at(ActivationRatio::ONE),
                     ],
                     zero_replica_window: policy.zero_replica_window,
+                    memo_subscription: registration.spec.memo_subscription.clone(),
                 }
             })
             .collect::<Vec<_>>();
@@ -530,11 +543,24 @@ impl CapabilityProviders {
         &self.inner.scene
     }
 
+    /// Test-only unscoped factory. Production wiring goes through
+    /// [`Self::scoped_with_memo_subscription`] so a module never silently
+    /// loses the memo scope its registration declared.
+    #[cfg(test)]
     pub(crate) fn scoped(&self, owner: ModuleInstanceId) -> ModuleCapabilityFactory {
+        self.scoped_with_memo_subscription(owner, MemoSubscription::All)
+    }
+
+    fn scoped_with_memo_subscription(
+        &self,
+        owner: ModuleInstanceId,
+        memo_subscription: MemoSubscription,
+    ) -> ModuleCapabilityFactory {
         ModuleCapabilityFactory {
             owner,
             root: self.clone(),
             memo_issued: Rc::new(Cell::new(false)),
+            memo_subscription,
         }
     }
 
@@ -1074,6 +1100,7 @@ pub struct ModuleCapabilityFactory {
     // Memo is the only single-issued capability: typed memo safety relies on
     // one payload type per module owner.
     memo_issued: Rc<Cell<bool>>,
+    memo_subscription: MemoSubscription,
 }
 
 impl ModuleCapabilityFactory {
@@ -1148,12 +1175,13 @@ impl ModuleCapabilityFactory {
 
     pub fn memo_updated_inbox(&self) -> MemoUpdatedInbox {
         let role_reader_cursors = self.root.inner.role_reader_cursors.clone();
-        TopicInbox::new_excluding_self_with_round_robin_hook(
+        TopicInbox::new_excluding_self_with_round_robin_hook_and_sources(
             self.owner.clone(),
             self.root.inner.memo_updates.clone(),
             Some(Rc::new(move |role| {
                 role_reader_cursors.enable_memo_round_robin(role);
             })),
+            self.memo_subscription.clone(),
         )
     }
 
@@ -1254,6 +1282,7 @@ impl ModuleCapabilityFactory {
             self.root.inner.blackboard.clone(),
             self.owner.clone(),
             self.root.inner.role_reader_cursors.clone(),
+            self.memo_subscription.clone(),
         )
     }
 
@@ -1458,6 +1487,9 @@ pub struct AllocatedModule {
     owner: ModuleInstanceId,
     caps: CapabilityProviders,
     builder: ErasedModuleBuilder,
+    // Kept so a restart rebuilds the module with the boot-time memo scope
+    // instead of silently widening it back to every module role.
+    memo_subscription: MemoSubscription,
     module: Box<dyn ErasedModule>,
 }
 
@@ -1466,12 +1498,14 @@ impl AllocatedModule {
         owner: ModuleInstanceId,
         caps: CapabilityProviders,
         builder: ErasedModuleBuilder,
+        memo_subscription: MemoSubscription,
         module: Box<dyn ErasedModule>,
     ) -> Self {
         Self {
             owner,
             caps,
             builder,
+            memo_subscription,
             module,
         }
     }
@@ -1481,7 +1515,9 @@ impl AllocatedModule {
     }
 
     pub async fn restart(&mut self) -> Result<(), ModuleRegistryError> {
-        let scoped = self.caps.scoped(self.owner.clone());
+        let scoped = self
+            .caps
+            .scoped_with_memo_subscription(self.owner.clone(), self.memo_subscription.clone());
         self.module = (self.builder)(scoped).await?;
         Ok(())
     }
@@ -1710,6 +1746,7 @@ impl ModuleRegistry {
         &self,
         caps: &CapabilityProviders,
     ) -> Result<AllocatedModules, ModuleRegistryError> {
+        self.validate_memo_subscriptions()?;
         let dependencies = self.compile_dependencies()?;
         let catalog = ModuleCatalog::from_registrations(&self.registrations, &self.dependencies);
         caps.install_module_catalog(catalog)?;
@@ -1761,11 +1798,15 @@ impl ModuleRegistry {
                     registration.spec.module.clone(),
                     ReplicaIndex::new(replica),
                 );
-                let scoped = caps.scoped(owner.clone());
+                let scoped = caps.scoped_with_memo_subscription(
+                    owner.clone(),
+                    registration.spec.memo_subscription.clone(),
+                );
                 modules.push(AllocatedModule::new(
                     owner,
                     caps.clone(),
                     Rc::clone(&registration.builder),
+                    registration.spec.memo_subscription.clone(),
                     (registration.builder)(scoped).await?,
                 ));
             }
@@ -1834,6 +1875,28 @@ impl ModuleRegistry {
             dependents_of,
         })
     }
+
+    fn validate_memo_subscriptions(&self) -> Result<(), ModuleRegistryError> {
+        let registered = self
+            .registrations
+            .iter()
+            .map(|registration| &registration.spec.module)
+            .collect::<HashSet<_>>();
+        for registration in &self.registrations {
+            let Some(sources) = registration.spec.memo_subscription.sources() else {
+                continue;
+            };
+            for source in sources {
+                if !registered.contains(source) {
+                    return Err(ModuleRegistryError::UnknownMemoSource {
+                        subscriber: registration.spec.module.clone(),
+                        memo_source: source.clone(),
+                    });
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 fn dfs_check_dependencies(
@@ -1895,6 +1958,11 @@ pub enum ModuleRegistryError {
     UnknownDependent { dependent: ModuleId },
     #[error("dependency {dependency} declared in depends_on() but not registered")]
     UnknownDependency { dependency: ModuleId },
+    #[error("module {subscriber} subscribes to memos from unregistered module {memo_source}")]
+    UnknownMemoSource {
+        subscriber: ModuleId,
+        memo_source: ModuleId,
+    },
     #[error(
         "module dependency cycle detected: {}",
         cycle.iter().map(ModuleId::as_str).collect::<Vec<_>>().join(" -> ")
@@ -2360,6 +2428,110 @@ mod tests {
             err,
             ModuleRegistryError::DuplicateModule { module } if module == expected
         ));
+    }
+
+    #[tokio::test]
+    async fn registry_build_rejects_unregistered_memo_source() {
+        let subscriber = ModuleId::new("memo-subscriber").unwrap();
+        let missing = ModuleId::new("missing-source").unwrap();
+        let caps = test_caps(Blackboard::default());
+        let result = ModuleRegistry::new()
+            .register(
+                ModuleRegistrationSpec::new(
+                    subscriber.clone(),
+                    test_policy(0..=0),
+                    ActivationRatio::ZERO,
+                )
+                .with_memo_sources([missing.clone()]),
+                noop_builder,
+            )
+            .unwrap()
+            .build(&caps)
+            .await;
+        let error = match result {
+            Ok(_) => panic!("unregistered memo source should fail registry build"),
+            Err(error) => error,
+        };
+
+        assert!(matches!(
+            error,
+            ModuleRegistryError::UnknownMemoSource {
+                subscriber: actual_subscriber,
+                memo_source,
+            } if actual_subscriber == subscriber && memo_source == missing
+        ));
+    }
+
+    #[tokio::test]
+    async fn restart_rebuilds_module_with_registered_memo_subscription() {
+        let caps = test_caps(Blackboard::default());
+        let subscriber = ModuleId::new("memo-subscriber").unwrap();
+        let inboxes: Rc<RefCell<Vec<MemoUpdatedInbox>>> = Rc::default();
+        let captured = inboxes.clone();
+        let (_runtime, mut modules) = ModuleRegistry::new()
+            .register(
+                ModuleRegistrationSpec::new(
+                    subscriber.clone(),
+                    test_policy(0..=0),
+                    ActivationRatio::ZERO,
+                )
+                .with_memo_sources([builtin::query_memory()]),
+                move |factory: ModuleCapabilityFactory| {
+                    let captured = captured.clone();
+                    async move {
+                        captured.borrow_mut().push(factory.memo_updated_inbox());
+                        Ok(NoopModule)
+                    }
+                },
+            )
+            .unwrap()
+            .register(
+                ModuleRegistrationSpec::new(
+                    builtin::query_memory(),
+                    test_policy(0..=0),
+                    ActivationRatio::ZERO,
+                ),
+                noop_builder,
+            )
+            .unwrap()
+            .register(
+                ModuleRegistrationSpec::new(
+                    builtin::sensory(),
+                    test_policy(0..=0),
+                    ActivationRatio::ZERO,
+                ),
+                noop_builder,
+            )
+            .unwrap()
+            .build(&caps)
+            .await
+            .unwrap()
+            .into_parts();
+
+        modules
+            .iter_mut()
+            .find(|module| module.owner().module == subscriber)
+            .expect("subscriber replica should be allocated")
+            .restart()
+            .await
+            .unwrap();
+
+        let mut inbox = inboxes
+            .borrow_mut()
+            .pop()
+            .expect("restart should rebuild the module through its capability factory");
+        scoped(&caps, builtin::sensory(), 0)
+            .memo()
+            .write("external context")
+            .await;
+        assert!(inbox.take_ready_items().unwrap().items.is_empty());
+
+        scoped(&caps, builtin::query_memory(), 0)
+            .memo()
+            .write("identity evidence")
+            .await;
+        let event = inbox.next_item().await.unwrap();
+        assert_eq!(event.body.owner.module, builtin::query_memory());
     }
 
     #[tokio::test]
@@ -2912,6 +3084,26 @@ mod tests {
             vec![(event.sender, "sensory memo")]
         );
         assert!(reader.unread_memo_logs().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn memo_updated_inbox_filters_registered_source_roles() {
+        let caps = test_caps(Blackboard::default());
+        let self_model_owner = ModuleInstanceId::new(builtin::self_model(), ReplicaIndex::ZERO);
+        let filtered = caps.scoped_with_memo_subscription(
+            self_model_owner,
+            MemoSubscription::only([builtin::query_memory()]),
+        );
+        let sensory = scoped(&caps, builtin::sensory(), 0);
+        let query_memory = scoped(&caps, builtin::query_memory(), 0);
+        let mut inbox = filtered.memo_updated_inbox();
+
+        sensory.memo().write("external context").await;
+        assert!(inbox.take_ready_items().unwrap().items.is_empty());
+
+        query_memory.memo().write("identity evidence").await;
+        let event = inbox.next_item().await.unwrap();
+        assert_eq!(event.body.owner.module, builtin::query_memory());
     }
 
     #[tokio::test]

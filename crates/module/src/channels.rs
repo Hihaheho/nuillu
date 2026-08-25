@@ -9,6 +9,8 @@ use futures::StreamExt;
 use futures::channel::mpsc;
 use nuillu_blackboard::{Blackboard, CognitionLogEntryRecord, MemoLogRecord};
 use nuillu_types::{ModuleId, ModuleInstanceId};
+
+use crate::MemoSubscription;
 use schemars::{JsonSchema, Schema, SchemaGenerator};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
@@ -162,7 +164,12 @@ impl<T: Clone> Topic<T> {
         }
     }
 
-    fn subscribe(&self, owner: ModuleInstanceId, exclude_self: bool) -> TopicSubscription<T> {
+    fn subscribe(
+        &self,
+        owner: ModuleInstanceId,
+        exclude_self: bool,
+        source_filter: MemoSubscription,
+    ) -> TopicSubscription<T> {
         let (sender, receiver) = mpsc::unbounded();
         let pending = Arc::new(AtomicBool::new(false));
         let mut inner = self.inner.lock().expect("Topic inner poisoned");
@@ -176,6 +183,7 @@ impl<T: Clone> Topic<T> {
             policy: self.default_policy,
             coalesce: false,
             pending: pending.clone(),
+            source_filter,
         });
         TopicSubscription {
             id,
@@ -233,6 +241,7 @@ struct TopicSubscriber<T: Clone> {
     policy: TopicPolicy,
     coalesce: bool,
     pending: Arc<AtomicBool>,
+    source_filter: MemoSubscription,
 }
 
 /// Publish capability for one typed topic.
@@ -267,6 +276,12 @@ impl<T: Clone> TopicMailbox<T> {
 
         let mut active_by_role = HashMap::<ModuleId, bool>::new();
         for subscriber in &inner.subscribers {
+            if subscriber.exclude_self && subscriber.owner == envelope.sender {
+                continue;
+            }
+            if !subscriber.source_filter.accepts(&envelope.sender.module) {
+                continue;
+            }
             let active = allocation.is_replica_active(&subscriber.owner);
             active_by_role
                 .entry(subscriber.owner.module.clone())
@@ -279,6 +294,9 @@ impl<T: Clone> TopicMailbox<T> {
         let mut round_robin_fallback_by_role = HashMap::<ModuleId, usize>::new();
         for (idx, subscriber) in inner.subscribers.iter().enumerate() {
             if subscriber.exclude_self && subscriber.owner == envelope.sender {
+                continue;
+            }
+            if !subscriber.source_filter.accepts(&envelope.sender.module) {
                 continue;
             }
             let active = allocation.is_replica_active(&subscriber.owner);
@@ -361,7 +379,7 @@ pub struct TopicInbox<T: Clone> {
 
 impl<T: Clone> TopicInbox<T> {
     pub(crate) fn new(owner: ModuleInstanceId, topic: Topic<T>) -> Self {
-        let subscription = topic.subscribe(owner.clone(), false);
+        let subscription = topic.subscribe(owner.clone(), false, MemoSubscription::All);
         Self {
             owner,
             topic,
@@ -383,7 +401,26 @@ impl<T: Clone> TopicInbox<T> {
         topic: Topic<T>,
         round_robin_hook: Option<RoundRobinHook>,
     ) -> Self {
-        let subscription = topic.subscribe(owner.clone(), true);
+        let subscription = topic.subscribe(owner.clone(), true, MemoSubscription::All);
+        Self {
+            owner,
+            topic,
+            subscription_id: subscription.id,
+            receiver: subscription.receiver,
+            pending: subscription.pending,
+            exclude_self: true,
+            delivery_configured: false,
+            round_robin_hook,
+        }
+    }
+
+    pub(crate) fn new_excluding_self_with_round_robin_hook_and_sources(
+        owner: ModuleInstanceId,
+        topic: Topic<T>,
+        round_robin_hook: Option<RoundRobinHook>,
+        source_filter: MemoSubscription,
+    ) -> Self {
+        let subscription = topic.subscribe(owner.clone(), true, source_filter);
         Self {
             owner,
             topic,
