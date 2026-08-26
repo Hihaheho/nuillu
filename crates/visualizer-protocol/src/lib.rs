@@ -18,7 +18,9 @@ use nuillu_module::{ActionAffordance, AmbientSensoryEntry, RuntimeEvent, Sensory
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use thiserror::Error;
 
-pub const VISUALIZER_PROTOCOL_VERSION: u32 = 6;
+pub use nuillu_module::ports::CognitionLogCursor;
+
+pub const VISUALIZER_PROTOCOL_VERSION: u32 = 7;
 pub const START_SUITE_ACTION_ID: &str = "suite:start";
 
 pub fn start_activation_action_id(tab_id: &VisualizerTabId) -> String {
@@ -209,7 +211,7 @@ pub enum VisualizerEvent {
     },
     CognitionLogEntriesLoaded {
         tab_id: VisualizerTabId,
-        offset: usize,
+        cursor: CognitionLogCursor,
         entries: Vec<PersistedCognitionEntryView>,
         has_more: bool,
     },
@@ -391,7 +393,7 @@ pub enum VisualizerCommand {
     },
     LoadCognitionLogEntries {
         tab_id: VisualizerTabId,
-        offset: usize,
+        cursor: CognitionLogCursor,
         limit: usize,
     },
     LoadMemoryRecords {
@@ -1870,7 +1872,7 @@ mod tests {
         let cognition_command = VisualizerClientMessage::Command {
             command: VisualizerCommand::LoadCognitionLogEntries {
                 tab_id: tab_id.clone(),
-                offset: 600,
+                cursor: CognitionLogCursor::Older { before_id: 600 },
                 limit: 100,
             },
         };
@@ -1893,7 +1895,7 @@ mod tests {
             actual,
             VisualizerClientMessage::Command {
                 command: VisualizerCommand::LoadCognitionLogEntries {
-                    offset: 600,
+                    cursor: CognitionLogCursor::Older { before_id: 600 },
                     limit: 100,
                     ..
                 },
@@ -1931,7 +1933,7 @@ mod tests {
         let cognition_event =
             VisualizerServerMessage::event(VisualizerEvent::CognitionLogEntriesLoaded {
                 tab_id: VisualizerTabId::new("live"),
-                offset: 600,
+                cursor: CognitionLogCursor::Newer { after_id: 41 },
                 entries: vec![PersistedCognitionEntryView {
                     id: 42,
                     source: "cognition-gate".to_owned(),
@@ -1960,7 +1962,7 @@ mod tests {
             actual,
             VisualizerServerMessage::Event {
                 event: VisualizerEvent::CognitionLogEntriesLoaded {
-                    offset: 600,
+                    cursor: CognitionLogCursor::Newer { after_id: 41 },
                     entries,
                     has_more: true,
                     ..

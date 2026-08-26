@@ -20,6 +20,7 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use nuillu_blackboard::CognitionLogEntry;
 use nuillu_types::ModuleInstanceId;
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -56,6 +57,22 @@ pub struct PersistedCognitionLogPageEntry {
     pub entry: CognitionLogEntry,
 }
 
+/// Anchor for a newest-first cognition-log page.
+///
+/// Keyset rather than offset: a page is addressed by the identity at its
+/// boundary, so concurrent appends can neither shift a window nor make it
+/// skip an entry, and the backend never reads past the rows it returns.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CognitionLogCursor {
+    /// The newest entries, with no anchor.
+    Newest,
+    /// Entries strictly older than `before_id`.
+    Older { before_id: i64 },
+    /// Entries strictly newer than `after_id`.
+    Newer { after_id: i64 },
+}
+
 #[async_trait(?Send)]
 pub trait CognitionLogRepository {
     async fn append(
@@ -69,28 +86,16 @@ pub trait CognitionLogRepository {
         from: DateTime<Utc>,
     ) -> Result<Vec<CognitionLogEntry>, PortError>;
     async fn recent(&self, limit: usize) -> Result<Vec<PersistedCognitionLogEntry>, PortError>;
-    /// Returns newest-first history for visualizer-style incremental loading.
-    async fn page_desc(
+    /// Returns up to `limit` entries at `cursor`, newest first.
+    ///
+    /// Implementations must return stable ids: a caller stitches consecutive
+    /// pages together by them, so the same entry has to keep the same id
+    /// across calls.
+    async fn page(
         &self,
-        offset: usize,
+        cursor: CognitionLogCursor,
         limit: usize,
-    ) -> Result<Vec<PersistedCognitionLogPageEntry>, PortError> {
-        let requested = offset.saturating_add(limit);
-        let mut entries = self.recent(requested).await?;
-        entries.reverse();
-        Ok(entries
-            .into_iter()
-            .skip(offset)
-            .take(limit)
-            .enumerate()
-            .map(|(index, record)| PersistedCognitionLogPageEntry {
-                id: -i64::try_from(offset.saturating_add(index).saturating_add(1))
-                    .unwrap_or(i64::MAX),
-                source: record.source,
-                entry: record.entry,
-            })
-            .collect())
-    }
+    ) -> Result<Vec<PersistedCognitionLogPageEntry>, PortError>;
 }
 
 /// Time source plus sleep. Indirected so tests can fully inject time —
@@ -239,6 +244,14 @@ impl CognitionLogRepository for NoopCognitionLogRepository {
     }
 
     async fn recent(&self, _limit: usize) -> Result<Vec<PersistedCognitionLogEntry>, PortError> {
+        Ok(Vec::new())
+    }
+
+    async fn page(
+        &self,
+        _cursor: CognitionLogCursor,
+        _limit: usize,
+    ) -> Result<Vec<PersistedCognitionLogPageEntry>, PortError> {
         Ok(Vec::new())
     }
 }

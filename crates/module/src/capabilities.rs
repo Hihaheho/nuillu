@@ -2004,7 +2004,8 @@ mod tests {
 
     use crate::allocation_persistence::PersistedAllocationSnapshot;
     use crate::ports::{
-        CognitionLogRepository, PersistedCognitionLogEntry, PortError, SystemClock,
+        CognitionLogCursor, CognitionLogRepository, PersistedCognitionLogEntry,
+        PersistedCognitionLogPageEntry, PortError, SystemClock,
     };
     use crate::runtime_events::{RuntimeEvent, RuntimeEventEmitter, RuntimeEventSink};
     use crate::session::{
@@ -2241,6 +2242,35 @@ mod tests {
                 .collect::<Vec<_>>();
             records.reverse();
             Ok(records)
+        }
+
+        async fn page(
+            &self,
+            cursor: CognitionLogCursor,
+            limit: usize,
+        ) -> Result<Vec<PersistedCognitionLogPageEntry>, PortError> {
+            Ok(self
+                .records
+                .lock()
+                .expect("records mutex poisoned")
+                .iter()
+                .enumerate()
+                .rev()
+                .filter(|(index, _)| {
+                    let id = i64::try_from(*index).unwrap_or(i64::MAX);
+                    match cursor {
+                        CognitionLogCursor::Newest => true,
+                        CognitionLogCursor::Older { before_id } => id < before_id,
+                        CognitionLogCursor::Newer { after_id } => id > after_id,
+                    }
+                })
+                .take(limit)
+                .map(|(index, (source, entry))| PersistedCognitionLogPageEntry {
+                    id: i64::try_from(index).unwrap_or(i64::MAX),
+                    source: source.clone(),
+                    entry: entry.clone(),
+                })
+                .collect())
         }
     }
 

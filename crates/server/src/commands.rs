@@ -17,11 +17,11 @@ use nuillu_storage::{
 };
 use nuillu_types::{MemoryIndex, ModuleId, ModuleInstanceId, ReplicaCapRange, ReplicaIndex};
 use nuillu_visualizer_protocol::{
-    AmbientSensorySnapshotRowView, ExternalActionEventRowView, ExternalActionEventStatusView,
-    MemoryRecordScope, ModuleSettingsView, OneShotSensoryInputRowView, PersistedCognitionEntryView,
-    UtteranceEventKindView, UtteranceEventRowView, VisualizerClientMessage, VisualizerCommand,
-    VisualizerEvent, VisualizerTabId, ZeroReplicaWindowView, run_runtime_action_id,
-    stop_runtime_action_id,
+    AmbientSensorySnapshotRowView, CognitionLogCursor, ExternalActionEventRowView,
+    ExternalActionEventStatusView, MemoryRecordScope, ModuleSettingsView,
+    OneShotSensoryInputRowView, PersistedCognitionEntryView, UtteranceEventKindView,
+    UtteranceEventRowView, VisualizerClientMessage, VisualizerCommand, VisualizerEvent,
+    VisualizerTabId, ZeroReplicaWindowView, run_runtime_action_id, stop_runtime_action_id,
 };
 
 use crate::SERVER_TAB_ID;
@@ -532,14 +532,14 @@ async fn handle_server_visualizer_message(
         }
         VisualizerCommand::LoadCognitionLogEntries {
             tab_id: command_tab,
-            offset,
+            cursor,
             limit,
         } if command_tab == *tab_id => {
-            match load_cognition_log_entries(env, offset, limit).await {
+            match load_cognition_log_entries(env, cursor, limit).await {
                 Ok((entries, has_more)) => {
                     visualizer.send_event(VisualizerEvent::CognitionLogEntriesLoaded {
                         tab_id: tab_id.clone(),
-                        offset,
+                        cursor,
                         entries,
                         has_more,
                     });
@@ -796,7 +796,7 @@ async fn load_memory_records(
 
 async fn load_cognition_log_entries(
     env: &ServerEnvironment,
-    offset: usize,
+    cursor: CognitionLogCursor,
     limit: usize,
 ) -> anyhow::Result<(Vec<PersistedCognitionEntryView>, bool)> {
     if limit == 0 {
@@ -804,7 +804,7 @@ async fn load_cognition_log_entries(
     }
     let records = env
         .cognition_log_repository
-        .page_desc(offset, limit.saturating_add(1))
+        .page(cursor, limit.saturating_add(1))
         .await?;
     let (records, has_more) = trim_chunk(records, limit);
     Ok((

@@ -20,8 +20,8 @@ use nuillu_module::{
     AllocationStore, MemoLogRepository, PersistedAllocationSnapshot, PersistedMemoLogEntry,
     PersistedSessionSnapshot, SessionKey, SessionStore,
     ports::{
-        CognitionLogRepository, PersistedCognitionLogEntry, PersistedCognitionLogPageEntry,
-        PortError,
+        CognitionLogCursor, CognitionLogRepository, PersistedCognitionLogEntry,
+        PersistedCognitionLogPageEntry, PortError,
     },
 };
 use nuillu_reward::{
@@ -581,18 +581,15 @@ impl CognitionLogRepository for LibsqlCognitionLogRepository {
         Ok(entries)
     }
 
-    async fn page_desc(
+    async fn page(
         &self,
-        offset: usize,
+        cursor: CognitionLogCursor,
         limit: usize,
     ) -> Result<Vec<PersistedCognitionLogPageEntry>, PortError> {
         if limit == 0 {
             return Ok(Vec::new());
         }
-        let mut rows = self
-            .conn
-            .query(
-                "SELECT id,
+        const COLUMNS: &str = "SELECT id,
                         owner_module,
                         owner_replica,
                         occurred_at_ms,
@@ -600,13 +597,36 @@ impl CognitionLogRepository for LibsqlCognitionLogRepository {
                         COALESCE(origin_module, owner_module),
                         COALESCE(origin_replica, owner_replica),
                         origin_memo_index
-                   FROM cognition_log_entries
-                  ORDER BY id DESC
-                  LIMIT ?1 OFFSET ?2",
-                params![limit_to_i64(limit), limit_to_i64(offset)],
-            )
-            .await
-            .map_err(map_libsql_error)?;
+                   FROM cognition_log_entries";
+        // `id` is the rowid and `cognition_log_entries_recent_idx` covers the
+        // descending scan, so each variant walks only the rows it returns.
+        let mut rows = match cursor {
+            CognitionLogCursor::Newest => {
+                self.conn
+                    .query(
+                        &format!("{COLUMNS} ORDER BY id DESC LIMIT ?1"),
+                        params![limit_to_i64(limit)],
+                    )
+                    .await
+            }
+            CognitionLogCursor::Older { before_id } => {
+                self.conn
+                    .query(
+                        &format!("{COLUMNS} WHERE id < ?1 ORDER BY id DESC LIMIT ?2"),
+                        params![before_id, limit_to_i64(limit)],
+                    )
+                    .await
+            }
+            CognitionLogCursor::Newer { after_id } => {
+                self.conn
+                    .query(
+                        &format!("{COLUMNS} WHERE id > ?1 ORDER BY id DESC LIMIT ?2"),
+                        params![after_id, limit_to_i64(limit)],
+                    )
+                    .await
+            }
+        }
+        .map_err(map_libsql_error)?;
         let mut entries = Vec::new();
         while let Some(row) = rows.next().await.map_err(map_libsql_error)? {
             let id: i64 = row.get(0).map_err(map_libsql_error)?;
@@ -6168,14 +6188,49 @@ mod tests {
             ]
         );
 
-        let page = repo.page_desc(1, 2).await.unwrap();
+        let newest = repo.page(CognitionLogCursor::Newest, 2).await.unwrap();
         assert_eq!(
-            page.iter()
+            newest
+                .iter()
                 .map(|record| record.entry.text.as_str())
                 .collect::<Vec<_>>(),
-            vec!["second", "first"]
+            vec!["third", "second"]
         );
-        assert!(page[0].id > page[1].id);
+        assert!(newest[0].id > newest[1].id);
+
+        let older = repo
+            .page(
+                CognitionLogCursor::Older {
+                    before_id: newest[1].id,
+                },
+                2,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            older
+                .iter()
+                .map(|record| record.entry.text.as_str())
+                .collect::<Vec<_>>(),
+            vec!["first"]
+        );
+
+        let newer = repo
+            .page(
+                CognitionLogCursor::Newer {
+                    after_id: newest[1].id,
+                },
+                8,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            newer
+                .iter()
+                .map(|record| record.entry.text.as_str())
+                .collect::<Vec<_>>(),
+            vec!["third"]
+        );
     }
 
     #[tokio::test]

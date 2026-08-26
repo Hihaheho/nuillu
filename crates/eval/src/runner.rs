@@ -4137,17 +4137,17 @@ async fn handle_visualizer_commands(
             }
             VisualizerCommand::LoadCognitionLogEntries {
                 tab_id,
-                offset,
+                cursor,
                 limit,
             } if tab_id.as_str() == case_id => {
                 let records = cognition_log_repository
-                    .page_desc(offset, limit.saturating_add(1))
+                    .page(cursor, limit.saturating_add(1))
                     .await
                     .unwrap_or_default();
                 let (records, has_more) = trim_visualizer_chunk(records, limit);
                 visualizer.send_event(VisualizerEvent::CognitionLogEntriesLoaded {
                     tab_id,
-                    offset,
+                    cursor,
                     entries: records
                         .into_iter()
                         .map(|record| PersistedCognitionEntryView {

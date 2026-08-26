@@ -1356,13 +1356,13 @@ impl VisualizerState {
             }
             VisualizerEvent::CognitionLogEntriesLoaded {
                 tab_id,
-                offset,
+                cursor,
                 entries,
                 has_more,
             } => {
                 self.tab_mut(tab_id)
                     .cognition
-                    .apply_page(offset, entries, has_more);
+                    .apply_page(cursor, entries, has_more);
             }
             VisualizerEvent::MemoryRecordsLoaded {
                 tab_id,
@@ -1851,7 +1851,7 @@ impl RuntimeTab {
     fn render_cognition_contents(
         &mut self,
         ui: &mut egui::Ui,
-        id_salt: &str,
+        id_salt: &'static str,
         messages: &mut Vec<VisualizerClientMessage>,
     ) {
         cognition::ui(ui, id_salt, &self.id, &mut self.cognition, messages);
@@ -2415,7 +2415,7 @@ mod tests {
                 VisualizerClientMessage::Command {
                     command: VisualizerCommand::LoadCognitionLogEntries {
                         tab_id: tab_id.clone(),
-                        offset: 0,
+                        cursor: CognitionLogCursor::Newest,
                         limit: crate::cognition::COGNITION_CHUNK_SIZE,
                     },
                 },

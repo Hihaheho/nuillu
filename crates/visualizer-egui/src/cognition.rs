@@ -1,101 +1,222 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashMap,
     hash::{DefaultHasher, Hash as _, Hasher as _},
 };
 
 use crate::{
-    CognitionLogView, PersistedCognitionEntryView, VisualizerClientMessage, VisualizerCommand,
-    VisualizerTabId, i18n::localized_module_name_with_id, text::hard_wrap_long_segments,
-    time::format_jst_datetime,
+    CognitionLogCursor, CognitionLogView, PersistedCognitionEntryView, VisualizerClientMessage,
+    VisualizerCommand, VisualizerTabId, i18n::localized_module_name_with_id,
+    text::hard_wrap_long_segments, time::format_jst_datetime,
 };
 
 pub(crate) const COGNITION_CHUNK_SIZE: usize = 100;
+/// Ceiling on entries held client-side.
+///
+/// The newest end is never evicted: a refresh prepends and drops from the old
+/// end, and paging further back stops once the pane holds this many. The log
+/// itself stays complete in the repository.
+pub(crate) const COGNITION_MAX_RETAINED: usize = 2_000;
 const CARD_MARGIN: f32 = 8.0;
 const CARD_GAP: f32 = 6.0;
 const HEADER_GAP: f32 = 4.0;
 const HARD_WRAP_LIMIT: usize = 96;
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct CognitionState {
+    /// Newest-first and contiguous from the newest entry the pane knows about.
     entries: Vec<PersistedCognitionEntryView>,
+    /// Position of every rendered entry, so anchoring never scans the list.
+    index_by_id: HashMap<i64, usize>,
+    /// Bumped whenever the rendered entries change, to invalidate pane layouts.
+    revision: u64,
+    /// Stand-in shown until the first page lands, derived from the blackboard.
     snapshot_entries: Vec<PersistedCognitionEntryView>,
+    snapshot_fingerprint: Option<u64>,
+    max_retained: usize,
     loaded_initial: bool,
-    has_more: bool,
+    has_older: bool,
     loading: bool,
     requested_initial: bool,
     refresh_needed: bool,
-    snapshot_fingerprint: Option<u64>,
-    layout_width_bits: u32,
-    height_cache: HashMap<i64, f32>,
+    panes: HashMap<&'static str, PaneLayout>,
+}
+
+impl Default for CognitionState {
+    fn default() -> Self {
+        Self::with_retention(COGNITION_MAX_RETAINED)
+    }
+}
+
+/// Cached vertical layout for one pane showing the log.
+///
+/// Two panes can show the same state at different widths, so the ledger is
+/// per-pane and is rebuilt only when the entries or the width actually change.
+#[derive(Debug, Default)]
+struct PaneLayout {
+    ready: bool,
+    revision: u64,
+    width_bits: u32,
+    /// Cumulative tops: `offsets[i]` is the top of entry `i`, and the last
+    /// element is the total height.
+    offsets: Vec<f32>,
+    height_by_id: HashMap<i64, f32>,
 }
 
 impl CognitionState {
-    pub fn observe_snapshot(&mut self, logs: &[CognitionLogView]) {
-        let mut hasher = DefaultHasher::new();
-        for log in logs {
-            log.source.hash(&mut hasher);
-            for entry in &log.entries {
-                entry.at.hash(&mut hasher);
-                entry.origin.hash(&mut hasher);
-                entry.text.hash(&mut hasher);
-            }
+    fn with_retention(max_retained: usize) -> Self {
+        Self {
+            entries: Vec::new(),
+            index_by_id: HashMap::new(),
+            revision: 0,
+            snapshot_entries: Vec::new(),
+            snapshot_fingerprint: None,
+            max_retained: max_retained.max(1),
+            loaded_initial: false,
+            has_older: false,
+            loading: false,
+            requested_initial: false,
+            refresh_needed: false,
+            panes: HashMap::new(),
         }
-        let fingerprint = hasher.finish();
-        if self.snapshot_fingerprint.is_some() && self.snapshot_fingerprint != Some(fingerprint) {
+    }
+
+    pub fn observe_snapshot(&mut self, logs: &[CognitionLogView]) {
+        let fingerprint = snapshot_fingerprint(logs);
+        if self.snapshot_fingerprint == Some(fingerprint) {
+            return;
+        }
+        if self.snapshot_fingerprint.is_some() {
             self.refresh_needed = true;
         }
         self.snapshot_fingerprint = Some(fingerprint);
+        if self.loaded_initial {
+            // Persisted pages drive the pane from here on; the snapshot only
+            // says when new entries exist to pull.
+            return;
+        }
+
         let mut snapshot_entries = logs
             .iter()
             .flat_map(|log| {
-                log.entries.iter().map(|entry| {
-                    let mut hasher = DefaultHasher::new();
-                    log.source.hash(&mut hasher);
-                    entry.at.hash(&mut hasher);
-                    entry.origin.hash(&mut hasher);
-                    entry.text.hash(&mut hasher);
-                    PersistedCognitionEntryView {
-                        id: i64::from_ne_bytes(hasher.finish().to_ne_bytes()),
-                        source: log.source.clone(),
-                        at: entry.at,
-                        origin: entry.origin.clone(),
-                        text: entry.text.clone(),
-                    }
+                log.entries.iter().map(|entry| PersistedCognitionEntryView {
+                    id: synthetic_id(&log.source, entry),
+                    source: log.source.clone(),
+                    at: entry.at,
+                    origin: entry.origin.clone(),
+                    text: entry.text.clone(),
                 })
             })
             .collect::<Vec<_>>();
         snapshot_entries
             .sort_by(|left, right| right.at.cmp(&left.at).then_with(|| right.id.cmp(&left.id)));
         self.snapshot_entries = snapshot_entries;
+        self.reindex();
     }
 
     pub fn apply_page(
         &mut self,
-        offset: usize,
+        cursor: CognitionLogCursor,
         entries: Vec<PersistedCognitionEntryView>,
         has_more: bool,
     ) {
         self.loading = false;
-        self.refresh_needed = false;
-        self.has_more = has_more;
-        if offset == 0 {
-            self.loaded_initial = true;
+        match cursor {
+            CognitionLogCursor::Newest => {
+                self.loaded_initial = true;
+                self.refresh_needed = false;
+                self.entries = entries;
+                self.has_older = has_more;
+            }
+            CognitionLogCursor::Older { .. } => {
+                let held = &self.index_by_id;
+                self.entries.extend(
+                    entries
+                        .into_iter()
+                        .filter(|entry| !held.contains_key(&entry.id)),
+                );
+                self.has_older = has_more;
+            }
+            CognitionLogCursor::Newer { .. } => {
+                self.refresh_needed = false;
+                if entries.is_empty() {
+                    return;
+                }
+                if has_more {
+                    // More arrived than one page holds, so splicing this page
+                    // onto what we have would leave a hole. Start over from
+                    // the newest instead; the rest is still one page back.
+                    self.entries = entries;
+                    self.has_older = true;
+                } else {
+                    let mut merged = entries;
+                    merged.retain(|entry| !self.index_by_id.contains_key(&entry.id));
+                    merged.append(&mut self.entries);
+                    self.entries = merged;
+                }
+            }
         }
-        if offset == 0 && self.entries.is_empty() {
-            self.entries = entries;
-            return;
+        if self.entries.len() > self.max_retained {
+            self.entries.truncate(self.max_retained);
+            // The dropped tail is still in the repository, so paging back is
+            // possible once the pane has room again.
+            self.has_older = true;
         }
-
-        let mut known = self
-            .entries
-            .iter()
-            .map(|entry| entry.id)
-            .collect::<HashSet<_>>();
-        self.entries
-            .extend(entries.into_iter().filter(|entry| known.insert(entry.id)));
-        self.entries
-            .sort_by_key(|entry| std::cmp::Reverse(entry.id));
+        self.reindex();
     }
+
+    /// Entries the pane draws: persisted pages once loaded, else the snapshot.
+    fn visible(&self) -> &[PersistedCognitionEntryView] {
+        if self.loaded_initial {
+            &self.entries
+        } else {
+            &self.snapshot_entries
+        }
+    }
+
+    fn can_load_older(&self) -> bool {
+        self.has_older && self.entries.len() < self.max_retained
+    }
+
+    fn reindex(&mut self) {
+        self.revision = self.revision.wrapping_add(1);
+        let mut index_by_id = std::mem::take(&mut self.index_by_id);
+        index_by_id.clear();
+        let source = if self.loaded_initial {
+            &self.entries
+        } else {
+            &self.snapshot_entries
+        };
+        index_by_id.extend(
+            source
+                .iter()
+                .enumerate()
+                .map(|(position, entry)| (entry.id, position)),
+        );
+        self.index_by_id = index_by_id;
+    }
+}
+
+fn snapshot_fingerprint(logs: &[CognitionLogView]) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    for log in logs {
+        log.source.hash(&mut hasher);
+        for entry in &log.entries {
+            entry.at.hash(&mut hasher);
+            entry.origin.hash(&mut hasher);
+            entry.text.hash(&mut hasher);
+        }
+    }
+    hasher.finish()
+}
+
+/// Stand-in identity for a snapshot entry, which carries no persisted id.
+fn synthetic_id(source: &str, entry: &crate::CognitionEntryView) -> i64 {
+    let mut hasher = DefaultHasher::new();
+    source.hash(&mut hasher);
+    entry.at.hash(&mut hasher);
+    entry.origin.hash(&mut hasher);
+    entry.text.hash(&mut hasher);
+    i64::from_ne_bytes(hasher.finish().to_ne_bytes())
 }
 
 #[derive(Clone, Copy, Default)]
@@ -106,49 +227,48 @@ struct ViewportAnchor {
 
 pub fn ui(
     ui: &mut egui::Ui,
-    id_salt: impl std::hash::Hash,
+    id_salt: &'static str,
     tab_id: &VisualizerTabId,
     state: &mut CognitionState,
     messages: &mut Vec<VisualizerClientMessage>,
 ) {
-    if (!state.requested_initial || state.refresh_needed) && !state.loading {
-        request_page(tab_id, state, messages, 0);
+    if !state.loading {
+        if !state.requested_initial {
+            request_page(tab_id, state, messages, CognitionLogCursor::Newest);
+        } else if state.refresh_needed {
+            let cursor = match state.entries.first() {
+                Some(newest) => CognitionLogCursor::Newer {
+                    after_id: newest.id,
+                },
+                None => CognitionLogCursor::Newest,
+            };
+            request_page(tab_id, state, messages, cursor);
+        }
     }
-
-    let entries = if state.loaded_initial {
-        &state.entries
-    } else {
-        &state.snapshot_entries
-    };
 
     let id = ui.make_persistent_id(id_salt);
     let available_width = ui.available_width().max(120.0);
     let width_bits = available_width.to_bits();
-    if state.layout_width_bits != width_bits {
-        state.layout_width_bits = width_bits;
-        state.height_cache.clear();
+    let mut pane = state.panes.remove(id_salt).unwrap_or_default();
+    let entries = state.visible();
+    if !pane.ready || pane.revision != state.revision || pane.width_bits != width_bits {
+        if pane.width_bits != width_bits {
+            pane.height_by_id.clear();
+        }
+        rebuild_layout(ui, entries, available_width, &mut pane);
+        pane.ready = true;
+        pane.revision = state.revision;
+        pane.width_bits = width_bits;
     }
-    let heights = entries
-        .iter()
-        .map(|entry| {
-            *state
-                .height_cache
-                .entry(entry.id)
-                .or_insert_with(|| entry_height(ui, entry, available_width))
-        })
-        .collect::<Vec<_>>();
-    let mut offsets = Vec::with_capacity(heights.len() + 1);
-    offsets.push(0.0);
-    for height in &heights {
-        offsets.push(offsets.last().copied().unwrap_or_default() + height);
-    }
+    let offsets = &pane.offsets;
     let total_height = offsets.last().copied().unwrap_or_default();
 
+    let anchor_key = id.with("cognition-viewport-anchor");
     let old_anchor = ui.ctx().data(|data| {
-        data.get_temp::<ViewportAnchor>(id.with("cognition-viewport-anchor"))
+        data.get_temp::<ViewportAnchor>(anchor_key)
             .unwrap_or_default()
     });
-    let corrected_offset = corrected_scroll_offset(old_anchor, entries, &offsets);
+    let corrected_offset = corrected_scroll_offset(old_anchor, &state.index_by_id, offsets);
 
     let mut scroll = egui::ScrollArea::vertical().id_salt(id);
     if let Some(offset) = corrected_offset {
@@ -164,9 +284,10 @@ pub fn ui(
             .partition_point(|offset| *offset < viewport.max.y)
             .min(entries.len());
         for index in start..end {
+            let height = offsets[index + 1] - offsets[index];
             let rect = egui::Rect::from_min_size(
                 egui::pos2(ui.max_rect().left(), ui.max_rect().top() + offsets[index]),
-                egui::vec2(available_width, heights[index] - CARD_GAP),
+                egui::vec2(available_width, height - CARD_GAP),
             );
             ui.scope_builder(egui::UiBuilder::new().max_rect(rect), |ui| {
                 render_entry(ui, &entries[index]);
@@ -174,31 +295,68 @@ pub fn ui(
         }
         viewport.max.y + viewport.height() >= total_height
     });
+    let reached_end = output.inner;
 
     ui.ctx().data_mut(|data| {
         data.insert_temp(
-            id.with("cognition-viewport-anchor"),
+            anchor_key,
             ViewportAnchor {
                 first_id: entries.first().map(|entry| entry.id),
                 offset: output.state.offset.y,
             },
         );
     });
-    let loaded_count = entries.len();
-    if output.inner && state.has_more && !state.loading {
-        request_page(tab_id, state, messages, loaded_count);
+    state.panes.insert(id_salt, pane);
+
+    if reached_end
+        && !state.loading
+        && state.can_load_older()
+        && let Some(oldest) = state.entries.last()
+    {
+        let cursor = CognitionLogCursor::Older {
+            before_id: oldest.id,
+        };
+        request_page(tab_id, state, messages, cursor);
     }
+}
+
+fn rebuild_layout(
+    ui: &egui::Ui,
+    entries: &[PersistedCognitionEntryView],
+    available_width: f32,
+    pane: &mut PaneLayout,
+) {
+    // Rebuilt into a fresh map so heights for evicted entries don't accumulate,
+    // while entries that survived keep their measurement.
+    let mut height_by_id = HashMap::with_capacity(entries.len());
+    let offsets = &mut pane.offsets;
+    offsets.clear();
+    offsets.reserve(entries.len() + 1);
+    offsets.push(0.0);
+    let mut running = 0.0;
+    for entry in entries {
+        let height = pane
+            .height_by_id
+            .get(&entry.id)
+            .copied()
+            .unwrap_or_else(|| entry_height(ui, entry, available_width));
+        height_by_id.insert(entry.id, height);
+        running += height;
+        offsets.push(running);
+    }
+    pane.height_by_id = height_by_id;
 }
 
 fn corrected_scroll_offset(
     old_anchor: ViewportAnchor,
-    entries: &[PersistedCognitionEntryView],
+    index_by_id: &HashMap<i64, usize>,
     offsets: &[f32],
 ) -> Option<f32> {
     let inserted_height = old_anchor
         .first_id
-        .and_then(|first_id| entries.iter().position(|entry| entry.id == first_id))
-        .map(|position| offsets[position])
+        .and_then(|first_id| index_by_id.get(&first_id))
+        .and_then(|position| offsets.get(*position))
+        .copied()
         .unwrap_or_default();
     (inserted_height > 0.0).then_some(old_anchor.offset + inserted_height)
 }
@@ -207,14 +365,14 @@ fn request_page(
     tab_id: &VisualizerTabId,
     state: &mut CognitionState,
     messages: &mut Vec<VisualizerClientMessage>,
-    offset: usize,
+    cursor: CognitionLogCursor,
 ) {
     state.loading = true;
     state.requested_initial = true;
     messages.push(VisualizerClientMessage::Command {
         command: VisualizerCommand::LoadCognitionLogEntries {
             tab_id: tab_id.clone(),
-            offset,
+            cursor,
             limit: COGNITION_CHUNK_SIZE,
         },
     });
@@ -288,18 +446,65 @@ mod tests {
     use super::*;
 
     #[test]
-    fn pages_merge_by_persisted_id_in_newest_first_order() {
+    fn older_pages_stitch_onto_the_newest_page_in_newest_first_order() {
         let mut state = CognitionState::default();
-        state.apply_page(0, vec![entry(3), entry(2)], true);
-        state.apply_page(2, vec![entry(2), entry(1)], false);
-        assert_eq!(
-            state
-                .entries
-                .iter()
-                .map(|entry| entry.id)
-                .collect::<Vec<_>>(),
-            vec![3, 2, 1]
+        state.apply_page(CognitionLogCursor::Newest, vec![entry(5), entry(4)], true);
+        state.apply_page(
+            CognitionLogCursor::Older { before_id: 4 },
+            vec![entry(4), entry(3)],
+            false,
         );
+
+        assert_eq!(loaded_ids(&state), vec![5, 4, 3]);
+        assert!(!state.can_load_older());
+    }
+
+    #[test]
+    fn a_refresh_prepends_newer_entries_and_evicts_only_the_oldest() {
+        let mut state = CognitionState::with_retention(3);
+        state.apply_page(
+            CognitionLogCursor::Newest,
+            vec![entry(3), entry(2), entry(1)],
+            false,
+        );
+        state.apply_page(
+            CognitionLogCursor::Newer { after_id: 3 },
+            vec![entry(5), entry(4)],
+            false,
+        );
+
+        assert_eq!(loaded_ids(&state), vec![5, 4, 3]);
+        // The evicted tail is still in the repository, so paging back reopens.
+        assert!(state.has_older);
+        // ...but not while the pane is already at its retention ceiling.
+        assert!(!state.can_load_older());
+    }
+
+    #[test]
+    fn a_refresh_larger_than_one_page_restarts_from_the_newest() {
+        let mut state = CognitionState::default();
+        state.apply_page(CognitionLogCursor::Newest, vec![entry(2), entry(1)], false);
+        state.apply_page(
+            CognitionLogCursor::Newer { after_id: 2 },
+            vec![entry(9), entry(8)],
+            true,
+        );
+
+        // Splicing 9,8 onto 2,1 would claim 7..3 never existed.
+        assert_eq!(loaded_ids(&state), vec![9, 8]);
+        assert!(state.can_load_older());
+    }
+
+    #[test]
+    fn an_empty_refresh_leaves_the_layout_untouched() {
+        let mut state = CognitionState::default();
+        state.apply_page(CognitionLogCursor::Newest, vec![entry(2), entry(1)], false);
+        let revision = state.revision;
+
+        state.apply_page(CognitionLogCursor::Newer { after_id: 2 }, Vec::new(), false);
+
+        assert_eq!(state.revision, revision);
+        assert_eq!(loaded_ids(&state), vec![2, 1]);
     }
 
     #[test]
@@ -320,17 +525,27 @@ mod tests {
 
     #[test]
     fn prepended_entries_keep_the_previous_viewport_content_anchored() {
-        let entries = vec![entry(5), entry(4), entry(3)];
+        let mut state = CognitionState::default();
+        state.apply_page(
+            CognitionLogCursor::Newest,
+            vec![entry(5), entry(4), entry(3)],
+            false,
+        );
+
         let offset = corrected_scroll_offset(
             ViewportAnchor {
                 first_id: Some(3),
                 offset: 0.0,
             },
-            &entries,
+            &state.index_by_id,
             &[0.0, 40.0, 90.0, 130.0],
         );
 
         assert_eq!(offset, Some(90.0));
+    }
+
+    fn loaded_ids(state: &CognitionState) -> Vec<i64> {
+        state.entries.iter().map(|entry| entry.id).collect()
     }
 
     fn entry(id: i64) -> PersistedCognitionEntryView {
