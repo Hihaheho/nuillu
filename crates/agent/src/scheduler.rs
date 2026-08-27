@@ -4417,6 +4417,7 @@ mod tests {
                             ReplicaProjection::Linear,
                         ),
                         ActivationRatio::ZERO,
+                        "Test arm subsystem",
                     ))
                     .with_registration_scope(child_scope)
                     .register_sync(test_policy(1..=1, fast_bpm()), {

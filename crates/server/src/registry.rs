@@ -89,20 +89,19 @@ pub(super) fn server_registry(
                 replica_projection(expanded.mount.replica_projection()),
             ),
             ActivationRatio::from_f64(expanded.mount.initial_activation()),
+            expanded.definition.allocation_description.clone(),
         );
         if let Some(label) = &expanded.definition.label {
             subsystem_spec = subsystem_spec.with_label(label.clone());
         }
-        subsystem_spec = subsystem_spec
-            .with_allocation_description(expanded.definition.allocation_description.clone())
-            .with_activation_table(
-                expanded
-                    .mount
-                    .activation_table
-                    .iter()
-                    .copied()
-                    .map(ActivationRatio::from_f64),
-            );
+        subsystem_spec = subsystem_spec.with_activation_table(
+            expanded
+                .mount
+                .activation_table
+                .iter()
+                .copied()
+                .map(ActivationRatio::from_f64),
+        );
         // One registration describes the mount; all capacity instances share
         // the same parent and subsystem id.
         if expanded

@@ -893,6 +893,14 @@ fn validate_subsystem_refs<'a>(
                 owner
             );
         }
+        if reference.replica_capacity() == 0 {
+            anyhow::bail!(
+                "server config {} sets replica-capacity=0 for subsystem {} under {}; subsystem mounts must have persistent capacity",
+                path.display(),
+                reference.subsystem,
+                owner
+            );
+        }
         let min = reference.replica_min();
         let max = reference.replica_max();
         if min > max {
@@ -2425,5 +2433,28 @@ activation-table = [1.0, 0.5]
         .unwrap_err()
         .to_string();
         assert!(error.contains("invalid threshold"), "{error}");
+    }
+
+    #[test]
+    fn rejects_zero_capacity_subsystem_mount() {
+        let error = parse_server_boot_config_content(
+            r#"
+@ subsystem-definitions[] {
+  id: arm
+  allocation-description = "Test arm subsystem."
+}
+@ subsystems[] {
+  subsystem: arm
+  replica-min = 0
+  replica-max = 0
+  replica-capacity = 0
+}
+"#,
+            Path::new(".tmp/server/zero-capacity-subsystem-test.eure"),
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(error.contains("replica-capacity=0"), "{error}");
     }
 }

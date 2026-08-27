@@ -80,6 +80,7 @@ impl SubsystemRegistrationSpec {
         subsystem: SubsystemId,
         policy: SubsystemPolicy,
         initial_activation: ActivationRatio,
+        allocation_description: impl Into<Arc<str>>,
     ) -> Self {
         Self {
             parent_scope,
@@ -87,7 +88,7 @@ impl SubsystemRegistrationSpec {
             policy,
             initial_activation,
             label: None,
-            allocation_description: Arc::from(""),
+            allocation_description: allocation_description.into(),
             activation_table: vec![
                 ActivationRatio::ONE,
                 ActivationRatio::from_f64(0.85),
@@ -1161,6 +1162,13 @@ impl AgentRuntimeControl {
         threshold: ActivationRatio,
     ) -> Option<tokio::sync::oneshot::Receiver<()>> {
         if !owner.scope.is_root() {
+            // Effective activation in a child scope may increase because of
+            // either its local module allocation or any ancestor mount. The
+            // local threshold waiter cannot observe the latter, so wake on
+            // the shared allocation-change signal and let the scheduler
+            // re-evaluate the effective threshold. This intentionally permits
+            // spurious wakeups from unrelated scopes in exchange for keeping
+            // the waiter path correct across the full hierarchy.
             return Some(self.blackboard.allocation_change_waiter().await);
         }
         self.blackboard
@@ -2328,6 +2336,16 @@ impl ModuleRegistry {
                     subsystem: spec.subsystem.clone(),
                 });
             }
+            if spec.policy.replica_capacity == 0 {
+                return Err(ModuleRegistryError::SubsystemReplicaCapacityZero {
+                    subsystem: spec.subsystem.clone(),
+                });
+            }
+            if spec.allocation_description.trim().is_empty() {
+                return Err(ModuleRegistryError::EmptySubsystemAllocationDescription {
+                    subsystem: spec.subsystem.clone(),
+                });
+            }
             if spec.policy.replica_capacity < spec.policy.replicas_range.max {
                 return Err(
                     ModuleRegistryError::SubsystemReplicaCapacityBelowPolicyMax {
@@ -2493,6 +2511,10 @@ pub enum ModuleRegistryError {
         parent: ScopeId,
         subsystem: SubsystemId,
     },
+    #[error("subsystem {subsystem} replica capacity must be greater than zero")]
+    SubsystemReplicaCapacityZero { subsystem: SubsystemId },
+    #[error("subsystem {subsystem} allocation description must not be empty")]
+    EmptySubsystemAllocationDescription { subsystem: SubsystemId },
     #[error(
         "subsystem {subsystem} replica capacity {capacity} is below policy capacity {policy_capacity}"
     )]
@@ -3323,9 +3345,9 @@ mod tests {
                         nuillu_blackboard::ReplicaProjection::Linear,
                     ),
                     ActivationRatio::from_f64(0.5),
+                    "Reaching and grasping",
                 )
                 .with_label("Arm")
-                .with_allocation_description("Reaching and grasping")
                 .with_activation_table([
                     ActivationRatio::ONE,
                     ActivationRatio::from_f64(0.4),
@@ -3360,6 +3382,60 @@ mod tests {
                 ActivationRatio::ZERO,
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn registry_rejects_zero_capacity_subsystem_mount() {
+        let caps = test_caps(Blackboard::default());
+        let subsystem = SubsystemId::new("arm").unwrap();
+        let result = ModuleRegistry::new()
+            .with_subsystem(SubsystemRegistrationSpec::new(
+                ScopeId::root(),
+                subsystem.clone(),
+                SubsystemPolicy::new(
+                    SubsystemReplicaRange::new(0, 0).unwrap(),
+                    0,
+                    nuillu_blackboard::ReplicaProjection::Linear,
+                ),
+                ActivationRatio::ZERO,
+                "Test arm subsystem",
+            ))
+            .build(&caps)
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(ModuleRegistryError::SubsystemReplicaCapacityZero {
+                subsystem: rejected
+            }) if rejected == subsystem
+        ));
+    }
+
+    #[tokio::test]
+    async fn registry_rejects_empty_subsystem_allocation_description() {
+        let caps = test_caps(Blackboard::default());
+        let subsystem = SubsystemId::new("arm").unwrap();
+        let result = ModuleRegistry::new()
+            .with_subsystem(SubsystemRegistrationSpec::new(
+                ScopeId::root(),
+                subsystem.clone(),
+                SubsystemPolicy::new(
+                    SubsystemReplicaRange::new(0, 1).unwrap(),
+                    1,
+                    nuillu_blackboard::ReplicaProjection::Linear,
+                ),
+                ActivationRatio::ZERO,
+                "  ",
+            ))
+            .build(&caps)
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(ModuleRegistryError::EmptySubsystemAllocationDescription {
+                subsystem: rejected
+            }) if rejected == subsystem
+        ));
     }
 
     #[tokio::test]

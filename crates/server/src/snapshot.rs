@@ -408,8 +408,11 @@ pub fn duration_millis_u64(duration: Duration) -> u64 {
 #[cfg(test)]
 mod tests {
     use chrono::{DateTime, Utc};
-    use nuillu_blackboard::{BlackboardCommand, InteroceptivePatch, MemoryMetaPatch};
-    use nuillu_types::MemoryIndex;
+    use nuillu_blackboard::{
+        ActivationRatio, BlackboardCommand, InteroceptivePatch, MemoryMetaPatch,
+        RegisteredSubsystemPolicy, ReplicaProjection, SubsystemPolicy, SubsystemReplicaRange,
+    };
+    use nuillu_types::{MemoryIndex, SubsystemId};
 
     use super::*;
 
@@ -442,33 +445,58 @@ mod tests {
         .unwrap();
 
         let blackboard = Blackboard::new();
+        blackboard
+            .apply(BlackboardCommand::SetRegisteredSubsystems {
+                registrations: vec![RegisteredSubsystemPolicy {
+                    subsystem: SubsystemId::new("arm").unwrap(),
+                    policy: SubsystemPolicy::new(
+                        SubsystemReplicaRange::new(2, 2).unwrap(),
+                        2,
+                        ReplicaProjection::Linear,
+                    ),
+                    initial_activation: ActivationRatio::ONE,
+                }],
+            })
+            .await;
         let scopes = scope_views(&config, &blackboard).await;
-        assert_eq!(scopes.len(), 3);
         assert_eq!(
-            scopes[0],
-            ScopeView {
-                id: "/".to_string(),
-                parent: None,
-                memory_scope: "global".to_string(),
-                subsystem: None,
-                replica: None,
-                local_activation: 1.0,
-                effective_activation: 1.0,
-                active_replicas: 1,
-                active: true,
-            }
+            scopes,
+            vec![
+                ScopeView {
+                    id: "/".to_string(),
+                    parent: None,
+                    memory_scope: "global".to_string(),
+                    subsystem: None,
+                    replica: None,
+                    local_activation: 1.0,
+                    effective_activation: 1.0,
+                    active_replicas: 1,
+                    active: true,
+                },
+                ScopeView {
+                    id: "/arm[0]".to_string(),
+                    parent: Some("/".to_string()),
+                    memory_scope: "local".to_string(),
+                    subsystem: Some("arm".to_string()),
+                    replica: Some(0),
+                    local_activation: 1.0,
+                    effective_activation: 1.0,
+                    active_replicas: 2,
+                    active: true,
+                },
+                ScopeView {
+                    id: "/arm[1]".to_string(),
+                    parent: Some("/".to_string()),
+                    memory_scope: "local".to_string(),
+                    subsystem: Some("arm".to_string()),
+                    replica: Some(1),
+                    local_activation: 1.0,
+                    effective_activation: 1.0,
+                    active_replicas: 2,
+                    active: true,
+                },
+            ]
         );
-        assert!(scopes.contains(&ScopeView {
-            id: "/arm[0]".to_string(),
-            parent: Some("/".to_string()),
-            memory_scope: "local".to_string(),
-            subsystem: Some("arm".to_string()),
-            replica: Some(0),
-            local_activation: 1.0,
-            effective_activation: 1.0,
-            active_replicas: 0,
-            active: false,
-        }));
     }
 
     #[tokio::test(flavor = "current_thread")]
