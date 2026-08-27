@@ -2457,4 +2457,76 @@ activation-table = [1.0, 0.5]
 
         assert!(error.contains("replica-capacity=0"), "{error}");
     }
+
+    #[test]
+    fn sibling_subsystem_definitions_mount_distinct_single_replica_scopes() {
+        let config = parse_server_boot_config_content(
+            r#"
+@ subsystem-definitions[] {
+  id: left-leg
+  allocation-description = "Test left leg subsystem."
+  memory-scope: local
+}
+@ subsystem-definitions[] {
+  id: center-leg
+  allocation-description = "Test center leg subsystem."
+  memory-scope: local
+}
+@ subsystem-definitions[] {
+  id: right-leg
+  allocation-description = "Test right leg subsystem."
+  memory-scope: global
+}
+@ subsystems[] {
+  subsystem: left-leg
+  replica-min = 0
+  replica-max = 1
+  replica-capacity = 1
+}
+@ subsystems[] {
+  subsystem: center-leg
+  replica-min = 0
+  replica-max = 1
+  replica-capacity = 1
+}
+@ subsystems[] {
+  subsystem: right-leg
+  replica-min = 0
+  replica-max = 1
+  replica-capacity = 1
+}
+"#,
+            Path::new(".tmp/server/sibling-subsystem-scopes-test.eure"),
+        )
+        .unwrap();
+
+        assert_eq!(
+            config
+                .expanded_subsystems()
+                .iter()
+                .map(|expanded| (
+                    expanded.scope.to_string(),
+                    expanded.definition.id.as_str().to_owned(),
+                    expanded.definition.memory_scope,
+                ))
+                .collect::<Vec<_>>(),
+            vec![
+                (
+                    "/left-leg[0]".to_owned(),
+                    "left-leg".to_owned(),
+                    ServerMemoryScope::Local
+                ),
+                (
+                    "/center-leg[0]".to_owned(),
+                    "center-leg".to_owned(),
+                    ServerMemoryScope::Local
+                ),
+                (
+                    "/right-leg[0]".to_owned(),
+                    "right-leg".to_owned(),
+                    ServerMemoryScope::Global
+                ),
+            ]
+        );
+    }
 }

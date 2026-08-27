@@ -1,16 +1,16 @@
 use std::{
-    collections::BTreeMap,
-    fs, io,
+    collections::{BTreeMap, BTreeSet},
+    fmt, fs, io,
     path::{Path, PathBuf},
 };
 
 use anyhow::Context as _;
 use chrono::{DateTime, Datelike as _, FixedOffset, NaiveDate, TimeZone as _, Utc};
 use eure::{FromEure, value::Text};
-use nuillu_memory::{MemoryCapabilities, MemoryConcept, MemoryKind, MemoryTag, NewMemory};
-use nuillu_types::{MemoryContent, MemoryIndex, MemoryRank};
+use nuillu_memory::{MemoryConcept, MemoryKind, MemoryNamespace, MemoryTag, NewMemory};
+use nuillu_types::{MemoryContent, MemoryIndex, MemoryRank, ScopeId, SubsystemId};
 
-use crate::ports::MemorySeedPort;
+use crate::ports::{MemorySeedPort, MemorySeedSummary, MemorySeedTarget};
 
 const MEMORY_SEED_DIR: &str = "memory-seeds";
 const DEFAULT_TRANSIENT_MEMORY_DECAY_SECS: i64 = 86_400;
@@ -31,14 +31,16 @@ impl FileMemorySeedPort {
 
 #[async_trait::async_trait(?Send)]
 impl MemorySeedPort for FileMemorySeedPort {
-    async fn seed(&self, memory: &MemoryCapabilities) -> anyhow::Result<usize> {
-        seed_memory_from_state_dir(&self.state_dir, memory).await
+    async fn seed(&self, targets: &[MemorySeedTarget]) -> anyhow::Result<MemorySeedSummary> {
+        seed_memory_from_state_dir(&self.state_dir, targets).await
     }
 }
 
 #[derive(Debug, Clone, FromEure)]
 #[eure(crate = ::eure::document, rename_all = "kebab-case")]
 struct MemorySeedFile {
+    #[eure(default)]
+    scope_path: Option<String>,
     #[eure(default)]
     memories: Vec<MemorySeedEntry>,
 }
@@ -66,6 +68,67 @@ struct ResolvedMemorySeed {
     index: MemoryIndex,
     memory: NewMemory,
     decay_secs: i64,
+}
+
+#[derive(Debug, Clone)]
+struct ParsedMemorySeedFile {
+    path: PathBuf,
+    scope_path: MemorySeedScopePath,
+    memories: Vec<ResolvedMemorySeed>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, PartialOrd, Ord)]
+struct MemorySeedScopePath(Vec<SubsystemId>);
+
+impl MemorySeedScopePath {
+    fn parse(value: &str) -> anyhow::Result<Self> {
+        if value == "/" {
+            return Ok(Self::default());
+        }
+        let path = value
+            .strip_prefix('/')
+            .ok_or_else(|| anyhow::anyhow!("scope path must start with '/'"))?;
+        if path.is_empty() || path.split('/').any(str::is_empty) {
+            anyhow::bail!("scope path must not contain an empty segment");
+        }
+        path.split('/')
+            .map(|segment| {
+                SubsystemId::new(segment).map_err(|error| {
+                    anyhow::anyhow!("invalid subsystem {segment:?} in scope path: {error}")
+                })
+            })
+            .collect::<anyhow::Result<Vec<_>>>()
+            .map(Self)
+    }
+
+    fn from_scope(scope: &ScopeId) -> Self {
+        Self(
+            scope
+                .path()
+                .iter()
+                .map(|instance| instance.subsystem.clone())
+                .collect(),
+        )
+    }
+}
+
+impl fmt::Display for MemorySeedScopePath {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.0.is_empty() {
+            return f.write_str("/");
+        }
+        for subsystem in &self.0 {
+            write!(f, "/{subsystem}")?;
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone)]
+struct TargetedMemorySeed {
+    target: usize,
+    path: PathBuf,
+    memory: ResolvedMemorySeed,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, FromEure)]
@@ -122,17 +185,17 @@ fn default_memory_kind() -> MemorySeedKind {
 
 pub(super) async fn seed_memory_from_state_dir(
     state_dir: &Path,
-    memory_caps: &MemoryCapabilities,
-) -> anyhow::Result<usize> {
-    seed_memory_from_dir(&state_dir.join(MEMORY_SEED_DIR), memory_caps).await
+    targets: &[MemorySeedTarget],
+) -> anyhow::Result<MemorySeedSummary> {
+    seed_memory_from_dir(&state_dir.join(MEMORY_SEED_DIR), targets).await
 }
 
 async fn seed_memory_from_dir(
     seed_dir: &Path,
-    memory_caps: &MemoryCapabilities,
-) -> anyhow::Result<usize> {
+    targets: &[MemorySeedTarget],
+) -> anyhow::Result<MemorySeedSummary> {
     if !seed_dir.exists() {
-        return Ok(0);
+        return Ok(MemorySeedSummary::default());
     }
     if !seed_dir.is_dir() {
         anyhow::bail!(
@@ -143,49 +206,130 @@ async fn seed_memory_from_dir(
 
     let files = discover_seed_files(seed_dir)
         .with_context(|| format!("discover memory seed files under {}", seed_dir.display()))?;
-    let seeds = parse_memory_seed_files(&files)?;
-    let writer = memory_caps.writer();
-    let mut count = 0;
-    for seed in seeds {
-        let index = seed.index.clone();
-        writer
-            .put_seeded_entry(seed.index, seed.memory, seed.decay_secs)
-            .await
-            .with_context(|| format!("seed memory {}", index.as_str()))?;
-        count += 1;
+    let files = parse_memory_seed_files(&files)?;
+    let mut targets_by_scope = BTreeMap::new();
+    let mut targets_by_path = BTreeMap::<MemorySeedScopePath, Vec<usize>>::new();
+    for (index, target) in targets.iter().enumerate() {
+        if targets_by_scope
+            .insert(target.scope().clone(), index)
+            .is_some()
+        {
+            anyhow::bail!("duplicate memory seed target for scope {}", target.scope());
+        }
+        targets_by_path
+            .entry(MemorySeedScopePath::from_scope(target.scope()))
+            .or_default()
+            .push(index);
     }
-    Ok(count)
+    let mut persistent_indexes = BTreeMap::<String, PathBuf>::new();
+    let mut seeds = Vec::new();
+    for file in files {
+        let Some(file_targets) = targets_by_path.get(&file.scope_path) else {
+            anyhow::bail!(
+                "memory seed file {} targets scope path {} which is not present in the subsystem topology",
+                file.path.display(),
+                file.scope_path
+            );
+        };
+        for memory in file.memories {
+            for &target in file_targets {
+                let mut targeted_memory = memory.clone();
+                targeted_memory.index = persistent_seed_index(
+                    targets[target].namespace(),
+                    targets[target].scope(),
+                    &memory.index,
+                );
+                let index = targeted_memory.index.as_str().to_owned();
+                if let Some(previous_path) = persistent_indexes.get(&index)
+                    && previous_path != &file.path
+                {
+                    anyhow::bail!(
+                        "duplicate resolved memory seed index {index:?} in {} and {}",
+                        previous_path.display(),
+                        file.path.display()
+                    );
+                }
+                persistent_indexes.insert(index, file.path.clone());
+                seeds.push(TargetedMemorySeed {
+                    target,
+                    path: file.path.clone(),
+                    memory: targeted_memory,
+                });
+            }
+        }
+    }
+
+    let mut seeded_targets = BTreeSet::new();
+    for seed in seeds {
+        let index = seed.memory.index.clone();
+        targets[seed.target]
+            .memory()
+            .writer()
+            .put_seeded_entry(
+                seed.memory.index,
+                seed.memory.memory,
+                seed.memory.decay_secs,
+            )
+            .await
+            .with_context(|| {
+                format!(
+                    "seed memory {} from {} into scope {}",
+                    index.as_str(),
+                    seed.path.display(),
+                    targets[seed.target].scope()
+                )
+            })?;
+        seeded_targets.insert(seed.target);
+    }
+    Ok(MemorySeedSummary {
+        memories: persistent_indexes.len(),
+        scopes: seeded_targets.len(),
+    })
 }
 
-fn parse_memory_seed_files(files: &[PathBuf]) -> anyhow::Result<Vec<ResolvedMemorySeed>> {
-    let mut indexes = BTreeMap::<String, PathBuf>::new();
-    let mut seeds = Vec::new();
+fn persistent_seed_index(
+    namespace: &MemoryNamespace,
+    scope: &ScopeId,
+    index: &MemoryIndex,
+) -> MemoryIndex {
+    match namespace {
+        MemoryNamespace::Global => index.clone(),
+        MemoryNamespace::Local(_) => {
+            MemoryIndex::new(format!("local-seed:{scope}:{}", index.as_str()))
+        }
+    }
+}
+
+fn parse_memory_seed_files(files: &[PathBuf]) -> anyhow::Result<Vec<ParsedMemorySeedFile>> {
+    let mut indexes = BTreeMap::<(MemorySeedScopePath, String), PathBuf>::new();
+    let mut parsed = Vec::new();
     for path in files {
-        for seed in parse_memory_seed_file(path)? {
+        let file = parse_memory_seed_file(path)?;
+        for seed in &file.memories {
             let index = seed.index.as_str().to_owned();
-            if let Some(previous_path) = indexes.insert(index.clone(), path.clone()) {
+            if let Some(previous_path) =
+                indexes.insert((file.scope_path.clone(), index.clone()), path.clone())
+            {
                 anyhow::bail!(
-                    "duplicate memory seed index {index:?} in {} and {}",
+                    "duplicate memory seed index {index:?} for scope path {} in {} and {}",
+                    file.scope_path,
                     previous_path.display(),
                     path.display()
                 );
             }
-            seeds.push(seed);
         }
+        parsed.push(file);
     }
-    Ok(seeds)
+    Ok(parsed)
 }
 
-fn parse_memory_seed_file(path: &Path) -> anyhow::Result<Vec<ResolvedMemorySeed>> {
+fn parse_memory_seed_file(path: &Path) -> anyhow::Result<ParsedMemorySeedFile> {
     let content = fs::read_to_string(path)
         .with_context(|| format!("read memory seed file {}", path.display()))?;
     parse_memory_seed_content(&content, path)
 }
 
-fn parse_memory_seed_content(
-    content: &str,
-    path: &Path,
-) -> anyhow::Result<Vec<ResolvedMemorySeed>> {
+fn parse_memory_seed_content(content: &str, path: &Path) -> anyhow::Result<ParsedMemorySeedFile> {
     let file: MemorySeedFile =
         eure::parse_content(content, path.to_path_buf()).map_err(|message| {
             anyhow::anyhow!(
@@ -193,11 +337,24 @@ fn parse_memory_seed_content(
                 path.display()
             )
         })?;
-    file.memories
+    let scope_path = file.scope_path.as_deref().unwrap_or("/");
+    let scope_path = MemorySeedScopePath::parse(scope_path).with_context(|| {
+        format!(
+            "{} scope-path {scope_path:?} is not a canonical scope path",
+            path.display()
+        )
+    })?;
+    let memories = file
+        .memories
         .into_iter()
         .enumerate()
         .map(|(index, memory)| resolve_memory_seed_entry(path, index, memory))
-        .collect()
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    Ok(ParsedMemorySeedFile {
+        path: path.to_path_buf(),
+        scope_path,
+        memories,
+    })
 }
 
 fn resolve_memory_seed_entry(
@@ -346,13 +503,13 @@ mod tests {
     use std::{cell::RefCell, collections::BTreeMap, rc::Rc};
 
     use async_trait::async_trait;
-    use chrono::TimeZone as _;
     use nuillu_blackboard::Blackboard;
     use nuillu_memory::{
-        IndexedMemory, LinkedMemoryQuery, LinkedMemoryRecord, MemoryLink, MemoryLinkRelation,
-        MemoryQuery, MemoryRecord, MemoryStore, NewMemoryLink,
+        IndexedMemory, LinkedMemoryQuery, LinkedMemoryRecord, MemoryCapabilities, MemoryLink,
+        MemoryLinkRelation, MemoryQuery, MemoryRecord, MemoryStore, NewMemoryLink,
     };
     use nuillu_module::ports::{Clock, PortError};
+    use nuillu_types::{ReplicaIndex, SubsystemInstanceId};
     use uuid::Uuid;
 
     use super::*;
@@ -486,7 +643,35 @@ mod tests {
     }
 
     fn parse_seed(content: &str) -> anyhow::Result<Vec<ResolvedMemorySeed>> {
-        parse_memory_seed_content(content, Path::new("seed.eure"))
+        parse_memory_seed_content(content, Path::new("seed.eure")).map(|file| file.memories)
+    }
+
+    fn scope(value: &str) -> ScopeId {
+        value
+            .strip_prefix('/')
+            .unwrap()
+            .split('/')
+            .filter(|segment| !segment.is_empty())
+            .fold(ScopeId::root(), |scope, segment| {
+                let (subsystem, replica) = segment.split_once('[').unwrap();
+                let replica = replica.strip_suffix(']').unwrap().parse::<u8>().unwrap();
+                scope.child(SubsystemInstanceId::new(
+                    SubsystemId::new(subsystem).unwrap(),
+                    ReplicaIndex::new(replica),
+                ))
+            })
+    }
+
+    fn memory_seed_target(
+        memory: &MemoryCapabilities,
+        blackboard: &Blackboard,
+        scope: ScopeId,
+        namespace: MemoryNamespace,
+    ) -> MemorySeedTarget {
+        let scoped_memory = memory
+            .with_namespace(namespace.clone())
+            .scoped(blackboard.scoped(scope.clone()));
+        MemorySeedTarget::new(scope, namespace, scoped_memory)
     }
 
     #[test]
@@ -618,6 +803,19 @@ mod tests {
             invalid_datetime.contains("occurred-at is invalid"),
             "{invalid_datetime}"
         );
+
+        let invalid_scope = parse_memory_seed_content(
+            r#"
+scope-path: /arm[0]
+"#,
+            Path::new("seed.eure"),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            invalid_scope.contains("is not a canonical scope path"),
+            "{invalid_scope}"
+        );
     }
 
     #[test]
@@ -696,12 +894,21 @@ mod tests {
             Vec::new(),
         );
 
-        let count = seed_memory_from_state_dir(&root, &memory_caps)
-            .await
-            .unwrap();
+        let targets = [MemorySeedTarget::new(
+            ScopeId::root(),
+            MemoryNamespace::Global,
+            memory_caps.clone(),
+        )];
+        let seeded = seed_memory_from_state_dir(&root, &targets).await.unwrap();
         memory_caps.bootstrap_identity_memories().await.unwrap();
 
-        assert_eq!(count, 2);
+        assert_eq!(
+            seeded,
+            MemorySeedSummary {
+                memories: 2,
+                scopes: 1
+            }
+        );
         let identities = blackboard.read(|bb| bb.identity_memories().to_vec()).await;
         assert_eq!(identities.len(), 1);
         assert_eq!(identities[0].index.as_str(), "identity-seed");
@@ -732,11 +939,472 @@ mod tests {
             Vec::new(),
         );
 
-        let count = seed_memory_from_state_dir(&root, &memory_caps)
-            .await
-            .unwrap();
+        let targets = [MemorySeedTarget::new(
+            ScopeId::root(),
+            MemoryNamespace::Global,
+            memory_caps,
+        )];
+        let seeded = seed_memory_from_state_dir(&root, &targets).await.unwrap();
 
-        assert_eq!(count, 0);
+        assert_eq!(seeded, MemorySeedSummary::default());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn local_scope_path_seeds_all_replicas_isolated_and_idempotent() {
+        let root = std::env::current_dir()
+            .unwrap()
+            .join(".tmp")
+            .join(format!("memory-seed-local-scopes-{}", Uuid::now_v7()));
+        let seed_dir = root.join(MEMORY_SEED_DIR);
+        fs::create_dir_all(&seed_dir).unwrap();
+        fs::write(
+            seed_dir.join("arm.eure"),
+            r#"
+scope-path: /arm
+
+@ memories[] {
+  index: shared-identity-key
+  rank: identity
+  content: Identity shared by every arm replica.
+}
+"#,
+        )
+        .unwrap();
+
+        let blackboard = Blackboard::new();
+        let store = MemorySeedTestStore::default();
+        let memory = MemoryCapabilities::new(
+            blackboard.clone(),
+            Rc::new(FixedClock(
+                Utc.with_ymd_and_hms(2026, 8, 27, 0, 0, 0).unwrap(),
+            )),
+            Rc::new(store.clone()),
+            Vec::new(),
+        );
+        let arm_zero = scope("/arm[0]");
+        let arm_one = scope("/arm[1]");
+        let finger = scope("/arm[0]/finger[0]");
+        let targets = vec![
+            memory_seed_target(
+                &memory,
+                &blackboard,
+                ScopeId::root(),
+                MemoryNamespace::Global,
+            ),
+            memory_seed_target(
+                &memory,
+                &blackboard,
+                arm_zero.clone(),
+                MemoryNamespace::Local(arm_zero.clone()),
+            ),
+            memory_seed_target(
+                &memory,
+                &blackboard,
+                arm_one.clone(),
+                MemoryNamespace::Local(arm_one.clone()),
+            ),
+            memory_seed_target(
+                &memory,
+                &blackboard,
+                finger.clone(),
+                MemoryNamespace::Local(finger.clone()),
+            ),
+        ];
+
+        let expected = MemorySeedSummary {
+            memories: 2,
+            scopes: 2,
+        };
+        assert_eq!(
+            seed_memory_from_state_dir(&root, &targets).await.unwrap(),
+            expected
+        );
+        assert_eq!(
+            seed_memory_from_state_dir(&root, &targets).await.unwrap(),
+            expected
+        );
+        for target in &targets {
+            target.memory().bootstrap_identity_memories().await.unwrap();
+        }
+
+        assert_eq!(
+            store.records.borrow().keys().cloned().collect::<Vec<_>>(),
+            vec![
+                "local-seed:/arm[0]:shared-identity-key".to_owned(),
+                "local-seed:/arm[1]:shared-identity-key".to_owned(),
+            ]
+        );
+        let root_identities = blackboard.read(|bb| bb.identity_memories().to_vec()).await;
+        let arm_zero_identities = blackboard
+            .scoped(arm_zero)
+            .read(|bb| bb.identity_memories().to_vec())
+            .await;
+        let arm_one_identities = blackboard
+            .scoped(arm_one)
+            .read(|bb| bb.identity_memories().to_vec())
+            .await;
+        let finger_identities = blackboard
+            .scoped(finger)
+            .read(|bb| bb.identity_memories().to_vec())
+            .await;
+        assert!(root_identities.is_empty());
+        assert_eq!(
+            arm_zero_identities[0].index.as_str(),
+            "local-seed:/arm[0]:shared-identity-key"
+        );
+        assert_eq!(
+            arm_zero_identities[0].content.as_str(),
+            "Identity shared by every arm replica."
+        );
+        assert_eq!(
+            arm_one_identities[0].index.as_str(),
+            "local-seed:/arm[1]:shared-identity-key"
+        );
+        assert_eq!(
+            arm_one_identities[0].content.as_str(),
+            "Identity shared by every arm replica."
+        );
+        assert!(finger_identities.is_empty());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn global_scope_seed_remains_shared_but_targets_scoped_metadata() {
+        let root = std::env::current_dir()
+            .unwrap()
+            .join(".tmp")
+            .join(format!("memory-seed-global-scope-{}", Uuid::now_v7()));
+        let seed_dir = root.join(MEMORY_SEED_DIR);
+        fs::create_dir_all(&seed_dir).unwrap();
+        fs::write(
+            seed_dir.join("arm.eure"),
+            r#"
+scope-path: /arm
+
+@ memories[] {
+  index: shared-global-identity
+  rank: identity
+  content: Globally shared identity.
+}
+"#,
+        )
+        .unwrap();
+
+        let blackboard = Blackboard::new();
+        let store = MemorySeedTestStore::default();
+        let memory = MemoryCapabilities::new(
+            blackboard.clone(),
+            Rc::new(FixedClock(
+                Utc.with_ymd_and_hms(2026, 8, 27, 0, 0, 0).unwrap(),
+            )),
+            Rc::new(store.clone()),
+            Vec::new(),
+        );
+        let arm_zero = scope("/arm[0]");
+        let arm_one = scope("/arm[1]");
+        let targets = vec![
+            memory_seed_target(
+                &memory,
+                &blackboard,
+                ScopeId::root(),
+                MemoryNamespace::Global,
+            ),
+            memory_seed_target(
+                &memory,
+                &blackboard,
+                arm_zero.clone(),
+                MemoryNamespace::Global,
+            ),
+            memory_seed_target(
+                &memory,
+                &blackboard,
+                arm_one.clone(),
+                MemoryNamespace::Global,
+            ),
+        ];
+
+        // Both arm replicas mirror one shared global memory, so the summary reports a single
+        // seeded memory even though two scopes were written through.
+        assert_eq!(
+            seed_memory_from_state_dir(&root, &targets).await.unwrap(),
+            MemorySeedSummary {
+                memories: 1,
+                scopes: 2
+            }
+        );
+        for target in &targets {
+            target.memory().bootstrap_identity_memories().await.unwrap();
+        }
+
+        assert_eq!(store.records.borrow().len(), 1);
+        assert_eq!(
+            blackboard
+                .read(|bb| bb.identity_memories()[0].index.clone())
+                .await
+                .as_str(),
+            "shared-global-identity"
+        );
+        assert_eq!(
+            blackboard
+                .scoped(arm_zero)
+                .read(|bb| bb.identity_memories()[0].index.clone())
+                .await
+                .as_str(),
+            "shared-global-identity"
+        );
+        assert_eq!(
+            blackboard
+                .scoped(arm_one)
+                .read(|bb| bb.identity_memories()[0].index.clone())
+                .await
+                .as_str(),
+            "shared-global-identity"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn rejects_seed_for_scope_outside_expanded_targets() {
+        let root = std::env::current_dir()
+            .unwrap()
+            .join(".tmp")
+            .join(format!("memory-seed-missing-scope-{}", Uuid::now_v7()));
+        let seed_dir = root.join(MEMORY_SEED_DIR);
+        fs::create_dir_all(&seed_dir).unwrap();
+        fs::write(
+            seed_dir.join("missing.eure"),
+            r#"
+scope-path: /arm
+
+@ memories[] {
+  index: unavailable
+  rank: permanent
+  content: This must not be seeded.
+}
+"#,
+        )
+        .unwrap();
+        let blackboard = Blackboard::new();
+        let store = MemorySeedTestStore::default();
+        let memory = MemoryCapabilities::new(
+            blackboard.clone(),
+            Rc::new(FixedClock(
+                Utc.with_ymd_and_hms(2026, 8, 27, 0, 0, 0).unwrap(),
+            )),
+            Rc::new(store.clone()),
+            Vec::new(),
+        );
+        let targets = [memory_seed_target(
+            &memory,
+            &blackboard,
+            ScopeId::root(),
+            MemoryNamespace::Global,
+        )];
+
+        let error = seed_memory_from_state_dir(&root, &targets)
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("scope path /arm"), "{error}");
+        assert!(store.records.borrow().is_empty());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn rejects_indexes_that_collide_after_global_scope_resolution() {
+        let root = std::env::current_dir()
+            .unwrap()
+            .join(".tmp")
+            .join(format!("memory-seed-global-collision-{}", Uuid::now_v7()));
+        let seed_dir = root.join(MEMORY_SEED_DIR);
+        fs::create_dir_all(&seed_dir).unwrap();
+        fs::write(
+            seed_dir.join("root.eure"),
+            r#"
+@ memories[] {
+  index: same-global-index
+  rank: permanent
+  content: Root declaration.
+}
+"#,
+        )
+        .unwrap();
+        fs::write(
+            seed_dir.join("arm.eure"),
+            r#"
+scope-path: /arm
+
+@ memories[] {
+  index: same-global-index
+  rank: permanent
+  content: Scoped declaration.
+}
+"#,
+        )
+        .unwrap();
+        let blackboard = Blackboard::new();
+        let store = MemorySeedTestStore::default();
+        let memory = MemoryCapabilities::new(
+            blackboard.clone(),
+            Rc::new(FixedClock(
+                Utc.with_ymd_and_hms(2026, 8, 27, 0, 0, 0).unwrap(),
+            )),
+            Rc::new(store.clone()),
+            Vec::new(),
+        );
+        let arm = scope("/arm[0]");
+        let targets = [
+            memory_seed_target(
+                &memory,
+                &blackboard,
+                ScopeId::root(),
+                MemoryNamespace::Global,
+            ),
+            memory_seed_target(&memory, &blackboard, arm, MemoryNamespace::Global),
+        ];
+
+        let error = seed_memory_from_state_dir(&root, &targets)
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert!(
+            error.contains("duplicate resolved memory seed index"),
+            "{error}"
+        );
+        assert!(store.records.borrow().is_empty());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn sibling_scope_path_files_seed_distinct_identity_per_scope() {
+        let root = std::env::current_dir()
+            .unwrap()
+            .join(".tmp")
+            .join(format!("memory-seed-sibling-scopes-{}", Uuid::now_v7()));
+        let seed_dir = root.join(MEMORY_SEED_DIR);
+        fs::create_dir_all(&seed_dir).unwrap();
+        for (file, scope_path, index, content) in [
+            ("root.eure", None, "whole-identity", "I am the whole body."),
+            (
+                "left.eure",
+                Some("/left-leg"),
+                "leg-identity",
+                "I am the left leg.",
+            ),
+            (
+                "center.eure",
+                Some("/center-leg"),
+                "leg-identity",
+                "I am the center leg.",
+            ),
+            (
+                "right.eure",
+                Some("/right-leg"),
+                "leg-identity",
+                "I am the right leg.",
+            ),
+        ] {
+            let scope_path = scope_path
+                .map(|path| format!("scope-path: {path}\n"))
+                .unwrap_or_default();
+            fs::write(
+                seed_dir.join(file),
+                format!(
+                    r#"
+{scope_path}
+@ memories[] {{
+  index: {index}
+  rank: identity
+  content: {content}
+}}
+"#
+                ),
+            )
+            .unwrap();
+        }
+
+        let blackboard = Blackboard::new();
+        let memory = MemoryCapabilities::new(
+            blackboard.clone(),
+            Rc::new(FixedClock(
+                Utc.with_ymd_and_hms(2026, 8, 27, 0, 0, 0).unwrap(),
+            )),
+            Rc::new(MemorySeedTestStore::default()),
+            Vec::new(),
+        );
+        let mut targets = vec![memory_seed_target(
+            &memory,
+            &blackboard,
+            ScopeId::root(),
+            MemoryNamespace::Global,
+        )];
+        for leg in ["left-leg", "center-leg", "right-leg"] {
+            let scope = scope(&format!("/{leg}[0]"));
+            targets.push(memory_seed_target(
+                &memory,
+                &blackboard,
+                scope.clone(),
+                MemoryNamespace::Local(scope),
+            ));
+        }
+
+        assert_eq!(
+            seed_memory_from_state_dir(&root, &targets).await.unwrap(),
+            MemorySeedSummary {
+                memories: 4,
+                scopes: 4
+            }
+        );
+        for target in &targets {
+            target.memory().bootstrap_identity_memories().await.unwrap();
+        }
+
+        let actual = targets
+            .iter()
+            .map(|target| {
+                let blackboard = blackboard.scoped(target.scope().clone());
+                async move {
+                    blackboard
+                        .read(|bb| {
+                            (
+                                target.scope().to_string(),
+                                bb.identity_memories()[0].index.as_str().to_owned(),
+                                bb.identity_memories()[0].content.as_str().to_owned(),
+                            )
+                        })
+                        .await
+                }
+            })
+            .collect::<Vec<_>>();
+        let actual = futures::future::join_all(actual).await;
+        assert_eq!(
+            actual,
+            vec![
+                (
+                    "/".to_owned(),
+                    "whole-identity".to_owned(),
+                    "I am the whole body.".to_owned(),
+                ),
+                (
+                    "/left-leg[0]".to_owned(),
+                    "local-seed:/left-leg[0]:leg-identity".to_owned(),
+                    "I am the left leg.".to_owned(),
+                ),
+                (
+                    "/center-leg[0]".to_owned(),
+                    "local-seed:/center-leg[0]:leg-identity".to_owned(),
+                    "I am the center leg.".to_owned(),
+                ),
+                (
+                    "/right-leg[0]".to_owned(),
+                    "local-seed:/right-leg[0]:leg-identity".to_owned(),
+                    "I am the right leg.".to_owned(),
+                ),
+            ]
+        );
         fs::remove_dir_all(root).unwrap();
     }
 }

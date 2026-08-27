@@ -39,8 +39,8 @@ pub use model_set::{
 };
 pub use nuillu_llm_trace_file::{FileLlmTraceSink, LlmLogContext};
 pub use ports::{
-    MemorySeedPort, NoopMemorySeed, NoopRuntimeEventLog, RuntimeEventLogPort, ServerHostPorts,
-    ServerStatePort,
+    MemorySeedPort, MemorySeedSummary, MemorySeedTarget, NoopMemorySeed, NoopRuntimeEventLog,
+    RuntimeEventLogPort, ServerHostPorts, ServerStatePort,
 };
 pub use registry::ServerModuleRegistrar;
 pub use runtime::{

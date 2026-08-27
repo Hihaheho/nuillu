@@ -79,7 +79,7 @@ globs = ["configs/modelsets/**/*.eure"]
 schema = "schemas/eval-model-set.schema.eure"
 
 @ targets.server-memory-seeds
-globs = [".tmp/**/memory-seeds/**/*.eure"]
+globs = [".tmp/**/memory-seeds/**/*.eure", "configs/agents/**/memory-seeds/**/*.eure"]
 schema = "schemas/server-memory-seeds.schema.eure"
 
 @ targets.server-config

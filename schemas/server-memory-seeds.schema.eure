@@ -2,6 +2,14 @@
 
 $schema = "https://eure.dev/v0.1.7/schemas/eure-schema.schema.eure"
 
+// Subsystem mount path such as /arm/finger. Replica indexes are not included;
+// one declaration is expanded to every concrete replica at the mount.
+scope-path {
+  $variant: text
+  min-length = 1
+}
+scope-path.$optional = true
+
 memories = [`$types.memory-seed`]
 memories.$optional = true
 

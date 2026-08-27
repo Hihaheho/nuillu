@@ -45,13 +45,17 @@ use nuillu_visualizer_protocol::{
 };
 
 use super::SERVER_TAB_ID;
-use super::config::{EmbeddingBackendConfig, LlmBackendConfig, LlmGenerationConfig, ServerConfig};
+use super::config::{
+    EmbeddingBackendConfig, LlmBackendConfig, LlmGenerationConfig, ServerConfig, ServerMemoryScope,
+};
 use super::gui::VisualizerEventSink;
 use super::llm_db_trace::DbLlmTraceSink;
 use super::llm_observer::VisualizerLlmObserver;
 #[cfg(feature = "libsql")]
 use super::memory_seed::FileMemorySeedPort;
-use super::ports::{NoopMemorySeed, NoopRuntimeEventLog, RuntimeEventLogPort, ServerHostPorts};
+use super::ports::{
+    MemorySeedTarget, NoopMemorySeed, NoopRuntimeEventLog, RuntimeEventLogPort, ServerHostPorts,
+};
 use super::runtime_event_log::runtime_event_message;
 #[cfg(feature = "libsql")]
 use super::runtime_event_log::{FileRuntimeEventLog, runtime_event_log_path};
@@ -351,24 +355,55 @@ pub(super) async fn build_server_environment(
         Vec::new(),
     );
     let startup_memory_caps = memory_caps.with_namespace(MemoryNamespace::Global);
+    let mut memory_seed_targets = vec![MemorySeedTarget::new(
+        nuillu_types::ScopeId::root(),
+        MemoryNamespace::Global,
+        startup_memory_caps.clone(),
+    )];
+    memory_seed_targets.extend(config.boot_config.expanded_subsystems().into_iter().map(
+        |expanded| {
+            let namespace = match expanded.definition.memory_scope {
+                ServerMemoryScope::Global => MemoryNamespace::Global,
+                ServerMemoryScope::Local => MemoryNamespace::Local(expanded.scope.clone()),
+            };
+            let scoped_memory = memory_caps
+                .with_namespace(namespace.clone())
+                .scoped(blackboard.scoped(expanded.scope.clone()));
+            MemorySeedTarget::new(expanded.scope, namespace, scoped_memory)
+        },
+    ));
     emit_startup_progress(&visualizer, "seeding startup memories");
-    let seeded_memories = host_ports
+    let seeded = host_ports
         .memory_seed()
-        .seed(&startup_memory_caps)
+        .seed(&memory_seed_targets)
         .await
         .context("seed startup memories")?;
-    if seeded_memories > 0 {
-        eprintln!("nuillu-server seeded memory entries count={seeded_memories}");
+    let seeded_summary = format!(
+        "count={} scopes={}/{}",
+        seeded.memories,
+        seeded.scopes,
+        memory_seed_targets.len()
+    );
+    if seeded.memories > 0 {
+        eprintln!("nuillu-server seeded memory entries {seeded_summary}");
     }
     emit_startup_progress(
         &visualizer,
-        format!("startup memories seeded count={seeded_memories}"),
+        format!("startup memories seeded {seeded_summary}"),
     );
     emit_startup_progress(&visualizer, "bootstrapping identity memories");
-    startup_memory_caps
-        .bootstrap_identity_memories()
-        .await
-        .map_err(|error| anyhow::anyhow!("failed to load identity memories: {error}"))?;
+    for target in &memory_seed_targets {
+        target
+            .memory()
+            .bootstrap_identity_memories()
+            .await
+            .map_err(|error| {
+                anyhow::anyhow!(
+                    "failed to load identity memories for scope {}: {error}",
+                    target.scope()
+                )
+            })?;
+    }
 
     let policy_caps =
         PolicyCapabilities::new(blackboard.clone(), clock.clone(), policy_store, Vec::new());

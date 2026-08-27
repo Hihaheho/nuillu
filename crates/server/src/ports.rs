@@ -1,9 +1,10 @@
 use std::rc::Rc;
 
 use async_trait::async_trait;
-use nuillu_memory::MemoryCapabilities;
+use nuillu_memory::{MemoryCapabilities, MemoryNamespace};
 use nuillu_module::{ActionAffordance, RuntimeEvent};
 use nuillu_storage::AgentStore;
+use nuillu_types::ScopeId;
 use nuillu_visualizer_protocol::{EditableSceneStateView, ModuleSettingsView};
 
 #[async_trait(?Send)]
@@ -35,7 +36,47 @@ pub trait RuntimeEventLogPort {
 
 #[async_trait(?Send)]
 pub trait MemorySeedPort {
-    async fn seed(&self, memory: &MemoryCapabilities) -> anyhow::Result<usize>;
+    async fn seed(&self, targets: &[MemorySeedTarget]) -> anyhow::Result<MemorySeedSummary>;
+}
+
+/// What a startup seed pass actually persisted.
+///
+/// `memories` counts distinct persisted memory indexes rather than write calls: a
+/// global-namespace seed declared at a subsystem mount is written once per replica scope
+/// but stores a single memory, so counting writes would over-report the seeded set.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct MemorySeedSummary {
+    pub memories: usize,
+    pub scopes: usize,
+}
+
+#[derive(Clone)]
+pub struct MemorySeedTarget {
+    scope: ScopeId,
+    namespace: MemoryNamespace,
+    memory: MemoryCapabilities,
+}
+
+impl MemorySeedTarget {
+    pub fn new(scope: ScopeId, namespace: MemoryNamespace, memory: MemoryCapabilities) -> Self {
+        Self {
+            scope,
+            namespace,
+            memory,
+        }
+    }
+
+    pub fn scope(&self) -> &ScopeId {
+        &self.scope
+    }
+
+    pub fn namespace(&self) -> &MemoryNamespace {
+        &self.namespace
+    }
+
+    pub fn memory(&self) -> &MemoryCapabilities {
+        &self.memory
+    }
 }
 
 #[derive(Clone)]
@@ -92,7 +133,7 @@ pub struct NoopMemorySeed;
 
 #[async_trait(?Send)]
 impl MemorySeedPort for NoopMemorySeed {
-    async fn seed(&self, _memory: &MemoryCapabilities) -> anyhow::Result<usize> {
-        Ok(0)
+    async fn seed(&self, _targets: &[MemorySeedTarget]) -> anyhow::Result<MemorySeedSummary> {
+        Ok(MemorySeedSummary::default())
     }
 }
