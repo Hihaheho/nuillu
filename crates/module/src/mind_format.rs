@@ -932,6 +932,52 @@ mod tests {
     }
 
     #[test]
+    fn cognition_batch_labels_sibling_scope_for_peer_dialogue() {
+        let subsystem = SubsystemId::new("arm").unwrap();
+        let arm_1 = ScopeId::root().child(SubsystemInstanceId::new(
+            subsystem.clone(),
+            ReplicaIndex::ZERO,
+        ));
+        let arm_2 =
+            ScopeId::root().child(SubsystemInstanceId::new(subsystem, ReplicaIndex::new(1)));
+        let origin = ModuleInstanceId::in_scope(
+            arm_1.clone(),
+            builtin::cognition_gate(),
+            ReplicaIndex::ZERO,
+        );
+        let record = CognitionLogEntryRecord {
+            index: 0,
+            source: origin.clone(),
+            entry: CognitionLogEntry {
+                at: now(),
+                text: "I think our shared motion makes us one".into(),
+                origin: CognitionLogOrigin::direct(origin),
+            },
+        };
+        let labels = ScopeLabels::new([
+            (arm_1, Arc::from("Arm 1")),
+            (arm_2.clone(), Arc::from("Arm 2")),
+        ]);
+        let arm_2_cx = activation_cx(
+            ModuleInstanceId::in_scope(arm_2, builtin::speak(), ReplicaIndex::ZERO),
+            labels,
+        );
+
+        assert_eq!(
+            format_bounded_cognition_log_batch_in_context(
+                &[record],
+                now(),
+                LlmContextWindow::new(1, 100, 500),
+                &arm_2_cx,
+            ),
+            Some(
+                "What you are currently thinking at 2026-05-11T06:23:00Z:\n- Just now: Arm 1: I think our shared motion makes us one"
+                    .to_owned()
+            )
+        );
+    }
+
+    #[test]
     fn memo_batch_is_system_note_text_and_sorts_old_to_new() {
         let sensory = nuillu_types::ModuleInstanceId::new(builtin::sensory(), ReplicaIndex::ZERO);
         let memory = nuillu_types::ModuleInstanceId::new(builtin::memory(), ReplicaIndex::ZERO);

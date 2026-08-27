@@ -3669,8 +3669,22 @@ fn memo_payload_columns(
 ) -> Result<(Option<String>, Option<String>), PortError> {
     match payload {
         MemoLogPayload::Plain => Ok((None, None)),
-        MemoLogPayload::Typed { type_name, json } => {
-            let payload_json = serde_json::to_string(json)
+        MemoLogPayload::Typed {
+            type_name,
+            json,
+            forwarded_cognition,
+        } => {
+            let stored_json = forwarded_cognition.as_ref().map_or_else(
+                || json.clone(),
+                |entry| {
+                    serde_json::json!({
+                        "__nuillu_memo_envelope_version": 1,
+                        "payload": json,
+                        "forwarded_cognition": entry,
+                    })
+                },
+            );
+            let payload_json = serde_json::to_string(&stored_json)
                 .map_err(|error| PortError::InvalidData(error.to_string()))?;
             Ok((Some(type_name.clone()), Some(payload_json)))
         }
@@ -3688,11 +3702,33 @@ fn memo_log_entry_from_row(row: &libsql::Row) -> Result<PersistedMemoLogEntry, P
     let payload_json: Option<String> = row.get(7).map_err(map_libsql_error)?;
     let payload = match (payload_type, payload_json) {
         (None, None) => MemoLogPayload::Plain,
-        (Some(type_name), Some(json)) => MemoLogPayload::Typed {
-            type_name,
-            json: serde_json::from_str(&json)
-                .map_err(|error| PortError::InvalidData(error.to_string()))?,
-        },
+        (Some(type_name), Some(json)) => {
+            let stored: serde_json::Value = serde_json::from_str(&json)
+                .map_err(|error| PortError::InvalidData(error.to_string()))?;
+            let is_envelope = stored
+                .get("__nuillu_memo_envelope_version")
+                .and_then(serde_json::Value::as_u64)
+                == Some(1);
+            let (json, forwarded_cognition) = if is_envelope {
+                let payload = stored.get("payload").cloned().ok_or_else(|| {
+                    PortError::InvalidData("memo payload envelope is missing payload".to_owned())
+                })?;
+                let forwarded = stored
+                    .get("forwarded_cognition")
+                    .cloned()
+                    .map(serde_json::from_value)
+                    .transpose()
+                    .map_err(|error| PortError::InvalidData(error.to_string()))?;
+                (payload, forwarded)
+            } else {
+                (stored, None)
+            };
+            MemoLogPayload::Typed {
+                type_name,
+                json,
+                forwarded_cognition,
+            }
+        }
         _ => {
             return Err(PortError::InvalidData(
                 "memo log payload_type and payload_json must both be null or both be set"
@@ -6316,6 +6352,7 @@ mod tests {
                 MemoLogPayload::Typed {
                     type_name: "query-payload".to_owned(),
                     json: serde_json::json!({ "hits": ["memory-1"] }),
+                    forwarded_cognition: None,
                 },
             ),
         ] {
@@ -6350,6 +6387,7 @@ mod tests {
                     payload: MemoLogPayload::Typed {
                         type_name: "query-payload".to_owned(),
                         json: serde_json::json!({ "hits": ["memory-1"] }),
+                        forwarded_cognition: None,
                     },
                 },
                 PersistedMemoLogEntry {
@@ -6365,6 +6403,42 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn memo_log_repository_round_trips_forwarded_cognition_envelope() {
+        let repo = memo_log_repository().await;
+        let owner =
+            ModuleInstanceId::new(ModuleId::new("subsystem-gate").unwrap(), ReplicaIndex::ZERO);
+        let origin = ModuleInstanceId::new(
+            ModuleId::new("cognition-gate").unwrap(),
+            ReplicaIndex::new(2),
+        );
+        let at = chrono::Utc.with_ymd_and_hms(2025, 6, 1, 12, 0, 0).unwrap();
+        let forwarded_cognition = CognitionLogEntry {
+            at,
+            text: "peer cognition".to_owned(),
+            origin: CognitionLogOrigin::direct(origin),
+        };
+        let expected = PersistedMemoLogEntry {
+            scope: ScopeId::root(),
+            record: MemoLogRecord {
+                owner,
+                index: 0,
+                written_at: at,
+                content: forwarded_cognition.text.clone(),
+                cognitive: true,
+            },
+            payload: MemoLogPayload::Typed {
+                type_name: "bridge-state".to_owned(),
+                json: serde_json::json!({ "seen": ["lineage"] }),
+                forwarded_cognition: Some(forwarded_cognition),
+            },
+        };
+
+        repo.append(&expected).await.unwrap();
+
+        assert_eq!(repo.recent_per_owner(1).await.unwrap(), vec![expected]);
     }
 
     #[tokio::test]

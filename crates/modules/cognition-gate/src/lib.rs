@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 
 use anyhow::{Context, Result, anyhow};
@@ -10,7 +11,7 @@ use nuillu_module::{
     compact_llm_context_text, ensure_persistent_session_seeded_in_context,
     push_formatted_cognition_log_batch_in_context,
 };
-use schemars::JsonSchema;
+use schemars::{JsonSchema, Schema, SchemaGenerator};
 use serde::{Deserialize, Serialize};
 
 mod batch;
@@ -54,6 +55,42 @@ const CANDIDATE_TEXT_CONTEXT_CHARS: usize = 1_200;
 const MAX_AWARENESS_ENTRIES: usize = 3;
 const MAX_DEFERRED_CANDIDATES: usize = 3;
 
+tokio::task_local! {
+    static CANDIDATE_RANKING_SCHEMA: Schema;
+}
+
+fn fallback_candidate_ranking_schema() -> Schema {
+    candidate_ranking_schema(&[])
+}
+
+fn candidate_ranking_schema(candidates: &[CognitionCandidate]) -> Schema {
+    let labels = candidates
+        .iter()
+        .map(|candidate| candidate.id.as_str())
+        .collect::<Vec<_>>();
+    let items = if labels.is_empty() {
+        serde_json::Value::Bool(false)
+    } else {
+        serde_json::json!({ "type": "string", "enum": labels })
+    };
+    Schema::try_from(serde_json::json!({
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+            "important_labels": {
+                "type": "array",
+                "items": items.clone(),
+            },
+            "noise_labels": {
+                "type": "array",
+                "items": items,
+            },
+        },
+        "required": ["important_labels", "noise_labels"],
+    }))
+    .expect("candidate ranking schema must be a JSON object")
+}
+
 pub fn session_auto_compaction() -> SessionAutoCompaction {
     SessionAutoCompaction::new(
         SessionCompactionConfig::default(),
@@ -68,7 +105,7 @@ pub fn session_auto_compaction() -> SessionAutoCompaction {
     output = RankAwarenessCandidatesOutput
 )]
 /// Rank candidate labels for the agent's current awareness.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RankAwarenessCandidatesArgs {
     /// Candidate labels worth admitting now, ordered most important first.
     #[serde(default)]
@@ -76,6 +113,26 @@ pub struct RankAwarenessCandidatesArgs {
     /// Stale, redundant, process-like, or low-value candidate labels, closest to noise first.
     #[serde(default)]
     pub noise_labels: Vec<String>,
+}
+
+impl JsonSchema for RankAwarenessCandidatesArgs {
+    fn inline_schema() -> bool {
+        true
+    }
+
+    fn schema_name() -> Cow<'static, str> {
+        "RankAwarenessCandidatesArgs".into()
+    }
+
+    fn schema_id() -> Cow<'static, str> {
+        "nuillu_cognition_gate::RankAwarenessCandidatesArgs.dynamic".into()
+    }
+
+    fn json_schema(_generator: &mut SchemaGenerator) -> Schema {
+        CANDIDATE_RANKING_SCHEMA
+            .try_with(Clone::clone)
+            .unwrap_or_else(|_| fallback_candidate_ranking_schema())
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
@@ -241,13 +298,7 @@ impl CognitionGateModule {
         candidates: &[CognitionCandidate],
     ) -> Result<Vec<MemoLogRecord>> {
         let outcome = self
-            .session
-            .text_turn()
-            .tools::<CognitionGateRankingTools>()
-            .available_tools([CognitionGateRankingToolsSelector::RankAwarenessCandidates])
-            .require_any_tool()
-            .max_output_tokens(768)
-            .collect_controlled_with(lutum, nuillu_module::AbortOnAvailableToolNameInText::new())
+            .run_candidate_ranking_turn(lutum, candidates)
             .await
             .map_err(|error| {
                 if missing_required_tool_call(&error) {
@@ -310,6 +361,28 @@ impl CognitionGateModule {
         }
     }
 
+    async fn run_candidate_ranking_turn(
+        &mut self,
+        lutum: &Lutum,
+        candidates: &[CognitionCandidate],
+    ) -> Result<TextStepOutcomeWithTools<CognitionGateRankingTools>> {
+        Ok(CANDIDATE_RANKING_SCHEMA
+            .scope(candidate_ranking_schema(candidates), async {
+                self.session
+                    .text_turn()
+                    .tools::<CognitionGateRankingTools>()
+                    .available_tools([CognitionGateRankingToolsSelector::RankAwarenessCandidates])
+                    .require_any_tool()
+                    .max_output_tokens(768)
+                    .collect_controlled_with(
+                        lutum,
+                        nuillu_module::AbortOnAvailableToolNameInText::new(),
+                    )
+                    .await
+            })
+            .await?)
+    }
+
     fn resolve_ranked_candidates(
         &self,
         args: &RankAwarenessCandidatesArgs,
@@ -332,7 +405,13 @@ impl CognitionGateModule {
             }
             let mut trimmed = record.clone();
             trimmed.content = text.to_owned();
-            self.cognition.append_from_memo(&trimmed).await;
+            let forwarded = self
+                .blackboard
+                .read(|bb| bb.forwarded_cognition_for_memo(&record.owner, record.index))
+                .await;
+            self.cognition
+                .append_from_memo_with_forwarded(&trimmed, forwarded)
+                .await;
         }
         Ok(())
     }
@@ -1198,6 +1277,35 @@ mod tests {
     }
 
     #[test]
+    fn ranking_tool_schema_constrains_both_lists_to_current_candidate_ids() {
+        let candidates = test_candidates(&["first", "second", "third"]);
+        let schema = serde_json::to_value(candidate_ranking_schema(&candidates)).unwrap();
+        let expected_items = serde_json::json!({
+            "type": "string",
+            "enum": ["sensory-1", "sensory-2", "sensory-3"],
+        });
+
+        assert_eq!(
+            schema,
+            serde_json::json!({
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                    "important_labels": {
+                        "type": "array",
+                        "items": expected_items.clone(),
+                    },
+                    "noise_labels": {
+                        "type": "array",
+                        "items": expected_items,
+                    },
+                },
+                "required": ["important_labels", "noise_labels"],
+            })
+        );
+    }
+
+    #[test]
     fn clean_candidates_puts_deferred_first_but_prefers_duplicate_fresh_content() {
         let deferred = test_candidates(&["same candidate", "old deferred"]);
         let fresh = test_candidates(&["same candidate", "new fresh"]);
@@ -1670,6 +1778,68 @@ mod tests {
             .await;
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].text, "same candidate");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn forwarded_cognitive_memo_preserves_original_origin_and_occurrence_time() {
+        let mut fixture = gate_fixture_with_adapter(MockLlmAdapter::new()).await;
+        let scope = nuillu_types::ScopeId::root().child(nuillu_types::SubsystemInstanceId::new(
+            nuillu_types::SubsystemId::new("arm").unwrap(),
+            nuillu_types::ReplicaIndex::new(1),
+        ));
+        let origin_owner = nuillu_types::ModuleInstanceId::in_scope(
+            scope,
+            builtin::cognition_gate(),
+            nuillu_types::ReplicaIndex::ZERO,
+        );
+        let occurred_at = SystemClock.now();
+        let forwarded = nuillu_blackboard::CognitionLogEntry {
+            at: occurred_at,
+            text: "Arm 2 offers a new turn".to_owned(),
+            origin: nuillu_blackboard::CognitionLogOrigin::direct(origin_owner),
+        };
+        let bridge_owner = nuillu_types::ModuleInstanceId::new(
+            builtin::subsystem_gate(),
+            nuillu_types::ReplicaIndex::ZERO,
+        );
+        let memo = fixture
+            .blackboard
+            .update_forwarded_typed_cognitive_memo_with_evictions(
+                bridge_owner,
+                (),
+                forwarded.clone(),
+                SystemClock.now(),
+            )
+            .await
+            .record;
+        let lutum = fixture.gate.llm.lutum().await;
+        let identity_memories: Vec<IdentityMemoryRecord> = Vec::new();
+        let cx = nuillu_module::ActivateCx::new(
+            &[],
+            &identity_memories,
+            &[],
+            compaction_runtime(&lutum),
+            Rc::new(SystemClock),
+        );
+
+        fixture
+            .gate
+            .activate(
+                &cx,
+                &CognitionGateBatch {
+                    memo_logs: vec![memo],
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            fixture
+                .blackboard
+                .read(|bb| bb.cognition_log().entries().to_vec())
+                .await,
+            vec![forwarded]
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]

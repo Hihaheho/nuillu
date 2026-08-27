@@ -3941,6 +3941,7 @@ mod tests {
             MemoLogPayload::Typed {
                 type_name: std::any::type_name::<TestMemoPayload>().to_owned(),
                 json: serde_json::json!({ "value": "typed" }),
+                forwarded_cognition: None,
             }
         );
     }

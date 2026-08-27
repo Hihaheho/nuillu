@@ -1,7 +1,9 @@
 use std::marker::PhantomData;
 use std::rc::Rc;
 
-use nuillu_blackboard::{Blackboard, MemoLogPayload, MemoLogRecord, TypedMemoLogRecord};
+use nuillu_blackboard::{
+    Blackboard, CognitionLogEntry, MemoLogPayload, MemoLogRecord, TypedMemoLogRecord,
+};
 use nuillu_types::{ModuleInstanceId, ScopeId};
 use serde::{Serialize, de::DeserializeOwned};
 
@@ -115,13 +117,29 @@ where
 
     /// Append a new typed owner memo item plus its plaintext representation.
     pub async fn write(&self, payload: T, memo: impl Into<String>) -> MemoLogRecord {
-        self.core.write_typed(payload, memo.into(), false).await
+        self.core
+            .write_typed(payload, memo.into(), false, None)
+            .await
     }
 
     /// Append a typed owner memo item whose plaintext representation is
     /// eligible for cognition-gate promotion.
     pub async fn write_cognitive(&self, payload: T, memo: impl Into<String>) -> MemoLogRecord {
-        self.core.write_typed(payload, memo.into(), true).await
+        self.core
+            .write_typed(payload, memo.into(), true, None)
+            .await
+    }
+
+    /// Append a typed cognitive memo that forwards an existing cognition entry.
+    /// The cognition gate can promote it without losing occurrence time or origin.
+    pub async fn write_forwarded_cognitive(
+        &self,
+        payload: T,
+        entry: CognitionLogEntry,
+    ) -> MemoLogRecord {
+        self.core
+            .write_typed(payload, entry.text.clone(), true, Some(entry))
+            .await
     }
 
     /// Return retained typed memo entries for this owner.
@@ -176,12 +194,14 @@ impl MemoCore {
         payload: T,
         memo: String,
         cognitive: bool,
+        forwarded_cognition: Option<CognitionLogEntry>,
     ) -> MemoLogRecord {
         let char_count = memo.chars().count();
         let persisted_payload = match serde_json::to_value(&payload) {
             Ok(json) => MemoLogPayload::Typed {
                 type_name: std::any::type_name::<T>().to_owned(),
                 json,
+                forwarded_cognition: forwarded_cognition.clone(),
             },
             Err(error) => {
                 tracing::warn!(
@@ -193,7 +213,16 @@ impl MemoCore {
                 MemoLogPayload::Plain
             }
         };
-        let result = if cognitive {
+        let result = if let Some(forwarded_cognition) = forwarded_cognition {
+            self.blackboard
+                .update_forwarded_typed_cognitive_memo_with_evictions(
+                    self.owner.clone(),
+                    payload,
+                    forwarded_cognition,
+                    self.clock.now(),
+                )
+                .await
+        } else if cognitive {
             self.blackboard
                 .update_typed_cognitive_memo_with_evictions(
                     self.owner.clone(),

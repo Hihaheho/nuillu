@@ -90,6 +90,20 @@ impl CognitionWriter {
         self.append_entry(entry).await;
     }
 
+    /// Promote a memo while retaining cognition provenance carried across a
+    /// subsystem boundary.
+    pub async fn append_from_memo_with_forwarded(
+        &self,
+        record: &MemoLogRecord,
+        forwarded: Option<CognitionLogEntry>,
+    ) {
+        let Some(entry) = forwarded else {
+            self.append_from_memo(record).await;
+            return;
+        };
+        self.append_entry(entry).await;
+    }
+
     pub fn owner(&self) -> &ModuleInstanceId {
         &self.owner
     }

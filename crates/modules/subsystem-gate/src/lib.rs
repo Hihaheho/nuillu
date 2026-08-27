@@ -33,8 +33,7 @@ pub struct SubsystemGateModule {
     outer_updates: CognitionLogUpdatedInbox,
     outer_reader: CognitionLogReader,
     outer_memo: TypedMemo<SubsystemGateMemo>,
-    inner_state: Option<SubsystemGateMemo>,
-    outer_state: Option<SubsystemGateMemo>,
+    state: Option<SubsystemGateMemo>,
 }
 
 impl SubsystemGateModule {
@@ -53,8 +52,7 @@ impl SubsystemGateModule {
             outer_updates,
             outer_reader,
             outer_memo,
-            inner_state: None,
-            outer_state: None,
+            state: None,
         }
     }
 
@@ -76,11 +74,10 @@ impl SubsystemGateModule {
     }
 
     async fn ensure_state_loaded(&mut self) {
-        if self.inner_state.is_none() {
-            self.inner_state = Some(latest_state(&self.inner_memo).await);
-        }
-        if self.outer_state.is_none() {
-            self.outer_state = Some(latest_state(&self.outer_memo).await);
+        if self.state.is_none() {
+            let inner = latest_state(&self.inner_memo).await;
+            let outer = latest_state(&self.outer_memo).await;
+            self.state = Some(merge_states(inner, outer));
         }
     }
 
@@ -90,9 +87,7 @@ impl SubsystemGateModule {
         // Parent cognition is offered to the cognition-gate in this scope.
         bridge_records(
             &batch.outer,
-            self.inner_state
-                .as_mut()
-                .expect("inner bridge state is initialized"),
+            self.state.as_mut().expect("bridge state is initialized"),
             &self.inner_memo,
         )
         .await?;
@@ -100,9 +95,7 @@ impl SubsystemGateModule {
         // Child cognition is offered to the cognition-gate in the parent scope.
         bridge_records(
             &batch.inner,
-            self.outer_state
-                .as_mut()
-                .expect("outer bridge state is initialized"),
+            self.state.as_mut().expect("bridge state is initialized"),
             &self.outer_memo,
         )
         .await?;
@@ -118,6 +111,20 @@ async fn latest_state(memo: &TypedMemo<SubsystemGateMemo>) -> SubsystemGateMemo 
         .unwrap_or_default()
 }
 
+fn merge_states(left: SubsystemGateMemo, right: SubsystemGateMemo) -> SubsystemGateMemo {
+    let mut merged = SubsystemGateMemo::default();
+    let mut seen = HashSet::new();
+    for fingerprint in left.seen.into_iter().chain(right.seen) {
+        if seen.insert(fingerprint.clone()) {
+            merged.seen.push_back(fingerprint);
+            while merged.seen.len() > MAX_SEEN_FINGERPRINTS {
+                merged.seen.pop_front();
+            }
+        }
+    }
+    merged
+}
+
 async fn bridge_records(
     records: &[CognitionLogEntryRecord],
     state: &mut SubsystemGateMemo,
@@ -125,7 +132,7 @@ async fn bridge_records(
 ) -> Result<()> {
     for record in take_unseen(records, state)? {
         target
-            .write_cognitive(state.clone(), record.entry.text.clone())
+            .write_forwarded_cognitive(state.clone(), record.entry.clone())
             .await;
     }
     Ok(())
@@ -223,6 +230,31 @@ mod tests {
             take_unseen(&records, &mut state).unwrap(),
             vec![&records[0]]
         );
-        assert!(take_unseen(&records, &mut state).unwrap().is_empty());
+        let returned_through_other_scope = vec![CognitionLogEntryRecord {
+            index: 42,
+            source: ModuleInstanceId::new(builtin::subsystem_gate(), ReplicaIndex::ZERO),
+            entry: records[0].entry.clone(),
+        }];
+        assert!(
+            take_unseen(&returned_through_other_scope, &mut state)
+                .unwrap()
+                .is_empty(),
+            "the shared lineage fingerprint must stop a bridged entry returning in the opposite direction"
+        );
+    }
+
+    #[test]
+    fn restored_direction_states_merge_into_one_lineage_set() {
+        let left = SubsystemGateMemo {
+            seen: VecDeque::from(["left".to_owned(), "shared".to_owned()]),
+        };
+        let right = SubsystemGateMemo {
+            seen: VecDeque::from(["shared".to_owned(), "right".to_owned()]),
+        };
+
+        assert_eq!(
+            merge_states(left, right).seen,
+            VecDeque::from(["left".to_owned(), "shared".to_owned(), "right".to_owned()])
+        );
     }
 }

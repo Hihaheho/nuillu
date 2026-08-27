@@ -13,9 +13,9 @@ use tokio::sync::{RwLock, oneshot};
 
 use crate::{
     ActivationRatio, AgenticDeadlockMarker, AllocationLimits, BlackboardCommand, CognitionLog,
-    CognitionLogEntryRecord, CognitionLogRecord, CognitionLogSet, CorePolicyRecord,
-    IdentityMemoryRecord, InteroceptiveState, MemoryMetadata, ModulePolicy, PolicyMetadata,
-    ResourceAllocation,
+    CognitionLogEntry, CognitionLogEntryRecord, CognitionLogRecord, CognitionLogSet,
+    CorePolicyRecord, IdentityMemoryRecord, InteroceptiveState, MemoryMetadata, ModulePolicy,
+    PolicyMetadata, ResourceAllocation,
 };
 
 const DEFAULT_MEMO_RETAINED_PER_OWNER: usize = 8;
@@ -103,6 +103,8 @@ pub enum MemoLogPayload {
     Typed {
         type_name: String,
         json: serde_json::Value,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        forwarded_cognition: Option<CognitionLogEntry>,
     },
 }
 
@@ -140,10 +142,12 @@ struct MemoLogEntry {
 enum MemoPayload {
     InMemory {
         payload: Arc<dyn Any>,
+        forwarded_cognition: Option<CognitionLogEntry>,
     },
     Serialized {
         type_name: String,
         json: serde_json::Value,
+        forwarded_cognition: Option<CognitionLogEntry>,
     },
 }
 
@@ -176,26 +180,57 @@ impl MemoLogEntry {
             _marker: PhantomData,
         })
     }
+
+    fn forwarded_cognition(&self) -> Option<&CognitionLogEntry> {
+        match &self.payload {
+            MemoPayload::InMemory {
+                forwarded_cognition,
+                ..
+            }
+            | MemoPayload::Serialized {
+                forwarded_cognition,
+                ..
+            } => forwarded_cognition.as_ref(),
+        }
+    }
 }
 
 impl MemoPayload {
     fn in_memory<T: 'static>(payload: T) -> Self {
+        Self::in_memory_with_forwarded_cognition(payload, None)
+    }
+
+    fn in_memory_with_forwarded_cognition<T: 'static>(
+        payload: T,
+        forwarded_cognition: Option<CognitionLogEntry>,
+    ) -> Self {
         Self::InMemory {
             payload: Arc::new(payload),
+            forwarded_cognition,
         }
     }
 
     fn from_persisted(payload: MemoLogPayload) -> Self {
         match payload {
             MemoLogPayload::Plain => Self::in_memory(()),
-            MemoLogPayload::Typed { type_name, json } => Self::Serialized { type_name, json },
+            MemoLogPayload::Typed {
+                type_name,
+                json,
+                forwarded_cognition,
+            } => Self::Serialized {
+                type_name,
+                json,
+                forwarded_cognition,
+            },
         }
     }
 
     fn typed_payload<T: DeserializeOwned + 'static>(&self) -> Option<Arc<dyn Any>> {
         match self {
-            Self::InMemory { payload } => Some(Arc::clone(payload)),
-            Self::Serialized { type_name, json } => {
+            Self::InMemory { payload, .. } => Some(Arc::clone(payload)),
+            Self::Serialized {
+                type_name, json, ..
+            } => {
                 let expected = std::any::type_name::<T>();
                 if type_name != expected {
                     tracing::warn!(
@@ -510,8 +545,10 @@ impl Blackboard {
         payload: T,
         written_at: DateTime<Utc>,
     ) -> MemoAppendResult {
-        self.update_typed_memo_with_evictions_and_cognitive(owner, memo, payload, written_at, false)
-            .await
+        self.update_typed_memo_with_evictions_and_cognitive(
+            owner, memo, payload, written_at, false, None,
+        )
+        .await
     }
 
     pub async fn update_typed_cognitive_memo<T: 'static>(
@@ -533,8 +570,28 @@ impl Blackboard {
         payload: T,
         written_at: DateTime<Utc>,
     ) -> MemoAppendResult {
-        self.update_typed_memo_with_evictions_and_cognitive(owner, memo, payload, written_at, true)
-            .await
+        self.update_typed_memo_with_evictions_and_cognitive(
+            owner, memo, payload, written_at, true, None,
+        )
+        .await
+    }
+
+    pub async fn update_forwarded_typed_cognitive_memo_with_evictions<T: 'static>(
+        &self,
+        owner: ModuleInstanceId,
+        payload: T,
+        forwarded_cognition: CognitionLogEntry,
+        written_at: DateTime<Utc>,
+    ) -> MemoAppendResult {
+        self.update_typed_memo_with_evictions_and_cognitive(
+            owner,
+            forwarded_cognition.text.clone(),
+            payload,
+            written_at,
+            true,
+            Some(forwarded_cognition),
+        )
+        .await
     }
 
     async fn update_typed_memo_with_evictions_and_cognitive<T: 'static>(
@@ -544,12 +601,13 @@ impl Blackboard {
         payload: T,
         written_at: DateTime<Utc>,
         cognitive: bool,
+        forwarded_cognition: Option<CognitionLogEntry>,
     ) -> MemoAppendResult {
         let mut guard = self.inner.write().await;
         guard.append_memo(
             owner,
             memo,
-            MemoPayload::in_memory(payload),
+            MemoPayload::in_memory_with_forwarded_cognition(payload, forwarded_cognition),
             written_at,
             cognitive,
         )
@@ -760,6 +818,19 @@ impl BlackboardInner {
             .into_iter()
             .flat_map(|records| records.iter().filter_map(MemoLogEntry::typed_record))
             .collect()
+    }
+
+    pub fn forwarded_cognition_for_memo(
+        &self,
+        owner: &ModuleInstanceId,
+        index: u64,
+    ) -> Option<CognitionLogEntry> {
+        self.memos
+            .get(owner)?
+            .iter()
+            .find(|entry| entry.record.index == index)?
+            .forwarded_cognition()
+            .cloned()
     }
 
     pub fn module_status_for_instance(&self, id: &ModuleInstanceId) -> Option<&ModuleRunStatus> {
@@ -1595,6 +1666,7 @@ mod tests {
             MemoLogPayload::Typed {
                 type_name: std::any::type_name::<TestPayload>().to_owned(),
                 json: serde_json::json!({ "value": "restored" }),
+                forwarded_cognition: None,
             },
         )
         .await;

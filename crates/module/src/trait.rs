@@ -79,16 +79,21 @@ impl<'a> ActivateCx<'a> {
         self
     }
 
-    /// Human-facing label for a cognition origin in a descendant subsystem.
-    /// Returns `None` for the activating module's own scope and outer scopes.
+    /// Human-facing label for a cognition origin in another named subsystem.
+    /// Descendants are rendered relative to the current scope; siblings and
+    /// other named scopes use their root-relative display name.
     pub fn relative_subsystem_label(&self, origin: &nuillu_types::ScopeId) -> Option<String> {
         let current = self
             .owner
             .as_ref()
             .map(|owner| owner.scope.clone())
             .unwrap_or_default();
+        if &current == origin {
+            return None;
+        }
         self.scope_labels
             .relative_descendant_label(&current, origin)
+            .or_else(|| self.scope_labels.label(origin))
     }
 
     /// Human-facing name for the activating module's scope.
