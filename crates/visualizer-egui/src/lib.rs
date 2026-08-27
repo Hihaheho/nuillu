@@ -1909,7 +1909,13 @@ impl RuntimeTab {
     ) -> Option<String> {
         let actions = ui
             .push_id(("modules-overview", id_salt), |ui| {
-                modules::render_modules_overview(ui, &self.blackboard, &self.modules, now_secs)
+                modules::render_modules_overview(
+                    ui,
+                    &self.blackboard,
+                    &self.modules,
+                    now_secs,
+                    id_salt == "simplified",
+                )
             })
             .inner;
         self.handle_module_overview_actions(actions, messages)

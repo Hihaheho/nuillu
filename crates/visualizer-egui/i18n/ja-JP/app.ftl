@@ -197,6 +197,12 @@ module-overview-enabled-hover = このモジュールが割り当て済みレプ
 module-overview-subsystem-read-only-hover = 現在のサブシステム操作は読み取り専用です
 module-overview-edit = 編集
 module-overview-edit-hover = { $module } を編集
+scope-tree-title = スコープ
+scope-tree-expand-all = すべて開く
+scope-tree-collapse-all = すべて閉じる
+scope-tree-modules-title = モジュール — { $scope }
+scope-tree-inactive = 非アクティブ
+scope-tree-activation-hover = ローカル { $local } × 親 { $parent } = 実効 { $effective }
 module-config-close-hover = 閉じる
 module-config-replicas = レプリカ
 module-config-to = まで

@@ -825,8 +825,13 @@ pub fn render_modules_overview(
     snapshot: &BlackboardSnapshot,
     state: &ModulesState,
     now_secs: f64,
+    scope_tree: bool,
 ) -> Vec<ModuleOverviewAction> {
-    let selected_scope = render_scope_navigation(ui, snapshot);
+    let selected_scope = if scope_tree {
+        render_scope_tree_navigation(ui, snapshot)
+    } else {
+        render_scope_selector_navigation(ui, snapshot)
+    };
     let rows = overview_rows_for_scope(state, snapshot, now_secs, &selected_scope);
     let editable = selected_scope == "/";
     let mut actions = Vec::new();
@@ -863,25 +868,11 @@ pub fn render_modules_overview(
     actions
 }
 
-fn render_scope_navigation(ui: &mut egui::Ui, snapshot: &BlackboardSnapshot) -> String {
+fn render_scope_selector_navigation(ui: &mut egui::Ui, snapshot: &BlackboardSnapshot) -> String {
     if !has_subsystem_scopes(snapshot) {
         return "/".to_owned();
     }
-    let scopes = if snapshot.scopes.is_empty() {
-        vec![ScopeView {
-            id: "/".to_owned(),
-            parent: None,
-            memory_scope: "global".to_owned(),
-            subsystem: None,
-            replica: None,
-            local_activation: 1.0,
-            effective_activation: 1.0,
-            active_replicas: 1,
-            active: true,
-        }]
-    } else {
-        snapshot.scopes.clone()
-    };
+    let scopes = navigation_scopes(snapshot);
     let state_id = ui.make_persistent_id("modules-selected-scope");
     let mut selected = ui
         .ctx()
@@ -940,6 +931,218 @@ fn render_scope_navigation(ui: &mut egui::Ui, snapshot: &BlackboardSnapshot) -> 
     ui.ctx()
         .data_mut(|data| data.insert_temp(state_id, selected.clone()));
     selected
+}
+
+fn render_scope_tree_navigation(ui: &mut egui::Ui, snapshot: &BlackboardSnapshot) -> String {
+    if !has_subsystem_scopes(snapshot) {
+        return "/".to_owned();
+    }
+    let scopes = navigation_scopes(snapshot);
+    let children = scope_children(&scopes);
+    let selected_id = ui.make_persistent_id("modules-selected-scope");
+    let expanded_id = ui.make_persistent_id("modules-expanded-scopes");
+    let mut selected = ui
+        .ctx()
+        .data(|data| data.get_temp::<String>(selected_id))
+        .filter(|selected| scopes.iter().any(|scope| scope.id == *selected))
+        .unwrap_or_else(|| "/".to_owned());
+    let mut expanded = ui
+        .ctx()
+        .data(|data| data.get_temp::<BTreeSet<String>>(expanded_id))
+        .unwrap_or_default();
+
+    ui.horizontal(|ui| {
+        ui.strong(ui.ctx().tr("scope-tree-title"));
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if ui
+                .small_button(ui.ctx().tr("scope-tree-collapse-all"))
+                .clicked()
+            {
+                expanded.clear();
+            }
+            if ui
+                .small_button(ui.ctx().tr("scope-tree-expand-all"))
+                .clicked()
+            {
+                expanded = children.keys().cloned().collect();
+            }
+        });
+    });
+
+    egui::ScrollArea::vertical()
+        .id_salt("scope-tree")
+        .max_height(180.0)
+        .auto_shrink([false, true])
+        .show(ui, |ui| {
+            if let Some(root) = scopes.iter().find(|scope| scope.id == "/") {
+                render_scope_tree_node(
+                    ui,
+                    root,
+                    0,
+                    &scopes,
+                    &children,
+                    &mut selected,
+                    &mut expanded,
+                );
+            }
+        });
+
+    ui.separator();
+    ui.strong(ui.ctx().tr_args(
+        "scope-tree-modules-title",
+        &[("scope", I18nArg::from(selected.as_str()))],
+    ));
+    ui.add_space(3.0);
+
+    ui.ctx()
+        .data_mut(|data| data.insert_temp(selected_id, selected.clone()));
+    ui.ctx()
+        .data_mut(|data| data.insert_temp(expanded_id, expanded));
+    selected
+}
+
+fn render_scope_tree_node(
+    ui: &mut egui::Ui,
+    scope: &ScopeView,
+    depth: usize,
+    scopes: &[ScopeView],
+    children: &BTreeMap<String, Vec<String>>,
+    selected: &mut String,
+    expanded: &mut BTreeSet<String>,
+) {
+    let child_ids = children.get(&scope.id);
+    let has_children = child_ids.is_some_and(|children| !children.is_empty());
+    let is_expanded = expanded.contains(&scope.id);
+    let is_selected = *selected == scope.id;
+    let fill = is_selected.then(|| visualizer_selection_row_fill(ui.visuals()));
+    let frame = fill.map_or_else(egui::Frame::new, |fill| egui::Frame::new().fill(fill));
+
+    frame
+        .inner_margin(egui::Margin::symmetric(4, 2))
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.add_space(depth as f32 * 16.0);
+                if has_children {
+                    let toggle = if is_expanded { "▾" } else { "▸" };
+                    if ui.small_button(toggle).clicked() {
+                        if is_expanded {
+                            expanded.remove(&scope.id);
+                        } else {
+                            expanded.insert(scope.id.clone());
+                        }
+                    }
+                } else {
+                    ui.add_space(22.0);
+                }
+
+                let label = scope_tree_label(scope);
+                if ui.selectable_label(is_selected, label).clicked() {
+                    *selected = scope.id.clone();
+                }
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let activation = format_activation_percent(scope.effective_activation);
+                    let activation = if scope.active {
+                        egui::RichText::new(activation).monospace()
+                    } else {
+                        egui::RichText::new(activation)
+                            .monospace()
+                            .color(ui.visuals().weak_text_color())
+                    };
+                    ui.label(activation)
+                        .on_hover_text(scope_activation_hover(ui, scope, scopes));
+                    if !scope.active {
+                        ui.weak(ui.ctx().tr("scope-tree-inactive"));
+                    }
+                });
+            });
+        });
+
+    if is_expanded && let Some(child_ids) = child_ids {
+        for child_id in child_ids {
+            if let Some(child) = scopes.iter().find(|scope| scope.id == *child_id) {
+                render_scope_tree_node(ui, child, depth + 1, scopes, children, selected, expanded);
+            }
+        }
+    }
+}
+
+fn navigation_scopes(snapshot: &BlackboardSnapshot) -> Vec<ScopeView> {
+    let mut scopes = snapshot.scopes.clone();
+    if !scopes.iter().any(|scope| scope.id == "/") {
+        scopes.push(root_scope_view());
+    }
+    scopes.sort_by(|left, right| left.id.cmp(&right.id));
+    scopes
+}
+
+fn root_scope_view() -> ScopeView {
+    ScopeView {
+        id: "/".to_owned(),
+        parent: None,
+        memory_scope: "global".to_owned(),
+        subsystem: None,
+        replica: None,
+        local_activation: 1.0,
+        effective_activation: 1.0,
+        active_replicas: 1,
+        active: true,
+    }
+}
+
+fn scope_children(scopes: &[ScopeView]) -> BTreeMap<String, Vec<String>> {
+    let mut children = BTreeMap::<String, Vec<String>>::new();
+    for scope in scopes {
+        if let Some(parent) = &scope.parent {
+            children
+                .entry(parent.clone())
+                .or_default()
+                .push(scope.id.clone());
+        }
+    }
+    for child_ids in children.values_mut() {
+        child_ids.sort();
+    }
+    children
+}
+
+fn scope_tree_label(scope: &ScopeView) -> String {
+    if scope.id == "/" {
+        return "Agent /".to_owned();
+    }
+    match (&scope.subsystem, scope.replica) {
+        (Some(subsystem), Some(replica)) => format!("{subsystem}[{replica}]"),
+        (Some(subsystem), None) => subsystem.clone(),
+        _ => scope.id.clone(),
+    }
+}
+
+fn format_activation_percent(activation: f64) -> String {
+    format!("{:.0}%", activation * 100.0)
+}
+
+fn scope_activation_hover(ui: &egui::Ui, scope: &ScopeView, scopes: &[ScopeView]) -> String {
+    let parent_activation = scope
+        .parent
+        .as_deref()
+        .and_then(|parent| scopes.iter().find(|candidate| candidate.id == parent))
+        .map_or(1.0, |parent| parent.effective_activation);
+    ui.ctx().tr_args(
+        "scope-tree-activation-hover",
+        &[
+            (
+                "local",
+                I18nArg::from(format_activation_percent(scope.local_activation)),
+            ),
+            (
+                "parent",
+                I18nArg::from(format_activation_percent(parent_activation)),
+            ),
+            (
+                "effective",
+                I18nArg::from(format_activation_percent(scope.effective_activation)),
+            ),
+        ],
+    )
 }
 
 fn has_subsystem_scopes(snapshot: &BlackboardSnapshot) -> bool {
@@ -4777,6 +4980,65 @@ mod tests {
             owner_scope("/arm[0]/finger[1]/predict"),
             "/arm[0]/finger[1]"
         );
+    }
+
+    #[test]
+    fn scope_tree_builds_nested_children_and_supplies_root() {
+        let snapshot = BlackboardSnapshot {
+            scopes: vec![
+                ScopeView {
+                    id: "/arm[0]/finger[1]".to_string(),
+                    parent: Some("/arm[0]".to_string()),
+                    memory_scope: "local".to_string(),
+                    subsystem: Some("finger".to_string()),
+                    replica: Some(1),
+                    local_activation: 0.5,
+                    effective_activation: 0.4,
+                    active_replicas: 1,
+                    active: true,
+                },
+                ScopeView {
+                    id: "/arm[0]".to_string(),
+                    parent: Some("/".to_string()),
+                    memory_scope: "local".to_string(),
+                    subsystem: Some("arm".to_string()),
+                    replica: Some(0),
+                    local_activation: 0.8,
+                    effective_activation: 0.8,
+                    active_replicas: 1,
+                    active: true,
+                },
+            ],
+            ..BlackboardSnapshot::default()
+        };
+
+        let scopes = navigation_scopes(&snapshot);
+        let children = scope_children(&scopes);
+        let labels = scopes.iter().map(scope_tree_label).collect::<Vec<_>>();
+
+        assert_eq!(
+            (
+                scopes
+                    .iter()
+                    .map(|scope| scope.id.as_str())
+                    .collect::<Vec<_>>(),
+                children,
+                labels
+            ),
+            (
+                vec!["/", "/arm[0]", "/arm[0]/finger[1]"],
+                BTreeMap::from([
+                    ("/".to_string(), vec!["/arm[0]".to_string()]),
+                    ("/arm[0]".to_string(), vec!["/arm[0]/finger[1]".to_string()],),
+                ]),
+                vec![
+                    "Agent /".to_string(),
+                    "arm[0]".to_string(),
+                    "finger[1]".to_string(),
+                ],
+            )
+        );
+        assert_eq!(format_activation_percent(0.4), "40%");
     }
 
     #[test]

@@ -198,6 +198,12 @@ module-overview-enabled-hover = Allow this module to use allocated replicas
 module-overview-subsystem-read-only-hover = Subsystem controls are read-only in this first visualizer pass
 module-overview-edit = Edit
 module-overview-edit-hover = edit { $module }
+scope-tree-title = Scopes
+scope-tree-expand-all = Expand all
+scope-tree-collapse-all = Collapse all
+scope-tree-modules-title = Modules — { $scope }
+scope-tree-inactive = Inactive
+scope-tree-activation-hover = Local { $local } × parent { $parent } = effective { $effective }
 module-config-close-hover = close
 module-config-replicas = Replicas
 module-config-to = to
