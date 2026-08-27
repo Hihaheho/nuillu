@@ -65,7 +65,7 @@ impl ActivityRole {
 struct ActivityMessage {
     id: Option<String>,
     role: ActivityRole,
-    speaker_scope: Option<String>,
+    speaker_path: Option<String>,
     content: String,
     source: Option<String>,
     streaming: bool,
@@ -76,7 +76,7 @@ impl ActivityMessage {
         Self {
             id: None,
             role,
-            speaker_scope: None,
+            speaker_path: None,
             content: content.into(),
             source: None,
             streaming: false,
@@ -229,10 +229,10 @@ impl SceneUiState {
             self.activity.push(ActivityMessage {
                 id: None,
                 role: ActivityRole::Assistant,
-                speaker_scope: utterance_sender_scope(&delta.sender),
+                speaker_path: utterance_sender_path(&delta.sender),
                 content: String::new(),
                 streaming: true,
-                source: Some(format!("{} -> {}", delta.sender, delta.target)),
+                source: Some(format!("-> {}", delta.target)),
             });
             index
         };
@@ -286,10 +286,9 @@ impl SceneUiState {
             generation_id,
         });
         let mut message = ActivityMessage::new(ActivityRole::Assistant, utterance.text);
-        message.speaker_scope = utterance_sender_scope(&utterance.sender);
+        message.speaker_path = utterance_sender_path(&utterance.sender);
         message.source = Some(format!(
-            "{} -> {} at {}",
-            utterance.sender,
+            "-> {} at {}",
             utterance.target,
             format_jst_datetime(utterance.emitted_at)
         ));
@@ -679,10 +678,10 @@ fn apply_utterance_event_row(
                 activity.push(ActivityMessage {
                     id: Some(format!("utterance:{}:{}", row.generation_id, row.sequence)),
                     role: ActivityRole::Assistant,
-                    speaker_scope: utterance_sender_scope(&row.sender),
+                    speaker_path: utterance_sender_path(&row.sender),
                     content: String::new(),
                     streaming: true,
-                    source: Some(format!("{} -> {}", row.sender, row.target)),
+                    source: Some(format!("-> {}", row.target)),
                 });
                 index
             };
@@ -711,10 +710,9 @@ fn apply_utterance_event_row(
             }
             let mut message = ActivityMessage::new(ActivityRole::Assistant, row.content.clone());
             message.id = Some(format!("utterance:{}", row.id));
-            message.speaker_scope = utterance_sender_scope(&row.sender);
+            message.speaker_path = utterance_sender_path(&row.sender);
             message.source = Some(format!(
-                "{} -> {} at {}",
-                row.sender,
+                "-> {} at {}",
                 row.target,
                 format_jst_datetime(row.occurred_at)
             ));
@@ -736,8 +734,8 @@ fn apply_utterance_event_row(
                 let mut message =
                     ActivityMessage::new(ActivityRole::Assistant, row.content.clone());
                 message.id = Some(format!("utterance:{}", row.id));
-                message.speaker_scope = utterance_sender_scope(&row.sender);
-                message.source = Some(format!("{} -> {} interrupted", row.sender, row.target));
+                message.speaker_path = utterance_sender_path(&row.sender);
+                message.source = Some(format!("-> {} interrupted", row.target));
                 activity.push(message);
             }
         }
@@ -761,9 +759,8 @@ fn one_shot_source(row: &OneShotSensoryInputRowView) -> String {
     }
 }
 
-fn utterance_sender_scope(sender: &str) -> Option<String> {
-    let (scope, _module) = sender.rsplit_once('/')?;
-    (!scope.is_empty()).then(|| scope.to_string())
+fn utterance_sender_path(sender: &str) -> Option<String> {
+    sender.starts_with('/').then(|| sender.to_string())
 }
 
 fn external_action_content(row: &ExternalActionEventRowView) -> String {
@@ -1346,8 +1343,8 @@ fn activity_message_ui(ui: &mut egui::Ui, message: &ActivityMessage) {
         .show(ui, |ui| {
             ui.horizontal_wrapped(|ui| {
                 let role = ui.ctx().tr(message.role.tr_key());
-                if let Some(scope) = &message.speaker_scope {
-                    ui.strong(format!("{role} {scope}"));
+                if let Some(path) = &message.speaker_path {
+                    ui.strong(path);
                 } else {
                     ui.strong(role);
                 }
@@ -2061,15 +2058,37 @@ mod tests {
     }
 
     #[test]
-    fn utterance_sender_scope_hides_root_and_keeps_nested_subsystem_path() {
-        assert_eq!(utterance_sender_scope("speak"), None);
+    fn utterance_sender_path_hides_root_and_keeps_full_nested_module_path() {
+        assert_eq!(utterance_sender_path("speak"), None);
         assert_eq!(
-            utterance_sender_scope("/arm[0]/speak"),
-            Some("/arm[0]".to_string())
+            utterance_sender_path("/arm[0]/speak"),
+            Some("/arm[0]/speak".to_string())
         );
         assert_eq!(
-            utterance_sender_scope("/arm[0]/finger[1]/speak"),
-            Some("/arm[0]/finger[1]".to_string())
+            utterance_sender_path("/arm[0]/finger[1]/speak"),
+            Some("/arm[0]/finger[1]/speak".to_string())
+        );
+    }
+
+    #[test]
+    fn scoped_utterance_keeps_sender_path_out_of_the_detail_source() {
+        let mut state = SceneUiState::default();
+        let mut utterance = utterance_completed(Some(1), "hello");
+        utterance.sender = "/arm[2]/speak".to_string();
+        utterance.target = "Ryo".to_string();
+
+        state.push_utterance_completed(utterance);
+
+        assert_eq!(
+            state.activity,
+            vec![ActivityMessage {
+                id: None,
+                role: ActivityRole::Assistant,
+                speaker_path: Some("/arm[2]/speak".to_string()),
+                content: "hello".to_string(),
+                source: Some("-> Ryo at 2026-06-13 15:18:51".to_string()),
+                streaming: false,
+            }]
         );
     }
 
