@@ -840,17 +840,19 @@ pub fn render_modules_overview(
         .ctx()
         .data(|data| data.get_temp::<OpenModuleConfig>(open_config_id));
 
-    egui::ScrollArea::both()
-        .id_salt("modules-overview")
-        .show(ui, |ui| {
-            overview_header(ui);
-            ui.separator();
-            for (index, row) in rows.iter().enumerate() {
-                ui.push_id(("overview-row", row.owner.as_str()), |ui| {
-                    overview_row(ui, row, index, editable, &mut actions, &mut open_config);
-                });
-            }
-        });
+    ui.push_id(("modules-overview-scope", selected_scope.as_str()), |ui| {
+        egui::ScrollArea::both()
+            .id_salt("modules-overview")
+            .show(ui, |ui| {
+                overview_header(ui);
+                ui.separator();
+                for (index, row) in rows.iter().enumerate() {
+                    ui.push_id(("overview-row", row.owner.as_str()), |ui| {
+                        overview_row(ui, row, index, editable, &mut actions, &mut open_config);
+                    });
+                }
+            });
+    });
 
     if editable {
         render_open_config_popup(ui, snapshot, &mut open_config, &mut actions);
