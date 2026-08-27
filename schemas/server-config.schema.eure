@@ -120,8 +120,15 @@ depends-on = [`$types.runtime-module`]
 depends-on.$optional = true
 memo-sources = [`$types.runtime-module`]
 memo-sources.$optional = true
+scope-targets = `$types.speech-target-map`
+scope-targets.$optional = true
 sessions = [`$types.server-module-session`]
 sessions.$optional = true
+
+@ $types.speech-target-map
+$variant: map
+key = `text`
+value = `text`
 
 @ $types.server-module-session
 key = `text`

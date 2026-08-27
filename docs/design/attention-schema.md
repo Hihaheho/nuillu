@@ -412,9 +412,12 @@ Surprise does not generate predictions. When predict memo-log evidence is absent
 Emits user-visible utterances. The module is named `speak` rather than `talk` because its role is the action of producing an utterance, not owning the whole conversation.
 
 Speak wakes on cognition-log updates when allocation makes it active. It reads the cognition log and
-uses an optional `speak_to` tool whose target argument is a concrete non-empty addressee. Current
-scene targets are planning hints, not a hard validation boundary. Calling the tool selects the
-addressee and starts generation; not calling it means no user-visible utterance is needed and the
+uses a speech-planning tool whose target argument is constrained to the available listener labels.
+Those labels combine current scene participants with the Speak registration's configured
+`scope-targets` label-to-logical-path map. Only labels are exposed to the model. After selection,
+the runtime resolves a configured label to its logical path and places that value in the existing
+broadcast utterance target metadata; it does not route to a concrete runtime replica. Calling the
+tool selects the addressee and starts generation; declining means no user-visible utterance is needed and the
 activation completes silently. During generation it records targeted utterance
 progress as a cognitive memo, writes the completed targeted utterance to its memo log as a cognitive
 memo, and emits through

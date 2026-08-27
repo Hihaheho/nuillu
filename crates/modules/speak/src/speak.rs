@@ -1,4 +1,5 @@
 use std::borrow::Cow;
+use std::collections::BTreeMap;
 use std::rc::Rc;
 
 use anyhow::{Context, Result};
@@ -25,9 +26,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::utterance::UtteranceWriter;
 
-const SPEECH_PLANNING_PROMPT: &str = r#"Plan and emit outward speech from the current cognition log and scene target hints.
+const SPEECH_PLANNING_PROMPT: &str = r#"Plan and emit outward speech from the current cognition log and available listener hints.
 Use exactly one available tool.
-Call prepare_speech only when new cognition supports a new outward utterance. target is the person or group who should hear it.
+Call prepare_speech only when new cognition supports a new outward utterance. target is the named listener or group who should hear it.
 For direct speech heard from a named speaker, target that speaker. Use everyone only when the cognition explicitly calls for group or broadcast speech.
 Call decline_speech_now when no new outward utterance is appropriate now. If speak should not be prioritized again until new cognition arrives, include inhibit_reason.
 Predictions, expected dialogue flow, and my own previous speech are not new outward speech motivation by themselves.
@@ -74,6 +75,41 @@ fn freeform_speech_target_schema() -> Schema {
         "minLength": 1,
     }))
     .expect("speech target schema must be a JSON object")
+}
+
+fn speech_target_schema(labels: &[String]) -> Schema {
+    Schema::try_from(serde_json::json!({
+        "type": "string",
+        "enum": labels,
+    }))
+    .expect("speech target schema must be a JSON object")
+}
+
+/// Configured listener labels and the stable target values placed on emitted
+/// utterances. Only labels are exposed to speech planning.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SpeechTargetCatalog {
+    named: BTreeMap<String, String>,
+}
+
+impl SpeechTargetCatalog {
+    pub fn new(targets: impl IntoIterator<Item = (impl Into<String>, impl Into<String>)>) -> Self {
+        Self {
+            named: targets
+                .into_iter()
+                .map(|(label, target)| (label.into(), target.into()))
+                .collect(),
+        }
+    }
+
+    fn available_targets(&self, scene: &SceneReader) -> BTreeMap<String, String> {
+        let mut available = target_hints_from_schema(&scene.target_schema())
+            .into_iter()
+            .map(|target| (target.clone(), target))
+            .collect::<BTreeMap<_, _>>();
+        available.extend(self.named.clone());
+        available
+    }
 }
 
 /// Wire-format string for a concrete speech addressee. Stored as `String` so
@@ -156,6 +192,7 @@ enum SpeakTools {
 #[derive(Clone, Debug)]
 struct PlannedSpeech {
     target: String,
+    target_label: String,
     speech_content: String,
 }
 
@@ -197,12 +234,11 @@ fn render_completed_utterance_planning_record(target: &str, text: &str) -> Strin
     )
 }
 
-fn format_planning_input(cognition_context: &str, target_hints: &[String]) -> String {
+fn format_planning_input(cognition_context: &str, listener_labels: &[String]) -> String {
     let mut out = cognition_context.trim().to_owned();
-    if !target_hints.is_empty() {
-        out.push_str("\n\nPreferred visible speech targets (not exhaustive): ");
-        out.push_str(&target_hints.join(", "));
-        out.push_str("\nUse another concrete non-empty target when cognition supports it.");
+    if !listener_labels.is_empty() {
+        out.push_str("\n\nAvailable listeners: ");
+        out.push_str(&listener_labels.join(", "));
     }
     out
 }
@@ -315,6 +351,7 @@ pub struct SpeakModule {
     utterance: UtteranceWriter,
     planning_llm: LlmAccess,
     scene: SceneReader,
+    speech_targets: SpeechTargetCatalog,
     clock: Rc<dyn Clock>,
     planning_session: Session,
     plan_prompt: std::sync::OnceLock<String>,
@@ -328,6 +365,7 @@ pub struct SpeakModuleParts {
     pub utterance: UtteranceWriter,
     pub planning_llm: LlmAccess,
     pub scene: SceneReader,
+    pub speech_targets: SpeechTargetCatalog,
     pub clock: Rc<dyn Clock>,
     pub planning_session: Session,
 }
@@ -342,6 +380,7 @@ impl SpeakModule {
             utterance,
             planning_llm,
             scene,
+            speech_targets,
             clock,
             planning_session,
         } = parts;
@@ -354,6 +393,7 @@ impl SpeakModule {
             utterance,
             planning_llm,
             scene,
+            speech_targets,
             clock,
             planning_session,
             plan_prompt: std::sync::OnceLock::new(),
@@ -427,22 +467,27 @@ impl SpeakModule {
         cognition_context: &str,
     ) -> Result<CommittedSpeechPlan> {
         self.ensure_planning_session_seeded(cx);
-        let scene_target_schema = self.scene.target_schema();
-        let target_hints = target_hints_from_schema(&scene_target_schema);
+        let available_targets = self.speech_targets.available_targets(&self.scene);
+        let target_labels = available_targets.keys().cloned().collect::<Vec<_>>();
         let mut turn_session = self.planning_session.clone();
-        push_planning_context(&mut turn_session, cognition_context, &target_hints);
+        push_planning_context(&mut turn_session, cognition_context, &target_labels);
 
         let lutum = self.planning_llm.lutum().await;
-        let target_schema = freeform_speech_target_schema();
+        let target_schema = speech_target_schema(&target_labels);
+        let available_tools = if target_labels.is_empty() {
+            vec![SpeakToolsSelector::DeclineSpeechNow]
+        } else {
+            vec![
+                SpeakToolsSelector::PrepareSpeech,
+                SpeakToolsSelector::DeclineSpeechNow,
+            ]
+        };
         let outcome = SPEECH_TARGET_SCHEMA
             .scope(target_schema, async {
                 turn_session
                     .text_turn()
                     .tools::<SpeakTools>()
-                    .available_tools([
-                        SpeakToolsSelector::PrepareSpeech,
-                        SpeakToolsSelector::DeclineSpeechNow,
-                    ])
+                    .available_tools(available_tools)
                     .require_any_tool()
                     .max_output_tokens(SPEECH_PLANNING_TURN_MAX_OUTPUT_TOKENS)
                     .collect_controlled_with(
@@ -481,14 +526,22 @@ impl SpeakModule {
                 for call in round.tool_calls.iter().cloned() {
                     match call {
                         SpeakToolsCall::PrepareSpeech(call) => {
-                            let target = call.input.target.as_str().trim().to_owned();
+                            let target_label = call.input.target.as_str().trim().to_owned();
+                            let target = available_targets.get(&target_label).cloned();
                             let speech_content = call.input.speech_content.trim().to_owned();
+                            if target.is_none() {
+                                cx.warn(format!(
+                                    "speak planning rejected prepare_speech: target {target_label:?} \
+                                    is not an available listener"
+                                ));
+                            }
                             let accepted = matches!(plan, FreshSpeechPlan::None)
-                                && is_non_empty_target(&target)
+                                && target.as_deref().is_some_and(is_non_empty_target)
                                 && is_non_empty_speech_content(&speech_content);
-                            if accepted {
+                            if accepted && let Some(target) = target {
                                 plan = FreshSpeechPlan::Prepare(PlannedSpeech {
                                     target,
+                                    target_label,
                                     speech_content,
                                 });
                             }
@@ -534,7 +587,7 @@ impl SpeakModule {
         let generation_id = self.utterance.next_generation_id();
         self.memo
             .write_cognitive(render_completed_utterance_memo(
-                &plan.target,
+                &plan.target_label,
                 &plan.speech_content,
             ))
             .await;
@@ -557,7 +610,7 @@ impl SpeakModule {
         self.ensure_planning_session_seeded(cx);
         self.planning_session
             .push_system(render_completed_utterance_planning_record(
-                &plan.target,
+                &plan.target_label,
                 &plan.speech_content,
             ));
         cx.compact_and_save(&mut self.planning_session, planning_usage)
@@ -967,6 +1020,7 @@ mod tests {
                                 .with_tier(nuillu_types::ModelTier::Premium)
                                 .into(),
                             scene: caps.scene_reader(),
+                            speech_targets: SpeechTargetCatalog::default(),
                             clock: caps.clock(),
                             planning_session: caps
                                 .session("planning")
@@ -1050,6 +1104,21 @@ mod tests {
         participants: impl IntoIterator<Item = Participant>,
         cognition: impl Into<String>,
     ) -> Result<(Blackboard, Rc<RefCell<Vec<(String, String)>>>)> {
+        try_activate_once_with_adapter_and_targets(
+            adapter,
+            participants,
+            SpeechTargetCatalog::default(),
+            cognition,
+        )
+        .await
+    }
+
+    async fn try_activate_once_with_adapter_and_targets(
+        adapter: MockLlmAdapter,
+        participants: impl IntoIterator<Item = Participant>,
+        speech_targets: SpeechTargetCatalog,
+        cognition: impl Into<String>,
+    ) -> Result<(Blackboard, Rc<RefCell<Vec<(String, String)>>>)> {
         let mut allocation = ResourceAllocation::default();
         allocation.set_activation(builtin::speak(), ActivationRatio::ONE);
         let blackboard = Blackboard::with_allocation(allocation);
@@ -1060,6 +1129,7 @@ mod tests {
         });
         let (mut module, caps) =
             speak_module_with_turn_adapter(blackboard.clone(), Arc::new(adapter), sink).await;
+        module.speech_targets = speech_targets;
         caps.scene().set(participants);
         let now = SystemClock.now();
         publish_cognition_update(&blackboard, &caps, now, cognition).await;
@@ -1794,7 +1864,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn speak_emits_for_non_scene_planned_target() {
+    async fn speak_rejects_unavailable_planned_target() {
         let adapter = MockLlmAdapter::new().with_text_scenario(prepare_speech_scenario(
             "OffstageVoice",
             "Stop that, please.",
@@ -1807,23 +1877,70 @@ mod tests {
         )
         .await;
 
-        assert_eq!(
-            completed.borrow().as_slice(),
-            &[(
-                "OffstageVoice".to_string(),
-                "Stop that, please.".to_string()
-            )]
-        );
-        let speak_owner = ModuleInstanceId::new(builtin::speak(), ReplicaIndex::ZERO);
-        let progress = blackboard
-            .read(|bb| bb.utterance_progress_for_instance(&speak_owner).cloned())
+        assert!(completed.borrow().is_empty());
+        assert_eq!(speak_memo_count(&blackboard).await, 0);
+        assert!(!speak_progress_exists(&blackboard).await);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn configured_listener_label_resolves_to_logical_target_without_prompt_leakage() {
+        let adapter = MockLlmAdapter::new().with_text_scenario(prepare_speech_scenario(
+            "Arm 1 の Finger 1",
+            "少し力を抜いて。",
+        ));
+        let capture = CapturingAdapter::new(adapter);
+        let observed = capture.clone();
+        let mut allocation = ResourceAllocation::default();
+        allocation.set_activation(builtin::speak(), ActivationRatio::ONE);
+        let blackboard = Blackboard::with_allocation(allocation);
+        let completed = Rc::new(RefCell::new(Vec::new()));
+        let sink: Rc<dyn crate::utterance::UtteranceSink> = Rc::new(CapturingUtteranceSink {
+            completed: Rc::clone(&completed),
+            done: RefCell::new(None),
+        });
+        let (mut module, caps) =
+            speak_module_with_turn_adapter(blackboard.clone(), Arc::new(capture), sink).await;
+        module.speech_targets = SpeechTargetCatalog::new([("Arm 1 の Finger 1", "arm1/finger1")]);
+        caps.scene().set([Participant::new("Ryo")]);
+        let now = SystemClock.now();
+        publish_cognition_update(
+            &blackboard,
+            &caps,
+            now,
+            "Arm 1 の Finger 1 に力を緩めるよう伝えたい。",
+        )
+        .await;
+
+        let batch = module.next_batch().await.unwrap();
+        let cx = test_activate_cx(&module, now).await;
+        SpeakModule::activate(&mut module, &cx, &batch)
             .await
             .unwrap();
-        assert_eq!(progress.target, "OffstageVoice");
+
         assert_eq!(
-            progress.state,
-            nuillu_blackboard::UtteranceProgressState::Completed
+            completed.borrow().as_slice(),
+            &[("arm1/finger1".to_string(), "少し力を抜いて。".to_string())]
         );
+        assert_eq!(
+            speak_memos(&blackboard).await,
+            vec!["I said to Arm 1 の Finger 1:\n少し力を抜いて。"]
+        );
+
+        let inputs = observed.text_inputs();
+        let planning_input = model_input_text(&inputs[0]);
+        assert!(planning_input.contains("Available listeners:"));
+        assert!(planning_input.contains("Arm 1 の Finger 1"));
+        assert!(planning_input.contains("Ryo"));
+        assert!(!planning_input.contains("arm1/finger1"));
+        assert!(!planning_input.to_ascii_lowercase().contains("scope"));
+        let turns = observed.text_turns();
+        let tool_schema = turns[0].config.tools[0].input_schema.to_string();
+        assert!(tool_schema.contains("Arm 1 の Finger 1"));
+        assert!(!tool_schema.contains("arm1/finger1"));
+        assert!(!tool_schema.to_ascii_lowercase().contains("scope"));
+        let planning_history = session_input_text(&module.planning_session);
+        assert!(!planning_history.contains("arm1/finger1"));
+        assert!(!planning_history.to_ascii_lowercase().contains("scope"));
     }
 
     #[test]

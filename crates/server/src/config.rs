@@ -292,6 +292,11 @@ pub struct ServerModuleSpec {
     /// none. Every listed role must also be registered in this config.
     #[eure(default)]
     pub memo_sources: Option<Vec<RuntimeModule>>,
+    /// Human-facing listener label to stable logical target path mappings
+    /// available to Speak. The labels are shown to the model; paths are only
+    /// written to the broadcast utterance target metadata.
+    #[eure(default)]
+    pub scope_targets: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, FromEure)]
@@ -1062,6 +1067,12 @@ impl ServerModuleSpec {
             })
     }
 
+    pub fn speech_targets(&self) -> impl Iterator<Item = (&str, &str)> {
+        self.scope_targets
+            .iter()
+            .map(|(label, path)| (label.as_str(), path.as_str()))
+    }
+
     pub fn replica_range(&self) -> ReplicaCapRange {
         ReplicaCapRange::new(self.replica_min, self.replica_max)
             .expect("server module spec should be validated before use")
@@ -1161,8 +1172,52 @@ impl ServerModuleSpec {
                 );
             }
         }
+        if self.id != RuntimeModule::Speak && !self.scope_targets.is_empty() {
+            anyhow::bail!(
+                "server config {} declares scope-targets for module {}; only speak accepts them",
+                path.display(),
+                self.id.as_str()
+            );
+        }
+        for (label, logical_path) in &self.scope_targets {
+            if label.trim() != label
+                || label.is_empty()
+                || label.contains(['\n', '\r'])
+                || matches!(label.as_str(), "everyone" | "self")
+            {
+                anyhow::bail!(
+                    "server config {} has invalid speech target label {:?} for module {}: labels must be trimmed, non-empty, single-line text and cannot be self or everyone",
+                    path.display(),
+                    label,
+                    self.id.as_str()
+                );
+            }
+            validate_logical_speech_target_path(logical_path, self.id, path)?;
+        }
         Ok(())
     }
+}
+
+fn validate_logical_speech_target_path(
+    logical_path: &str,
+    module: RuntimeModule,
+    config_path: &Path,
+) -> anyhow::Result<()> {
+    let valid = logical_path.trim() == logical_path
+        && !logical_path.is_empty()
+        && !logical_path.contains(['\n', '\r'])
+        && logical_path
+            .split('/')
+            .all(|segment| !segment.is_empty() && SubsystemId::new(segment.to_owned()).is_ok());
+    if !valid {
+        anyhow::bail!(
+            "server config {} has invalid logical speech target path {:?} for module {}: expected slash-separated subsystem-style ids such as arm1/finger1",
+            config_path.display(),
+            logical_path,
+            module.as_str()
+        );
+    }
+    Ok(())
 }
 
 impl ServerActionSpec {
@@ -1521,6 +1576,7 @@ fn module_spec<const G: usize, const D: usize>(
         groups: groups.to_vec(),
         depends_on: depends_on.to_vec(),
         memo_sources: None,
+        scope_targets: BTreeMap::new(),
     }
 }
 
@@ -1778,6 +1834,61 @@ activation-table = [1.0, 0.5]
         .unwrap();
 
         assert_eq!(config.modules[0].memo_sources, Some(Vec::new()));
+    }
+
+    #[test]
+    fn parse_speak_scope_targets_preserves_labels_and_logical_paths() {
+        let config = parse_server_boot_config_content(
+            r#"
+@ modules[] {
+  id: speak
+  replica-min = 0
+  replica-max = 1
+  bpm-min = 3.0
+  bpm-max = 6.0
+  initial-activation = 0.0
+  scope-targets = {
+    "Arm 1 の Finger 1" => "arm1/finger1"
+    "Arm 2 の Finger 1" => "arm2/finger1"
+  }
+}
+"#,
+            Path::new(".tmp/server/speak-targets.eure"),
+        )
+        .unwrap();
+
+        assert_eq!(
+            config.modules[0].scope_targets,
+            BTreeMap::from([
+                ("Arm 1 の Finger 1".to_string(), "arm1/finger1".to_string()),
+                ("Arm 2 の Finger 1".to_string(), "arm2/finger1".to_string()),
+            ])
+        );
+    }
+
+    #[test]
+    fn parse_speak_scope_targets_rejects_runtime_replica_paths() {
+        let error = parse_server_boot_config_content(
+            r#"
+@ modules[] {
+  id: speak
+  replica-min = 0
+  replica-max = 1
+  bpm-min = 3.0
+  bpm-max = 6.0
+  initial-activation = 0.0
+  scope-targets = { "Finger" => "arm[0]/finger[1]" }
+}
+"#,
+            Path::new(".tmp/server/speak-targets.eure"),
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(
+            error.contains("invalid logical speech target path"),
+            "{error}"
+        );
     }
 
     #[test]

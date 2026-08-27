@@ -594,8 +594,10 @@ fn register_server_module(
         RuntimeModule::Speak => {
             let utterance_sink = utterance_sink.clone();
             let planning_tier = spec.session_tier("planning");
+            let speech_targets = nuillu_speak::SpeechTargetCatalog::new(spec.speech_targets());
             registry.register_server(spec, move |caps| {
                 let utterance_sink = utterance_sink.clone();
+                let speech_targets = speech_targets.clone();
                 async move {
                     Ok(nuillu_speak::SpeakModule::new(
                         nuillu_speak::SpeakModuleParts {
@@ -611,6 +613,7 @@ fn register_server_module(
                             ),
                             planning_llm: caps.llm("planning").with_tier(planning_tier).into(),
                             scene: caps.scene_reader(),
+                            speech_targets,
                             clock: caps.clock(),
                             planning_session: caps
                                 .session("planning")

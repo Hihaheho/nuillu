@@ -5600,6 +5600,7 @@ fn register_eval_module(
                                         .with_tier(planning_tier)
                                         .into(),
                                     scene: caps.scene_reader(),
+                                    speech_targets: nuillu_speak::SpeechTargetCatalog::default(),
                                     clock: caps.clock(),
                                     planning_session: caps
                                         .session("planning")

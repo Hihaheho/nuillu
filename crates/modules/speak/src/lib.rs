@@ -5,7 +5,7 @@ mod utterance;
 mod test_support;
 
 pub use speak::planning_session_auto_compaction;
-pub use speak::{SpeakModule, SpeakModuleParts};
+pub use speak::{SpeakModule, SpeakModuleParts, SpeechTargetCatalog};
 pub use utterance::{
     NoopUtteranceSink, Utterance, UtteranceAbort, UtteranceDelta, UtteranceSink, UtteranceWriter,
 };

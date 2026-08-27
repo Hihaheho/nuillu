@@ -173,6 +173,11 @@ activation-table = [1.0, 0.85, 0.7, 0.5, 0.3, 0.0]
   bpm-max = 15.0
   initial-activation = 0.0
   groups = ["sleep-suppressed", "action-target"]
+  scope-targets = {
+    "Center leg" => "center-leg"
+    "Left leg" => "left-leg"
+    "Right leg" => "right-leg"
+  }
 
   @ sessions[]
   key: planning
@@ -316,6 +321,11 @@ activation-table = [1.0, 0.85, 0.7, 0.5, 0.3, 0.0]
     bpm-max = 15.0
     initial-activation = 0.0
     groups = ["sleep-suppressed", "action-target"]
+    scope-targets = {
+      "Center leg" => "center-leg"
+      "Right leg" => "right-leg"
+      "Whole octopus" => "main"
+    }
 
     @ sessions[]
     key: planning
@@ -459,6 +469,11 @@ activation-table = [1.0, 0.85, 0.7, 0.5, 0.3, 0.0]
     bpm-max = 15.0
     initial-activation = 0.0
     groups = ["sleep-suppressed", "action-target"]
+    scope-targets = {
+      "Left leg" => "left-leg"
+      "Right leg" => "right-leg"
+      "Whole octopus" => "main"
+    }
 
     @ sessions[]
     key: planning
@@ -602,6 +617,11 @@ activation-table = [1.0, 0.85, 0.7, 0.5, 0.3, 0.0]
     bpm-max = 15.0
     initial-activation = 0.0
     groups = ["sleep-suppressed", "action-target"]
+    scope-targets = {
+      "Center leg" => "center-leg"
+      "Left leg" => "left-leg"
+      "Whole octopus" => "main"
+    }
 
     @ sessions[]
     key: planning
