@@ -1027,10 +1027,11 @@ async fn refresh_active_and_schedule(
     }
     zero_windows.reset_allocation_active(owners, &allocation_active);
     for (index, owner) in owners.iter().enumerate() {
+        let scheduling_disabled = runtime.is_forced_disabled(owner).await;
         let self_wake_permit_active =
-            runtime.has_pending_self_wake_permit(owner) && !runtime.is_forced_disabled(owner).await;
-        active[index] =
-            allocation_active[index] || zero_windows.allows(owner) || self_wake_permit_active;
+            runtime.has_pending_self_wake_permit(owner) && !scheduling_disabled;
+        active[index] = !scheduling_disabled
+            && (allocation_active[index] || zero_windows.allows(owner) || self_wake_permit_active);
     }
 
     for index in 0..states.len() {
@@ -2711,7 +2712,8 @@ mod tests {
     use async_trait::async_trait;
     use nuillu_blackboard::{
         ActivationRatio, Blackboard, BlackboardCommand, Bpm, IdentityMemoryRecord, ModulePolicy,
-        ModuleRunStatus, ResourceAllocation, ZeroReplicaWindowPolicy, linear_ratio_fn,
+        ModuleRunStatus, ReplicaProjection, ResourceAllocation, SubsystemPolicy,
+        SubsystemReplicaRange, ZeroReplicaWindowPolicy, linear_ratio_fn,
     };
     use nuillu_module::{
         ActivationGate, ActivationGateEvent, ActivationGateVote, AttentionControlRequest,
@@ -2720,12 +2722,13 @@ mod tests {
         LlmRequestSource, Memo, MemoUpdated, MemoUpdatedInbox, Module, ModuleCapabilityFactory,
         ModuleDependencies, ModuleRegistrationSpec, ModuleRegistry, ModuleRegistryError,
         PersistedSessionSnapshot, RuntimeEvent, RuntimeEventSink, RuntimePolicy, SelfWake,
-        SessionCompactionPolicy, SessionKey, SessionStore, StaticModule,
+        SessionCompactionPolicy, SessionKey, SessionStore, StaticModule, SubsystemRegistrationSpec,
         ports::{Timer, TokioTimer},
     };
     use nuillu_types::{
         MemoryContent, MemoryIndex, ModelTier, ModuleActivationId, ModuleId, ModuleInstanceId,
-        ReplicaCapRange, ReplicaIndex, ScopedModuleId, builtin,
+        ReplicaCapRange, ReplicaIndex, ScopeId, ScopedModuleId, SubsystemId, SubsystemInstanceId,
+        builtin,
     };
     use tokio::sync::oneshot;
     use tokio::task::LocalSet;
@@ -4351,6 +4354,108 @@ mod tests {
 
     fn fast_bpm() -> std::ops::RangeInclusive<Bpm> {
         Bpm::from_f64(60_000.0)..=Bpm::from_f64(60_000.0)
+    }
+
+    struct ScopeActivationProbe {
+        activations: Rc<Cell<u32>>,
+        batch_sent: bool,
+    }
+
+    impl StaticModule for ScopeActivationProbe {
+        fn id() -> &'static str {
+            "scope-activation-probe"
+        }
+
+        fn peer_context() -> Option<&'static str> {
+            None
+        }
+    }
+
+    #[async_trait(?Send)]
+    impl Module for ScopeActivationProbe {
+        type Batch = ();
+
+        async fn next_batch(&mut self) -> anyhow::Result<Self::Batch> {
+            if self.batch_sent {
+                std::future::pending().await
+            } else {
+                self.batch_sent = true;
+                Ok(())
+            }
+        }
+
+        async fn activate(
+            &mut self,
+            _cx: &nuillu_module::ActivateCx<'_>,
+            _batch: &Self::Batch,
+        ) -> anyhow::Result<()> {
+            self.activations
+                .set(self.activations.get().saturating_add(1));
+            Ok(())
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = false)]
+    async fn inactive_subsystem_ancestor_blocks_module_until_mount_activation() {
+        LocalSet::new()
+            .run_until(async {
+                let blackboard = Blackboard::default();
+                let caps = test_caps(blackboard.clone());
+                let subsystem = SubsystemId::new("arm").unwrap();
+                let child_scope = ScopeId::root().child(SubsystemInstanceId::new(
+                    subsystem.clone(),
+                    ReplicaIndex::ZERO,
+                ));
+                let activations = Rc::new(Cell::new(0_u32));
+                let modules = ModuleRegistry::new()
+                    .with_subsystem(SubsystemRegistrationSpec::new(
+                        ScopeId::root(),
+                        subsystem.clone(),
+                        SubsystemPolicy::new(
+                            SubsystemReplicaRange::new(0, 1).unwrap(),
+                            1,
+                            ReplicaProjection::Linear,
+                        ),
+                        ActivationRatio::ZERO,
+                    ))
+                    .with_registration_scope(child_scope)
+                    .register_sync(test_policy(1..=1, fast_bpm()), {
+                        let activations = Rc::clone(&activations);
+                        move |_| ScopeActivationProbe {
+                            activations: Rc::clone(&activations),
+                            batch_sent: false,
+                        }
+                    })
+                    .unwrap()
+                    .build(&caps)
+                    .await
+                    .unwrap();
+
+                super::run(modules, test_config(), {
+                    let blackboard = blackboard.clone();
+                    let activations = Rc::clone(&activations);
+                    async move {
+                        for _ in 0..4 {
+                            tokio::task::yield_now().await;
+                        }
+                        assert_eq!(activations.get(), 0);
+                        blackboard
+                            .apply(BlackboardCommand::SetSubsystemActivation {
+                                writer: ModuleInstanceId::new(
+                                    builtin::allocation(),
+                                    ReplicaIndex::ZERO,
+                                ),
+                                subsystem,
+                                activation: ActivationRatio::ONE,
+                            })
+                            .await;
+                        wait_for_cell_count(&activations, 1).await;
+                    }
+                })
+                .await
+                .unwrap();
+            })
+            .await;
     }
 
     fn test_policy(

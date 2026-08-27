@@ -35,6 +35,16 @@ activation-table = [1.0, 0.85, 0.7, 0.5, 0.3, 0.0]
 }
 
 @ modules[] {
+  id: subsystem-allocation
+  replica-min = 1
+  replica-max = 1
+  replica-capacity = 1
+  bpm-min = 10.0
+  bpm-max = 10.0
+  initial-activation = 1.0
+}
+
+@ modules[] {
   id: action
   replica-min = 1
   replica-max = 1
@@ -173,7 +183,7 @@ activation-table = [1.0, 0.85, 0.7, 0.5, 0.3, 0.0]
 @ subsystem-definitions[] {
   id: arm
   label: Arm
-  root: subsystem-gate
+  allocation-description = "Coordinates reaching, grasping, manipulation, and arm-local cognition."
   memory-scope: local
 
   @ modules[] {
@@ -315,5 +325,9 @@ activation-table = [1.0, 0.85, 0.7, 0.5, 0.3, 0.0]
 
 @ subsystems[] {
   subsystem: arm
-  replicas = 3
+  replica-min = 0
+  replica-max = 3
+  replica-capacity = 3
+  initial-activation = 1.0
+  activation-table = [1.0, 0.85, 0.7, 0.5, 0.3, 0.0]
 }

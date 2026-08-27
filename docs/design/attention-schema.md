@@ -19,15 +19,24 @@ at every hierarchy level; different scopes have separate cognition logs, memo ow
 allocation. Configuration templates may be reused at multiple positions, but recursive references
 are rejected before runtime expansion.
 
-Every subsystem declares one root module. The conventional builtin root is `subsystem-gate`, a
-deterministic bridge rather than an admission gate. It mechanically converts parent cognition into
+Subsystem identity belongs to its `SubsystemId`, `SubsystemInstanceId`, and `ScopeId`; no module
+represents a subsystem as a root. `subsystem-gate` is an optional deterministic boundary module. It mechanically converts parent cognition into
 cognitive subsystem-gate memos in the child scope and child cognition into cognitive
 subsystem-gate memos in the parent scope. It preserves the text exactly, uses no LLM, and never
 writes either cognition log. The cognition-gate already present on each side remains the sole module
-that decides whether those memos enter that side's cognition log. Root selection changes this bridge
-and scope/allocation wiring only; it does not grant or remove ordinary capabilities from the
-selected module role. Applications may provide another root module with the same explicit bridge
-capabilities.
+that decides whether those memos enter that side's cognition log. Hosts may wire additional boundary
+modules by granting only their constructors the required outer-scope capabilities.
+
+Each parent scope may run `subsystem-allocation` to allocate activation among its immediate child
+mounts. Child effective activation is the product of parent effective activation and the mount's
+local activation. A module's effective activation multiplies that scope activation by its local
+module allocation before replica and BPM projections are applied.
+
+Each reusable subsystem definition provides a required `allocation-description` describing the
+work for which the parent allocator should activate it. Each `subsystems[]` mount has its own
+`activation-table`; priority position is resolved through that target mount's table, allowing the
+same definition to use different allocation characteristics under different parents. The default
+table is `[1.0, 0.85, 0.7, 0.5, 0.3, 0.0]`.
 
 Memory scope is configured independently. `global` shares explicitly global-tagged records across
 the agent, while `local` exposes only records tagged with that complete subsystem path. Missing scope

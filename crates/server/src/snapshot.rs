@@ -25,13 +25,22 @@ pub(crate) async fn emit_visualizer_blackboard_snapshot(
     visualizer: &VisualizerHook,
 ) {
     let mut snapshot = BlackboardSnapshot {
-        scopes: scope_views(boot_config),
+        scopes: scope_views(boot_config, blackboard).await,
         ..BlackboardSnapshot::default()
     };
     for scoped_blackboard in blackboard.all_scopes() {
         let scope = scoped_blackboard.scope().clone();
+        let scope_activation = blackboard.scope_activation_state(&scope).await;
+        let effective_allocation = blackboard.effective_module_allocation(&scope).await;
         let scoped_snapshot = scoped_blackboard
-            .read(|bb| visualizer_scoped_blackboard_snapshot(&scope, bb))
+            .read(|bb| {
+                visualizer_scoped_blackboard_snapshot(
+                    &scope,
+                    bb,
+                    &effective_allocation,
+                    scope_activation.effective_activation,
+                )
+            })
             .await;
         merge_blackboard_snapshot(&mut snapshot, scoped_snapshot, scope.is_root());
     }
@@ -41,7 +50,7 @@ pub(crate) async fn emit_visualizer_blackboard_snapshot(
     });
 }
 
-fn scope_views(boot_config: &ServerBootConfig) -> Vec<ScopeView> {
+async fn scope_views(boot_config: &ServerBootConfig, blackboard: &Blackboard) -> Vec<ScopeView> {
     let expanded = boot_config.expanded_subsystems();
     if expanded.is_empty() {
         return Vec::new();
@@ -49,21 +58,37 @@ fn scope_views(boot_config: &ServerBootConfig) -> Vec<ScopeView> {
     let mut scopes = vec![ScopeView {
         id: ScopeId::root().to_string(),
         parent: None,
-        root_module: None,
         memory_scope: "global".to_owned(),
+        subsystem: None,
+        replica: None,
+        local_activation: 1.0,
+        effective_activation: 1.0,
+        active_replicas: 1,
+        active: true,
     }];
-    scopes.extend(expanded.into_iter().map(|expanded| {
-        ScopeView {
+    for expanded in expanded {
+        let state = blackboard.scope_activation_state(&expanded.scope).await;
+        let instance = expanded
+            .scope
+            .path()
+            .last()
+            .expect("expanded scope is non-root");
+        scopes.push(ScopeView {
             id: expanded.scope.to_string(),
             parent: expanded.scope.parent().map(|scope| scope.to_string()),
-            root_module: Some(expanded.definition.root_module_id().to_string()),
             memory_scope: match expanded.definition.memory_scope {
                 ServerMemoryScope::Global => "global",
                 ServerMemoryScope::Local => "local",
             }
             .to_owned(),
-        }
-    }));
+            subsystem: Some(instance.subsystem.to_string()),
+            replica: Some(instance.replica.get()),
+            local_activation: state.local_activation.as_f64(),
+            effective_activation: state.effective_activation.as_f64(),
+            active_replicas: state.active_replicas,
+            active: state.active,
+        });
+    }
     scopes.sort_by(|left, right| left.id.cmp(&right.id));
     scopes
 }
@@ -136,12 +161,19 @@ pub fn linked_memory_record_view(record: LinkedMemoryRecord) -> LinkedMemoryReco
 
 #[cfg(test)]
 fn visualizer_blackboard_snapshot(bb: &BlackboardInner) -> BlackboardSnapshot {
-    visualizer_scoped_blackboard_snapshot(&ScopeId::root(), bb)
+    visualizer_scoped_blackboard_snapshot(
+        &ScopeId::root(),
+        bb,
+        bb.allocation(),
+        nuillu_blackboard::ActivationRatio::ONE,
+    )
 }
 
 fn visualizer_scoped_blackboard_snapshot(
     scope: &ScopeId,
     bb: &BlackboardInner,
+    effective_allocation: &ResourceAllocation,
+    scope_activation: nuillu_blackboard::ActivationRatio,
 ) -> BlackboardSnapshot {
     let include_root_content = scope.is_root();
     BlackboardSnapshot {
@@ -156,7 +188,12 @@ fn visualizer_scoped_blackboard_snapshot(
                 status: format!("{:?}", record.status),
             })
             .collect(),
-        allocation: allocation_views(scope, bb.allocation()),
+        allocation: allocation_views(
+            scope,
+            bb.allocation(),
+            effective_allocation,
+            scope_activation,
+        ),
         interoception: include_root_content
             .then(|| interoception_view(bb.interoception()))
             .unwrap_or_default(),
@@ -252,19 +289,26 @@ fn interoceptive_mode_name(mode: InteroceptiveMode) -> &'static str {
     }
 }
 
-fn allocation_views(scope: &ScopeId, allocation: &ResourceAllocation) -> Vec<AllocationView> {
+fn allocation_views(
+    scope: &ScopeId,
+    allocation: &ResourceAllocation,
+    effective: &ResourceAllocation,
+    scope_activation: nuillu_blackboard::ActivationRatio,
+) -> Vec<AllocationView> {
     let mut modules = allocation
         .module_ids()
         .into_iter()
         .map(|module| {
-            let bpm = allocation.bpm_for(&module);
+            let bpm = effective.bpm_for(&module);
             AllocationView {
                 scope: scope.to_string(),
                 bpm: bpm.map(|bpm| bpm.as_f64()),
                 period_ms: bpm.map(|bpm| duration_millis_u64(bpm.period())),
                 module: module.as_str().to_owned(),
                 activation_ratio: allocation.activation_for(&module).as_f64(),
-                active_replicas: allocation.active_replicas(&module),
+                scope_activation_ratio: scope_activation.as_f64(),
+                effective_activation_ratio: effective.effective_activation_for(&module).as_f64(),
+                active_replicas: effective.active_replicas(&module),
             }
         })
         .collect::<Vec<_>>();
@@ -369,13 +413,13 @@ mod tests {
 
     use super::*;
 
-    #[test]
-    fn scope_views_include_parent_root_and_memory_mode() {
+    #[tokio::test]
+    async fn scope_views_include_parent_activation_and_memory_mode() {
         let config = crate::config::parse_server_boot_config_content(
             r#"
 @ subsystem-definitions[] {
   id: arm
-  root: predict
+  allocation-description = "Test arm subsystem."
   memory-scope: local
 
   @ modules[] {
@@ -397,22 +441,33 @@ mod tests {
         )
         .unwrap();
 
-        let scopes = scope_views(&config);
+        let blackboard = Blackboard::new();
+        let scopes = scope_views(&config, &blackboard).await;
         assert_eq!(scopes.len(), 3);
         assert_eq!(
             scopes[0],
             ScopeView {
                 id: "/".to_string(),
                 parent: None,
-                root_module: None,
                 memory_scope: "global".to_string(),
+                subsystem: None,
+                replica: None,
+                local_activation: 1.0,
+                effective_activation: 1.0,
+                active_replicas: 1,
+                active: true,
             }
         );
         assert!(scopes.contains(&ScopeView {
             id: "/arm[0]".to_string(),
             parent: Some("/".to_string()),
-            root_module: Some("predict".to_string()),
             memory_scope: "local".to_string(),
+            subsystem: Some("arm".to_string()),
+            replica: Some(0),
+            local_activation: 1.0,
+            effective_activation: 1.0,
+            active_replicas: 0,
+            active: false,
         }));
     }
 

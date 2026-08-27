@@ -15,7 +15,7 @@ use crate::{
     ActivationRatio, AgenticDeadlockMarker, AllocationLimits, BlackboardCommand, CognitionLog,
     CognitionLogEntry, CognitionLogEntryRecord, CognitionLogRecord, CognitionLogSet,
     CorePolicyRecord, IdentityMemoryRecord, InteroceptiveState, MemoryMetadata, ModulePolicy,
-    PolicyMetadata, ResourceAllocation,
+    PolicyMetadata, ResourceAllocation, SubsystemAllocation, SubsystemPolicy,
 };
 
 const DEFAULT_MEMO_RETAINED_PER_OWNER: usize = 8;
@@ -40,6 +40,14 @@ pub struct Blackboard {
     allocation_change_waiters: Arc<Mutex<Vec<oneshot::Sender<()>>>>,
     peer_contexts: Arc<OnceLock<PeerContexts>>,
     scopes: Rc<RefCell<HashMap<ScopeId, BlackboardScopeResources>>>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ScopeActivationState {
+    pub local_activation: ActivationRatio,
+    pub effective_activation: ActivationRatio,
+    pub active_replicas: u8,
+    pub active: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -78,6 +86,8 @@ pub struct BlackboardInner {
     module_policies: HashMap<ModuleId, ModulePolicy>,
     module_replica_capacities: HashMap<ModuleId, u8>,
     allocation_limits: AllocationLimits,
+    subsystem_allocation: SubsystemAllocation,
+    subsystem_policies: HashMap<nuillu_types::SubsystemId, SubsystemPolicy>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -446,6 +456,80 @@ impl Blackboard {
         scopes.into_iter().map(|scope| self.scoped(scope)).collect()
     }
 
+    /// Derive the hierarchical activation and prefix-replica status for a
+    /// scope. Root is always effectively active at ratio 1.0.
+    pub async fn scope_activation_state(&self, scope: &ScopeId) -> ScopeActivationState {
+        if scope.is_root() {
+            return ScopeActivationState {
+                local_activation: ActivationRatio::ONE,
+                effective_activation: ActivationRatio::ONE,
+                active_replicas: 1,
+                active: true,
+            };
+        }
+
+        let mut parent = ScopeId::root();
+        let mut parent_effective = ActivationRatio::ONE;
+        let mut ancestors_active = true;
+        let mut result = ScopeActivationState {
+            local_activation: ActivationRatio::ZERO,
+            effective_activation: ActivationRatio::ZERO,
+            active_replicas: 0,
+            active: false,
+        };
+        for instance in scope.path() {
+            let parent_blackboard = self.scoped(parent.clone());
+            let (local, policy) = parent_blackboard
+                .read(|bb| {
+                    (
+                        bb.subsystem_allocation()
+                            .activation_for(&instance.subsystem),
+                        bb.subsystem_policies().get(&instance.subsystem).cloned(),
+                    )
+                })
+                .await;
+            let effective = parent_effective.multiplied(local);
+            let active_replicas = policy
+                .map(|policy| {
+                    policy.active_replicas_for(crate::ActivationInput {
+                        local,
+                        scope: parent_effective,
+                        effective,
+                    })
+                })
+                .unwrap_or(0);
+            let active = ancestors_active && instance.replica.get() < active_replicas;
+            result = ScopeActivationState {
+                local_activation: local,
+                effective_activation: effective,
+                active_replicas,
+                active,
+            };
+            ancestors_active = active;
+            parent_effective = effective;
+            parent = parent.child(instance.clone());
+        }
+        result
+    }
+
+    /// Re-project a scope's local module allocation through its effective
+    /// hierarchical activation without storing a second mutable copy.
+    pub async fn effective_module_allocation(&self, scope: &ScopeId) -> ResourceAllocation {
+        let scope_activation = self
+            .scope_activation_state(scope)
+            .await
+            .effective_activation;
+        self.scoped(scope.clone())
+            .read(|bb| {
+                bb.allocation()
+                    .clone()
+                    .derived_in_scope(bb.module_policies(), scope_activation)
+                    .limited(bb.allocation_limits())
+                    .force_disable_modules(bb.forced_disabled_modules())
+            })
+            .await
+    }
+
     /// Install the registered-module peer context catalog.
     /// Idempotent on first call; subsequent calls are silently ignored to keep
     /// the post-boot snapshot stable for prompt caching.
@@ -473,13 +557,18 @@ impl Blackboard {
 
     /// Apply one command under the blackboard write lock.
     pub async fn apply(&self, cmd: BlackboardCommand) {
+        let subsystem_changed = matches!(
+            &cmd,
+            BlackboardCommand::SetRegisteredSubsystems { .. }
+                | BlackboardCommand::SetSubsystemActivation { .. }
+        );
         let mut guard = self.inner.write().await;
         let before = guard.allocation.clone();
         guard.apply(cmd);
         let allocation_changed = before != guard.allocation;
         self.notify_active_waiters(&guard.allocation);
         self.notify_activation_increase_waiters(&guard.allocation);
-        if allocation_changed {
+        if allocation_changed || subsystem_changed {
             self.notify_allocation_change_waiters();
         }
     }
@@ -775,6 +864,8 @@ impl Default for BlackboardInner {
             module_policies: HashMap::new(),
             module_replica_capacities: HashMap::new(),
             allocation_limits: AllocationLimits::default(),
+            subsystem_allocation: SubsystemAllocation::default(),
+            subsystem_policies: HashMap::new(),
         }
     }
 }
@@ -1058,6 +1149,14 @@ impl BlackboardInner {
         &self.module_policies
     }
 
+    pub fn subsystem_allocation(&self) -> &SubsystemAllocation {
+        &self.subsystem_allocation
+    }
+
+    pub fn subsystem_policies(&self) -> &HashMap<nuillu_types::SubsystemId, SubsystemPolicy> {
+        &self.subsystem_policies
+    }
+
     pub fn module_replica_capacity(&self, module: &ModuleId) -> Option<u8> {
         self.module_replica_capacities
             .get(module)
@@ -1193,6 +1292,32 @@ impl BlackboardInner {
                         .insert(registration.module, registration.policy);
                 }
                 self.recompute_effective_allocation();
+            }
+            BlackboardCommand::SetRegisteredSubsystems { registrations } => {
+                self.subsystem_policies.clear();
+                for registration in registrations {
+                    if !self
+                        .subsystem_allocation
+                        .has_activation(&registration.subsystem)
+                    {
+                        self.subsystem_allocation.set_activation(
+                            registration.subsystem.clone(),
+                            registration.initial_activation,
+                        );
+                    }
+                    self.subsystem_policies
+                        .insert(registration.subsystem, registration.policy);
+                }
+            }
+            BlackboardCommand::SetSubsystemActivation {
+                writer: _,
+                subsystem,
+                activation,
+            } => {
+                if self.subsystem_policies.contains_key(&subsystem) {
+                    self.subsystem_allocation
+                        .set_activation(subsystem, activation);
+                }
             }
             BlackboardCommand::SetAllocationLimits(limits) => {
                 self.allocation_limits = limits;
@@ -2249,6 +2374,72 @@ mod tests {
         .await;
 
         assert_eq!(waiter.await, Ok(()));
+    }
+
+    #[tokio::test]
+    async fn nested_scope_and_module_activation_compose_multiplicatively() {
+        let blackboard = Blackboard::default();
+        let arm = SubsystemId::new("arm").unwrap();
+        let finger = SubsystemId::new("finger").unwrap();
+        let arm_scope =
+            ScopeId::root().child(SubsystemInstanceId::new(arm.clone(), ReplicaIndex::ZERO));
+        let finger_scope =
+            arm_scope.child(SubsystemInstanceId::new(finger.clone(), ReplicaIndex::ZERO));
+
+        blackboard
+            .apply(BlackboardCommand::SetRegisteredSubsystems {
+                registrations: vec![crate::RegisteredSubsystemPolicy {
+                    subsystem: arm,
+                    policy: crate::SubsystemPolicy::new(
+                        crate::SubsystemReplicaRange::new(0, 1).unwrap(),
+                        1,
+                        crate::ReplicaProjection::Linear,
+                    ),
+                    initial_activation: crate::ActivationRatio::from_f64(0.8),
+                }],
+            })
+            .await;
+        blackboard
+            .scoped(arm_scope.clone())
+            .apply(BlackboardCommand::SetRegisteredSubsystems {
+                registrations: vec![crate::RegisteredSubsystemPolicy {
+                    subsystem: finger,
+                    policy: crate::SubsystemPolicy::new(
+                        crate::SubsystemReplicaRange::new(0, 1).unwrap(),
+                        1,
+                        crate::ReplicaProjection::Linear,
+                    ),
+                    initial_activation: crate::ActivationRatio::from_f64(0.5),
+                }],
+            })
+            .await;
+        blackboard
+            .scoped(finger_scope.clone())
+            .apply(BlackboardCommand::SetRegisteredModules {
+                registrations: vec![crate::RegisteredModulePolicy {
+                    module: builtin::predict(),
+                    policy: crate::ModulePolicy::with_projections(
+                        ReplicaCapRange::new(0, 1).unwrap(),
+                        crate::Bpm::range(1.0, 5.0),
+                        crate::ReplicaProjection::Linear,
+                        crate::RateProjection::Linear,
+                    ),
+                    replica_capacity: 1,
+                    initial_activation: crate::ActivationRatio::from_f64(0.25),
+                }],
+            })
+            .await;
+
+        let scope = blackboard.scope_activation_state(&finger_scope).await;
+        let modules = blackboard.effective_module_allocation(&finger_scope).await;
+        assert_eq!(scope.local_activation.as_f64(), 0.5);
+        assert_eq!(scope.effective_activation.as_f64(), 0.4);
+        assert_eq!(
+            modules
+                .effective_activation_for(&builtin::predict())
+                .as_f64(),
+            0.1
+        );
     }
 
     fn test_policy(range: ReplicaCapRange) -> crate::ModulePolicy {

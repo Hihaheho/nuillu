@@ -39,6 +39,7 @@ variants.reward = { = "reward", $variant => "literal" }
 variants.predict = { = "predict", $variant => "literal" }
 variants.surprise = { = "surprise", $variant => "literal" }
 variants.subsystem-gate = { = "subsystem-gate", $variant => "literal" }
+variants.subsystem-allocation = { = "subsystem-allocation", $variant => "literal" }
 variants.speak = { = "speak", $variant => "literal" }
 
 @ $types.model-tier
@@ -57,9 +58,9 @@ variants.local = { = "local", $variant => "literal" }
 id = `text`
 label = `text`
 label.$optional = true
+allocation-description = `text`
 modules = [`$types.server-module`]
 modules.$optional = true
-root = `text`
 memory-scope = `$types.memory-scope`
 memory-scope.$optional = true
 subsystems = [`$types.subsystem-ref`]
@@ -68,6 +69,26 @@ subsystems.$optional = true
 @ $types.subsystem-ref
 subsystem = `text`
 replicas = `integer`
+replicas.$optional = true
+replica-min = `integer`
+replica-min.$optional = true
+replica-max = `integer`
+replica-max.$optional = true
+replica-capacity = `integer`
+replica-capacity.$optional = true
+initial-activation = `float`
+initial-activation.$optional = true
+replica-curve = `$types.projection-curve`
+replica-curve.$optional = true
+replica-threshold = `float`
+replica-threshold.$optional = true
+activation-table = [`float`]
+activation-table.$optional = true
+
+@ $types.projection-curve
+$variant: union
+variants.linear = { = "linear", $variant => "literal" }
+variants.threshold = { = "threshold", $variant => "literal" }
 
 @ $types.module-group
 $variant: union
@@ -85,6 +106,14 @@ replica-capacity.$optional = true
 bpm-min = `float`
 bpm-max = `float`
 initial-activation = `float`
+replica-curve = `$types.projection-curve`
+replica-curve.$optional = true
+replica-threshold = `float`
+replica-threshold.$optional = true
+rate-curve = `$types.projection-curve`
+rate-curve.$optional = true
+rate-threshold = `float`
+rate-threshold.$optional = true
 groups = [`$types.module-group`]
 groups.$optional = true
 depends-on = [`$types.runtime-module`]

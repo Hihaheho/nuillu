@@ -26,6 +26,7 @@ This document is the implementation source of truth. It describes the desired ar
 15. **Replica-capped persistent module instances** — Boot registers modules as `(module_id, cap_range, builder)`, creates module instances up to `cap_range.max`, and never destroys those instances when allocation lowers replica count. Allocation changes routing and event-loop scheduling.
 16. **Controller proposals with deterministic effective allocation** — Allocation replicas write priority proposals. The runtime derives the effective `ResourceAllocation` by deterministic averaging of activation ratios, computes active replicas and rates from each module's boot-time policy, then applies `RuntimePolicy` hard limits such as max total active replicas.
 17. **Registry-derived controller schema** — The allocation structured-output JSON Schema is generated from module registrations, enumerates module ids, and exposes only `memo` plus `priority_module_ids`. Priority positions are mapped through the host/base activation table because LLM output is not a trust boundary.
+17a. **Subsystem allocation metadata is mount-aware** — A subsystem definition supplies its required `allocation-description`; each mount supplies its own activation table. The subsystem-allocation schema enumerates only immediate child ids, and the owner-stamped writer maps each target's priority position through that target mount's table.
 18. **Free-form memo logs** — `Memo` appends durable module-output log entries. Each entry is plain free-form text, not JSON/YAML, a code-fenced format, or a structured data exchange protocol. Memo entries have an opt-in `cognitive` routing flag that defaults to false. Cognitive memo plaintext must already be safe evidence for cognition, while non-cognitive memo text remains ordinary bookkeeping. Modules consume this surface through unread memo logs and keep any needed durable context in their own persistent `Session` plus compaction; there is no latest-memo snapshot read API. Structured output is reserved for runtime control decisions whose fields are read by code.
 19. **Memory and learning are distinct reinforcement substrates** — Memory preserves *what happened* and is reinforced by **access**: rank rises when entries are read or queried, and this rule is owned by `MemoryStore` rather than by any module. Learning preserves *what worked* and *what failed* through a TD-0 (temporal-difference, one-step lookbehind, no discount) credit-assignment loop. `policy` is a read-only advisor/proposer: it searches stored policies by vector search over the `trigger` field only, synthesizes new `(trigger, behavior)` candidates when needed, predicts each candidate's current `predicted_expected_reward`, writes ordinary advice to its memo, and writes a structured `PolicyConsiderationPayload` through a reward-crate custom capability. `reward` settles custom-evicted policy considerations, aggregates the 6-source `ObservedReward`, computes `td_error = observed_scalar − predicted_expected_reward`, inserts credited synthetic candidates, and applies value, expected-reward, confidence, and reward-token deltas through the reward-owned `PolicyUpserter`. Rank crosses tiers only as a derived consequence of value × reward-tokens. Policies and memories never share a store, a rank enum, or a strengthening rule. The retrieval module that surfaces memories is named `query-memory`.
 20. **Interoception and homeostasis are separate** — `interoception` owns the canonical internal-state estimate: `wake_arousal`, `nrem_pressure`, `rem_pressure`, `affect_arousal`, `valence`, and untyped `emotion`. `homeostasis` reads that state and regulates allocation, but it does not estimate internal state. There is no separate `emotion` module in v1.
@@ -35,7 +36,7 @@ This document is the implementation source of truth. It describes the desired ar
 24. **Whether recall is useful is a semantic decision** — Query-memory wakes from admitted cognition while allocation controls whether it is active. Rust may coalesce wake signals and exclude evidence already surfaced, but it must not pretend that keyword rules can decide whether memory would clarify the current cognition. The query-memory planning turn must be able to choose either a concrete retrieval plan or an explicit semantic no-retrieval decision; only the latter avoids search and evidence-selection work for that activation.
 25. **Memory ingest gates durable relevance, not scheduler freshness** — A concurrent cognitive system cannot generally determine from version numbers alone that an LLM-produced memory statement is semantically stale. The memory LLM gate decides whether evidence is worth preserving and should reject incidental in-flight progress/absence claims such as "has not answered yet" or "is still waiting" unless that unresolved state is itself the remembered event. When both are available, prefer the settled interaction or durable decision.
 26. **Self-model is an embodied and mental-state snapshot** — Self-model integrates the agent's body/form, abilities and limitations, interoceptive and affective condition, attention, intention, uncertainty, and agency. It does not preserve a conversation transcript, action chronology, poem history, or every question and answer. New output integrates and replaces superseded self-state instead of appending a recap.
-27. **Subsystems are finite hierarchical runtime scopes** — Boot config defines reusable subsystem templates and mounts any finite number of replicas at root or beneath another template. Recursive definition cycles are rejected before expansion. Each expanded scope has exactly one configured root module; the builtin `subsystem-gate` is the conventional outer/inner bridge, while a user-defined module role may be selected instead. Root selection affects subsystem allocation and scope wiring, not the module's ordinary capability set. The builtin bridge performs no LLM call and makes no admission decision: it mechanically writes outer cognition as an inner cognitive memo and inner cognition as an outer cognitive memo, leaving each side's cognition-gate as the sole promotion boundary.
+27. **Subsystems are finite hierarchical allocation scopes** — Boot config defines reusable subsystem templates and mounts bounded persistent replica capacity at root or beneath another template. Recursive definition cycles are rejected before expansion. A subsystem is identified by `SubsystemId` / `SubsystemInstanceId` / `ScopeId`, never by a root module. The optional builtin `subsystem-gate` is an ordinary outer/inner cognition bridge: it performs no LLM call and makes no admission decision.
 28. **Subsystem state boundaries are explicit** — Cognition logs, memos, and allocation are isolated per scope. Memory is either global or local per subsystem definition. Local memory is namespaced by the complete `ScopeId`; global memory is shared. Persisted module-owner keys and memory records always carry explicit scope metadata. Data written before this representation must be reset or regenerated; runtime readers do not infer a missing scope from stale records.
 
 ---
@@ -155,7 +156,13 @@ pub struct ResourceAllocation {
 }
 ```
 
-`ActivationRatio` is an internal fixed-point value serialized as a JSON number in `0.0..=1.0`. Active replicas are derived from the effective ratio and boot-time cap range:
+`ActivationRatio` is an internal fixed-point value serialized as a JSON number in `0.0..=1.0`.
+Scope composition is fixed: `child_effective = parent_effective × child_local`, and module
+composition is `module_effective = scope_effective × module_local`. Projection is a separate policy
+axis. Config exposes standard linear and threshold curves; Rust registration may provide custom
+replica/rate functions with local, scope, and effective inputs. BPM is interpolated from its range
+after effective activation is projected, rather than multiplying maximum BPM by scope activation.
+Active replicas are derived from the effective ratio and boot-time cap range:
 
 ```rust
 if cap_range.max == 0 {
@@ -422,8 +429,9 @@ Memory metadata remains keyed by `MemoryIndex`. Storage-level memory replicas ar
 ### Subsystem scope boundaries
 
 Each expanded subsystem scope receives its own blackboard view, cognition log, memo owners, and
-allocation snapshot. Its configured root module is wired in the inner scope and may receive explicit
-outer cognition-reader and outer memo capabilities. The builtin `subsystem-gate` copies every new
+module allocation snapshot. Immediate child mounts have a separate subsystem allocation state in
+the parent scope. Modules wired as boundary bridges may receive explicit outer cognition-reader and
+outer memo capabilities. The builtin `subsystem-gate` copies every new
 outer cognition entry into its cognitive memo in the inner scope and every new inner cognition entry
 into its cognitive memo targeted at the immediate parent. It preserves the cognition text exactly,
 does not call an LLM, and never writes a cognition log directly. The cognition-gate in each target
@@ -665,6 +673,19 @@ The controller prompt receives a registry-derived JSON Schema. The schema enumer
 When current memo logs and cognition logs suggest that the agent should gather evidence before speaking, the controller enters an evidence-gathering allocation phase: it keeps or raises query and cognition-gate activation priority. Query modules continue to write memo-authoritative results as log entries; cognition-gate may later promote useful query memo-log content into cognition logs. Once cognition-log state indicates that a concrete outward/internal action may be useful, the controller can allocate Action; Action then executes one concrete action tool.
 
 This is not a request/response wait and not a query-completion correlation protocol. The controller allocates work from memo logs, attention-control requests, cognition logs, and allocation state, while query results remain durable only through query-module memo logs. Attention-control requests are admitted, deferred, or rejected in the controller memo; deferred requests are not stored in a separate pending queue.
+
+### Subsystem Allocation
+
+Capabilities: `MemoUpdatedInbox`, `BlackboardReader`, `SubsystemCatalogView`,
+`SubsystemAllocationReader`, `SubsystemAllocationWriter`, `LlmAccess`.
+
+The allocator reasons only over immediate child mounts. Its dynamic tool schema enumerates those
+child subsystem ids, while the ephemeral context includes each definition's
+`allocation-description`, current local/effective activation, active replicas, replica bounds, and
+the mount-specific activation table. It returns a complete descending priority list; the
+owner-stamped writer validates every id and independently resolves each target's position through
+that mount's table. Omitted targets receive zero activation. The free-form decision memo remains in
+the persistent subsystem-allocation session history.
 
 ### Action
 

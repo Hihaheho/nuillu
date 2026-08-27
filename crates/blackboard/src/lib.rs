@@ -27,21 +27,23 @@ mod policy;
 mod state;
 
 pub use allocation::{
-    ActivationRatio, ActivationRatioFn, AllocationCommand, AllocationEffectKind,
+    ActivationInput, ActivationRatio, ActivationRatioFn, AllocationCommand, AllocationEffectKind,
     AllocationEffectLevel, AllocationEffectPolicy, AllocationLimits, Bpm, ModulePolicy,
-    RateLimitRatio, ReplicasRatio, ResourceAllocation, ZeroReplicaWindowPolicy, linear_ratio_fn,
+    RateLimitRatio, RateProjection, RateProjectionFn, ReplicaProjection, ReplicaProjectionFn,
+    ReplicasRatio, ResourceAllocation, SubsystemAllocation, SubsystemAllocationCommand,
+    SubsystemPolicy, SubsystemReplicaRange, ZeroReplicaWindowPolicy, linear_ratio_fn,
     rate_only_ratio_fn, replicas_only_ratio_fn,
 };
 pub use cognition_log::{
     AgenticDeadlockMarker, CognitionLog, CognitionLogEntry, CognitionLogEntryRecord,
     CognitionLogOrigin, CognitionLogRecord, CognitionLogSet,
 };
-pub use command::{BlackboardCommand, RegisteredModulePolicy};
+pub use command::{BlackboardCommand, RegisteredModulePolicy, RegisteredSubsystemPolicy};
 pub use interoception::{InteroceptiveMode, InteroceptivePatch, InteroceptiveState};
 pub use memory::{IdentityMemoryRecord, MemoryMetaPatch, MemoryMetadata};
 pub use policy::{CorePolicyRecord, PolicyMetaPatch, PolicyMetadata};
 pub use state::{
     Blackboard, BlackboardInner, CognitionLogAppendResult, MemoAppendResult, MemoLogPayload,
-    MemoLogRecord, ModuleRunStatus, ModuleRunStatusRecord, TypedMemoLogRecord, UtteranceProgress,
-    UtteranceProgressRecord, UtteranceProgressState,
+    MemoLogRecord, ModuleRunStatus, ModuleRunStatusRecord, ScopeActivationState,
+    TypedMemoLogRecord, UtteranceProgress, UtteranceProgressRecord, UtteranceProgressState,
 };

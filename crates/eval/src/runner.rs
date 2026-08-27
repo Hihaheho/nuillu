@@ -5887,6 +5887,8 @@ fn visualizer_blackboard_snapshot(bb: &BlackboardInner) -> BlackboardSnapshot {
                     period_ms: bpm.map(|bpm| duration_millis_u64(bpm.period())),
                     module: module.module,
                     activation_ratio: module.activation_ratio,
+                    scope_activation_ratio: 1.0,
+                    effective_activation_ratio: module.activation_ratio,
                     active_replicas: module.active_replicas,
                 }
             })

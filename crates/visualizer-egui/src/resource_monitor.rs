@@ -988,6 +988,8 @@ mod tests {
                 scope: "/".to_string(),
                 module: module.to_string(),
                 activation_ratio,
+                scope_activation_ratio: 1.0,
+                effective_activation_ratio: activation_ratio,
                 active_replicas,
                 bpm: Some(bpm),
                 period_ms: Some(period_ms),

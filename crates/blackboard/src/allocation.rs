@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ops::RangeInclusive;
 use std::time::Duration;
 
-use nuillu_types::{ModuleId, ModuleInstanceId, ReplicaCapRange};
+use nuillu_types::{ModuleId, ModuleInstanceId, ReplicaCapRange, SubsystemId};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 const ACTIVATION_RATIO_SCALE: u16 = 10_000;
@@ -34,6 +34,15 @@ impl ActivationRatio {
     pub(crate) fn from_raw(raw: u16) -> Self {
         Self(raw.min(ACTIVATION_RATIO_SCALE))
     }
+
+    /// Compose two hierarchy activation factors. The fixed-point product is
+    /// rounded to the nearest representable ratio.
+    pub fn multiplied(self, other: Self) -> Self {
+        let product = u32::from(self.raw()) * u32::from(other.raw());
+        let rounded =
+            (product + u32::from(ACTIVATION_RATIO_SCALE / 2)) / u32::from(ACTIVATION_RATIO_SCALE);
+        Self::from_raw(rounded as u16)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -59,6 +68,18 @@ pub struct AllocationCommand {
     pub effect: AllocationEffectKind,
     pub module: ModuleId,
     pub level: AllocationEffectLevel,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SubsystemAllocationCommand {
+    pub subsystem: SubsystemId,
+    pub level: AllocationEffectLevel,
+}
+
+impl SubsystemAllocationCommand {
+    pub fn target(subsystem: SubsystemId, level: AllocationEffectLevel) -> Self {
+        Self { subsystem, level }
+    }
 }
 
 impl AllocationCommand {
@@ -241,6 +262,74 @@ impl Bpm {
 /// stateless.
 pub type ActivationRatioFn = fn(ActivationRatio) -> (ReplicasRatio, RateLimitRatio);
 
+/// Hierarchical activation values made available to Rust-registered custom
+/// projections. Standard projections intentionally use only `effective`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ActivationInput {
+    pub local: ActivationRatio,
+    pub scope: ActivationRatio,
+    pub effective: ActivationRatio,
+}
+
+impl ActivationInput {
+    pub fn new(local: ActivationRatio, scope: ActivationRatio) -> Self {
+        Self {
+            local,
+            scope,
+            effective: local.multiplied(scope),
+        }
+    }
+}
+
+pub type ReplicaProjectionFn = fn(ActivationInput) -> ReplicasRatio;
+pub type RateProjectionFn = fn(ActivationInput) -> RateLimitRatio;
+
+#[derive(Debug, Clone, Copy)]
+pub enum ReplicaProjection {
+    Linear,
+    Threshold(ActivationRatio),
+    Custom(ReplicaProjectionFn),
+}
+
+impl ReplicaProjection {
+    pub fn project(self, input: ActivationInput) -> ReplicasRatio {
+        match self {
+            Self::Linear => ReplicasRatio::from_f64(input.effective.as_f64()),
+            Self::Threshold(threshold) => {
+                if input.effective < threshold {
+                    ReplicasRatio::ZERO
+                } else {
+                    ReplicasRatio::ONE
+                }
+            }
+            Self::Custom(project) => project(input),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum RateProjection {
+    Linear,
+    Threshold(ActivationRatio),
+    Custom(RateProjectionFn),
+}
+
+impl RateProjection {
+    pub fn project(self, input: ActivationInput) -> RateLimitRatio {
+        match self {
+            Self::Linear => RateLimitRatio::from_f64(input.effective.as_f64()),
+            Self::Threshold(threshold) => {
+                if input.effective < threshold {
+                    RateLimitRatio::ZERO
+                } else {
+                    RateLimitRatio::ONE
+                }
+            }
+            Self::Custom(project) => project(input),
+        }
+    }
+}
+
 /// Both axes track the controller's activation linearly.
 pub fn linear_ratio_fn(r: ActivationRatio) -> (ReplicasRatio, RateLimitRatio) {
     let v = r.as_f64();
@@ -265,6 +354,8 @@ pub struct ModulePolicy {
     pub replicas_range: ReplicaCapRange,
     pub rate_limit_range: RangeInclusive<Bpm>,
     pub activation_ratio_fn: ActivationRatioFn,
+    pub replica_projection: Option<ReplicaProjection>,
+    pub rate_projection: Option<RateProjection>,
     pub zero_replica_window: ZeroReplicaWindowPolicy,
 }
 
@@ -278,7 +369,35 @@ impl ModulePolicy {
             replicas_range,
             rate_limit_range,
             activation_ratio_fn,
+            replica_projection: None,
+            rate_projection: None,
             zero_replica_window: ZeroReplicaWindowPolicy::default(),
+        }
+    }
+
+    /// Register independent resource-axis projections. This is the preferred
+    /// API for new wiring; `new` remains available for existing combined
+    /// projection functions.
+    pub fn with_projections(
+        replicas_range: ReplicaCapRange,
+        rate_limit_range: RangeInclusive<Bpm>,
+        replica_projection: ReplicaProjection,
+        rate_projection: RateProjection,
+    ) -> Self {
+        Self {
+            replicas_range,
+            rate_limit_range,
+            activation_ratio_fn: linear_ratio_fn,
+            replica_projection: Some(replica_projection),
+            rate_projection: Some(rate_projection),
+            zero_replica_window: ZeroReplicaWindowPolicy::default(),
+        }
+    }
+
+    pub fn project(&self, input: ActivationInput) -> (ReplicasRatio, RateLimitRatio) {
+        match (self.replica_projection, self.rate_projection) {
+            (Some(replicas), Some(rate)) => (replicas.project(input), rate.project(input)),
+            _ => (self.activation_ratio_fn)(input.effective),
         }
     }
 
@@ -307,6 +426,83 @@ impl ModulePolicy {
     /// messages can queue until boot wiring or a later policy makes it active.
     pub fn max_active_replicas(&self) -> u8 {
         self.replicas_range.max.max(1)
+    }
+}
+
+/// Boot-time resource policy for one immediate child subsystem mount.
+#[derive(Debug, Clone)]
+pub struct SubsystemPolicy {
+    pub replicas_range: SubsystemReplicaRange,
+    pub replica_capacity: u8,
+    pub replica_projection: ReplicaProjection,
+}
+
+impl SubsystemPolicy {
+    pub fn new(
+        replicas_range: SubsystemReplicaRange,
+        replica_capacity: u8,
+        replica_projection: ReplicaProjection,
+    ) -> Self {
+        Self {
+            replicas_range,
+            replica_capacity,
+            replica_projection,
+        }
+    }
+
+    pub fn active_replicas_for(&self, input: ActivationInput) -> u8 {
+        let ratio = self.replica_projection.project(input);
+        let requested = if self.replicas_range.max == 0 {
+            0
+        } else {
+            (ratio.as_f64() * f64::from(self.replicas_range.max)).ceil() as u8
+        };
+        self.replicas_range
+            .clamp(requested)
+            .min(self.replica_capacity)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SubsystemReplicaRange {
+    pub min: u8,
+    pub max: u8,
+}
+
+impl SubsystemReplicaRange {
+    pub fn new(min: u8, max: u8) -> Option<Self> {
+        (min <= max).then_some(Self { min, max })
+    }
+
+    pub fn clamp(self, requested: u8) -> u8 {
+        requested.clamp(self.min, self.max)
+    }
+}
+
+/// Local allocation state for immediate child subsystem mounts in one scope.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct SubsystemAllocation {
+    #[serde(default)]
+    activation: HashMap<SubsystemId, ActivationRatio>,
+}
+
+impl SubsystemAllocation {
+    pub fn has_activation(&self, subsystem: &SubsystemId) -> bool {
+        self.activation.contains_key(subsystem)
+    }
+
+    pub fn activation_for(&self, subsystem: &SubsystemId) -> ActivationRatio {
+        self.activation.get(subsystem).copied().unwrap_or_default()
+    }
+
+    pub fn set_activation(&mut self, subsystem: SubsystemId, ratio: ActivationRatio) {
+        self.activation.insert(subsystem, ratio);
+    }
+
+    pub fn subsystem_ids(&self) -> Vec<SubsystemId> {
+        let mut ids = self.activation.keys().cloned().collect::<Vec<_>>();
+        ids.sort_by(|left, right| left.as_str().cmp(right.as_str()));
+        ids
     }
 }
 
@@ -357,6 +553,8 @@ pub struct ResourceAllocation {
     active_replicas: HashMap<ModuleId, u8>,
     #[serde(skip)]
     bpm: HashMap<ModuleId, Bpm>,
+    #[serde(skip)]
+    effective_activation: HashMap<ModuleId, ActivationRatio>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -397,6 +595,13 @@ impl ResourceAllocation {
         self.bpm.get(id).copied()
     }
 
+    pub fn effective_activation_for(&self, id: &ModuleId) -> ActivationRatio {
+        self.effective_activation
+            .get(id)
+            .copied()
+            .unwrap_or_else(|| self.activation_for(id))
+    }
+
     pub fn active_replicas(&self, id: &ModuleId) -> u8 {
         self.active_replicas.get(id).copied().unwrap_or_default()
     }
@@ -430,6 +635,8 @@ impl ResourceAllocation {
     pub fn retain_modules(&mut self, allowed: &std::collections::HashSet<ModuleId>) {
         self.activation.retain(|id, _| allowed.contains(id));
         self.bpm.retain(|id, _| allowed.contains(id));
+        self.effective_activation
+            .retain(|id, _| allowed.contains(id));
         self.active_replicas.retain(|id, _| allowed.contains(id));
     }
 
@@ -447,12 +654,31 @@ impl ResourceAllocation {
     /// knob and each registered module's [`ModulePolicy`]. Modules without a
     /// registered policy are left at zero active replicas (the unregistered
     /// fallback).
-    pub fn derived(mut self, policies: &HashMap<ModuleId, ModulePolicy>) -> Self {
+    pub fn derived(self, policies: &HashMap<ModuleId, ModulePolicy>) -> Self {
+        self.derive_with_scope(policies, ActivationRatio::ONE)
+    }
+
+    pub fn derived_in_scope(
+        self,
+        policies: &HashMap<ModuleId, ModulePolicy>,
+        scope_activation: ActivationRatio,
+    ) -> Self {
+        self.derive_with_scope(policies, scope_activation)
+    }
+
+    fn derive_with_scope(
+        mut self,
+        policies: &HashMap<ModuleId, ModulePolicy>,
+        scope_activation: ActivationRatio,
+    ) -> Self {
         self.active_replicas.clear();
         self.bpm.clear();
+        self.effective_activation.clear();
         for (id, policy) in policies {
-            let ratio = self.activation_for(id);
-            let (replicas_ratio, rate_ratio) = (policy.activation_ratio_fn)(ratio);
+            let input = ActivationInput::new(self.activation_for(id), scope_activation);
+            let (replicas_ratio, rate_ratio) = policy.project(input);
+            self.effective_activation
+                .insert(id.clone(), input.effective);
             self.active_replicas
                 .insert(id.clone(), policy.active_replicas_for(replicas_ratio));
             self.bpm.insert(id.clone(), policy.bpm_for(rate_ratio));
@@ -511,6 +737,7 @@ impl ResourceAllocation {
             .cloned()
             .chain(self.active_replicas.keys().cloned())
             .chain(self.bpm.keys().cloned())
+            .chain(self.effective_activation.keys().cloned())
             .collect::<HashSet<_>>()
             .into_iter()
             .collect::<Vec<_>>();
@@ -538,6 +765,71 @@ mod tests {
     fn set(allocation: &mut ResourceAllocation, module: &str, ratio: f64) {
         let module = id(module);
         allocation.set_activation(module, ActivationRatio::from_f64(ratio));
+    }
+
+    #[test]
+    fn hierarchical_linear_rate_projects_effective_ratio_into_bpm_range() {
+        let module = id("worker");
+        let policy = ModulePolicy::with_projections(
+            ReplicaCapRange::new(0, 1).unwrap(),
+            Bpm::range(1.0, 5.0),
+            ReplicaProjection::Linear,
+            RateProjection::Linear,
+        );
+        let mut allocation = ResourceAllocation::default();
+        allocation.set_activation(module.clone(), ActivationRatio::ONE);
+        let derived = allocation.derived_in_scope(
+            &HashMap::from([(module.clone(), policy)]),
+            ActivationRatio::from_f64(0.5),
+        );
+
+        assert_eq!(derived.effective_activation_for(&module).as_f64(), 0.5);
+        assert_eq!(derived.bpm_for(&module).unwrap().as_f64(), 3.0);
+    }
+
+    #[test]
+    fn threshold_replica_projection_respects_minimum() {
+        let policy = SubsystemPolicy::new(
+            SubsystemReplicaRange::new(1, 4).unwrap(),
+            4,
+            ReplicaProjection::Threshold(ActivationRatio::from_f64(0.3)),
+        );
+        assert_eq!(
+            policy.active_replicas_for(ActivationInput::new(
+                ActivationRatio::from_f64(0.2),
+                ActivationRatio::ONE,
+            )),
+            1
+        );
+        assert_eq!(
+            policy.active_replicas_for(ActivationInput::new(
+                ActivationRatio::from_f64(0.3),
+                ActivationRatio::ONE,
+            )),
+            4
+        );
+    }
+
+    #[test]
+    fn custom_projection_receives_local_scope_and_effective_activation() {
+        fn custom(input: ActivationInput) -> ReplicasRatio {
+            assert_eq!(input.local.as_f64(), 0.5);
+            assert_eq!(input.scope.as_f64(), 0.8);
+            assert_eq!(input.effective.as_f64(), 0.4);
+            ReplicasRatio::ONE
+        }
+        let policy = SubsystemPolicy::new(
+            SubsystemReplicaRange::new(0, 2).unwrap(),
+            2,
+            ReplicaProjection::Custom(custom),
+        );
+        assert_eq!(
+            policy.active_replicas_for(ActivationInput::new(
+                ActivationRatio::from_f64(0.5),
+                ActivationRatio::from_f64(0.8),
+            )),
+            2
+        );
     }
 
     #[test]

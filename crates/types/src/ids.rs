@@ -504,6 +504,7 @@ pub mod builtin {
         predict               => "predict",
         surprise              => "surprise",
         subsystem_gate        => "subsystem-gate",
+        subsystem_allocation  => "subsystem-allocation",
         speak_gate            => "speak-gate",
         speak                 => "speak",
         sleep                 => "sleep",

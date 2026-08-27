@@ -976,14 +976,24 @@ pub struct BlackboardSnapshot {
     pub memory_metadata: Vec<MemoryMetadataView>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ScopeView {
     pub id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub root_module: Option<String>,
     pub memory_scope: String,
+    #[serde(default)]
+    pub subsystem: Option<String>,
+    #[serde(default)]
+    pub replica: Option<u8>,
+    #[serde(default)]
+    pub local_activation: f64,
+    #[serde(default)]
+    pub effective_activation: f64,
+    #[serde(default)]
+    pub active_replicas: u8,
+    #[serde(default)]
+    pub active: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1000,6 +1010,10 @@ pub struct AllocationView {
     pub scope: String,
     pub module: String,
     pub activation_ratio: f64,
+    #[serde(default)]
+    pub scope_activation_ratio: f64,
+    #[serde(default)]
+    pub effective_activation_ratio: f64,
     pub active_replicas: u8,
     #[serde(default)]
     pub bpm: Option<f64>,

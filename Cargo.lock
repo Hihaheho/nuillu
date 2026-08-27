@@ -3562,6 +3562,7 @@ dependencies = [
  "nuillu-sensory",
  "nuillu-speak",
  "nuillu-storage",
+ "nuillu-subsystem-allocation",
  "nuillu-subsystem-gate",
  "nuillu-surprise",
  "nuillu-types",
@@ -3606,6 +3607,24 @@ dependencies = [
  "nuillu-types",
  "serde_json",
  "sha2",
+]
+
+[[package]]
+name = "nuillu-subsystem-allocation"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "lutum",
+ "lutum-protocol",
+ "nuillu-blackboard",
+ "nuillu-module",
+ "nuillu-types",
+ "schemars",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]

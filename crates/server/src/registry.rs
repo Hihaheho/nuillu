@@ -1,15 +1,24 @@
 use std::rc::Rc;
 use std::sync::Arc;
 
-use nuillu_blackboard::{ActivationRatio, Bpm, ModulePolicy, ResourceAllocation, linear_ratio_fn};
+#[cfg(test)]
+use nuillu_blackboard::linear_ratio_fn;
+use nuillu_blackboard::{
+    ActivationRatio, Bpm, ModulePolicy, RateProjection, ReplicaProjection, ResourceAllocation,
+    SubsystemPolicy, SubsystemReplicaRange,
+};
 use nuillu_memory::{MemoryCapabilities, MemoryNamespace};
-use nuillu_module::{ModuleRegistrationSpec, ModuleRegistry, ModuleRegistryError, StaticModule};
+use nuillu_module::{
+    ModuleRegistrationSpec, ModuleRegistry, ModuleRegistryError, StaticModule,
+    SubsystemRegistrationSpec,
+};
 use nuillu_reward::PolicyCapabilities;
 use nuillu_speak::{UtteranceSink, UtteranceWriter};
 use nuillu_types::{ModuleId, ScopeId};
 
 use super::config::{
     RuntimeModule, ServerBootConfig, ServerMemoryScope, ServerModuleGroup, ServerModuleSpec,
+    ServerProjectionCurve, ServerProjectionSpec,
 };
 
 /// Host-provided registration hook applied after the built-in server modules.
@@ -64,6 +73,46 @@ pub(super) fn server_registry(
             registry.scoped_depends_on(ScopeId::root(), dependent, dependency)
         });
     for expanded in boot_config.expanded_subsystems() {
+        let mut subsystem_spec = SubsystemRegistrationSpec::new(
+            expanded
+                .scope
+                .parent()
+                .expect("expanded subsystem has parent"),
+            expanded.definition.subsystem_id(),
+            SubsystemPolicy::new(
+                SubsystemReplicaRange::new(
+                    expanded.mount.replica_min(),
+                    expanded.mount.replica_max(),
+                )
+                .expect("validated subsystem replica range"),
+                expanded.mount.replica_capacity(),
+                replica_projection(expanded.mount.replica_projection()),
+            ),
+            ActivationRatio::from_f64(expanded.mount.initial_activation()),
+        );
+        if let Some(label) = &expanded.definition.label {
+            subsystem_spec = subsystem_spec.with_label(label.clone());
+        }
+        subsystem_spec = subsystem_spec
+            .with_allocation_description(expanded.definition.allocation_description.clone())
+            .with_activation_table(
+                expanded
+                    .mount
+                    .activation_table
+                    .iter()
+                    .copied()
+                    .map(ActivationRatio::from_f64),
+            );
+        // One registration describes the mount; all capacity instances share
+        // the same parent and subsystem id.
+        if expanded
+            .scope
+            .path()
+            .last()
+            .is_some_and(|instance| instance.replica == nuillu_types::ReplicaIndex::ZERO)
+        {
+            registry = registry.with_subsystem(subsystem_spec);
+        }
         let scoped_memory_caps = match expanded.definition.memory_scope {
             ServerMemoryScope::Global => memory_caps.with_namespace(MemoryNamespace::Global),
             ServerMemoryScope::Local => {
@@ -80,8 +129,6 @@ pub(super) fn server_registry(
                 utterance_sink,
             );
         }
-        registry = registry
-            .with_subsystem_root(expanded.scope.clone(), expanded.definition.root_module_id());
         registry = configured_dependency_edges(&expanded.definition.modules)
             .into_iter()
             .fold(registry, |registry, (dependent, dependency)| {
@@ -514,6 +561,37 @@ fn register_server_module(
                 outer_memo,
             ))
         }),
+        RuntimeModule::SubsystemAllocation => {
+            let main_tier = spec.session_tier("main");
+            registry.register_server(spec, move |caps| {
+                let catalog = caps.subsystem_catalog().children();
+                let activation_tables = catalog
+                    .iter()
+                    .map(|item| {
+                        (
+                            item.subsystem.clone(),
+                            item.activation_table.iter().copied().collect(),
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                async move {
+                    Ok(nuillu_subsystem_allocation::SubsystemAllocationModule::new(
+                        caps.memo_updated_inbox(),
+                        caps.blackboard_reader(),
+                        caps.subsystem_allocation_reader(),
+                        caps.subsystem_allocation_writer(activation_tables),
+                        catalog,
+                        caps.llm("main").with_tier(main_tier).into(),
+                        caps.session("main")
+                            .with_tier(main_tier)
+                            .with_auto_compaction(
+                                nuillu_subsystem_allocation::session_auto_compaction(),
+                            )
+                            .await?,
+                    ))
+                }
+            })
+        }
         RuntimeModule::Speak => {
             let utterance_sink = utterance_sink.clone();
             let planning_tier = spec.session_tier("planning");
@@ -598,11 +676,30 @@ fn group_modules(boot_config: &ServerBootConfig, group: ServerModuleGroup) -> Ve
 }
 
 fn policy(module: &ServerModuleSpec) -> ModulePolicy {
-    ModulePolicy::new(
+    ModulePolicy::with_projections(
         module.replica_range(),
         Bpm::range(module.bpm_min, module.bpm_max),
-        linear_ratio_fn,
+        replica_projection(module.replica_projection()),
+        rate_projection(module.rate_projection()),
     )
+}
+
+fn replica_projection(spec: ServerProjectionSpec) -> ReplicaProjection {
+    match spec.curve {
+        ServerProjectionCurve::Linear => ReplicaProjection::Linear,
+        ServerProjectionCurve::Threshold => ReplicaProjection::Threshold(
+            ActivationRatio::from_f64(spec.threshold.expect("validated threshold")),
+        ),
+    }
+}
+
+fn rate_projection(spec: ServerProjectionSpec) -> RateProjection {
+    match spec.curve {
+        ServerProjectionCurve::Linear => RateProjection::Linear,
+        ServerProjectionCurve::Threshold => RateProjection::Threshold(ActivationRatio::from_f64(
+            spec.threshold.expect("validated threshold"),
+        )),
+    }
 }
 
 fn set_allocation_module(allocation: &mut ResourceAllocation, id: ModuleId, activation_ratio: f64) {

@@ -130,6 +130,7 @@ pub enum RuntimeModule {
     Predict,
     Surprise,
     SubsystemGate,
+    SubsystemAllocation,
     Speak,
 }
 
@@ -156,9 +157,9 @@ pub struct ServerSubsystemDef {
     pub id: String,
     #[eure(default)]
     pub label: Option<String>,
+    pub allocation_description: String,
     #[eure(default)]
     pub modules: Vec<ServerModuleSpec>,
-    pub root: String,
     #[eure(default)]
     pub memory_scope: ServerMemoryScope,
     #[eure(default)]
@@ -169,17 +170,81 @@ impl ServerSubsystemDef {
     pub fn subsystem_id(&self) -> SubsystemId {
         SubsystemId::new(self.id.clone()).expect("validated subsystem id")
     }
-
-    pub fn root_module_id(&self) -> ModuleId {
-        ModuleId::new(self.root.clone()).expect("validated subsystem root module id")
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, FromEure)]
 #[eure(crate = ::eure::document, rename_all = "kebab-case")]
 pub struct ServerSubsystemRef {
     pub subsystem: String,
-    pub replicas: u8,
+    #[eure(default)]
+    pub replicas: Option<u8>,
+    #[eure(default)]
+    pub replica_min: Option<u8>,
+    #[eure(default)]
+    pub replica_max: Option<u8>,
+    #[eure(default)]
+    pub replica_capacity: Option<u8>,
+    #[eure(default)]
+    pub initial_activation: Option<f64>,
+    #[eure(default)]
+    pub replica_curve: ServerProjectionCurve,
+    #[eure(default)]
+    pub replica_threshold: Option<f64>,
+    #[eure(default = "default_activation_table_values")]
+    pub activation_table: Vec<f64>,
+}
+
+impl ServerSubsystemRef {
+    pub fn replica_min(&self) -> u8 {
+        self.replica_min
+            .unwrap_or_else(|| self.replicas.unwrap_or(1))
+    }
+
+    pub fn replica_max(&self) -> u8 {
+        self.replica_max
+            .unwrap_or_else(|| self.replicas.unwrap_or(1))
+    }
+
+    pub fn replica_capacity(&self) -> u8 {
+        self.replica_capacity.unwrap_or_else(|| self.replica_max())
+    }
+
+    pub fn initial_activation(&self) -> f64 {
+        self.initial_activation.unwrap_or(1.0)
+    }
+
+    pub fn replica_projection(&self) -> ServerProjectionSpec {
+        ServerProjectionSpec {
+            curve: self.replica_curve,
+            threshold: self.replica_threshold,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, FromEure)]
+#[eure(crate = ::eure::document, rename_all = "kebab-case")]
+pub struct ServerProjectionSpec {
+    #[eure(default)]
+    pub curve: ServerProjectionCurve,
+    #[eure(default)]
+    pub threshold: Option<f64>,
+}
+
+impl Default for ServerProjectionSpec {
+    fn default() -> Self {
+        Self {
+            curve: ServerProjectionCurve::Linear,
+            threshold: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, FromEure)]
+#[eure(crate = ::eure::document, rename_all = "kebab-case")]
+pub enum ServerProjectionCurve {
+    #[default]
+    Linear,
+    Threshold,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, FromEure)]
@@ -194,6 +259,7 @@ pub enum ServerMemoryScope {
 pub struct ExpandedSubsystem<'a> {
     pub scope: ScopeId,
     pub definition: &'a ServerSubsystemDef,
+    pub mount: &'a ServerSubsystemRef,
 }
 
 #[derive(Debug, Clone, PartialEq, FromEure)]
@@ -207,6 +273,14 @@ pub struct ServerModuleSpec {
     pub bpm_min: f64,
     pub bpm_max: f64,
     pub initial_activation: f64,
+    #[eure(default)]
+    pub replica_curve: ServerProjectionCurve,
+    #[eure(default)]
+    pub replica_threshold: Option<f64>,
+    #[eure(default)]
+    pub rate_curve: ServerProjectionCurve,
+    #[eure(default)]
+    pub rate_threshold: Option<f64>,
     #[eure(default)]
     pub sessions: Vec<ServerModuleSessionSpec>,
     #[eure(default)]
@@ -364,6 +438,7 @@ impl RuntimeModule {
             Self::Predict => "predict",
             Self::Surprise => "surprise",
             Self::SubsystemGate => "subsystem-gate",
+            Self::SubsystemAllocation => "subsystem-allocation",
             Self::Speak => "speak",
         }
     }
@@ -390,6 +465,7 @@ impl RuntimeModule {
             Self::Predict => builtin::predict(),
             Self::Surprise => builtin::surprise(),
             Self::SubsystemGate => builtin::subsystem_gate(),
+            Self::SubsystemAllocation => builtin::subsystem_allocation(),
             Self::Speak => builtin::speak(),
         }
     }
@@ -419,6 +495,7 @@ impl RuntimeModule {
             Self::Predict => &[("main", ModelTier::Cheap)],
             Self::Surprise => &[("main", ModelTier::Default)],
             Self::SubsystemGate => &[],
+            Self::SubsystemAllocation => &[("main", ModelTier::Default)],
             Self::Speak => &[("planning", ModelTier::Premium)],
         }
     }
@@ -702,6 +779,13 @@ impl ServerBootConfig {
                     definition.id
                 );
             }
+            if definition.allocation_description.trim().is_empty() {
+                anyhow::bail!(
+                    "server config {} has an empty allocation-description for subsystem {}",
+                    path.display(),
+                    definition.id
+                );
+            }
             if definitions
                 .insert(definition.id.as_str(), definition)
                 .is_some()
@@ -713,27 +797,6 @@ impl ServerBootConfig {
                 );
             }
             validate_module_set(&definition.modules, path, &definition.id)?;
-            let module_ids = definition
-                .modules
-                .iter()
-                .map(ServerModuleSpec::module_id)
-                .collect::<HashSet<_>>();
-            let root = ModuleId::new(definition.root.clone()).map_err(|error| {
-                anyhow::anyhow!(
-                    "server config {} has invalid root {:?} in subsystem {}: {error}",
-                    path.display(),
-                    definition.root,
-                    definition.id
-                )
-            })?;
-            if !module_ids.contains(&root) {
-                anyhow::bail!(
-                    "server config {} declares unknown root {} in subsystem {}",
-                    path.display(),
-                    root.as_str(),
-                    definition.id
-                );
-            }
         }
         validate_subsystem_refs(&self.subsystems, "root", &definitions, path)?;
         for definition in &self.subsystem_definitions {
@@ -821,14 +884,45 @@ fn validate_subsystem_refs<'a>(
 ) -> anyhow::Result<()> {
     let mut seen = HashSet::new();
     for reference in references {
-        if reference.replicas == 0 {
+        validate_activation_table(&reference.activation_table, path)?;
+        if reference.activation_table.is_empty() {
             anyhow::bail!(
-                "server config {} sets zero replicas for subsystem {} under {}",
+                "server config {} has an empty activation-table for subsystem {} under {}",
                 path.display(),
                 reference.subsystem,
                 owner
             );
         }
+        let min = reference.replica_min();
+        let max = reference.replica_max();
+        if min > max {
+            anyhow::bail!(
+                "server config {} has invalid replica range for subsystem {} under {}: min {min} exceeds max {max}",
+                path.display(),
+                reference.subsystem,
+                owner
+            );
+        }
+        let capacity = reference.replica_capacity();
+        if capacity < max {
+            anyhow::bail!(
+                "server config {} sets replica-capacity={} for subsystem {} under {}, below policy max {}",
+                path.display(),
+                capacity,
+                reference.subsystem,
+                owner,
+                max
+            );
+        }
+        validate_finite_subsystem_ratio(
+            reference.initial_activation(),
+            "initial-activation",
+            &reference.subsystem,
+            path,
+        )?;
+        reference
+            .replica_projection()
+            .validate(&format!("subsystem {} replicas", reference.subsystem), path)?;
         if !definitions.contains_key(reference.subsystem.as_str()) {
             anyhow::bail!(
                 "server config {} references unknown subsystem {} under {}",
@@ -885,13 +979,13 @@ fn validate_subsystem_cycles<'a>(
 
 fn expand_subsystem_refs<'a>(
     parent: &ScopeId,
-    references: &[ServerSubsystemRef],
+    references: &'a [ServerSubsystemRef],
     definitions: &BTreeMap<&'a str, &'a ServerSubsystemDef>,
     expanded: &mut Vec<ExpandedSubsystem<'a>>,
 ) {
     for reference in references {
         let definition = definitions[reference.subsystem.as_str()];
-        for replica in 0..reference.replicas {
+        for replica in 0..reference.replica_capacity() {
             let scope = parent.child(SubsystemInstanceId::new(
                 definition.subsystem_id(),
                 ReplicaIndex::new(replica),
@@ -899,6 +993,7 @@ fn expand_subsystem_refs<'a>(
             expanded.push(ExpandedSubsystem {
                 scope: scope.clone(),
                 definition,
+                mount: reference,
             });
             expand_subsystem_refs(&scope, &definition.subsystems, definitions, expanded);
         }
@@ -918,12 +1013,12 @@ fn expand_scope_labels<'a>(
             .as_deref()
             .unwrap_or(definition.id.as_str())
             .trim();
-        for replica in 0..reference.replicas {
+        for replica in 0..reference.replica_capacity() {
             let scope = parent.child(SubsystemInstanceId::new(
                 definition.subsystem_id(),
                 ReplicaIndex::new(replica),
             ));
-            let segment: Arc<str> = if reference.replicas == 1 {
+            let segment: Arc<str> = if reference.replica_capacity() == 1 {
                 Arc::from(label)
             } else {
                 Arc::from(format!("{label} {}", u16::from(replica) + 1))
@@ -964,6 +1059,20 @@ impl ServerModuleSpec {
             .expect("server module spec should be validated before use")
     }
 
+    pub fn replica_projection(&self) -> ServerProjectionSpec {
+        ServerProjectionSpec {
+            curve: self.replica_curve,
+            threshold: self.replica_threshold,
+        }
+    }
+
+    pub fn rate_projection(&self) -> ServerProjectionSpec {
+        ServerProjectionSpec {
+            curve: self.rate_curve,
+            threshold: self.rate_threshold,
+        }
+    }
+
     fn validate(&self, path: &Path) -> anyhow::Result<()> {
         ReplicaCapRange::new(self.replica_min, self.replica_max).map_err(|error| {
             anyhow::anyhow!(
@@ -991,6 +1100,10 @@ impl ServerModuleSpec {
             );
         }
         validate_finite_ratio(self.initial_activation, "initial-activation", self.id, path)?;
+        self.replica_projection()
+            .validate(&format!("module {} replicas", self.id.as_str()), path)?;
+        self.rate_projection()
+            .validate(&format!("module {} rate", self.id.as_str()), path)?;
         if !self.bpm_min.is_finite() || !self.bpm_max.is_finite() || self.bpm_min <= 0.0 {
             anyhow::bail!(
                 "server config {} has invalid bpm range for {}: {}..={}",
@@ -1132,6 +1245,48 @@ fn validate_finite_ratio(
         path.display(),
         module.as_str()
     )
+}
+
+fn validate_finite_subsystem_ratio(
+    value: f64,
+    field: &str,
+    subsystem: &str,
+    path: &Path,
+) -> anyhow::Result<()> {
+    if value.is_finite() && (0.0..=1.0).contains(&value) {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "server config {} has invalid {field} for subsystem {subsystem}: {value}",
+        path.display()
+    )
+}
+
+impl ServerProjectionSpec {
+    fn validate(&self, target: &str, path: &Path) -> anyhow::Result<()> {
+        match self.curve {
+            ServerProjectionCurve::Linear if self.threshold.is_some() => anyhow::bail!(
+                "server config {} sets threshold for linear projection on {target}",
+                path.display()
+            ),
+            ServerProjectionCurve::Threshold => {
+                let Some(threshold) = self.threshold else {
+                    anyhow::bail!(
+                        "server config {} omits threshold for threshold projection on {target}",
+                        path.display()
+                    );
+                };
+                if !threshold.is_finite() || !(0.0..=1.0).contains(&threshold) {
+                    anyhow::bail!(
+                        "server config {} has invalid threshold for {target}: {threshold}",
+                        path.display()
+                    );
+                }
+            }
+            ServerProjectionCurve::Linear => {}
+        }
+        Ok(())
+    }
 }
 
 fn default_activation_table_values() -> Vec<f64> {
@@ -1350,6 +1505,10 @@ fn module_spec<const G: usize, const D: usize>(
         bpm_min,
         bpm_max,
         initial_activation,
+        replica_curve: ServerProjectionCurve::Linear,
+        replica_threshold: None,
+        rate_curve: ServerProjectionCurve::Linear,
+        rate_threshold: None,
         sessions: Vec::new(),
         groups: groups.to_vec(),
         depends_on: depends_on.to_vec(),
@@ -1991,7 +2150,7 @@ activation-table = [1.0, 0.5]
             r#"
 @ subsystem-definitions[] {
   id = "finger"
-  root: predict
+  allocation-description = "Test finger subsystem."
   memory-scope = "local"
 
   @ modules[] {
@@ -2006,7 +2165,7 @@ activation-table = [1.0, 0.5]
 
 @ subsystem-definitions[] {
   id = "arm"
-  root: cognition-gate
+  allocation-description = "Test arm subsystem."
 
   @ modules[] {
     id = "cognition-gate"
@@ -2055,7 +2214,7 @@ activation-table = [1.0, 0.5]
             r#"
 @ subsystem-definitions[] {
   id = "alpha"
-  root: predict
+  allocation-description = "Test alpha subsystem."
   @ modules[] {
     id: predict
     replica-min = 1
@@ -2068,7 +2227,7 @@ activation-table = [1.0, 0.5]
 }
 @ subsystem-definitions[] {
   id = "beta"
-  root: predict
+  allocation-description = "Test beta subsystem."
   @ modules[] {
     id: predict
     replica-min = 1
@@ -2090,13 +2249,13 @@ activation-table = [1.0, 0.5]
     }
 
     #[test]
-    fn subsystem_gate_can_root_scopes_with_action_and_speak_modules() {
+    fn subsystem_gate_is_an_optional_ordinary_module_with_action_and_speak_peers() {
         let config = parse_server_boot_config_content(
             r#"
 @ subsystem-definitions[] {
   id: arm
   label: Arm
-  root: subsystem-gate
+  allocation-description = "Test arm subsystem."
   memory-scope: local
 
   @ modules[] {
@@ -2137,10 +2296,6 @@ activation-table = [1.0, 0.5]
         .unwrap();
 
         assert_eq!(config.subsystem_definitions.len(), 1);
-        assert_eq!(
-            config.subsystem_definitions[0].root_module_id(),
-            builtin::subsystem_gate()
-        );
         assert!(
             config.subsystem_definitions[0]
                 .modules
@@ -2170,7 +2325,7 @@ activation-table = [1.0, 0.5]
 @ subsystem-definitions[] {
   id: arm
   label: Arm
-  root: predict
+  allocation-description = "Test arm subsystem."
   @ modules[] {
     id: predict
     replica-min = 1
@@ -2196,5 +2351,79 @@ activation-table = [1.0, 0.5]
                 .relative_descendant_label(&ScopeId::root(), scope),
             Some("Arm".to_string())
         );
+    }
+
+    #[test]
+    fn parses_standard_projection_curves_and_subsystem_capacity() {
+        let config = parse_server_boot_config_content(
+            r#"
+@ modules[] {
+  id: predict
+  replica-min = 0
+  replica-max = 2
+  replica-capacity = 2
+  bpm-min = 1.0
+  bpm-max = 5.0
+  initial-activation = 0.5
+  replica-curve: threshold
+  replica-threshold = 0.3
+  rate-curve: linear
+}
+@ subsystem-definitions[] {
+  id: arm
+  allocation-description = "Test arm subsystem."
+}
+@ subsystems[] {
+  subsystem: arm
+  replica-min = 0
+  replica-max = 4
+  replica-capacity = 4
+  initial-activation = 0.5
+  replica-curve: threshold
+  replica-threshold = 0.4
+  activation-table = [1.0, 0.6, 0.2, 0.0]
+}
+"#,
+            Path::new(".tmp/server/projection-test.eure"),
+        )
+        .unwrap();
+
+        assert_eq!(
+            config.modules[0].replica_curve,
+            ServerProjectionCurve::Threshold
+        );
+        assert_eq!(config.subsystems[0].replica_min(), 0);
+        assert_eq!(config.subsystems[0].replica_max(), 4);
+        assert_eq!(
+            config.subsystems[0].activation_table,
+            vec![1.0, 0.6, 0.2, 0.0]
+        );
+        assert_eq!(
+            config.subsystem_definitions[0].allocation_description,
+            "Test arm subsystem."
+        );
+        assert_eq!(config.expanded_subsystems().len(), 4);
+    }
+
+    #[test]
+    fn rejects_invalid_projection_parameters() {
+        let error = parse_server_boot_config_content(
+            r#"
+@ modules[] {
+  id: predict
+  replica-min = 0
+  replica-max = 1
+  bpm-min = 1.0
+  bpm-max = 5.0
+  initial-activation = 0.5
+  replica-curve: threshold
+  replica-threshold = 1.2
+}
+"#,
+            Path::new(".tmp/server/invalid-projection-test.eure"),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("invalid threshold"), "{error}");
     }
 }

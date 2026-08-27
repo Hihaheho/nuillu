@@ -871,8 +871,13 @@ fn render_scope_navigation(ui: &mut egui::Ui, snapshot: &BlackboardSnapshot) -> 
         vec![ScopeView {
             id: "/".to_owned(),
             parent: None,
-            root_module: None,
             memory_scope: "global".to_owned(),
+            subsystem: None,
+            replica: None,
+            local_activation: 1.0,
+            effective_activation: 1.0,
+            active_replicas: 1,
+            active: true,
         }]
     } else {
         snapshot.scopes.clone()
@@ -906,13 +911,14 @@ fn render_scope_navigation(ui: &mut egui::Ui, snapshot: &BlackboardSnapshot) -> 
     if let Some(scope) = scopes.iter().find(|scope| scope.id == selected) {
         ui.horizontal_wrapped(|ui| {
             ui.small(format!("Memory: {}", scope.memory_scope.to_uppercase()));
-            if let Some(root) = &scope.root_module {
-                ui.small(format!("Root: {root}")).on_hover_text(
-                    "Subsystem topology/allocation root; this does not grant capabilities",
-                );
-            }
+            ui.small(format!(
+                "Activation: local {:.2} × parent = effective {:.2} · {}",
+                scope.local_activation,
+                scope.effective_activation,
+                if scope.active { "active" } else { "inactive" }
+            ));
         });
-        if let (Some(parent), Some(root)) = (&scope.parent, &scope.root_module) {
+        if let Some(parent) = &scope.parent {
             egui::Frame::group(ui.style())
                 .fill(visualizer_selection_card_fill(ui.visuals()))
                 .inner_margin(egui::Margin::symmetric(8, 5))
@@ -922,8 +928,8 @@ fn render_scope_navigation(ui: &mut egui::Ui, snapshot: &BlackboardSnapshot) -> 
                             selected = parent.clone();
                         }
                         ui.label("⇄");
-                        ui.strong(root);
-                        ui.small("ROOT · LLM boundary");
+                        ui.strong(scope.subsystem.as_deref().unwrap_or("subsystem"));
+                        ui.small(format!("replica {}", scope.replica.unwrap_or_default()));
                         ui.label("⇄");
                         ui.monospace(format!("Inner {}", scope.id));
                     });
@@ -4681,6 +4687,8 @@ mod tests {
                 scope: "/".to_string(),
                 module: "surprise".to_string(),
                 activation_ratio: 0.25,
+                scope_activation_ratio: 1.0,
+                effective_activation_ratio: 0.25,
                 active_replicas: 1,
                 bpm: Some(9.0),
                 period_ms: Some(6667),
@@ -4713,14 +4721,24 @@ mod tests {
                 ScopeView {
                     id: "/".to_string(),
                     parent: None,
-                    root_module: None,
                     memory_scope: "global".to_string(),
+                    subsystem: None,
+                    replica: None,
+                    local_activation: 1.0,
+                    effective_activation: 1.0,
+                    active_replicas: 1,
+                    active: true,
                 },
                 ScopeView {
                     id: "/arm[0]".to_string(),
                     parent: Some("/".to_string()),
-                    root_module: Some("subsystem-gate".to_string()),
                     memory_scope: "local".to_string(),
+                    subsystem: Some("arm".to_string()),
+                    replica: Some(0),
+                    local_activation: 1.0,
+                    effective_activation: 1.0,
+                    active_replicas: 1,
+                    active: true,
                 },
             ],
             module_statuses: vec![ModuleStatusView {
@@ -4733,6 +4751,8 @@ mod tests {
                 scope: "/arm[0]".to_string(),
                 module: "subsystem-gate".to_string(),
                 activation_ratio: 1.0,
+                scope_activation_ratio: 1.0,
+                effective_activation_ratio: 1.0,
                 active_replicas: 1,
                 bpm: Some(12.0),
                 period_ms: Some(5_000),
@@ -4781,6 +4801,8 @@ mod tests {
                 scope: "/".to_string(),
                 module: "sensory".to_string(),
                 activation_ratio: 1.0,
+                scope_activation_ratio: 1.0,
+                effective_activation_ratio: 1.0,
                 active_replicas: 1,
                 bpm: Some(18.0),
                 period_ms: Some(3333),
@@ -5218,6 +5240,8 @@ mod tests {
                 scope: "/".to_string(),
                 module: "sensory".to_string(),
                 activation_ratio: 0.25,
+                scope_activation_ratio: 1.0,
+                effective_activation_ratio: 0.25,
                 active_replicas: 1,
                 bpm: None,
                 period_ms: None,
@@ -5878,6 +5902,8 @@ mod tests {
                 scope: "/".to_string(),
                 module: "sensory".to_string(),
                 activation_ratio: 1.0,
+                scope_activation_ratio: 1.0,
+                effective_activation_ratio: 1.0,
                 active_replicas: 1,
                 bpm: Some(20.0),
                 period_ms: Some(3000),
@@ -5929,6 +5955,8 @@ mod tests {
                 scope: "/".to_string(),
                 module: "sensory".to_string(),
                 activation_ratio: 1.0,
+                scope_activation_ratio: 1.0,
+                effective_activation_ratio: 1.0,
                 active_replicas: 1,
                 bpm: Some(20.0),
                 period_ms: Some(3000),
@@ -6062,6 +6090,8 @@ mod tests {
                 scope: "/".to_string(),
                 module: "sensory".to_string(),
                 activation_ratio: 0.75,
+                scope_activation_ratio: 1.0,
+                effective_activation_ratio: 0.75,
                 active_replicas: 1,
                 bpm: Some(12.5),
                 period_ms: Some(3000),

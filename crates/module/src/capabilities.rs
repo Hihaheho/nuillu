@@ -10,11 +10,12 @@ use std::time::Duration;
 use lutum::{Lutum, Session};
 use nuillu_blackboard::{
     ActivationRatio, AgenticDeadlockMarker, Blackboard, BlackboardCommand, Bpm, ModulePolicy,
-    ModuleRunStatus, RegisteredModulePolicy, ZeroReplicaWindowPolicy,
+    ModuleRunStatus, RegisteredModulePolicy, RegisteredSubsystemPolicy, SubsystemPolicy,
+    SubsystemReplicaRange, ZeroReplicaWindowPolicy,
 };
 use nuillu_types::{
     ModelTier, ModuleActivationId, ModuleGroupId, ModuleId, ModuleInstanceId, ReplicaCapRange,
-    ReplicaIndex, ScopeId, ScopedModuleId,
+    ReplicaIndex, ScopeId, ScopedModuleId, SubsystemId,
 };
 
 use crate::activation_gate::ActivationGateHub;
@@ -43,7 +44,8 @@ use crate::{
     MemoUpdatedInbox, MemoUpdatedMailbox, MemoryMetadataReader, Module, ModuleBatch,
     ModuleStatusReader, NoopAllocationStore, NoopExternalActionExecutor, NoopMemoLogRepository,
     PersistedMemoLogEntry, ScopeLabels, SensoryInput, SensoryInputInbox, SensoryInputMailbox,
-    SessionCompactionPolicy, StaticModule, TimeDivision, TopicInbox, TopicMailbox, TypedMemo,
+    SessionCompactionPolicy, StaticModule, SubsystemAllocationReader, SubsystemAllocationWriter,
+    TimeDivision, TopicInbox, TopicMailbox, TypedMemo,
 };
 
 /// Immutable boot-time description of one registered module role.
@@ -58,6 +60,63 @@ pub struct ModuleRegistrationSpec {
     groups: BTreeSet<ModuleGroupId>,
     dependencies: Vec<ModuleId>,
     memo_subscription: MemoSubscription,
+}
+
+/// Immutable boot-time description of an immediate child subsystem mount.
+#[derive(Debug, Clone)]
+pub struct SubsystemRegistrationSpec {
+    pub parent_scope: ScopeId,
+    pub subsystem: SubsystemId,
+    pub policy: SubsystemPolicy,
+    pub initial_activation: ActivationRatio,
+    pub label: Option<Arc<str>>,
+    pub allocation_description: Arc<str>,
+    pub activation_table: Arc<[ActivationRatio]>,
+}
+
+impl SubsystemRegistrationSpec {
+    pub fn new(
+        parent_scope: ScopeId,
+        subsystem: SubsystemId,
+        policy: SubsystemPolicy,
+        initial_activation: ActivationRatio,
+    ) -> Self {
+        Self {
+            parent_scope,
+            subsystem,
+            policy,
+            initial_activation,
+            label: None,
+            allocation_description: Arc::from(""),
+            activation_table: vec![
+                ActivationRatio::ONE,
+                ActivationRatio::from_f64(0.85),
+                ActivationRatio::from_f64(0.70),
+                ActivationRatio::from_f64(0.50),
+                ActivationRatio::from_f64(0.30),
+                ActivationRatio::ZERO,
+            ]
+            .into(),
+        }
+    }
+
+    pub fn with_label(mut self, label: impl Into<Arc<str>>) -> Self {
+        self.label = Some(label.into());
+        self
+    }
+
+    pub fn with_allocation_description(mut self, description: impl Into<Arc<str>>) -> Self {
+        self.allocation_description = description.into();
+        self
+    }
+
+    pub fn with_activation_table(
+        mut self,
+        table: impl IntoIterator<Item = ActivationRatio>,
+    ) -> Self {
+        self.activation_table = table.into_iter().collect::<Vec<_>>().into();
+        self
+    }
 }
 
 impl ModuleRegistrationSpec {
@@ -189,21 +248,37 @@ struct ModuleCatalogEntry {
 pub struct ModuleCatalog {
     entries: Arc<[ModuleCatalogEntry]>,
     dependency_edges: Arc<[(ScopedModuleId, ScopedModuleId)]>,
-    subsystem_roots: Arc<[(ScopeId, ModuleId)]>,
+    subsystems: Arc<[SubsystemCatalogEntry]>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SubsystemCatalogEntry {
+    parent_scope: ScopeId,
+    subsystem: SubsystemId,
+    label: Option<Arc<str>>,
+    allocation_description: Arc<str>,
+    activation_table: Arc<[ActivationRatio]>,
+    replica_range: SubsystemReplicaRange,
+    replica_capacity: u8,
+    initial_activation: ActivationRatio,
+    projection_curve_bits: [u64; 3],
 }
 
 impl ModuleCatalog {
     fn from_registrations(
         registrations: &[ModuleRegistration],
         dependencies: &[(ScopedModuleId, ScopedModuleId)],
-        subsystem_roots: &BTreeMap<ScopeId, ModuleId>,
+        subsystems: &[SubsystemRegistrationSpec],
     ) -> Self {
         let entries = registrations
             .iter()
             .map(|registration| {
                 let policy = &registration.spec.policy;
                 let curve_at = |activation| {
-                    let (replicas, rate) = (policy.activation_ratio_fn)(activation);
+                    let (replicas, rate) = policy.project(nuillu_blackboard::ActivationInput::new(
+                        activation,
+                        ActivationRatio::ONE,
+                    ));
                     (replicas.as_f64().to_bits(), rate.as_f64().to_bits())
                 };
                 ModuleCatalogEntry {
@@ -231,9 +306,33 @@ impl ModuleCatalog {
         Self {
             entries: entries.into(),
             dependency_edges: dependencies.to_vec().into(),
-            subsystem_roots: subsystem_roots
+            subsystems: subsystems
                 .iter()
-                .map(|(scope, module)| (scope.clone(), module.clone()))
+                .map(|spec| SubsystemCatalogEntry {
+                    parent_scope: spec.parent_scope.clone(),
+                    subsystem: spec.subsystem.clone(),
+                    label: spec.label.clone(),
+                    allocation_description: spec.allocation_description.clone(),
+                    activation_table: spec.activation_table.clone(),
+                    replica_range: spec.policy.replicas_range,
+                    replica_capacity: spec.policy.replica_capacity,
+                    initial_activation: spec.initial_activation,
+                    projection_curve_bits: [
+                        ActivationRatio::ZERO,
+                        ActivationRatio::from_f64(0.5),
+                        ActivationRatio::ONE,
+                    ]
+                    .map(|activation| {
+                        spec.policy
+                            .replica_projection
+                            .project(nuillu_blackboard::ActivationInput::new(
+                                activation,
+                                ActivationRatio::ONE,
+                            ))
+                            .as_f64()
+                            .to_bits()
+                    }),
+                })
                 .collect::<Vec<_>>()
                 .into(),
         }
@@ -253,17 +352,48 @@ impl ModuleCatalog {
             .any(|entry| &entry.scope == scope && &entry.module == module)
     }
 
-    fn subsystem_root_in_scope(&self, scope: &ScopeId) -> Option<ModuleId> {
-        self.subsystem_roots
+    fn subsystems_in_scope(&self, scope: &ScopeId) -> Vec<SubsystemCatalogItem> {
+        self.subsystems
             .iter()
-            .find(|(candidate, _)| candidate == scope)
-            .map(|(_, module)| module.clone())
+            .filter(|entry| &entry.parent_scope == scope)
+            .map(|entry| SubsystemCatalogItem {
+                subsystem: entry.subsystem.clone(),
+                label: entry.label.clone(),
+                allocation_description: entry.allocation_description.clone(),
+                activation_table: entry.activation_table.clone(),
+                replica_range: entry.replica_range,
+                replica_capacity: entry.replica_capacity,
+                initial_activation: entry.initial_activation,
+            })
+            .collect()
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SubsystemCatalogItem {
+    pub subsystem: SubsystemId,
+    pub label: Option<Arc<str>>,
+    pub allocation_description: Arc<str>,
+    pub activation_table: Arc<[ActivationRatio]>,
+    pub replica_range: SubsystemReplicaRange,
+    pub replica_capacity: u8,
+    pub initial_activation: ActivationRatio,
 }
 
 pub struct ModuleCatalogView<'a> {
     catalog: &'a ModuleCatalog,
     scope: &'a ScopeId,
+}
+
+pub struct SubsystemCatalogView<'a> {
+    catalog: &'a ModuleCatalog,
+    scope: &'a ScopeId,
+}
+
+impl SubsystemCatalogView<'_> {
+    pub fn children(&self) -> Vec<SubsystemCatalogItem> {
+        self.catalog.subsystems_in_scope(self.scope)
+    }
 }
 
 impl ModuleCatalogView<'_> {
@@ -275,8 +405,8 @@ impl ModuleCatalogView<'_> {
         self.catalog.contains_in_scope(self.scope, module)
     }
 
-    pub fn subsystem_root(&self) -> Option<ModuleId> {
-        self.catalog.subsystem_root_in_scope(self.scope)
+    pub fn child_subsystems(&self) -> Vec<SubsystemCatalogItem> {
+        self.catalog.subsystems_in_scope(self.scope)
     }
 }
 
@@ -662,6 +792,18 @@ impl CapabilityProviders {
             .await;
     }
 
+    async fn set_registered_subsystems(
+        &self,
+        scope: ScopeId,
+        registrations: Vec<RegisteredSubsystemPolicy>,
+    ) {
+        self.inner
+            .blackboard
+            .scoped(scope)
+            .apply(BlackboardCommand::SetRegisteredSubsystems { registrations })
+            .await;
+    }
+
     pub(crate) async fn apply_runtime_policy(&self, scope: ScopeId) {
         let blackboard = self.inner.blackboard.scoped(scope);
         blackboard
@@ -880,10 +1022,13 @@ impl AgentRuntimeControl {
     }
 
     pub async fn is_active(&self, owner: &ModuleInstanceId) -> bool {
-        self.blackboard
-            .scoped(owner.scope.clone())
-            .read(|bb| bb.allocation().is_replica_active(owner))
-            .await
+        let scope = self.blackboard.scope_activation_state(&owner.scope).await;
+        scope.active
+            && self
+                .blackboard
+                .effective_module_allocation(&owner.scope)
+                .await
+                .is_replica_active(owner)
     }
 
     pub async fn is_forced_disabled(&self, owner: &ModuleInstanceId) -> bool {
@@ -891,7 +1036,13 @@ impl AgentRuntimeControl {
             .blackboard
             .read(|bb| bb.forced_disabled_modules().contains(&owner.module))
             .await;
+        let scope_inactive = !self
+            .blackboard
+            .scope_activation_state(&owner.scope)
+            .await
+            .active;
         globally_disabled
+            || scope_inactive
             || self
                 .blackboard
                 .scoped(owner.scope.clone())
@@ -950,22 +1101,28 @@ impl AgentRuntimeControl {
         &self,
         owner: &ModuleInstanceId,
     ) -> Option<(Bpm, ActivationRatio)> {
-        self.blackboard
-            .scoped(owner.scope.clone())
-            .read(|bb| {
-                let allocation = bb.allocation();
-                allocation
-                    .bpm_for(&owner.module)
-                    .map(|bpm| (bpm, allocation.activation_for(&owner.module)))
-            })
-            .await
+        let allocation = self
+            .blackboard
+            .effective_module_allocation(&owner.scope)
+            .await;
+        allocation
+            .bpm_for(&owner.module)
+            .map(|bpm| (bpm, allocation.effective_activation_for(&owner.module)))
     }
 
     pub async fn active_replicas(&self, module: &ScopedModuleId) -> u8 {
-        self.blackboard
-            .scoped(module.scope.clone())
-            .read(|bb| bb.allocation().active_replicas(&module.module))
+        if !self
+            .blackboard
+            .scope_activation_state(&module.scope)
             .await
+            .active
+        {
+            return 0;
+        }
+        self.blackboard
+            .effective_module_allocation(&module.scope)
+            .await
+            .active_replicas(&module.module)
     }
 
     pub async fn zero_replica_window_policies(
@@ -1003,6 +1160,9 @@ impl AgentRuntimeControl {
         owner: &ModuleInstanceId,
         threshold: ActivationRatio,
     ) -> Option<tokio::sync::oneshot::Receiver<()>> {
+        if !owner.scope.is_root() {
+            return Some(self.blackboard.allocation_change_waiter().await);
+        }
         self.blackboard
             .scoped(owner.scope.clone())
             .activation_increase_waiter(owner.module.clone(), threshold)
@@ -1013,6 +1173,14 @@ impl AgentRuntimeControl {
         &self,
         owner: &ModuleInstanceId,
     ) -> Option<tokio::sync::oneshot::Receiver<()>> {
+        if !self
+            .blackboard
+            .scope_activation_state(&owner.scope)
+            .await
+            .active
+        {
+            return Some(self.blackboard.allocation_change_waiter().await);
+        }
         self.blackboard
             .scoped(owner.scope.clone())
             .activation_waiter(owner.clone())
@@ -1229,6 +1397,18 @@ impl ModuleCapabilityFactory {
             .expect("module catalog is installed before module construction");
         ModuleCatalogView {
             catalog,
+            scope: &self.owner.scope,
+        }
+    }
+
+    pub fn subsystem_catalog(&self) -> SubsystemCatalogView<'_> {
+        SubsystemCatalogView {
+            catalog: self
+                .root
+                .inner
+                .module_catalog
+                .get()
+                .expect("module catalog installed before module construction"),
             scope: &self.owner.scope,
         }
     }
@@ -1574,6 +1754,21 @@ impl ModuleCapabilityFactory {
         )
     }
 
+    pub fn subsystem_allocation_reader(&self) -> SubsystemAllocationReader {
+        SubsystemAllocationReader::new(self.blackboard.clone())
+    }
+
+    pub fn subsystem_allocation_writer(
+        &self,
+        activation_tables: Vec<(SubsystemId, Vec<ActivationRatio>)>,
+    ) -> SubsystemAllocationWriter {
+        SubsystemAllocationWriter::new(
+            self.owner.clone(),
+            self.blackboard.clone(),
+            activation_tables,
+        )
+    }
+
     pub fn interoception_policy(&self) -> InteroceptionRuntimePolicy {
         self.root.inner.runtime_policy.interoception.clone()
     }
@@ -1831,7 +2026,7 @@ pub struct ModuleRegistry {
     registrations: Vec<ModuleRegistration>,
     dependencies: Vec<(ScopedModuleId, ScopedModuleId)>,
     registration_scope: ScopeId,
-    subsystem_roots: BTreeMap<ScopeId, ModuleId>,
+    subsystems: Vec<SubsystemRegistrationSpec>,
 }
 
 impl fmt::Debug for ModuleRegistry {
@@ -1881,7 +2076,7 @@ impl ModuleRegistry {
             registrations: Vec::new(),
             dependencies: Vec::new(),
             registration_scope: ScopeId::root(),
-            subsystem_roots: BTreeMap::new(),
+            subsystems: Vec::new(),
         }
     }
 
@@ -1892,11 +2087,10 @@ impl ModuleRegistry {
         self
     }
 
-    /// Mark the single module role that represents one subsystem for
-    /// topology and subsystem-level allocation. This does not grant any
-    /// capability to the module.
-    pub fn with_subsystem_root(mut self, scope: ScopeId, module: ModuleId) -> Self {
-        self.subsystem_roots.insert(scope, module);
+    /// Register an immediate child subsystem mount as a first-class resource
+    /// allocation target.
+    pub fn with_subsystem(mut self, spec: SubsystemRegistrationSpec) -> Self {
+        self.subsystems.push(spec);
         self
     }
 
@@ -2016,19 +2210,11 @@ impl ModuleRegistry {
     ) -> Result<AllocatedModules, ModuleRegistryError> {
         self.validate_memo_subscriptions()?;
         let dependencies = self.compile_dependencies()?;
-        for (scope, module) in &self.subsystem_roots {
-            if !self.registrations.iter().any(|registration| {
-                registration.spec.scope == *scope && registration.spec.module == *module
-            }) {
-                return Err(ModuleRegistryError::UnknownSubsystemRoot {
-                    module: ScopedModuleId::new(scope.clone(), module.clone()),
-                });
-            }
-        }
+        self.validate_subsystems()?;
         let catalog = ModuleCatalog::from_registrations(
             &self.registrations,
             &self.dependencies,
-            &self.subsystem_roots,
+            &self.subsystems,
         );
         caps.install_module_catalog(catalog)?;
 
@@ -2043,6 +2229,20 @@ impl ModuleRegistry {
         // persistence-only tests and tools), so their retention policy must
         // always be installed before restoring persisted entries.
         caps.apply_runtime_policy(ScopeId::root()).await;
+        let mut subsystems_by_parent = BTreeMap::<ScopeId, Vec<RegisteredSubsystemPolicy>>::new();
+        for subsystem in &self.subsystems {
+            subsystems_by_parent
+                .entry(subsystem.parent_scope.clone())
+                .or_default()
+                .push(RegisteredSubsystemPolicy {
+                    subsystem: subsystem.subsystem.clone(),
+                    policy: subsystem.policy.clone(),
+                    initial_activation: subsystem.initial_activation,
+                });
+        }
+        for (scope, registrations) in subsystems_by_parent {
+            caps.set_registered_subsystems(scope, registrations).await;
+        }
         for (scope, registrations) in &registrations_by_scope {
             if !scope.is_root() {
                 caps.apply_runtime_policy(scope.clone()).await;
@@ -2117,6 +2317,28 @@ impl ModuleRegistry {
             modules,
             dependencies,
         ))
+    }
+
+    fn validate_subsystems(&self) -> Result<(), ModuleRegistryError> {
+        let mut mounted = HashSet::new();
+        for spec in &self.subsystems {
+            if !mounted.insert((spec.parent_scope.clone(), spec.subsystem.clone())) {
+                return Err(ModuleRegistryError::DuplicateSubsystemMount {
+                    parent: spec.parent_scope.clone(),
+                    subsystem: spec.subsystem.clone(),
+                });
+            }
+            if spec.policy.replica_capacity < spec.policy.replicas_range.max {
+                return Err(
+                    ModuleRegistryError::SubsystemReplicaCapacityBelowPolicyMax {
+                        subsystem: spec.subsystem.clone(),
+                        capacity: spec.policy.replica_capacity,
+                        policy_capacity: spec.policy.replicas_range.max,
+                    },
+                );
+            }
+        }
+        Ok(())
     }
 
     fn compile_dependencies(&self) -> Result<ModuleDependencies, ModuleRegistryError> {
@@ -2266,8 +2488,19 @@ pub enum ModuleRegistryError {
         subscriber: ModuleId,
         memo_source: ModuleId,
     },
-    #[error("subsystem root {module} is not registered")]
-    UnknownSubsystemRoot { module: ScopedModuleId },
+    #[error("subsystem {subsystem} is mounted more than once under {parent}")]
+    DuplicateSubsystemMount {
+        parent: ScopeId,
+        subsystem: SubsystemId,
+    },
+    #[error(
+        "subsystem {subsystem} replica capacity {capacity} is below policy capacity {policy_capacity}"
+    )]
+    SubsystemReplicaCapacityBelowPolicyMax {
+        subsystem: SubsystemId,
+        capacity: u8,
+        policy_capacity: u8,
+    },
     #[error("module {owner} requires an outer scope")]
     MissingOuterScope { owner: ModuleInstanceId },
     #[error(
@@ -2827,23 +3060,16 @@ mod tests {
         let role = ModuleId::new(NoopModule::id()).unwrap();
         let left_outer = Rc::new(Cell::new(false));
         let right_outer = Rc::new(Cell::new(false));
-        let left_root_seen = Rc::new(Cell::new(false));
         let left_seen = Rc::clone(&left_outer);
         let right_seen = Rc::clone(&right_outer);
-        let root_seen = Rc::clone(&left_root_seen);
-        let root_role = role.clone();
 
         let registry = ModuleRegistry::new()
             .with_registration_scope(left_scope.clone())
-            .with_subsystem_root(left_scope.clone(), role.clone())
             .register(
                 static_spec::<NoopModule>(test_policy(0..=1)),
                 move |caps: ModuleCapabilityFactory| {
                     let left_seen = Rc::clone(&left_seen);
-                    let root_seen = Rc::clone(&root_seen);
-                    let root_role = root_role.clone();
                     async move {
-                        root_seen.set(caps.module_catalog().subsystem_root() == Some(root_role));
                         let outer = caps.outer_cognition_writer();
                         left_seen.set(outer.is_some());
                         outer.unwrap().append("forwarded from left").await;
@@ -2880,7 +3106,6 @@ mod tests {
         );
         assert!(left_outer.get());
         assert!(right_outer.get());
-        assert!(left_root_seen.get());
         let persisted = cognition_repo.records();
         assert_eq!(persisted.len(), 1);
         assert!(persisted[0].0.is_root());
@@ -3077,6 +3302,63 @@ mod tests {
         assert_eq!(
             blackboard.peer_contexts().to_vec(),
             vec![(noop, Arc::from("test stub"))]
+        );
+    }
+
+    #[tokio::test]
+    async fn build_installs_subsystem_allocation_metadata_in_catalog() {
+        let blackboard = Blackboard::default();
+        let caps = test_caps(blackboard);
+        let subsystem = SubsystemId::new("arm").unwrap();
+        let catalog_seen = Rc::new(RefCell::new(Vec::new()));
+        let seen = Rc::clone(&catalog_seen);
+        ModuleRegistry::new()
+            .with_subsystem(
+                SubsystemRegistrationSpec::new(
+                    ScopeId::root(),
+                    subsystem.clone(),
+                    SubsystemPolicy::new(
+                        SubsystemReplicaRange::new(0, 2).unwrap(),
+                        2,
+                        nuillu_blackboard::ReplicaProjection::Linear,
+                    ),
+                    ActivationRatio::from_f64(0.5),
+                )
+                .with_label("Arm")
+                .with_allocation_description("Reaching and grasping")
+                .with_activation_table([
+                    ActivationRatio::ONE,
+                    ActivationRatio::from_f64(0.4),
+                    ActivationRatio::ZERO,
+                ]),
+            )
+            .register(static_spec::<NoopModule>(test_policy(0..=0)), move |caps| {
+                let seen = Rc::clone(&seen);
+                async move {
+                    *seen.borrow_mut() = caps.subsystem_catalog().children();
+                    Ok(NoopModule)
+                }
+            })
+            .unwrap()
+            .build(&caps)
+            .await
+            .unwrap();
+
+        let seen = catalog_seen.borrow();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].subsystem, subsystem);
+        assert_eq!(seen[0].label.as_deref(), Some("Arm"));
+        assert_eq!(
+            seen[0].allocation_description.as_ref(),
+            "Reaching and grasping"
+        );
+        assert_eq!(
+            seen[0].activation_table.as_ref(),
+            &[
+                ActivationRatio::ONE,
+                ActivationRatio::from_f64(0.4),
+                ActivationRatio::ZERO,
+            ]
         );
     }
 
@@ -4134,6 +4416,86 @@ mod tests {
         assert_eq!(
             allocation.activation_for(&builtin::cognition_gate()),
             ActivationRatio::ONE
+        );
+    }
+
+    #[tokio::test]
+    async fn subsystem_writer_uses_each_mounts_activation_table_and_zeros_omissions() {
+        let blackboard = Blackboard::default();
+        let arm = SubsystemId::new("arm").unwrap();
+        let eye = SubsystemId::new("eye").unwrap();
+        let policy = SubsystemPolicy::new(
+            SubsystemReplicaRange::new(0, 1).unwrap(),
+            1,
+            nuillu_blackboard::ReplicaProjection::Linear,
+        );
+        blackboard
+            .apply(BlackboardCommand::SetRegisteredSubsystems {
+                registrations: vec![
+                    RegisteredSubsystemPolicy {
+                        subsystem: arm.clone(),
+                        policy: policy.clone(),
+                        initial_activation: ActivationRatio::ZERO,
+                    },
+                    RegisteredSubsystemPolicy {
+                        subsystem: eye.clone(),
+                        policy,
+                        initial_activation: ActivationRatio::ZERO,
+                    },
+                ],
+            })
+            .await;
+        let caps = test_caps(blackboard.clone());
+        let writer =
+            scoped(&caps, builtin::subsystem_allocation(), 0).subsystem_allocation_writer(vec![
+                (
+                    arm.clone(),
+                    vec![ActivationRatio::ONE, ActivationRatio::from_f64(0.8)],
+                ),
+                (
+                    eye.clone(),
+                    vec![ActivationRatio::ONE, ActivationRatio::from_f64(0.4)],
+                ),
+            ]);
+
+        writer
+            .submit([
+                nuillu_blackboard::SubsystemAllocationCommand::target(
+                    arm.clone(),
+                    AllocationEffectLevel::High,
+                ),
+                nuillu_blackboard::SubsystemAllocationCommand::target(
+                    eye.clone(),
+                    AllocationEffectLevel::High,
+                ),
+            ])
+            .await
+            .unwrap();
+        assert_eq!(
+            blackboard
+                .read(|bb| bb.subsystem_allocation().activation_for(&arm))
+                .await,
+            ActivationRatio::from_f64(0.8)
+        );
+        assert_eq!(
+            blackboard
+                .read(|bb| bb.subsystem_allocation().activation_for(&eye))
+                .await,
+            ActivationRatio::from_f64(0.4)
+        );
+
+        writer
+            .submit([nuillu_blackboard::SubsystemAllocationCommand::target(
+                arm.clone(),
+                AllocationEffectLevel::Max,
+            )])
+            .await
+            .unwrap();
+        assert_eq!(
+            blackboard
+                .read(|bb| bb.subsystem_allocation().activation_for(&eye))
+                .await,
+            ActivationRatio::ZERO
         );
     }
 

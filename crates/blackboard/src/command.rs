@@ -1,10 +1,12 @@
 use chrono::{DateTime, Utc};
-use nuillu_types::{MemoryIndex, MemoryRank, ModuleId, ModuleInstanceId, PolicyIndex, PolicyRank};
+use nuillu_types::{
+    MemoryIndex, MemoryRank, ModuleId, ModuleInstanceId, PolicyIndex, PolicyRank, SubsystemId,
+};
 
 use crate::{
     ActivationRatio, AgenticDeadlockMarker, AllocationLimits, CognitionLogEntry, CorePolicyRecord,
     IdentityMemoryRecord, InteroceptivePatch, MemoryMetaPatch, ModulePolicy, ModuleRunStatus,
-    PolicyMetaPatch, ResourceAllocation, UtteranceProgress,
+    PolicyMetaPatch, ResourceAllocation, SubsystemPolicy, UtteranceProgress,
 };
 
 /// Registry-owned boot policy for one module role.
@@ -13,6 +15,13 @@ pub struct RegisteredModulePolicy {
     pub module: ModuleId,
     pub policy: ModulePolicy,
     pub replica_capacity: u8,
+    pub initial_activation: ActivationRatio,
+}
+
+#[derive(Debug, Clone)]
+pub struct RegisteredSubsystemPolicy {
+    pub subsystem: SubsystemId,
+    pub policy: SubsystemPolicy,
     pub initial_activation: ActivationRatio,
 }
 
@@ -82,6 +91,16 @@ pub enum BlackboardCommand {
     /// that are not already present in the host base allocation.
     SetRegisteredModules {
         registrations: Vec<RegisteredModulePolicy>,
+    },
+    /// Replace the immediate-child subsystem mount catalog in this scope and
+    /// seed local activation for newly registered mounts.
+    SetRegisteredSubsystems {
+        registrations: Vec<RegisteredSubsystemPolicy>,
+    },
+    SetSubsystemActivation {
+        writer: ModuleInstanceId,
+        subsystem: SubsystemId,
+        activation: ActivationRatio,
     },
     SetAllocationLimits(AllocationLimits),
     SetMemoRetentionPerOwner(usize),

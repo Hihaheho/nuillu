@@ -19,7 +19,8 @@
 pub use nuillu_blackboard::{
     AgenticDeadlockMarker, AllocationCommand, AllocationEffectKind, AllocationEffectLevel,
     AllocationEffectPolicy, CognitionLogEntryRecord, MemoLogRecord, ModuleRunStatus,
-    ModuleRunStatusRecord, ResourceAllocation, UtteranceProgress, UtteranceProgressState,
+    ModuleRunStatusRecord, ResourceAllocation, SubsystemAllocationCommand, UtteranceProgress,
+    UtteranceProgressState,
 };
 
 mod action;
@@ -47,6 +48,7 @@ mod scene;
 mod scope_labels;
 mod session;
 mod session_compaction;
+mod subsystem_allocation;
 mod tiers;
 mod time_division;
 mod tool_text_guard;
@@ -74,7 +76,8 @@ pub use capabilities::{
     CapabilityProviderPorts, CapabilityProviderRuntime, CapabilityProviders, HostIo,
     InternalHarnessIo, LlmCapabilityRequest, ModuleCapabilityFactory, ModuleCatalog,
     ModuleDependencies, ModuleRegisterer, ModuleRegistrationSpec, ModuleRegistry,
-    ModuleRegistryError, SelfWake, SelfWakePermitClaim,
+    ModuleRegistryError, SelfWake, SelfWakePermitClaim, SubsystemCatalogItem, SubsystemCatalogView,
+    SubsystemRegistrationSpec,
 };
 pub use channels::{
     ActionAffordancesUpdated, ActionAffordancesUpdatedInbox, ActionAffordancesUpdatedMailbox,
@@ -138,6 +141,9 @@ pub use session_compaction::{
     DEFAULT_SESSION_COMPACTION_PREFIX_RATIO, SessionCompactionConfig, SessionCompactionPolicy,
     SessionCompactionProtectedPrefix, SessionCompactionRuntime, compact_session,
     compact_session_if_needed, session_compaction_cutoff,
+};
+pub use subsystem_allocation::{
+    SubsystemAllocationReader, SubsystemAllocationView, SubsystemAllocationWriter,
 };
 pub use tiers::{LlmConcurrencyPool, LlmTierHandle, LutumTiers};
 pub use time_division::{TimeDivision, TimeDivisionBucket, TimeDivisionError};
