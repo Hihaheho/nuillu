@@ -9,7 +9,7 @@ use lutum::{MessageContent, ModelInputItem, Session, TextStepOutcomeWithTools, T
 use nuillu_module::{
     AmbientSensoryEntry, LlmAccess, Memo, Module, SceneReader, SensoryInput, SensoryInputInbox,
     SensoryModality, SessionAutoCompaction, SessionCompactionConfig,
-    SessionCompactionProtectedPrefix, ensure_persistent_session_seeded,
+    SessionCompactionProtectedPrefix, ensure_persistent_session_seeded_in_context,
     ports::{Clock, Timer},
 };
 use schemars::JsonSchema;
@@ -292,22 +292,12 @@ impl SensoryModule {
 
     fn ensure_one_shot_session_seeded(&mut self, cx: &nuillu_module::ActivateCx<'_>) {
         let system_prompt = self.one_shot_system_prompt(cx).to_owned();
-        ensure_persistent_session_seeded(
-            &mut self.one_shot_session,
-            system_prompt,
-            cx.identity_memories(),
-            cx.now(),
-        );
+        ensure_persistent_session_seeded_in_context(&mut self.one_shot_session, system_prompt, cx);
     }
 
     fn ensure_ambient_session_seeded(&mut self, cx: &nuillu_module::ActivateCx<'_>) {
         let system_prompt = self.ambient_system_prompt(cx).to_owned();
-        ensure_persistent_session_seeded(
-            &mut self.ambient_session,
-            system_prompt,
-            cx.identity_memories(),
-            cx.now(),
-        );
+        ensure_persistent_session_seeded_in_context(&mut self.ambient_session, system_prompt, cx);
     }
 
     fn format_age(now: DateTime<Utc>, observed_at: DateTime<Utc>) -> String {

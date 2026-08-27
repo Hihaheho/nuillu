@@ -83,7 +83,7 @@ globs = [".tmp/**/memory-seeds/**/*.eure"]
 schema = "schemas/server-memory-seeds.schema.eure"
 
 @ targets.server-config
-globs = [".tmp/**/config.eure"]
+globs = [".tmp/**/config.eure", "configs/agents/**/config.eure"]
 schema = "schemas/server-config.schema.eure"
 
 @ cli

@@ -101,7 +101,13 @@ pub(super) async fn drive_server_until_shutdown(
         if visualizer.shutdown_requested() {
             break;
         }
-        emit_visualizer_blackboard_snapshot(SERVER_TAB_ID, &env.blackboard, visualizer).await;
+        emit_visualizer_blackboard_snapshot(
+            SERVER_TAB_ID,
+            &env.blackboard,
+            boot_config,
+            visualizer,
+        )
+        .await;
     }
 }
 
@@ -664,7 +670,8 @@ async fn emit_current_visualizer_snapshot(
         boot_config.overlay_action_affordances(action_affordances.affordances()),
     );
     emit_recent_activity_rows(env, visualizer, tab_id).await;
-    emit_visualizer_blackboard_snapshot(SERVER_TAB_ID, &env.blackboard, visualizer).await;
+    emit_visualizer_blackboard_snapshot(SERVER_TAB_ID, &env.blackboard, boot_config, visualizer)
+        .await;
     emit_persisted_llm_transcripts(
         env.llm_transcript_store.as_ref(),
         SERVER_TAB_ID,

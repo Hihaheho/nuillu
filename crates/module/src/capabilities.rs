@@ -1,5 +1,5 @@
 use std::cell::{Cell, RefCell};
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt;
 use std::future::{Future, IntoFuture};
 use std::pin::Pin;
@@ -14,7 +14,7 @@ use nuillu_blackboard::{
 };
 use nuillu_types::{
     ModelTier, ModuleActivationId, ModuleGroupId, ModuleId, ModuleInstanceId, ReplicaCapRange,
-    ReplicaIndex,
+    ReplicaIndex, ScopeId, ScopedModuleId,
 };
 
 use crate::activation_gate::ActivationGateHub;
@@ -42,13 +42,14 @@ use crate::{
     MemoLogEvictedInbox, MemoLogEvictedMailbox, MemoLogRepository, MemoSubscription, MemoUpdated,
     MemoUpdatedInbox, MemoUpdatedMailbox, MemoryMetadataReader, Module, ModuleBatch,
     ModuleStatusReader, NoopAllocationStore, NoopExternalActionExecutor, NoopMemoLogRepository,
-    PersistedMemoLogEntry, SensoryInput, SensoryInputInbox, SensoryInputMailbox,
+    PersistedMemoLogEntry, ScopeLabels, SensoryInput, SensoryInputInbox, SensoryInputMailbox,
     SessionCompactionPolicy, StaticModule, TimeDivision, TopicInbox, TopicMailbox, TypedMemo,
 };
 
 /// Immutable boot-time description of one registered module role.
 #[derive(Debug, Clone)]
 pub struct ModuleRegistrationSpec {
+    scope: ScopeId,
     module: ModuleId,
     peer_context: Option<Arc<str>>,
     policy: ModulePolicy,
@@ -67,6 +68,7 @@ impl ModuleRegistrationSpec {
     ) -> Self {
         let replica_capacity = policy.max_active_replicas();
         Self {
+            scope: ScopeId::root(),
             module,
             peer_context: None,
             policy,
@@ -92,6 +94,19 @@ impl ModuleRegistrationSpec {
     pub fn with_peer_context(mut self, peer_context: impl Into<Arc<str>>) -> Self {
         self.peer_context = Some(peer_context.into());
         self
+    }
+
+    pub fn in_scope(mut self, scope: ScopeId) -> Self {
+        self.scope = scope;
+        self
+    }
+
+    pub fn scope(&self) -> &ScopeId {
+        &self.scope
+    }
+
+    pub fn scoped_module(&self) -> ScopedModuleId {
+        ScopedModuleId::new(self.scope.clone(), self.module.clone())
     }
 
     pub fn without_peer_context(mut self) -> Self {
@@ -156,6 +171,7 @@ impl ModuleRegistrationSpec {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ModuleCatalogEntry {
+    scope: ScopeId,
     module: ModuleId,
     peer_context: Option<Arc<str>>,
     groups: BTreeSet<ModuleGroupId>,
@@ -172,13 +188,15 @@ struct ModuleCatalogEntry {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ModuleCatalog {
     entries: Arc<[ModuleCatalogEntry]>,
-    dependency_edges: Arc<[(ModuleId, ModuleId)]>,
+    dependency_edges: Arc<[(ScopedModuleId, ScopedModuleId)]>,
+    subsystem_roots: Arc<[(ScopeId, ModuleId)]>,
 }
 
 impl ModuleCatalog {
     fn from_registrations(
         registrations: &[ModuleRegistration],
-        dependencies: &[(ModuleId, ModuleId)],
+        dependencies: &[(ScopedModuleId, ScopedModuleId)],
+        subsystem_roots: &BTreeMap<ScopeId, ModuleId>,
     ) -> Self {
         let entries = registrations
             .iter()
@@ -189,6 +207,7 @@ impl ModuleCatalog {
                     (replicas.as_f64().to_bits(), rate.as_f64().to_bits())
                 };
                 ModuleCatalogEntry {
+                    scope: registration.spec.scope.clone(),
                     module: registration.spec.module.clone(),
                     peer_context: registration.spec.peer_context.clone(),
                     groups: registration.spec.groups.clone(),
@@ -212,19 +231,52 @@ impl ModuleCatalog {
         Self {
             entries: entries.into(),
             dependency_edges: dependencies.to_vec().into(),
+            subsystem_roots: subsystem_roots
+                .iter()
+                .map(|(scope, module)| (scope.clone(), module.clone()))
+                .collect::<Vec<_>>()
+                .into(),
         }
     }
 
-    pub fn members(&self, group: &ModuleGroupId) -> Vec<ModuleId> {
+    fn members_in_scope(&self, scope: &ScopeId, group: &ModuleGroupId) -> Vec<ModuleId> {
         self.entries
             .iter()
-            .filter(|entry| entry.groups.contains(group))
+            .filter(|entry| &entry.scope == scope && entry.groups.contains(group))
             .map(|entry| entry.module.clone())
             .collect()
     }
 
+    fn contains_in_scope(&self, scope: &ScopeId, module: &ModuleId) -> bool {
+        self.entries
+            .iter()
+            .any(|entry| &entry.scope == scope && &entry.module == module)
+    }
+
+    fn subsystem_root_in_scope(&self, scope: &ScopeId) -> Option<ModuleId> {
+        self.subsystem_roots
+            .iter()
+            .find(|(candidate, _)| candidate == scope)
+            .map(|(_, module)| module.clone())
+    }
+}
+
+pub struct ModuleCatalogView<'a> {
+    catalog: &'a ModuleCatalog,
+    scope: &'a ScopeId,
+}
+
+impl ModuleCatalogView<'_> {
+    pub fn members(&self, group: &ModuleGroupId) -> Vec<ModuleId> {
+        self.catalog.members_in_scope(self.scope, group)
+    }
+
     pub fn contains(&self, module: &ModuleId) -> bool {
-        self.entries.iter().any(|entry| &entry.module == module)
+        self.catalog.contains_in_scope(self.scope, module)
+    }
+
+    pub fn subsystem_root(&self) -> Option<ModuleId> {
+        self.catalog.subsystem_root_in_scope(self.scope)
     }
 }
 
@@ -266,6 +318,7 @@ struct CapabilityProvidersInner {
     allocation_store: Rc<dyn AllocationStore>,
     memo_log_repository: Rc<dyn MemoLogRepository>,
     module_catalog: OnceLock<ModuleCatalog>,
+    scope_labels: Rc<RefCell<Rc<ScopeLabels>>>,
 }
 
 /// Owner-stamped handle for requesting another scheduler pass for the holder.
@@ -530,8 +583,14 @@ impl CapabilityProviders {
                 allocation_store,
                 memo_log_repository,
                 module_catalog: OnceLock::new(),
+                scope_labels: Rc::new(RefCell::new(Rc::new(ScopeLabels::default()))),
             }),
         }
+    }
+
+    /// Install boot-time subsystem display metadata before the agent starts.
+    pub fn set_scope_labels(&self, labels: ScopeLabels) {
+        *self.inner.scope_labels.borrow_mut() = Rc::new(labels);
     }
 
     /// Access the scene registry for host-driven participant updates.
@@ -556,16 +615,26 @@ impl CapabilityProviders {
         owner: ModuleInstanceId,
         memo_subscription: MemoSubscription,
     ) -> ModuleCapabilityFactory {
+        let blackboard = self.inner.blackboard.scoped(owner.scope.clone());
         ModuleCapabilityFactory {
             owner,
             root: self.clone(),
+            blackboard,
             memo_issued: Rc::new(Cell::new(false)),
+            outer_memo_issued: Rc::new(Cell::new(false)),
             memo_subscription,
         }
     }
 
-    pub(crate) fn set_module_contexts(&self, peer_contexts: Vec<(ModuleId, Arc<str>)>) {
-        self.inner.blackboard.set_module_contexts(peer_contexts);
+    pub(crate) fn set_module_contexts(
+        &self,
+        scope: ScopeId,
+        peer_contexts: Vec<(ModuleId, Arc<str>)>,
+    ) {
+        self.inner
+            .blackboard
+            .scoped(scope)
+            .set_module_contexts(peer_contexts);
     }
 
     fn install_module_catalog(&self, catalog: ModuleCatalog) -> Result<(), ModuleRegistryError> {
@@ -581,28 +650,31 @@ impl CapabilityProviders {
             .map_err(|_| ModuleRegistryError::CatalogChangedAfterBoot)
     }
 
-    async fn set_registered_modules(&self, registrations: Vec<RegisteredModulePolicy>) {
+    async fn set_registered_modules(
+        &self,
+        scope: ScopeId,
+        registrations: Vec<RegisteredModulePolicy>,
+    ) {
         self.inner
             .blackboard
+            .scoped(scope)
             .apply(BlackboardCommand::SetRegisteredModules { registrations })
             .await;
     }
 
-    pub(crate) async fn apply_runtime_policy(&self) {
-        self.inner
-            .blackboard
+    pub(crate) async fn apply_runtime_policy(&self, scope: ScopeId) {
+        let blackboard = self.inner.blackboard.scoped(scope);
+        blackboard
             .apply(BlackboardCommand::SetAllocationLimits(
                 self.inner.runtime_policy.allocation_limits,
             ))
             .await;
-        self.inner
-            .blackboard
+        blackboard
             .apply(BlackboardCommand::SetMemoRetentionPerOwner(
                 self.inner.runtime_policy.memo_retained_per_owner,
             ))
             .await;
-        self.inner
-            .blackboard
+        blackboard
             .apply(BlackboardCommand::SetCognitionLogRetentionEntries(
                 self.inner.runtime_policy.cognition_log_retained_entries,
             ))
@@ -628,6 +700,7 @@ impl CapabilityProviders {
             runtime_events: self.inner.runtime_events.clone(),
             activation_gates: self.inner.activation_gates.clone(),
             session_store: self.inner.session_store.clone(),
+            scope_labels: self.inner.scope_labels.clone(),
         }
     }
 
@@ -652,8 +725,8 @@ impl CapabilityProviders {
         let count = snapshots.len();
         for snapshot in snapshots {
             snapshot.validate_version()?;
-            self.inner
-                .blackboard
+            let blackboard = self.inner.blackboard.scoped(snapshot.owner.scope.clone());
+            blackboard
                 .apply(BlackboardCommand::RecordAllocationEffects {
                     writer: snapshot.owner,
                     targets: snapshot.targets,
@@ -665,43 +738,37 @@ impl CapabilityProviders {
     }
 
     pub async fn restore_cognition_log_entries(&self) -> Result<usize, PortError> {
-        let already_hydrated = self
-            .inner
-            .blackboard
-            .read(|bb| !bb.cognition_log().is_empty())
-            .await;
-        if already_hydrated {
-            return Ok(0);
-        }
-
         let records = self
             .inner
             .cognition_log_port
             .recent(self.inner.runtime_policy.cognition_log_retained_entries)
             .await?;
-        let count = records.len();
+        let mut restorable_scopes = BTreeSet::new();
+        for record in &records {
+            let scope = record.scope.clone();
+            let blackboard = self.inner.blackboard.scoped(scope.clone());
+            if blackboard.read(|bb| bb.cognition_log().is_empty()).await {
+                restorable_scopes.insert(scope);
+            }
+        }
+        let mut count = 0;
         for record in records {
-            self.inner
-                .blackboard
-                .apply(BlackboardCommand::AppendCognitionLog {
-                    source: record.source,
-                    entry: record.entry,
-                })
-                .await;
+            if restorable_scopes.contains(&record.scope) {
+                self.inner
+                    .blackboard
+                    .scoped(record.scope)
+                    .apply(BlackboardCommand::AppendCognitionLog {
+                        source: record.source,
+                        entry: record.entry,
+                    })
+                    .await;
+                count += 1;
+            }
         }
         Ok(count)
     }
 
     pub async fn restore_memo_log_entries(&self) -> Result<usize, PortError> {
-        let already_hydrated = self
-            .inner
-            .blackboard
-            .read(|bb| !bb.recent_memo_logs().is_empty())
-            .await;
-        if already_hydrated {
-            return Ok(0);
-        }
-
         let retained_per_owner = self
             .inner
             .blackboard
@@ -713,11 +780,14 @@ impl CapabilityProviders {
             .recent_per_owner(retained_per_owner)
             .await?;
         let count = records.len();
-        for PersistedMemoLogEntry { record, payload } in records {
-            self.inner
-                .blackboard
-                .restore_memo_log_entry(record, payload)
-                .await;
+        for PersistedMemoLogEntry {
+            scope,
+            record,
+            payload,
+        } in records
+        {
+            let blackboard = self.inner.blackboard.scoped(scope);
+            blackboard.restore_memo_log_entry(record, payload).await;
         }
         Ok(count)
     }
@@ -767,6 +837,7 @@ pub struct AgentRuntimeControl {
     runtime_events: RuntimeEventEmitter,
     activation_gates: ActivationGateHub,
     session_store: Rc<dyn SessionStore>,
+    scope_labels: Rc<RefCell<Rc<ScopeLabels>>>,
 }
 
 impl AgentRuntimeControl {
@@ -810,14 +881,22 @@ impl AgentRuntimeControl {
 
     pub async fn is_active(&self, owner: &ModuleInstanceId) -> bool {
         self.blackboard
+            .scoped(owner.scope.clone())
             .read(|bb| bb.allocation().is_replica_active(owner))
             .await
     }
 
-    pub async fn is_forced_disabled(&self, module: &ModuleId) -> bool {
-        self.blackboard
-            .read(|bb| bb.forced_disabled_modules().contains(module))
-            .await
+    pub async fn is_forced_disabled(&self, owner: &ModuleInstanceId) -> bool {
+        let globally_disabled = self
+            .blackboard
+            .read(|bb| bb.forced_disabled_modules().contains(&owner.module))
+            .await;
+        globally_disabled
+            || self
+                .blackboard
+                .scoped(owner.scope.clone())
+                .read(|bb| bb.forced_disabled_modules().contains(&owner.module))
+                .await
     }
 
     pub fn clock(&self) -> Rc<dyn Clock> {
@@ -839,12 +918,19 @@ impl AgentRuntimeControl {
     /// Snapshot of the registered-module peer-context catalog. Cheap
     /// synchronous read; the scheduler turns this into an [`ActivateCx`] for
     /// each `activate` call.
-    pub fn peer_contexts(&self) -> Vec<(ModuleId, Arc<str>)> {
-        self.blackboard.peer_contexts().to_vec()
+    pub fn peer_contexts(&self, owner: &ModuleInstanceId) -> Vec<(ModuleId, Arc<str>)> {
+        self.blackboard
+            .scoped(owner.scope.clone())
+            .peer_contexts()
+            .to_vec()
     }
 
-    pub async fn identity_memories(&self) -> Vec<nuillu_blackboard::IdentityMemoryRecord> {
+    pub async fn identity_memories(
+        &self,
+        owner: &ModuleInstanceId,
+    ) -> Vec<nuillu_blackboard::IdentityMemoryRecord> {
         self.blackboard
+            .scoped(owner.scope.clone())
             .read(|bb| bb.identity_memories().to_vec())
             .await
     }
@@ -855,6 +941,7 @@ impl AgentRuntimeControl {
 
     pub async fn record_module_status(&self, owner: ModuleInstanceId, status: ModuleRunStatus) {
         self.blackboard
+            .scoped(owner.scope.clone())
             .apply(BlackboardCommand::SetModuleRunStatus { owner, status })
             .await;
     }
@@ -864,6 +951,7 @@ impl AgentRuntimeControl {
         owner: &ModuleInstanceId,
     ) -> Option<(Bpm, ActivationRatio)> {
         self.blackboard
+            .scoped(owner.scope.clone())
             .read(|bb| {
                 let allocation = bb.allocation();
                 allocation
@@ -873,28 +961,41 @@ impl AgentRuntimeControl {
             .await
     }
 
-    pub async fn active_replicas(&self, module: &ModuleId) -> u8 {
+    pub async fn active_replicas(&self, module: &ScopedModuleId) -> u8 {
         self.blackboard
-            .read(|bb| bb.allocation().active_replicas(module))
+            .scoped(module.scope.clone())
+            .read(|bb| bb.allocation().active_replicas(&module.module))
             .await
     }
 
-    pub async fn zero_replica_window_policies(&self) -> HashMap<ModuleId, ZeroReplicaWindowPolicy> {
-        self.blackboard
-            .read(|bb| {
-                bb.module_policies()
-                    .iter()
-                    .filter_map(|(module, policy)| {
-                        (policy.replicas_range.max > 0
-                            && policy
-                                .zero_replica_window
-                                .controller_activation_period()
-                                .is_some())
-                        .then_some((module.clone(), policy.zero_replica_window))
+    pub async fn zero_replica_window_policies(
+        &self,
+    ) -> HashMap<ScopedModuleId, ZeroReplicaWindowPolicy> {
+        let mut policies = HashMap::new();
+        for blackboard in self.blackboard.all_scopes() {
+            let scope = blackboard.scope().clone();
+            policies.extend(
+                blackboard
+                    .read(|bb| {
+                        bb.module_policies()
+                            .iter()
+                            .filter_map(|(module, policy)| {
+                                (policy.replicas_range.max > 0
+                                    && policy
+                                        .zero_replica_window
+                                        .controller_activation_period()
+                                        .is_some())
+                                .then_some((
+                                    ScopedModuleId::new(scope.clone(), module.clone()),
+                                    policy.zero_replica_window,
+                                ))
+                            })
+                            .collect::<Vec<_>>()
                     })
-                    .collect()
-            })
-            .await
+                    .await,
+            );
+        }
+        policies
     }
 
     pub async fn activation_increase_waiter(
@@ -903,6 +1004,7 @@ impl AgentRuntimeControl {
         threshold: ActivationRatio,
     ) -> Option<tokio::sync::oneshot::Receiver<()>> {
         self.blackboard
+            .scoped(owner.scope.clone())
             .activation_increase_waiter(owner.module.clone(), threshold)
             .await
     }
@@ -911,7 +1013,10 @@ impl AgentRuntimeControl {
         &self,
         owner: &ModuleInstanceId,
     ) -> Option<tokio::sync::oneshot::Receiver<()>> {
-        self.blackboard.activation_waiter(owner.clone()).await
+        self.blackboard
+            .scoped(owner.scope.clone())
+            .activation_waiter(owner.clone())
+            .await
     }
 
     pub async fn allocation_change_waiter(&self) -> tokio::sync::oneshot::Receiver<()> {
@@ -943,11 +1048,12 @@ impl AgentRuntimeControl {
         cx: crate::ActivateCx<'a>,
         owner: ModuleInstanceId,
     ) -> crate::ActivateCx<'a> {
-        cx.with_session_checkpoint_runtime(
-            self.session_store.clone(),
-            self.runtime_events.clone(),
-            owner,
-        )
+        cx.with_scope_labels(self.scope_labels.borrow().clone())
+            .with_session_checkpoint_runtime(
+                self.session_store.clone(),
+                self.runtime_events.clone(),
+                owner,
+            )
     }
 
     pub async fn delete_module_sessions(&self, owner: &ModuleInstanceId) -> Result<u64, PortError> {
@@ -1097,9 +1203,11 @@ impl InternalHarnessIo {
 pub struct ModuleCapabilityFactory {
     owner: ModuleInstanceId,
     root: CapabilityProviders,
+    blackboard: Blackboard,
     // Memo is the only single-issued capability: typed memo safety relies on
     // one payload type per module owner.
     memo_issued: Rc<Cell<bool>>,
+    outer_memo_issued: Rc<Cell<bool>>,
     memo_subscription: MemoSubscription,
 }
 
@@ -1112,12 +1220,17 @@ impl ModuleCapabilityFactory {
 
     /// The immutable catalog compiled from all registrations before any
     /// module constructor runs.
-    pub fn module_catalog(&self) -> &ModuleCatalog {
-        self.root
+    pub fn module_catalog(&self) -> ModuleCatalogView<'_> {
+        let catalog = self
+            .root
             .inner
             .module_catalog
             .get()
-            .expect("module catalog is installed before module construction")
+            .expect("module catalog is installed before module construction");
+        ModuleCatalogView {
+            catalog,
+            scope: &self.owner.scope,
+        }
     }
 
     pub fn self_wake(&self) -> SelfWake {
@@ -1143,13 +1256,32 @@ impl ModuleCapabilityFactory {
 
     pub fn cognition_log_updated_inbox(&self) -> CognitionLogUpdatedInbox {
         let role_reader_cursors = self.root.inner.role_reader_cursors.clone();
+        let scope = self.owner.scope.clone();
         TopicInbox::new_excluding_self_with_round_robin_hook(
             self.owner.clone(),
             self.root.inner.cognition_log_updates.clone(),
             Some(Rc::new(move |role| {
-                role_reader_cursors.enable_cognition_round_robin(role);
+                role_reader_cursors.enable_cognition_round_robin(
+                    &ScopedModuleId::new(scope.clone(), role.clone()),
+                    &scope,
+                );
             })),
         )
+    }
+
+    pub fn outer_cognition_log_updated_inbox(&self) -> Option<CognitionLogUpdatedInbox> {
+        let outer_scope = self.owner.scope.parent()?;
+        let role_reader_cursors = self.root.inner.role_reader_cursors.clone();
+        let owner_role = self.owner.scoped_module();
+        let cursor_scope = outer_scope.clone();
+        Some(TopicInbox::new_excluding_self_in_scope(
+            self.owner.clone(),
+            outer_scope,
+            self.root.inner.cognition_log_updates.clone(),
+            Some(Rc::new(move |_role| {
+                role_reader_cursors.enable_cognition_round_robin(&owner_role, &cursor_scope);
+            })),
+        ))
     }
 
     pub fn cognition_log_evicted_inbox(&self) -> CognitionLogEvictedInbox {
@@ -1175,11 +1307,13 @@ impl ModuleCapabilityFactory {
 
     pub fn memo_updated_inbox(&self) -> MemoUpdatedInbox {
         let role_reader_cursors = self.root.inner.role_reader_cursors.clone();
+        let scope = self.owner.scope.clone();
         TopicInbox::new_excluding_self_with_round_robin_hook_and_sources(
             self.owner.clone(),
             self.root.inner.memo_updates.clone(),
             Some(Rc::new(move |role| {
-                role_reader_cursors.enable_memo_round_robin(role);
+                role_reader_cursors
+                    .enable_memo_round_robin(&ScopedModuleId::new(scope.clone(), role.clone()));
             })),
             self.memo_subscription.clone(),
         )
@@ -1227,7 +1361,8 @@ impl ModuleCapabilityFactory {
         self.claim_memo();
         Memo::new(
             self.owner.clone(),
-            self.root.inner.blackboard.clone(),
+            self.owner.scope.clone(),
+            self.blackboard.clone(),
             self.root.inner.memo_log_repository.clone(),
             TopicMailbox::new(self.owner.clone(), self.root.inner.memo_updates.clone()),
             TopicMailbox::new(
@@ -1246,7 +1381,8 @@ impl ModuleCapabilityFactory {
         self.claim_memo();
         TypedMemo::new(
             self.owner.clone(),
-            self.root.inner.blackboard.clone(),
+            self.owner.scope.clone(),
+            self.blackboard.clone(),
             self.root.inner.memo_log_repository.clone(),
             TopicMailbox::new(self.owner.clone(), self.root.inner.memo_updates.clone()),
             TopicMailbox::new(
@@ -1256,6 +1392,66 @@ impl ModuleCapabilityFactory {
             self.root.inner.clock.clone(),
             self.root.inner.runtime_events.clone(),
         )
+    }
+
+    fn claim_outer_memo(&self) {
+        assert!(
+            !self.outer_memo_issued.replace(true),
+            "module requested multiple outer memo capabilities; choose exactly one of outer_memo() or outer_typed_memo::<T>()"
+        );
+    }
+
+    /// Plaintext memo written into the immediate parent scope while retaining
+    /// the holder's owner stamp. Returns `None` for a root-scoped module.
+    pub fn outer_memo(&self) -> Option<Memo> {
+        let outer_scope = self.owner.scope.parent()?;
+        self.claim_outer_memo();
+        Some(Memo::new(
+            self.owner.clone(),
+            outer_scope.clone(),
+            self.root.inner.blackboard.scoped(outer_scope.clone()),
+            self.root.inner.memo_log_repository.clone(),
+            TopicMailbox::new_in_scope(
+                self.owner.clone(),
+                outer_scope.clone(),
+                self.root.inner.memo_updates.clone(),
+            ),
+            TopicMailbox::new_in_scope(
+                self.owner.clone(),
+                outer_scope,
+                self.root.inner.memo_log_evictions.clone(),
+            ),
+            self.root.inner.clock.clone(),
+            self.root.inner.runtime_events.clone(),
+        ))
+    }
+
+    /// Typed memo written into the immediate parent scope while retaining the
+    /// holder's owner stamp. Returns `None` for a root-scoped module.
+    pub fn outer_typed_memo<T>(&self) -> Option<TypedMemo<T>>
+    where
+        T: serde::Serialize + serde::de::DeserializeOwned + 'static,
+    {
+        let outer_scope = self.owner.scope.parent()?;
+        self.claim_outer_memo();
+        Some(TypedMemo::new(
+            self.owner.clone(),
+            outer_scope.clone(),
+            self.root.inner.blackboard.scoped(outer_scope.clone()),
+            self.root.inner.memo_log_repository.clone(),
+            TopicMailbox::new_in_scope(
+                self.owner.clone(),
+                outer_scope.clone(),
+                self.root.inner.memo_updates.clone(),
+            ),
+            TopicMailbox::new_in_scope(
+                self.owner.clone(),
+                outer_scope,
+                self.root.inner.memo_log_evictions.clone(),
+            ),
+            self.root.inner.clock.clone(),
+            self.root.inner.runtime_events.clone(),
+        ))
     }
 
     pub fn llm(&self, key: impl Into<String>) -> LlmCapabilityRequest {
@@ -1279,7 +1475,7 @@ impl ModuleCapabilityFactory {
 
     pub fn blackboard_reader(&self) -> BlackboardReader {
         BlackboardReader::new_for_owner_with_role_cursors(
-            self.root.inner.blackboard.clone(),
+            self.blackboard.clone(),
             self.owner.clone(),
             self.root.inner.role_reader_cursors.clone(),
             self.memo_subscription.clone(),
@@ -1287,39 +1483,48 @@ impl ModuleCapabilityFactory {
     }
 
     pub fn memory_metadata_reader(&self) -> MemoryMetadataReader {
-        self.root.memory_metadata_reader()
+        MemoryMetadataReader::new(self.blackboard.clone())
     }
 
     /// Raw [`Blackboard`] handle. Domain crates use this to build their own
     /// owner-stamped capability handles outside of `nuillu-module`.
     pub fn blackboard(&self) -> Blackboard {
-        self.root.inner.blackboard.clone()
+        self.blackboard.clone()
     }
 
     pub fn cognition_log_reader(&self) -> CognitionLogReader {
         CognitionLogReader::new_for_owner_with_role_cursors(
-            self.root.inner.blackboard.clone(),
+            self.blackboard.clone(),
             self.owner.clone(),
             self.root.inner.role_reader_cursors.clone(),
         )
     }
 
+    pub fn outer_cognition_log_reader(&self) -> Option<CognitionLogReader> {
+        let outer_scope = self.owner.scope.parent()?;
+        Some(CognitionLogReader::new_for_owner_with_role_cursors(
+            self.root.inner.blackboard.scoped(outer_scope),
+            self.owner.clone(),
+            self.root.inner.role_reader_cursors.clone(),
+        ))
+    }
+
     pub fn allocation_reader(&self) -> AllocationReader {
-        self.root.allocation_reader()
+        AllocationReader::new(self.blackboard.clone())
     }
 
     pub fn interoception_reader(&self) -> InteroceptiveReader {
-        InteroceptiveReader::new(self.root.inner.blackboard.clone())
+        InteroceptiveReader::new(self.blackboard.clone())
     }
 
     pub fn module_status_reader(&self) -> ModuleStatusReader {
-        self.root.module_status_reader()
+        ModuleStatusReader::new(self.blackboard.clone())
     }
 
     pub fn cognition_writer(&self) -> CognitionWriter {
         CognitionWriter::new(
             self.owner.clone(),
-            self.root.inner.blackboard.clone(),
+            self.blackboard.clone(),
             self.root.inner.cognition_log_port.clone(),
             CognitionLogUpdatedMailbox::new(
                 self.owner.clone(),
@@ -1333,6 +1538,27 @@ impl ModuleCapabilityFactory {
         )
     }
 
+    pub fn outer_cognition_writer(&self) -> Option<CognitionWriter> {
+        let outer_scope = self.owner.scope.parent()?;
+        Some(CognitionWriter::new_in_scope(
+            self.owner.clone(),
+            outer_scope.clone(),
+            self.root.inner.blackboard.scoped(outer_scope.clone()),
+            self.root.inner.cognition_log_port.clone(),
+            CognitionLogUpdatedMailbox::new_in_scope(
+                self.owner.clone(),
+                outer_scope.clone(),
+                self.root.inner.cognition_log_updates.clone(),
+            ),
+            CognitionLogEvictedMailbox::new_in_scope(
+                self.owner.clone(),
+                outer_scope,
+                self.root.inner.cognition_log_evictions.clone(),
+            ),
+            self.root.inner.clock.clone(),
+        ))
+    }
+
     pub fn allocation_writer(
         &self,
         allowed_target_modules: Vec<ModuleId>,
@@ -1340,7 +1566,7 @@ impl ModuleCapabilityFactory {
     ) -> AllocationWriter {
         AllocationWriter::new(
             self.owner.clone(),
-            self.root.inner.blackboard.clone(),
+            self.blackboard.clone(),
             allowed_target_modules,
             allowed_suppression_modules,
             self.root.inner.runtime_policy.allocation_effects.clone(),
@@ -1355,7 +1581,7 @@ impl ModuleCapabilityFactory {
     pub fn interoception_writer(&self) -> InteroceptiveWriter {
         InteroceptiveWriter::new(
             self.owner.clone(),
-            self.root.inner.blackboard.clone(),
+            self.blackboard.clone(),
             InteroceptiveUpdatedMailbox::new(
                 self.owner.clone(),
                 self.root.inner.interoception_updates.clone(),
@@ -1584,16 +1810,16 @@ impl AllocatedModules {
 /// Per-module dependency map keyed by role, not replica.
 #[derive(Debug, Default, Clone)]
 pub struct ModuleDependencies {
-    deps_of: HashMap<ModuleId, Vec<ModuleId>>,
-    dependents_of: HashMap<ModuleId, Vec<ModuleId>>,
+    deps_of: HashMap<ScopedModuleId, Vec<ScopedModuleId>>,
+    dependents_of: HashMap<ScopedModuleId, Vec<ScopedModuleId>>,
 }
 
 impl ModuleDependencies {
-    pub fn deps_of(&self, module: &ModuleId) -> &[ModuleId] {
+    pub fn deps_of(&self, module: &ScopedModuleId) -> &[ScopedModuleId] {
         self.deps_of.get(module).map(Vec::as_slice).unwrap_or(&[])
     }
 
-    pub fn dependents_of(&self, module: &ModuleId) -> &[ModuleId] {
+    pub fn dependents_of(&self, module: &ScopedModuleId) -> &[ScopedModuleId] {
         self.dependents_of
             .get(module)
             .map(Vec::as_slice)
@@ -1603,7 +1829,9 @@ impl ModuleDependencies {
 
 pub struct ModuleRegistry {
     registrations: Vec<ModuleRegistration>,
-    dependencies: Vec<(ModuleId, ModuleId)>,
+    dependencies: Vec<(ScopedModuleId, ScopedModuleId)>,
+    registration_scope: ScopeId,
+    subsystem_roots: BTreeMap<ScopeId, ModuleId>,
 }
 
 impl fmt::Debug for ModuleRegistry {
@@ -1652,13 +1880,46 @@ impl ModuleRegistry {
         Self {
             registrations: Vec::new(),
             dependencies: Vec::new(),
+            registration_scope: ScopeId::root(),
+            subsystem_roots: BTreeMap::new(),
         }
+    }
+
+    /// Set the scope applied to subsequently registered specs. Hosts use this
+    /// while expanding reusable module wiring across subsystem instances.
+    pub fn with_registration_scope(mut self, scope: ScopeId) -> Self {
+        self.registration_scope = scope;
+        self
+    }
+
+    /// Mark the single module role that represents one subsystem for
+    /// topology and subsystem-level allocation. This does not grant any
+    /// capability to the module.
+    pub fn with_subsystem_root(mut self, scope: ScopeId, module: ModuleId) -> Self {
+        self.subsystem_roots.insert(scope, module);
+        self
     }
 
     /// Declare that `dependent` should wait for active `dependency` replicas to flush before
     /// activation. Both roles must be registered and the dependency graph must be acyclic.
     pub fn depends_on(mut self, dependent: ModuleId, dependency: ModuleId) -> Self {
-        self.dependencies.push((dependent, dependency));
+        self.dependencies.push((
+            ScopedModuleId::new(ScopeId::root(), dependent),
+            ScopedModuleId::new(ScopeId::root(), dependency),
+        ));
+        self
+    }
+
+    pub fn scoped_depends_on(
+        mut self,
+        scope: ScopeId,
+        dependent: ModuleId,
+        dependency: ModuleId,
+    ) -> Self {
+        self.dependencies.push((
+            ScopedModuleId::new(scope.clone(), dependent),
+            ScopedModuleId::new(scope, dependency),
+        ));
         self
     }
 
@@ -1683,7 +1944,7 @@ impl ModuleRegistry {
         self.registrations
             .retain(|registration| !removed.contains(&registration.spec.module));
         self.dependencies.retain(|(dependent, dependency)| {
-            !removed.contains(dependent) && !removed.contains(dependency)
+            !removed.contains(&dependent.module) && !removed.contains(&dependency.module)
         });
         self
     }
@@ -1693,19 +1954,25 @@ impl ModuleRegistry {
     /// distinct ids.
     pub fn register<B>(
         mut self,
-        spec: ModuleRegistrationSpec,
+        mut spec: ModuleRegistrationSpec,
         builder: B,
     ) -> Result<Self, ModuleRegistryError>
     where
         B: ModuleRegisterer + 'static,
     {
+        if spec.scope.is_root() && !self.registration_scope.is_root() {
+            spec.scope = self.registration_scope.clone();
+        }
         let module = spec.module.clone();
+        let scoped_module = spec.scoped_module();
         if self
             .registrations
             .iter()
-            .any(|registration| registration.spec.module == module)
+            .any(|registration| registration.spec.scoped_module() == scoped_module)
         {
-            return Err(ModuleRegistryError::DuplicateModule { module });
+            return Err(ModuleRegistryError::DuplicateModule {
+                module: scoped_module,
+            });
         }
         let replica_capacity = spec.replica_capacity;
         if replica_capacity > ReplicaCapRange::V1_MAX {
@@ -1722,12 +1989,13 @@ impl ModuleRegistry {
                 policy_capacity,
             });
         }
-        self.dependencies.extend(
-            spec.dependencies
-                .iter()
-                .cloned()
-                .map(|dependency| (spec.module.clone(), dependency)),
-        );
+        self.dependencies
+            .extend(spec.dependencies.iter().cloned().map(|dependency| {
+                (
+                    spec.scoped_module(),
+                    ScopedModuleId::new(spec.scope.clone(), dependency),
+                )
+            }));
         self.registrations.push(ModuleRegistration {
             spec,
             builder: Rc::new(move |caps| {
@@ -1748,22 +2016,51 @@ impl ModuleRegistry {
     ) -> Result<AllocatedModules, ModuleRegistryError> {
         self.validate_memo_subscriptions()?;
         let dependencies = self.compile_dependencies()?;
-        let catalog = ModuleCatalog::from_registrations(&self.registrations, &self.dependencies);
+        for (scope, module) in &self.subsystem_roots {
+            if !self.registrations.iter().any(|registration| {
+                registration.spec.scope == *scope && registration.spec.module == *module
+            }) {
+                return Err(ModuleRegistryError::UnknownSubsystemRoot {
+                    module: ScopedModuleId::new(scope.clone(), module.clone()),
+                });
+            }
+        }
+        let catalog = ModuleCatalog::from_registrations(
+            &self.registrations,
+            &self.dependencies,
+            &self.subsystem_roots,
+        );
         caps.install_module_catalog(catalog)?;
 
-        caps.apply_runtime_policy().await;
-        caps.set_registered_modules(
-            self.registrations
-                .iter()
-                .map(|registration| RegisteredModulePolicy {
-                    module: registration.spec.module.clone(),
-                    policy: registration.spec.policy.clone(),
-                    replica_capacity: registration.spec.replica_capacity,
-                    initial_activation: registration.spec.initial_activation,
-                })
-                .collect(),
-        )
-        .await;
+        let mut registrations_by_scope = BTreeMap::<ScopeId, Vec<&ModuleRegistration>>::new();
+        for registration in &self.registrations {
+            registrations_by_scope
+                .entry(registration.spec.scope.clone())
+                .or_default()
+                .push(registration);
+        }
+        // Root resources exist even when the registry is empty (for example in
+        // persistence-only tests and tools), so their retention policy must
+        // always be installed before restoring persisted entries.
+        caps.apply_runtime_policy(ScopeId::root()).await;
+        for (scope, registrations) in &registrations_by_scope {
+            if !scope.is_root() {
+                caps.apply_runtime_policy(scope.clone()).await;
+            }
+            caps.set_registered_modules(
+                scope.clone(),
+                registrations
+                    .iter()
+                    .map(|registration| RegisteredModulePolicy {
+                        module: registration.spec.module.clone(),
+                        policy: registration.spec.policy.clone(),
+                        replica_capacity: registration.spec.replica_capacity,
+                        initial_activation: registration.spec.initial_activation,
+                    })
+                    .collect(),
+            )
+            .await;
+        }
         caps.restore_memo_log_entries()
             .await
             .map_err(ModuleRegistryError::MemoLogRestore)?;
@@ -1776,25 +2073,29 @@ impl ModuleRegistry {
         // Install the post-boot module catalogs before any module is constructed
         // so module constructors can read peers from `caps.peer_contexts()`
         // synchronously when they assemble their system prompts.
-        caps.set_module_contexts(
-            self.registrations
-                .iter()
-                .filter_map(|registration| {
-                    registration
-                        .spec
-                        .peer_context
-                        .clone()
-                        .map(|context| (registration.spec.module.clone(), context))
-                })
-                .collect(),
-        );
+        for (scope, registrations) in &registrations_by_scope {
+            caps.set_module_contexts(
+                scope.clone(),
+                registrations
+                    .iter()
+                    .filter_map(|registration| {
+                        registration
+                            .spec
+                            .peer_context
+                            .clone()
+                            .map(|context| (registration.spec.module.clone(), context))
+                    })
+                    .collect(),
+            );
+        }
         let mut modules = Vec::new();
         for registration in &self.registrations {
             // Build every possible replica up to the registered max, with a
             // replica-0 floor so inactive modules can retain queued messages.
             let total_replicas = registration.spec.replica_capacity;
             for replica in 0..total_replicas {
-                let owner = ModuleInstanceId::new(
+                let owner = ModuleInstanceId::in_scope(
+                    registration.spec.scope.clone(),
                     registration.spec.module.clone(),
                     ReplicaIndex::new(replica),
                 );
@@ -1822,10 +2123,10 @@ impl ModuleRegistry {
         let registered = self
             .registrations
             .iter()
-            .map(|registration| &registration.spec.module)
+            .map(|registration| registration.spec.scoped_module())
             .collect::<HashSet<_>>();
-        let mut deps_of = HashMap::<ModuleId, Vec<ModuleId>>::new();
-        let mut dependents_of = HashMap::<ModuleId, Vec<ModuleId>>::new();
+        let mut deps_of = HashMap::<ScopedModuleId, Vec<ScopedModuleId>>::new();
+        let mut dependents_of = HashMap::<ScopedModuleId, Vec<ScopedModuleId>>::new();
 
         for (dependent, dependency) in &self.dependencies {
             if !registered.contains(dependent) {
@@ -1854,10 +2155,10 @@ impl ModuleRegistry {
             }
         }
 
-        let mut visiting = HashSet::<ModuleId>::new();
-        let mut visited = HashSet::<ModuleId>::new();
+        let mut visiting = HashSet::<ScopedModuleId>::new();
+        let mut visited = HashSet::<ScopedModuleId>::new();
         for module in registered {
-            if visited.contains(module) {
+            if visited.contains(&module) {
                 continue;
             }
             let mut stack = Vec::new();
@@ -1880,14 +2181,16 @@ impl ModuleRegistry {
         let registered = self
             .registrations
             .iter()
-            .map(|registration| &registration.spec.module)
+            .map(|registration| registration.spec.scoped_module())
             .collect::<HashSet<_>>();
         for registration in &self.registrations {
             let Some(sources) = registration.spec.memo_subscription.sources() else {
                 continue;
             };
             for source in sources {
-                if !registered.contains(source) {
+                let scoped_source =
+                    ScopedModuleId::new(registration.spec.scope.clone(), source.clone());
+                if !registered.contains(&scoped_source) {
                     return Err(ModuleRegistryError::UnknownMemoSource {
                         subscriber: registration.spec.module.clone(),
                         memo_source: source.clone(),
@@ -1900,11 +2203,11 @@ impl ModuleRegistry {
 }
 
 fn dfs_check_dependencies(
-    node: ModuleId,
-    deps_of: &HashMap<ModuleId, Vec<ModuleId>>,
-    visiting: &mut HashSet<ModuleId>,
-    visited: &mut HashSet<ModuleId>,
-    stack: &mut Vec<ModuleId>,
+    node: ScopedModuleId,
+    deps_of: &HashMap<ScopedModuleId, Vec<ScopedModuleId>>,
+    visiting: &mut HashSet<ScopedModuleId>,
+    visited: &mut HashSet<ScopedModuleId>,
+    stack: &mut Vec<ScopedModuleId>,
 ) -> Result<(), ModuleRegistryError> {
     if visited.contains(&node) {
         return Ok(());
@@ -1939,7 +2242,7 @@ pub enum ModuleRegistryError {
     #[error(transparent)]
     ModuleId(#[from] nuillu_types::ModuleIdParseError),
     #[error("module {module} is already registered")]
-    DuplicateModule { module: ModuleId },
+    DuplicateModule { module: ScopedModuleId },
     #[error(
         "module catalog changed after this agent environment booted; create a new environment to apply registration changes"
     )]
@@ -1955,19 +2258,23 @@ pub enum ModuleRegistryError {
         policy_capacity: u8,
     },
     #[error("dependent {dependent} declared in depends_on() but not registered")]
-    UnknownDependent { dependent: ModuleId },
+    UnknownDependent { dependent: ScopedModuleId },
     #[error("dependency {dependency} declared in depends_on() but not registered")]
-    UnknownDependency { dependency: ModuleId },
+    UnknownDependency { dependency: ScopedModuleId },
     #[error("module {subscriber} subscribes to memos from unregistered module {memo_source}")]
     UnknownMemoSource {
         subscriber: ModuleId,
         memo_source: ModuleId,
     },
+    #[error("subsystem root {module} is not registered")]
+    UnknownSubsystemRoot { module: ScopedModuleId },
+    #[error("module {owner} requires an outer scope")]
+    MissingOuterScope { owner: ModuleInstanceId },
     #[error(
         "module dependency cycle detected: {}",
-        cycle.iter().map(ModuleId::as_str).collect::<Vec<_>>().join(" -> ")
+        cycle.iter().map(ToString::to_string).collect::<Vec<_>>().join(" -> ")
     )]
-    DependencyCycle { cycle: Vec<ModuleId> },
+    DependencyCycle { cycle: Vec<ScopedModuleId> },
     #[error("failed to acquire session capability for {owner}: {source}")]
     SessionAcquire {
         owner: ModuleInstanceId,
@@ -2000,7 +2307,7 @@ mod tests {
         ActivationRatio, AllocationCommand, AllocationEffectLevel, Blackboard, BlackboardCommand,
         CognitionLogEntry, CognitionLogOrigin, MemoLogPayload, MemoLogRecord, ResourceAllocation,
     };
-    use nuillu_types::{ModuleId, ReplicaCapRange, builtin};
+    use nuillu_types::{ModuleId, ReplicaCapRange, SubsystemId, SubsystemInstanceId, builtin};
 
     use crate::allocation_persistence::PersistedAllocationSnapshot;
     use crate::ports::{
@@ -2028,17 +2335,22 @@ mod tests {
 
     #[derive(Clone, Default)]
     struct RecordingCognitionLogRepository {
-        records: Arc<std::sync::Mutex<Vec<(ModuleInstanceId, CognitionLogEntry)>>>,
+        records: Arc<std::sync::Mutex<Vec<(ScopeId, ModuleInstanceId, CognitionLogEntry)>>>,
     }
 
     impl RecordingCognitionLogRepository {
         fn with_records(records: Vec<(ModuleInstanceId, CognitionLogEntry)>) -> Self {
             Self {
-                records: Arc::new(std::sync::Mutex::new(records)),
+                records: Arc::new(std::sync::Mutex::new(
+                    records
+                        .into_iter()
+                        .map(|(source, entry)| (source.scope.clone(), source, entry))
+                        .collect(),
+                )),
             }
         }
 
-        fn records(&self) -> Vec<(ModuleInstanceId, CognitionLogEntry)> {
+        fn records(&self) -> Vec<(ScopeId, ModuleInstanceId, CognitionLogEntry)> {
             self.records.lock().expect("records mutex poisoned").clone()
         }
     }
@@ -2172,7 +2484,7 @@ mod tests {
                 std::collections::BTreeMap::<String, Vec<PersistedMemoLogEntry>>::new();
             for entry in self.records.borrow().iter().cloned() {
                 grouped
-                    .entry(entry.record.owner.to_string())
+                    .entry(format!("{}\n{}", entry.scope, entry.record.owner))
                     .or_default()
                     .push(entry);
             }
@@ -2183,11 +2495,15 @@ mod tests {
                 records.extend(group[keep_from..].iter().cloned());
             }
             records.sort_by(|left, right| {
-                left.record
-                    .owner
-                    .module
-                    .as_str()
-                    .cmp(right.record.owner.module.as_str())
+                left.scope
+                    .cmp(&right.scope)
+                    .then_with(|| {
+                        left.record
+                            .owner
+                            .module
+                            .as_str()
+                            .cmp(right.record.owner.module.as_str())
+                    })
                     .then_with(|| left.record.owner.replica.cmp(&right.record.owner.replica))
                     .then_with(|| left.record.index.cmp(&right.record.index))
             });
@@ -2199,18 +2515,20 @@ mod tests {
     impl CognitionLogRepository for RecordingCognitionLogRepository {
         async fn append(
             &self,
+            scope: ScopeId,
             source: ModuleInstanceId,
             entry: CognitionLogEntry,
         ) -> Result<(), PortError> {
             self.records
                 .lock()
                 .expect("records mutex poisoned")
-                .push((source, entry));
+                .push((scope, source, entry));
             Ok(())
         }
 
         async fn since(
             &self,
+            scope: &ScopeId,
             source: &ModuleInstanceId,
             from: DateTime<Utc>,
         ) -> Result<Vec<CognitionLogEntry>, PortError> {
@@ -2219,8 +2537,10 @@ mod tests {
                 .lock()
                 .expect("records mutex poisoned")
                 .iter()
-                .filter(|(record_source, entry)| record_source == source && entry.at >= from)
-                .map(|(_, entry)| entry.clone())
+                .filter(|(record_scope, record_source, entry)| {
+                    record_scope == scope && record_source == source && entry.at >= from
+                })
+                .map(|(_, _, entry)| entry.clone())
                 .collect())
         }
 
@@ -2235,7 +2555,8 @@ mod tests {
                 .iter()
                 .rev()
                 .take(limit)
-                .map(|(source, entry)| PersistedCognitionLogEntry {
+                .map(|(scope, source, entry)| PersistedCognitionLogEntry {
+                    scope: scope.clone(),
                     source: source.clone(),
                     entry: entry.clone(),
                 })
@@ -2265,11 +2586,14 @@ mod tests {
                     }
                 })
                 .take(limit)
-                .map(|(index, (source, entry))| PersistedCognitionLogPageEntry {
-                    id: i64::try_from(index).unwrap_or(i64::MAX),
-                    source: source.clone(),
-                    entry: entry.clone(),
-                })
+                .map(
+                    |(index, (scope, source, entry))| PersistedCognitionLogPageEntry {
+                        id: i64::try_from(index).unwrap_or(i64::MAX),
+                        scope: scope.clone(),
+                        source: source.clone(),
+                        entry: entry.clone(),
+                    },
+                )
                 .collect())
         }
     }
@@ -2453,11 +2777,147 @@ mod tests {
             .register(static_spec::<NoopModule>(test_policy(0..=0)), noop_builder)
             .unwrap_err();
 
-        let expected = nuillu_types::ModuleId::new(NoopModule::id()).unwrap();
+        let expected = ScopedModuleId::new(
+            ScopeId::root(),
+            nuillu_types::ModuleId::new(NoopModule::id()).unwrap(),
+        );
         assert!(matches!(
             err,
             ModuleRegistryError::DuplicateModule { module } if module == expected
         ));
+    }
+
+    #[tokio::test]
+    async fn child_owned_outer_cognition_inbox_observes_the_immediate_parent_scope() {
+        let caps = test_caps(Blackboard::default());
+        let child_scope = ScopeId::root().child(SubsystemInstanceId::new(
+            SubsystemId::new("arm").unwrap(),
+            ReplicaIndex::ZERO,
+        ));
+        let gate_owner =
+            ModuleInstanceId::in_scope(child_scope, builtin::subsystem_gate(), ReplicaIndex::ZERO);
+        let mut outer_inbox = caps
+            .scoped(gate_owner)
+            .outer_cognition_log_updated_inbox()
+            .unwrap()
+            .broadcast();
+        let root_source = ModuleInstanceId::new(builtin::cognition_gate(), ReplicaIndex::ZERO);
+
+        caps.scoped(root_source.clone())
+            .cognition_writer()
+            .append("outer cognition")
+            .await;
+
+        assert_eq!(outer_inbox.next_item().await.unwrap().sender, root_source);
+    }
+
+    #[tokio::test]
+    async fn registry_allows_the_same_role_in_distinct_subsystem_scopes() {
+        let blackboard = Blackboard::default();
+        let cognition_repo = RecordingCognitionLogRepository::default();
+        let caps =
+            test_caps_with_cognition_repo(blackboard.clone(), Rc::new(cognition_repo.clone()));
+        let subsystem = SubsystemId::new("arm").unwrap();
+        let left_scope = ScopeId::root().child(SubsystemInstanceId::new(
+            subsystem.clone(),
+            ReplicaIndex::ZERO,
+        ));
+        let right_scope =
+            ScopeId::root().child(SubsystemInstanceId::new(subsystem, ReplicaIndex::new(1)));
+        let role = ModuleId::new(NoopModule::id()).unwrap();
+        let left_outer = Rc::new(Cell::new(false));
+        let right_outer = Rc::new(Cell::new(false));
+        let left_root_seen = Rc::new(Cell::new(false));
+        let left_seen = Rc::clone(&left_outer);
+        let right_seen = Rc::clone(&right_outer);
+        let root_seen = Rc::clone(&left_root_seen);
+        let root_role = role.clone();
+
+        let registry = ModuleRegistry::new()
+            .with_registration_scope(left_scope.clone())
+            .with_subsystem_root(left_scope.clone(), role.clone())
+            .register(
+                static_spec::<NoopModule>(test_policy(0..=1)),
+                move |caps: ModuleCapabilityFactory| {
+                    let left_seen = Rc::clone(&left_seen);
+                    let root_seen = Rc::clone(&root_seen);
+                    let root_role = root_role.clone();
+                    async move {
+                        root_seen.set(caps.module_catalog().subsystem_root() == Some(root_role));
+                        let outer = caps.outer_cognition_writer();
+                        left_seen.set(outer.is_some());
+                        outer.unwrap().append("forwarded from left").await;
+                        Ok(NoopModule)
+                    }
+                },
+            )
+            .unwrap()
+            .with_registration_scope(right_scope.clone())
+            .register(
+                static_spec::<NoopModule>(test_policy(0..=1)),
+                move |caps: ModuleCapabilityFactory| {
+                    let right_seen = Rc::clone(&right_seen);
+                    async move {
+                        right_seen.set(caps.outer_cognition_writer().is_some());
+                        Ok(NoopModule)
+                    }
+                },
+            )
+            .unwrap();
+
+        let allocated = registry.build(&caps).await.unwrap();
+        let owners = allocated
+            .modules
+            .iter()
+            .map(|module| module.owner().clone())
+            .collect::<HashSet<_>>();
+        assert_eq!(
+            owners,
+            HashSet::from([
+                ModuleInstanceId::in_scope(left_scope.clone(), role.clone(), ReplicaIndex::ZERO,),
+                ModuleInstanceId::in_scope(right_scope.clone(), role.clone(), ReplicaIndex::ZERO,),
+            ])
+        );
+        assert!(left_outer.get());
+        assert!(right_outer.get());
+        assert!(left_root_seen.get());
+        let persisted = cognition_repo.records();
+        assert_eq!(persisted.len(), 1);
+        assert!(persisted[0].0.is_root());
+        assert_eq!(persisted[0].1.scope, left_scope);
+        assert_eq!(
+            persisted[0].2.origin,
+            CognitionLogOrigin::direct(ModuleInstanceId::in_scope(
+                left_scope.clone(),
+                role.clone(),
+                ReplicaIndex::ZERO,
+            ))
+        );
+        assert_eq!(
+            blackboard
+                .read(|bb| {
+                    bb.cognition_log()
+                        .entries()
+                        .iter()
+                        .map(|entry| entry.text.clone())
+                        .collect::<Vec<_>>()
+                })
+                .await,
+            vec!["forwarded from left".to_owned()]
+        );
+        assert!(blackboard.read(|bb| bb.module_policies().is_empty()).await);
+        assert!(
+            blackboard
+                .scoped(left_scope)
+                .read(|bb| bb.module_policies().contains_key(&role))
+                .await
+        );
+        assert!(
+            blackboard
+                .scoped(right_scope)
+                .read(|bb| bb.module_policies().contains_key(&role))
+                .await
+        );
     }
 
     #[tokio::test]
@@ -2686,8 +3146,10 @@ mod tests {
             ]
         );
         assert_eq!(
-            allocated.dependencies().deps_of(&beta),
-            std::slice::from_ref(&alpha)
+            allocated
+                .dependencies()
+                .deps_of(&ScopedModuleId::new(ScopeId::root(), beta.clone())),
+            std::slice::from_ref(&ScopedModuleId::new(ScopeId::root(), alpha.clone()))
         );
         assert_eq!(
             catalog_seen_during_build.borrow().as_slice(),
@@ -2858,8 +3320,18 @@ mod tests {
             .unwrap();
 
         assert_eq!(allocated.len(), 1);
-        assert_eq!(allocated.dependencies().deps_of(&dependent), &[]);
-        assert_eq!(allocated.dependencies().dependents_of(&dependency), &[]);
+        assert_eq!(
+            allocated
+                .dependencies()
+                .deps_of(&ScopedModuleId::new(ScopeId::root(), dependent)),
+            &[]
+        );
+        assert_eq!(
+            allocated
+                .dependencies()
+                .dependents_of(&ScopedModuleId::new(ScopeId::root(), dependency)),
+            &[]
+        );
     }
 
     #[tokio::test]
@@ -3076,8 +3548,9 @@ mod tests {
 
         let records = repo.records();
         assert_eq!(records.len(), 1);
-        assert_eq!(records[0].0, owner);
-        assert_eq!(records[0].1.text, "food boundary changed");
+        assert!(records[0].0.is_root());
+        assert_eq!(records[0].1, owner);
+        assert_eq!(records[0].2.text, "food boundary changed");
 
         let update = updates.next_item().await.unwrap();
         assert_eq!(update.sender, owner);
@@ -3326,6 +3799,79 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn outer_typed_memo_targets_parent_without_changing_owner_stamp() {
+        #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+        struct BridgeState {
+            direction: String,
+        }
+
+        let blackboard = Blackboard::default();
+        let repo = RecordingMemoLogRepository::default();
+        let caps = test_caps_with_memo_log_repository(
+            blackboard.clone(),
+            Rc::new(repo.clone()),
+            RuntimePolicy::default(),
+        );
+        let child_scope = ScopeId::root().child(SubsystemInstanceId::new(
+            SubsystemId::new("arm").unwrap(),
+            ReplicaIndex::ZERO,
+        ));
+        let owner = ModuleInstanceId::in_scope(
+            child_scope.clone(),
+            builtin::subsystem_gate(),
+            ReplicaIndex::ZERO,
+        );
+        let gate = caps.scoped(owner.clone());
+        let outer = gate.outer_typed_memo::<BridgeState>().unwrap();
+        let inner = gate.typed_memo::<BridgeState>();
+
+        inner
+            .write_cognitive(
+                BridgeState {
+                    direction: "in".to_owned(),
+                },
+                "parent cognition",
+            )
+            .await;
+        outer
+            .write_cognitive(
+                BridgeState {
+                    direction: "out".to_owned(),
+                },
+                "child cognition",
+            )
+            .await;
+
+        assert_eq!(
+            blackboard
+                .scoped(child_scope.clone())
+                .read(|bb| bb.recent_memo_logs())
+                .await
+                .into_iter()
+                .map(|record| (record.owner, record.content, record.cognitive))
+                .collect::<Vec<_>>(),
+            vec![(owner.clone(), "parent cognition".to_owned(), true)]
+        );
+        assert_eq!(
+            blackboard
+                .scoped(ScopeId::root())
+                .read(|bb| bb.recent_memo_logs())
+                .await
+                .into_iter()
+                .map(|record| (record.owner, record.content, record.cognitive))
+                .collect::<Vec<_>>(),
+            vec![(owner, "child cognition".to_owned(), true)]
+        );
+        assert_eq!(
+            repo.appends()
+                .into_iter()
+                .map(|entry| entry.scope)
+                .collect::<Vec<_>>(),
+            vec![child_scope, ScopeId::root()]
+        );
+    }
+
+    #[tokio::test]
     async fn memo_write_persists_plain_payload() {
         let blackboard = Blackboard::default();
         let repo = RecordingMemoLogRepository::default();
@@ -3343,6 +3889,7 @@ mod tests {
         assert_eq!(
             appends,
             vec![PersistedMemoLogEntry {
+                scope: ScopeId::root(),
                 record: MemoLogRecord {
                     owner,
                     index: 0,
@@ -3384,6 +3931,7 @@ mod tests {
 
         let appends = repo.appends();
         assert_eq!(appends.len(), 1);
+        assert_eq!(appends[0].scope, ScopeId::root());
         assert_eq!(appends[0].record.owner, owner);
         assert_eq!(appends[0].record.index, 0);
         assert!(appends[0].record.cognitive);
@@ -3403,6 +3951,7 @@ mod tests {
         let owner = ModuleInstanceId::new(builtin::sensory(), ReplicaIndex::ZERO);
         let repo = RecordingMemoLogRepository::with_records(vec![
             PersistedMemoLogEntry {
+                scope: ScopeId::root(),
                 record: MemoLogRecord {
                     owner: owner.clone(),
                     index: 0,
@@ -3413,6 +3962,7 @@ mod tests {
                 payload: MemoLogPayload::Plain,
             },
             PersistedMemoLogEntry {
+                scope: ScopeId::root(),
                 record: MemoLogRecord {
                     owner: owner.clone(),
                     index: 1,

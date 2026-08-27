@@ -15,7 +15,7 @@ use nuillu_blackboard::{
     Blackboard, BlackboardInner, CognitionLog, CognitionLogEntryRecord, InteroceptiveState,
     MemoLogRecord, MemoryMetadata, ModuleRunStatus, ModuleRunStatusRecord, ResourceAllocation,
 };
-use nuillu_types::{MemoryIndex, ModuleId, ModuleInstanceId};
+use nuillu_types::{MemoryIndex, ModuleInstanceId, ScopeId, ScopedModuleId};
 
 use crate::MemoSubscription;
 
@@ -30,25 +30,35 @@ type SharedCognitionCursor = Rc<tokio::sync::Mutex<Option<u64>>>;
 /// not affect whether the cursor is shared.
 #[derive(Clone, Default)]
 pub(crate) struct RoleReaderCursors {
-    memo: Rc<RefCell<HashMap<ModuleId, SharedMemoCursor>>>,
-    cognition: Rc<RefCell<HashMap<ModuleId, SharedCognitionCursor>>>,
+    memo: Rc<RefCell<HashMap<ScopedModuleId, SharedMemoCursor>>>,
+    cognition: Rc<RefCell<HashMap<(ScopedModuleId, ScopeId), SharedCognitionCursor>>>,
 }
 
 impl RoleReaderCursors {
-    pub(crate) fn enable_memo_round_robin(&self, role: &ModuleId) {
+    pub(crate) fn enable_memo_round_robin(&self, role: &ScopedModuleId) {
         self.memo.borrow_mut().entry(role.clone()).or_default();
     }
 
-    pub(crate) fn enable_cognition_round_robin(&self, role: &ModuleId) {
-        self.cognition.borrow_mut().entry(role.clone()).or_default();
+    pub(crate) fn enable_cognition_round_robin(&self, role: &ScopedModuleId, scope: &ScopeId) {
+        self.cognition
+            .borrow_mut()
+            .entry((role.clone(), scope.clone()))
+            .or_default();
     }
 
-    fn memo_for(&self, role: &ModuleId) -> Option<SharedMemoCursor> {
+    fn memo_for(&self, role: &ScopedModuleId) -> Option<SharedMemoCursor> {
         self.memo.borrow().get(role).cloned()
     }
 
-    fn cognition_for(&self, role: &ModuleId) -> Option<SharedCognitionCursor> {
-        self.cognition.borrow().get(role).cloned()
+    fn cognition_for(
+        &self,
+        role: &ScopedModuleId,
+        scope: &ScopeId,
+    ) -> Option<SharedCognitionCursor> {
+        self.cognition
+            .borrow()
+            .get(&(role.clone(), scope.clone()))
+            .cloned()
     }
 }
 
@@ -62,7 +72,7 @@ pub struct BlackboardReader {
     blackboard: Blackboard,
     owner: Option<ModuleInstanceId>,
     last_seen_memo_indices: Arc<Mutex<MemoCursor>>,
-    role_cursors: Option<(ModuleId, RoleReaderCursors)>,
+    role_cursors: Option<(ScopedModuleId, RoleReaderCursors)>,
     memo_subscription: MemoSubscription,
 }
 
@@ -87,7 +97,7 @@ impl BlackboardReader {
             blackboard,
             owner: Some(owner.clone()),
             last_seen_memo_indices: Arc::new(Mutex::new(HashMap::new())),
-            role_cursors: Some((owner.module, role_cursors)),
+            role_cursors: Some((owner.scoped_module(), role_cursors)),
             memo_subscription,
         }
     }
@@ -202,15 +212,18 @@ impl MemoryMetadataReader {
 #[derive(Clone)]
 pub struct CognitionLogReader {
     blackboard: Blackboard,
+    scope: ScopeId,
     owner: Option<ModuleInstanceId>,
     last_seen_cognition_index: Rc<Cell<Option<u64>>>,
-    role_cursors: Option<(ModuleId, RoleReaderCursors)>,
+    role_cursors: Option<(ScopedModuleId, RoleReaderCursors)>,
 }
 
 impl CognitionLogReader {
     pub(crate) fn new(blackboard: Blackboard) -> Self {
+        let scope = blackboard.scope().clone();
         Self {
             blackboard,
+            scope,
             owner: None,
             last_seen_cognition_index: Rc::new(Cell::new(None)),
             role_cursors: None,
@@ -219,8 +232,10 @@ impl CognitionLogReader {
 
     #[cfg(test)]
     pub(crate) fn new_for_owner(blackboard: Blackboard, owner: ModuleInstanceId) -> Self {
+        let scope = blackboard.scope().clone();
         Self {
             blackboard,
+            scope,
             owner: Some(owner),
             last_seen_cognition_index: Rc::new(Cell::new(None)),
             role_cursors: None,
@@ -232,11 +247,13 @@ impl CognitionLogReader {
         owner: ModuleInstanceId,
         role_cursors: RoleReaderCursors,
     ) -> Self {
+        let scope = blackboard.scope().clone();
         Self {
             blackboard,
+            scope,
             owner: Some(owner.clone()),
             last_seen_cognition_index: Rc::new(Cell::new(None)),
-            role_cursors: Some((owner.module, role_cursors)),
+            role_cursors: Some((owner.scoped_module(), role_cursors)),
         }
     }
 
@@ -251,6 +268,10 @@ impl CognitionLogReader {
                 f(&log)
             })
             .await
+    }
+
+    pub fn scope(&self) -> &ScopeId {
+        &self.scope
     }
 
     pub async fn snapshot(&self) -> nuillu_blackboard::CognitionLogSet {
@@ -269,7 +290,7 @@ impl CognitionLogReader {
         let shared_cursor = self
             .role_cursors
             .as_ref()
-            .and_then(|(role, cursors)| cursors.cognition_for(role));
+            .and_then(|(role, cursors)| cursors.cognition_for(role, &self.scope));
         let last_seen = if let Some(shared_cursor) = shared_cursor {
             *shared_cursor.lock().await
         } else {
@@ -286,7 +307,7 @@ impl CognitionLogReader {
         let shared_cursor = self
             .role_cursors
             .as_ref()
-            .and_then(|(role, cursors)| cursors.cognition_for(role));
+            .and_then(|(role, cursors)| cursors.cognition_for(role, &self.scope));
         let records = if let Some(shared_cursor) = shared_cursor {
             let mut cursor = shared_cursor.lock().await;
             let records = self

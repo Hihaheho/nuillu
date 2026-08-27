@@ -960,6 +960,8 @@ pub struct ExternalActionEventRowView {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct BlackboardSnapshot {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub scopes: Vec<ScopeView>,
     pub module_statuses: Vec<ModuleStatusView>,
     pub allocation: Vec<AllocationView>,
     #[serde(default)]
@@ -974,6 +976,16 @@ pub struct BlackboardSnapshot {
     pub memory_metadata: Vec<MemoryMetadataView>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScopeView {
+    pub id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub root_module: Option<String>,
+    pub memory_scope: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModuleStatusView {
     pub owner: String,
@@ -984,6 +996,8 @@ pub struct ModuleStatusView {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AllocationView {
+    #[serde(default = "root_scope_id", skip_serializing_if = "is_root_scope_id")]
+    pub scope: String,
     pub module: String,
     pub activation_ratio: f64,
     pub active_replicas: u8,
@@ -1023,6 +1037,8 @@ impl Default for InteroceptionView {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ModulePolicyView {
+    #[serde(default = "root_scope_id", skip_serializing_if = "is_root_scope_id")]
+    pub scope: String,
     pub module: String,
     pub replica_min: u8,
     pub replica_max: u8,
@@ -1030,6 +1046,14 @@ pub struct ModulePolicyView {
     pub bpm_min: f64,
     pub bpm_max: f64,
     pub zero_replica_window: ZeroReplicaWindowView,
+}
+
+fn root_scope_id() -> String {
+    "/".to_owned()
+}
+
+fn is_root_scope_id(scope: &String) -> bool {
+    scope == "/"
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

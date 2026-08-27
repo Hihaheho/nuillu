@@ -8,7 +8,7 @@ use nuillu_module::RuntimeEvent;
 use crate::{
     AllocationView, BlackboardSnapshot, LlmInputItemView, LlmObservationEvent,
     LlmObservationSource, LlmTranscriptTurnStatus, LlmTranscriptTurnView, LlmUsageView, MemoView,
-    ModulePolicyView, ModuleSettingsView, ModuleStatusView, VisualizerClientMessage,
+    ModulePolicyView, ModuleSettingsView, ModuleStatusView, ScopeView, VisualizerClientMessage,
     VisualizerCommand, VisualizerTabId, ZeroReplicaWindowView,
     i18n::{EguiI18nExt as _, I18nArg, localized_module_name, localized_module_name_with_id},
     memos, module_filter,
@@ -319,7 +319,7 @@ pub fn apply_blackboard_snapshot(state: &mut ModulesState, snapshot: &Blackboard
         apply_module_status(state, status);
     }
     for allocation in &snapshot.allocation {
-        let owner = owner_for_replica(&allocation.module, 0);
+        let owner = owner_for_scope_replica(&allocation.scope, &allocation.module, 0);
         let module = module_mut_with_metadata(state, owner, allocation.module.clone(), 0);
         if module.runtime_status.is_none() {
             module.runtime_status = Some("not reported".to_string());
@@ -720,17 +720,34 @@ pub fn overview_rows(
     snapshot: &BlackboardSnapshot,
     now_secs: f64,
 ) -> Vec<ModuleOverviewRow> {
+    overview_rows_for_scope(state, snapshot, now_secs, "/")
+}
+
+fn overview_rows_for_scope(
+    state: &ModulesState,
+    snapshot: &BlackboardSnapshot,
+    now_secs: f64,
+    selected_scope: &str,
+) -> Vec<ModuleOverviewRow> {
     let mut rows = BTreeMap::<String, ModuleOverviewRow>::new();
 
-    for allocation in &snapshot.allocation {
+    for allocation in snapshot
+        .allocation
+        .iter()
+        .filter(|allocation| allocation.scope == selected_scope)
+    {
         upsert_overview_row(
             &mut rows,
-            owner_for_replica(&allocation.module, 0),
+            owner_for_scope_replica(&allocation.scope, &allocation.module, 0),
             &allocation.module,
             0,
         );
     }
-    for status in &snapshot.module_statuses {
+    for status in snapshot
+        .module_statuses
+        .iter()
+        .filter(|status| owner_scope(&status.owner) == selected_scope)
+    {
         let row = upsert_overview_row(
             &mut rows,
             status.owner.clone(),
@@ -739,7 +756,10 @@ pub fn overview_rows(
         );
         row.runtime_status = status.status.clone();
     }
-    for module in state.iter() {
+    for module in state
+        .iter()
+        .filter(|module| owner_scope(&module.owner) == selected_scope)
+    {
         let module_name = module_name(module);
         let row = upsert_overview_row(
             &mut rows,
@@ -768,11 +788,13 @@ pub fn overview_rows(
     let allocations = snapshot
         .allocation
         .iter()
+        .filter(|allocation| allocation.scope == selected_scope)
         .map(|allocation| (allocation.module.as_str(), allocation))
         .collect::<BTreeMap<_, _>>();
     let policies = snapshot
         .module_policies
         .iter()
+        .filter(|policy| policy.scope == selected_scope)
         .map(|policy| (policy.module.as_str(), policy))
         .collect::<BTreeMap<_, _>>();
     for row in rows.values_mut() {
@@ -804,7 +826,9 @@ pub fn render_modules_overview(
     state: &ModulesState,
     now_secs: f64,
 ) -> Vec<ModuleOverviewAction> {
-    let rows = overview_rows(state, snapshot, now_secs);
+    let selected_scope = render_scope_navigation(ui, snapshot);
+    let rows = overview_rows_for_scope(state, snapshot, now_secs, &selected_scope);
+    let editable = selected_scope == "/";
     let mut actions = Vec::new();
     let open_config_id = ui.make_persistent_id("module-config-popup");
     let mut open_config = ui
@@ -818,12 +842,16 @@ pub fn render_modules_overview(
             ui.separator();
             for (index, row) in rows.iter().enumerate() {
                 ui.push_id(("overview-row", row.owner.as_str()), |ui| {
-                    overview_row(ui, row, index, &mut actions, &mut open_config);
+                    overview_row(ui, row, index, editable, &mut actions, &mut open_config);
                 });
             }
         });
 
-    render_open_config_popup(ui, snapshot, &mut open_config, &mut actions);
+    if editable {
+        render_open_config_popup(ui, snapshot, &mut open_config, &mut actions);
+    } else {
+        open_config = None;
+    }
     if let Some(open_config) = open_config {
         ui.ctx()
             .data_mut(|data| data.insert_temp(open_config_id, open_config));
@@ -833,6 +861,83 @@ pub fn render_modules_overview(
     }
 
     actions
+}
+
+fn render_scope_navigation(ui: &mut egui::Ui, snapshot: &BlackboardSnapshot) -> String {
+    if !has_subsystem_scopes(snapshot) {
+        return "/".to_owned();
+    }
+    let scopes = if snapshot.scopes.is_empty() {
+        vec![ScopeView {
+            id: "/".to_owned(),
+            parent: None,
+            root_module: None,
+            memory_scope: "global".to_owned(),
+        }]
+    } else {
+        snapshot.scopes.clone()
+    };
+    let state_id = ui.make_persistent_id("modules-selected-scope");
+    let mut selected = ui
+        .ctx()
+        .data(|data| data.get_temp::<String>(state_id))
+        .filter(|selected| scopes.iter().any(|scope| scope.id == *selected))
+        .unwrap_or_else(|| "/".to_owned());
+
+    ui.horizontal_wrapped(|ui| {
+        ui.strong("Scope");
+        egui::ComboBox::from_id_salt((state_id, "selector"))
+            .selected_text(&selected)
+            .show_ui(ui, |ui| {
+                for scope in &scopes {
+                    let depth = scope.id.matches('/').count().saturating_sub(1);
+                    let label = if scope.id == "/" {
+                        "Agent /".to_owned()
+                    } else {
+                        format!("{}{}", "  ".repeat(depth), scope.id)
+                    };
+                    ui.selectable_value(&mut selected, scope.id.clone(), label);
+                }
+            });
+        ui.separator();
+        ui.monospace(format!("Agent {}", selected));
+    });
+
+    if let Some(scope) = scopes.iter().find(|scope| scope.id == selected) {
+        ui.horizontal_wrapped(|ui| {
+            ui.small(format!("Memory: {}", scope.memory_scope.to_uppercase()));
+            if let Some(root) = &scope.root_module {
+                ui.small(format!("Root: {root}")).on_hover_text(
+                    "Subsystem topology/allocation root; this does not grant capabilities",
+                );
+            }
+        });
+        if let (Some(parent), Some(root)) = (&scope.parent, &scope.root_module) {
+            egui::Frame::group(ui.style())
+                .fill(visualizer_selection_card_fill(ui.visuals()))
+                .inner_margin(egui::Margin::symmetric(8, 5))
+                .show(ui, |ui| {
+                    ui.horizontal_wrapped(|ui| {
+                        if ui.small_button(format!("Outer {parent}")).clicked() {
+                            selected = parent.clone();
+                        }
+                        ui.label("⇄");
+                        ui.strong(root);
+                        ui.small("ROOT · LLM boundary");
+                        ui.label("⇄");
+                        ui.monospace(format!("Inner {}", scope.id));
+                    });
+                });
+        }
+    }
+    ui.separator();
+    ui.ctx()
+        .data_mut(|data| data.insert_temp(state_id, selected.clone()));
+    selected
+}
+
+fn has_subsystem_scopes(snapshot: &BlackboardSnapshot) -> bool {
+    snapshot.scopes.iter().any(|scope| scope.id != "/")
 }
 
 pub fn render_module(
@@ -1821,6 +1926,7 @@ fn overview_row(
     ui: &mut egui::Ui,
     row: &ModuleOverviewRow,
     index: usize,
+    editable: bool,
     actions: &mut Vec<ModuleOverviewAction>,
     open_config: &mut Option<OpenModuleConfig>,
 ) {
@@ -1828,8 +1934,8 @@ fn overview_row(
     let frame = fill.map_or_else(egui::Frame::new, |fill| egui::Frame::new().fill(fill));
     frame.show(ui, |ui| {
         ui.horizontal(|ui| {
-            overview_disable_cell(ui, row, actions);
-            overview_config_cell(ui, row, open_config);
+            overview_disable_cell(ui, row, editable, actions);
+            overview_config_cell(ui, row, editable, open_config);
             overview_module_cell(ui, row, actions);
             overview_replica_cell(ui, row);
             overview_label_cell(
@@ -1952,6 +2058,7 @@ fn overview_row_fill_kind(row: &ModuleOverviewRow, index: usize) -> Option<Overv
 fn overview_disable_cell(
     ui: &mut egui::Ui,
     row: &ModuleOverviewRow,
+    editable: bool,
     actions: &mut Vec<ModuleOverviewAction>,
 ) {
     ui.allocate_ui_with_layout(
@@ -1960,8 +2067,12 @@ fn overview_disable_cell(
         |ui| {
             let mut enabled = !row.forced_disabled;
             if ui
-                .add(egui::Checkbox::without_text(&mut enabled))
-                .on_hover_text(ui.ctx().tr("module-overview-enabled-hover"))
+                .add_enabled(editable, egui::Checkbox::without_text(&mut enabled))
+                .on_hover_text(if editable {
+                    ui.ctx().tr("module-overview-enabled-hover")
+                } else {
+                    ui.ctx().tr("module-overview-subsystem-read-only-hover")
+                })
                 .changed()
             {
                 actions.push(ModuleOverviewAction::SetDisabled {
@@ -1976,6 +2087,7 @@ fn overview_disable_cell(
 fn overview_config_cell(
     ui: &mut egui::Ui,
     row: &ModuleOverviewRow,
+    editable: bool,
     open_config: &mut Option<OpenModuleConfig>,
 ) {
     ui.allocate_ui_with_layout(
@@ -1986,10 +2098,14 @@ fn overview_config_cell(
                 ui.label("-");
                 return;
             };
-            let response = ui.add_sized(
-                [CONFIG_COLUMN_WIDTH, OVERVIEW_ROW_HEIGHT],
-                egui::Button::new(ui.ctx().tr("module-overview-edit")),
-            );
+            let response = ui
+                .add_enabled_ui(editable, |ui| {
+                    ui.add_sized(
+                        [CONFIG_COLUMN_WIDTH, OVERVIEW_ROW_HEIGHT],
+                        egui::Button::new(ui.ctx().tr("module-overview-edit")),
+                    )
+                })
+                .inner;
             let anchor = response.rect.right_top();
             let clicked = response.clicked();
             response.on_hover_text(ui.ctx().tr_args(
@@ -2642,6 +2758,25 @@ fn owner_for_replica(module: &str, replica: u8) -> String {
     } else {
         format!("{module}[{replica}]")
     }
+}
+
+fn owner_for_scope_replica(scope: &str, module: &str, replica: u8) -> String {
+    let owner = owner_for_replica(module, replica);
+    if scope == "/" || scope.is_empty() {
+        owner
+    } else {
+        format!("{scope}/{owner}")
+    }
+}
+
+fn owner_scope(owner: &str) -> &str {
+    if !owner.starts_with('/') {
+        return "/";
+    }
+    owner
+        .rsplit_once('/')
+        .map(|(scope, _)| if scope.is_empty() { "/" } else { scope })
+        .unwrap_or("/")
 }
 
 fn module_name(module: &ModuleState) -> String {
@@ -4543,6 +4678,7 @@ mod tests {
                 status: "AwaitingBatch".to_string(),
             }],
             allocation: vec![AllocationView {
+                scope: "/".to_string(),
                 module: "surprise".to_string(),
                 activation_ratio: 0.25,
                 active_replicas: 1,
@@ -4570,6 +4706,60 @@ mod tests {
     }
 
     #[test]
+    fn subsystem_scope_rows_use_scoped_owners_and_do_not_leak_into_root() {
+        let mut state = ModulesState::default();
+        let snapshot = BlackboardSnapshot {
+            scopes: vec![
+                ScopeView {
+                    id: "/".to_string(),
+                    parent: None,
+                    root_module: None,
+                    memory_scope: "global".to_string(),
+                },
+                ScopeView {
+                    id: "/arm[0]".to_string(),
+                    parent: Some("/".to_string()),
+                    root_module: Some("subsystem-gate".to_string()),
+                    memory_scope: "local".to_string(),
+                },
+            ],
+            module_statuses: vec![ModuleStatusView {
+                owner: "/arm[0]/subsystem-gate".to_string(),
+                module: "subsystem-gate".to_string(),
+                replica: 0,
+                status: "AwaitingBatch".to_string(),
+            }],
+            allocation: vec![AllocationView {
+                scope: "/arm[0]".to_string(),
+                module: "subsystem-gate".to_string(),
+                activation_ratio: 1.0,
+                active_replicas: 1,
+                bpm: Some(12.0),
+                period_ms: Some(5_000),
+            }],
+            ..BlackboardSnapshot::default()
+        };
+
+        assert!(!has_subsystem_scopes(&BlackboardSnapshot::default()));
+        assert!(has_subsystem_scopes(&snapshot));
+        apply_blackboard_snapshot(&mut state, &snapshot);
+
+        assert!(state.modules.contains_key("/arm[0]/subsystem-gate"));
+        assert!(overview_rows(&state, &snapshot, TEST_NOW_SECS).is_empty());
+        assert_eq!(
+            overview_rows_for_scope(&state, &snapshot, TEST_NOW_SECS, "/arm[0]")
+                .into_iter()
+                .map(|row| row.owner)
+                .collect::<Vec<_>>(),
+            vec!["/arm[0]/subsystem-gate".to_string()]
+        );
+        assert_eq!(
+            owner_scope("/arm[0]/finger[1]/predict"),
+            "/arm[0]/finger[1]"
+        );
+    }
+
+    #[test]
     fn overview_rows_hide_capacity_only_inactive_replicas() {
         let state = ModulesState::default();
         let snapshot = BlackboardSnapshot {
@@ -4588,6 +4778,7 @@ mod tests {
                 },
             ],
             allocation: vec![AllocationView {
+                scope: "/".to_string(),
                 module: "sensory".to_string(),
                 activation_ratio: 1.0,
                 active_replicas: 1,
@@ -4595,6 +4786,7 @@ mod tests {
                 period_ms: Some(3333),
             }],
             module_policies: vec![ModulePolicyView {
+                scope: "/".to_string(),
                 module: "sensory".to_string(),
                 replica_min: 0,
                 replica_max: 1,
@@ -5023,6 +5215,7 @@ mod tests {
 
         let snapshot = BlackboardSnapshot {
             allocation: vec![AllocationView {
+                scope: "/".to_string(),
                 module: "sensory".to_string(),
                 activation_ratio: 0.25,
                 active_replicas: 1,
@@ -5682,6 +5875,7 @@ mod tests {
         );
         let snapshot = BlackboardSnapshot {
             allocation: vec![AllocationView {
+                scope: "/".to_string(),
                 module: "sensory".to_string(),
                 activation_ratio: 1.0,
                 active_replicas: 1,
@@ -5732,6 +5926,7 @@ mod tests {
         );
         let snapshot = BlackboardSnapshot {
             allocation: vec![AllocationView {
+                scope: "/".to_string(),
                 module: "sensory".to_string(),
                 activation_ratio: 1.0,
                 active_replicas: 1,
@@ -5864,6 +6059,7 @@ mod tests {
                 status: "Activating".to_string(),
             }],
             allocation: vec![AllocationView {
+                scope: "/".to_string(),
                 module: "sensory".to_string(),
                 activation_ratio: 0.75,
                 active_replicas: 1,

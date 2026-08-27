@@ -189,6 +189,7 @@ module-overview-act-err = 活性化エラー
 module-overview-llm-err = LLM エラー
 module-overview-latest-llm-out = 最新 LLM 出力
 module-overview-enabled-hover = このモジュールが割り当て済みレプリカを使えるようにする
+module-overview-subsystem-read-only-hover = 現在のサブシステム操作は読み取り専用です
 module-overview-edit = 編集
 module-overview-edit-hover = { $module } を編集
 module-config-close-hover = 閉じる

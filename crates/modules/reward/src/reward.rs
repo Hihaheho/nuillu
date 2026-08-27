@@ -12,8 +12,9 @@ use nuillu_module::ports::{Clock, PortError};
 use nuillu_module::{
     BlackboardReader, CognitionLogReader, InteroceptiveReader, LlmAccess, LlmContextWindow, Memo,
     Module, SessionAutoCompaction, SessionCompactionConfig, SessionCompactionProtectedPrefix,
-    compact_llm_context_text, ensure_persistent_session_seeded, format_bounded_cognition_log_batch,
-    format_bounded_memo_log_batch, format_policy_system_prompt,
+    compact_llm_context_text, ensure_persistent_session_seeded_in_context,
+    format_bounded_cognition_log_batch_in_context, format_bounded_memo_log_batch,
+    format_policy_system_prompt,
 };
 use nuillu_types::{PolicyIndex, PolicyRank, SignedUnitF32, UnitF32};
 use schemars::JsonSchema;
@@ -426,12 +427,7 @@ impl RewardModule {
 
     fn ensure_session_seeded(&mut self, cx: &nuillu_module::ActivateCx<'_>) {
         let system_prompt = self.system_prompt(cx).to_owned();
-        ensure_persistent_session_seeded(
-            &mut self.session,
-            system_prompt,
-            cx.identity_memories(),
-            cx.now(),
-        );
+        ensure_persistent_session_seeded_in_context(&mut self.session, system_prompt, cx);
     }
 
     async fn settle(
@@ -613,10 +609,11 @@ impl RewardModule {
                 ),
                 format_bounded_memo_log_batch(&memos, cx.now(), REWARD_MEMO_CONTEXT_WINDOW)
                     .unwrap_or_else(|| "none".to_owned()),
-                format_bounded_cognition_log_batch(
+                format_bounded_cognition_log_batch_in_context(
                     &cognition,
                     cx.now(),
                     REWARD_COGNITION_CONTEXT_WINDOW,
+                    cx,
                 )
                 .unwrap_or_else(|| "none".to_owned()),
                 interoception.affect_arousal,

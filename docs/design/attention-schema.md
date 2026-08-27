@@ -12,6 +12,27 @@ A module's role is exactly the set of capabilities it is granted at construction
 
 The module set is open. The modules below are core roles, and additional domain modules can be added without changing the runtime.
 
+## Subsystem Scopes
+
+The agent may contain finite nested subsystem scopes. A scope path identifies one concrete replica
+at every hierarchy level; different scopes have separate cognition logs, memo ownership, and
+allocation. Configuration templates may be reused at multiple positions, but recursive references
+are rejected before runtime expansion.
+
+Every subsystem declares one root module. The conventional builtin root is `subsystem-gate`, a
+deterministic bridge rather than an admission gate. It mechanically converts parent cognition into
+cognitive subsystem-gate memos in the child scope and child cognition into cognitive
+subsystem-gate memos in the parent scope. It preserves the text exactly, uses no LLM, and never
+writes either cognition log. The cognition-gate already present on each side remains the sole module
+that decides whether those memos enter that side's cognition log. Root selection changes this bridge
+and scope/allocation wiring only; it does not grant or remove ordinary capabilities from the
+selected module role. Applications may provide another root module with the same explicit bridge
+capabilities.
+
+Memory scope is configured independently. `global` shares explicitly global-tagged records across
+the agent, while `local` exposes only records tagged with that complete subsystem path. Missing scope
+metadata is not interpreted as global.
+
 ## Agent States
 
 ### Cognition Log

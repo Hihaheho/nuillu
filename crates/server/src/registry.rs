@@ -2,13 +2,15 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use nuillu_blackboard::{ActivationRatio, Bpm, ModulePolicy, ResourceAllocation, linear_ratio_fn};
-use nuillu_memory::MemoryCapabilities;
+use nuillu_memory::{MemoryCapabilities, MemoryNamespace};
 use nuillu_module::{ModuleRegistrationSpec, ModuleRegistry, ModuleRegistryError, StaticModule};
 use nuillu_reward::PolicyCapabilities;
 use nuillu_speak::{UtteranceSink, UtteranceWriter};
-use nuillu_types::ModuleId;
+use nuillu_types::{ModuleId, ScopeId};
 
-use super::config::{RuntimeModule, ServerBootConfig, ServerModuleGroup, ServerModuleSpec};
+use super::config::{
+    RuntimeModule, ServerBootConfig, ServerMemoryScope, ServerModuleGroup, ServerModuleSpec,
+};
 
 /// Host-provided registration hook applied after the built-in server modules.
 ///
@@ -45,16 +47,48 @@ pub(super) fn server_registry(
     policy_caps: &PolicyCapabilities,
     utterance_sink: &Rc<dyn UtteranceSink>,
 ) -> ModuleRegistry {
-    let mut registry = ModuleRegistry::new();
+    let mut registry = ModuleRegistry::new().with_registration_scope(ScopeId::root());
+    let root_memory_caps = memory_caps.with_namespace(MemoryNamespace::Global);
     for module in &boot_config.modules {
-        registry =
-            register_server_module(registry, module, memory_caps, policy_caps, utterance_sink);
+        registry = register_server_module(
+            registry,
+            module,
+            &root_memory_caps,
+            policy_caps,
+            utterance_sink,
+        );
     }
-    configured_dependency_edges(boot_config)
+    registry = configured_dependency_edges(&boot_config.modules)
         .into_iter()
         .fold(registry, |registry, (dependent, dependency)| {
-            registry.depends_on(dependent, dependency)
-        })
+            registry.scoped_depends_on(ScopeId::root(), dependent, dependency)
+        });
+    for expanded in boot_config.expanded_subsystems() {
+        let scoped_memory_caps = match expanded.definition.memory_scope {
+            ServerMemoryScope::Global => memory_caps.with_namespace(MemoryNamespace::Global),
+            ServerMemoryScope::Local => {
+                memory_caps.with_namespace(MemoryNamespace::Local(expanded.scope.clone()))
+            }
+        };
+        registry = registry.with_registration_scope(expanded.scope.clone());
+        for module in &expanded.definition.modules {
+            registry = register_server_module(
+                registry,
+                module,
+                &scoped_memory_caps,
+                policy_caps,
+                utterance_sink,
+            );
+        }
+        registry = registry
+            .with_subsystem_root(expanded.scope.clone(), expanded.definition.root_module_id());
+        registry = configured_dependency_edges(&expanded.definition.modules)
+            .into_iter()
+            .fold(registry, |registry, (dependent, dependency)| {
+                registry.scoped_depends_on(expanded.scope.clone(), dependent, dependency)
+            });
+    }
+    registry.with_registration_scope(ScopeId::root())
 }
 
 trait ServerRegistryExt {
@@ -238,6 +272,7 @@ fn register_server_module(
             registry.register_server(spec, move |caps| {
                 let memory_caps = memory_caps.clone();
                 async move {
+                    let memory_caps = memory_caps.scoped(caps.blackboard());
                     Ok(nuillu_memory::QueryMemoryModule::new(
                         caps.cognition_log_updated_inbox(),
                         caps.blackboard_reader(),
@@ -259,6 +294,7 @@ fn register_server_module(
             registry.register_server(spec, move |caps| {
                 let memory_caps = memory_caps.clone();
                 async move {
+                    let memory_caps = memory_caps.scoped(caps.blackboard());
                     Ok(nuillu_memory::MemoryModule::new(
                         caps.memo_updated_inbox(),
                         caps.cognition_log_updated_inbox(),
@@ -285,6 +321,7 @@ fn register_server_module(
             registry.register_server(spec, move |caps| {
                 let memory_caps = memory_caps.clone();
                 async move {
+                    let memory_caps = memory_caps.scoped(caps.blackboard());
                     Ok(nuillu_memory::MemoryCompactionModule::new(
                         caps.interoception_updated_inbox(),
                         caps.blackboard_reader(),
@@ -301,6 +338,7 @@ fn register_server_module(
             registry.register_server(spec, move |caps| {
                 let memory_caps = memory_caps.clone();
                 async move {
+                    let memory_caps = memory_caps.scoped(caps.blackboard());
                     Ok(nuillu_memory::MemoryAssociationModule::new(
                         caps.interoception_updated_inbox(),
                         caps.blackboard_reader(),
@@ -452,6 +490,30 @@ fn register_server_module(
                 ))
             })
         }
+        RuntimeModule::SubsystemGate => registry.register_server(spec, move |caps| async move {
+            let owner = caps.owner().clone();
+            let outer_updates = caps.outer_cognition_log_updated_inbox().ok_or_else(|| {
+                nuillu_module::ModuleRegistryError::MissingOuterScope {
+                    owner: owner.clone(),
+                }
+            })?;
+            let outer_reader = caps.outer_cognition_log_reader().ok_or_else(|| {
+                nuillu_module::ModuleRegistryError::MissingOuterScope {
+                    owner: owner.clone(),
+                }
+            })?;
+            let outer_memo = caps
+                .outer_typed_memo::<nuillu_subsystem_gate::SubsystemGateMemo>()
+                .ok_or(nuillu_module::ModuleRegistryError::MissingOuterScope { owner })?;
+            Ok(nuillu_subsystem_gate::SubsystemGateModule::new(
+                caps.cognition_log_updated_inbox().broadcast().coalesce(),
+                caps.cognition_log_reader(),
+                caps.typed_memo::<nuillu_subsystem_gate::SubsystemGateMemo>(),
+                outer_updates.broadcast().coalesce(),
+                outer_reader,
+                outer_memo,
+            ))
+        }),
         RuntimeModule::Speak => {
             let utterance_sink = utterance_sink.clone();
             let planning_tier = spec.session_tier("planning");
@@ -508,10 +570,13 @@ pub(super) fn full_agent_allocation(boot_config: &ServerBootConfig) -> ResourceA
     allocation
 }
 
-fn configured_dependency_edges(boot_config: &ServerBootConfig) -> Vec<(ModuleId, ModuleId)> {
-    let active = boot_config.active_module_ids();
+fn configured_dependency_edges(modules: &[ServerModuleSpec]) -> Vec<(ModuleId, ModuleId)> {
+    let active = modules
+        .iter()
+        .map(ServerModuleSpec::module_id)
+        .collect::<std::collections::HashSet<_>>();
     let mut edges = Vec::new();
-    for module in &boot_config.modules {
+    for module in modules {
         let dependent = module.module_id();
         for dependency in &module.depends_on {
             let dependency = dependency.module_id();
@@ -625,7 +690,7 @@ mod tests {
             .modules
             .retain(|module| module.id != RuntimeModule::Policy);
 
-        let edges = configured_dependency_edges(&boot_config);
+        let edges = configured_dependency_edges(&boot_config.modules);
 
         assert!(!edges.contains(&(builtin::cognition_gate(), builtin::policy())));
         assert!(edges.contains(&(builtin::cognition_gate(), builtin::sensory())));

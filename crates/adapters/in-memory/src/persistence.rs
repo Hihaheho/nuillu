@@ -7,7 +7,7 @@ use nuillu_module::{
     AllocationStore, MemoLogRepository, PersistedAllocationSnapshot, PersistedMemoLogEntry,
     PersistedSessionSnapshot, SessionKey, SessionStore,
 };
-use nuillu_types::ModuleInstanceId;
+use nuillu_types::{ModuleInstanceId, ScopeId};
 
 fn lock_error(name: &str) -> PortError {
     PortError::Backend(format!("{name} lock poisoned"))
@@ -45,10 +45,11 @@ impl MemoLogRepository for InMemoryMemoLogRepository {
             .entries
             .lock()
             .map_err(|_| lock_error("memo log repository"))?;
-        let mut by_owner = HashMap::<ModuleInstanceId, Vec<PersistedMemoLogEntry>>::new();
+        let mut by_owner =
+            HashMap::<(ScopeId, ModuleInstanceId), Vec<PersistedMemoLogEntry>>::new();
         for entry in entries.iter().cloned() {
             by_owner
-                .entry(entry.record.owner.clone())
+                .entry((entry.scope.clone(), entry.record.owner.clone()))
                 .or_default()
                 .push(entry);
         }
@@ -59,11 +60,15 @@ impl MemoLogRepository for InMemoryMemoLogRepository {
             recent.extend(owner_entries.drain(start..));
         }
         recent.sort_by(|left, right| {
-            left.record
-                .owner
-                .module
-                .as_str()
-                .cmp(right.record.owner.module.as_str())
+            left.scope
+                .cmp(&right.scope)
+                .then_with(|| {
+                    left.record
+                        .owner
+                        .module
+                        .as_str()
+                        .cmp(right.record.owner.module.as_str())
+                })
                 .then_with(|| {
                     left.record
                         .owner
@@ -183,6 +188,7 @@ mod tests {
         for (owner, index) in [(owner(1), 1), (owner(0), 1), (owner(0), 2)] {
             store
                 .append(&PersistedMemoLogEntry {
+                    scope: ScopeId::root(),
                     record: MemoLogRecord {
                         owner,
                         index,

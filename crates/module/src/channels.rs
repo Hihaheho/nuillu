@@ -8,7 +8,7 @@ use chrono::{DateTime, Utc};
 use futures::StreamExt;
 use futures::channel::mpsc;
 use nuillu_blackboard::{Blackboard, CognitionLogEntryRecord, MemoLogRecord};
-use nuillu_types::{ModuleId, ModuleInstanceId};
+use nuillu_types::{ModuleId, ModuleInstanceId, ScopeId, ScopedModuleId};
 
 use crate::MemoSubscription;
 use schemars::{JsonSchema, Schema, SchemaGenerator};
@@ -167,6 +167,7 @@ impl<T: Clone> Topic<T> {
     fn subscribe(
         &self,
         owner: ModuleInstanceId,
+        observed_scope: ScopeId,
         exclude_self: bool,
         source_filter: MemoSubscription,
     ) -> TopicSubscription<T> {
@@ -178,6 +179,7 @@ impl<T: Clone> Topic<T> {
         inner.subscribers.push(TopicSubscriber {
             id,
             owner,
+            observed_scope,
             sender,
             exclude_self,
             policy: self.default_policy,
@@ -219,7 +221,7 @@ struct TopicSubscription<T: Clone> {
 
 struct TopicInner<T: Clone> {
     subscribers: Vec<TopicSubscriber<T>>,
-    next_by_role: HashMap<ModuleId, usize>,
+    next_by_role: HashMap<ScopedModuleId, usize>,
     next_subscription_id: u64,
 }
 
@@ -236,6 +238,7 @@ impl<T: Clone> Default for TopicInner<T> {
 struct TopicSubscriber<T: Clone> {
     id: u64,
     owner: ModuleInstanceId,
+    observed_scope: ScopeId,
     sender: mpsc::UnboundedSender<Envelope<T>>,
     exclude_self: bool,
     policy: TopicPolicy,
@@ -248,12 +251,30 @@ struct TopicSubscriber<T: Clone> {
 #[derive(Clone)]
 pub struct TopicMailbox<T: Clone> {
     owner: ModuleInstanceId,
+    delivery_scope: ScopeId,
     topic: Topic<T>,
 }
 
 impl<T: Clone> TopicMailbox<T> {
     pub(crate) fn new(owner: ModuleInstanceId, topic: Topic<T>) -> Self {
-        Self { owner, topic }
+        let delivery_scope = owner.scope.clone();
+        Self {
+            owner,
+            delivery_scope,
+            topic,
+        }
+    }
+
+    pub(crate) fn new_in_scope(
+        owner: ModuleInstanceId,
+        delivery_scope: ScopeId,
+        topic: Topic<T>,
+    ) -> Self {
+        Self {
+            owner,
+            delivery_scope,
+            topic,
+        }
     }
 
     pub async fn publish(&self, body: T) -> Result<usize, Envelope<T>> {
@@ -261,11 +282,13 @@ impl<T: Clone> TopicMailbox<T> {
             sender: self.owner.clone(),
             body,
         };
-        let allocation = self
-            .topic
-            .blackboard
-            .read(|bb| bb.allocation().clone())
-            .await;
+        let mut allocations = HashMap::new();
+        for blackboard in self.topic.blackboard.all_scopes() {
+            allocations.insert(
+                blackboard.scope().clone(),
+                blackboard.read(|bb| bb.allocation().clone()).await,
+            );
+        }
         let mut delivered = 0;
         let mut delivered_owners = Vec::new();
         let mut inner = self.topic.inner.lock().expect("Topic inner poisoned");
@@ -274,34 +297,44 @@ impl<T: Clone> TopicMailbox<T> {
             .subscribers
             .retain(|subscriber| !subscriber.sender.is_closed());
 
-        let mut active_by_role = HashMap::<ModuleId, bool>::new();
+        let mut active_by_role = HashMap::<ScopedModuleId, bool>::new();
         for subscriber in &inner.subscribers {
+            if subscriber.observed_scope != self.delivery_scope {
+                continue;
+            }
             if subscriber.exclude_self && subscriber.owner == envelope.sender {
                 continue;
             }
             if !subscriber.source_filter.accepts(&envelope.sender.module) {
                 continue;
             }
-            let active = allocation.is_replica_active(&subscriber.owner);
+            let active = allocations
+                .get(&subscriber.owner.scope)
+                .is_some_and(|allocation| allocation.is_replica_active(&subscriber.owner));
             active_by_role
-                .entry(subscriber.owner.module.clone())
+                .entry(subscriber.owner.scoped_module())
                 .and_modify(|any_active| *any_active |= active)
                 .or_insert(active);
         }
 
         let mut chosen = Vec::new();
-        let mut round_robin_by_role = HashMap::<ModuleId, Vec<usize>>::new();
-        let mut round_robin_fallback_by_role = HashMap::<ModuleId, usize>::new();
+        let mut round_robin_by_role = HashMap::<ScopedModuleId, Vec<usize>>::new();
+        let mut round_robin_fallback_by_role = HashMap::<ScopedModuleId, usize>::new();
         for (idx, subscriber) in inner.subscribers.iter().enumerate() {
+            if subscriber.observed_scope != self.delivery_scope {
+                continue;
+            }
             if subscriber.exclude_self && subscriber.owner == envelope.sender {
                 continue;
             }
             if !subscriber.source_filter.accepts(&envelope.sender.module) {
                 continue;
             }
-            let active = allocation.is_replica_active(&subscriber.owner);
+            let active = allocations
+                .get(&subscriber.owner.scope)
+                .is_some_and(|allocation| allocation.is_replica_active(&subscriber.owner));
             let fallback = !active_by_role
-                .get(&subscriber.owner.module)
+                .get(&subscriber.owner.scoped_module())
                 .copied()
                 .unwrap_or(false)
                 && subscriber.owner.replica == nuillu_types::ReplicaIndex::ZERO;
@@ -310,7 +343,7 @@ impl<T: Clone> TopicMailbox<T> {
                 TopicPolicy::Fanout => {}
                 TopicPolicy::RoleLoadBalanced if active => {
                     round_robin_by_role
-                        .entry(subscriber.owner.module.clone())
+                        .entry(subscriber.owner.scoped_module())
                         .or_default()
                         .push(idx);
                 }
@@ -318,7 +351,7 @@ impl<T: Clone> TopicMailbox<T> {
                     if subscriber.owner.replica == nuillu_types::ReplicaIndex::ZERO =>
                 {
                     round_robin_fallback_by_role
-                        .entry(subscriber.owner.module.clone())
+                        .entry(subscriber.owner.scoped_module())
                         .or_insert(idx);
                 }
                 TopicPolicy::RoleLoadBalanced => {}
@@ -379,7 +412,9 @@ pub struct TopicInbox<T: Clone> {
 
 impl<T: Clone> TopicInbox<T> {
     pub(crate) fn new(owner: ModuleInstanceId, topic: Topic<T>) -> Self {
-        let subscription = topic.subscribe(owner.clone(), false, MemoSubscription::All);
+        let observed_scope = owner.scope.clone();
+        let subscription =
+            topic.subscribe(owner.clone(), observed_scope, false, MemoSubscription::All);
         Self {
             owner,
             topic,
@@ -401,7 +436,9 @@ impl<T: Clone> TopicInbox<T> {
         topic: Topic<T>,
         round_robin_hook: Option<RoundRobinHook>,
     ) -> Self {
-        let subscription = topic.subscribe(owner.clone(), true, MemoSubscription::All);
+        let observed_scope = owner.scope.clone();
+        let subscription =
+            topic.subscribe(owner.clone(), observed_scope, true, MemoSubscription::All);
         Self {
             owner,
             topic,
@@ -420,7 +457,28 @@ impl<T: Clone> TopicInbox<T> {
         round_robin_hook: Option<RoundRobinHook>,
         source_filter: MemoSubscription,
     ) -> Self {
-        let subscription = topic.subscribe(owner.clone(), true, source_filter);
+        let observed_scope = owner.scope.clone();
+        let subscription = topic.subscribe(owner.clone(), observed_scope, true, source_filter);
+        Self {
+            owner,
+            topic,
+            subscription_id: subscription.id,
+            receiver: subscription.receiver,
+            pending: subscription.pending,
+            exclude_self: true,
+            delivery_configured: false,
+            round_robin_hook,
+        }
+    }
+
+    pub(crate) fn new_excluding_self_in_scope(
+        owner: ModuleInstanceId,
+        observed_scope: ScopeId,
+        topic: Topic<T>,
+        round_robin_hook: Option<RoundRobinHook>,
+    ) -> Self {
+        let subscription =
+            topic.subscribe(owner.clone(), observed_scope, true, MemoSubscription::All);
         Self {
             owner,
             topic,

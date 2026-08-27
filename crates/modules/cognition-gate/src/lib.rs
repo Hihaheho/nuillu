@@ -7,7 +7,8 @@ use nuillu_blackboard::MemoLogRecord;
 use nuillu_module::{
     BlackboardReader, CognitionWriter, LlmAccess, LlmContextWindow, MemoUpdatedInbox, Module,
     SessionAutoCompaction, SessionCompactionConfig, SessionCompactionProtectedPrefix,
-    compact_llm_context_text, ensure_persistent_session_seeded, push_formatted_cognition_log_batch,
+    compact_llm_context_text, ensure_persistent_session_seeded_in_context,
+    push_formatted_cognition_log_batch_in_context,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -142,12 +143,7 @@ impl CognitionGateModule {
     }
 
     fn ensure_session_seeded(&mut self, cx: &nuillu_module::ActivateCx<'_>) {
-        ensure_persistent_session_seeded(
-            &mut self.session,
-            SYSTEM_PROMPT,
-            cx.identity_memories(),
-            cx.now(),
-        );
+        ensure_persistent_session_seeded_in_context(&mut self.session, SYSTEM_PROMPT, cx);
     }
 
     #[tracing::instrument(skip_all, err(Debug, level = "warn"))]
@@ -207,10 +203,10 @@ impl CognitionGateModule {
         self.ensure_session_seeded(cx);
         let session_len_before_activation = self.session.input().items().len();
 
-        push_formatted_cognition_log_batch(
+        push_formatted_cognition_log_batch_in_context(
             &mut self.session,
             &unread_cognition,
-            cx.now(),
+            cx,
             COGNITION_CONTEXT_WINDOW,
         );
         self.session

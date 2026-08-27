@@ -2,7 +2,7 @@ use std::marker::PhantomData;
 use std::rc::Rc;
 
 use nuillu_blackboard::{Blackboard, MemoLogPayload, MemoLogRecord, TypedMemoLogRecord};
-use nuillu_types::ModuleInstanceId;
+use nuillu_types::{ModuleInstanceId, ScopeId};
 use serde::{Serialize, de::DeserializeOwned};
 
 use crate::ports::Clock;
@@ -37,6 +37,7 @@ pub struct TypedMemo<T> {
 #[derive(Clone)]
 struct MemoCore {
     owner: ModuleInstanceId,
+    scope: ScopeId,
     blackboard: Blackboard,
     memo_log_repository: Rc<dyn MemoLogRepository>,
     updates: MemoUpdatedMailbox,
@@ -48,6 +49,7 @@ struct MemoCore {
 impl Memo {
     pub(crate) fn new(
         owner: ModuleInstanceId,
+        scope: ScopeId,
         blackboard: Blackboard,
         memo_log_repository: Rc<dyn MemoLogRepository>,
         updates: MemoUpdatedMailbox,
@@ -58,6 +60,7 @@ impl Memo {
         Self {
             core: MemoCore::new(
                 owner,
+                scope,
                 blackboard,
                 memo_log_repository,
                 updates,
@@ -87,6 +90,7 @@ where
 {
     pub(crate) fn new(
         owner: ModuleInstanceId,
+        scope: ScopeId,
         blackboard: Blackboard,
         memo_log_repository: Rc<dyn MemoLogRepository>,
         updates: MemoUpdatedMailbox,
@@ -97,6 +101,7 @@ where
         Self {
             core: MemoCore::new(
                 owner,
+                scope,
                 blackboard,
                 memo_log_repository,
                 updates,
@@ -128,6 +133,7 @@ where
 impl MemoCore {
     fn new(
         owner: ModuleInstanceId,
+        scope: ScopeId,
         blackboard: Blackboard,
         memo_log_repository: Rc<dyn MemoLogRepository>,
         updates: MemoUpdatedMailbox,
@@ -137,6 +143,7 @@ impl MemoCore {
     ) -> Self {
         Self {
             owner,
+            scope,
             blackboard,
             memo_log_repository,
             updates,
@@ -213,6 +220,7 @@ impl MemoCore {
 
     async fn persist_memo(&self, record: &MemoLogRecord, payload: MemoLogPayload) {
         let entry = PersistedMemoLogEntry {
+            scope: self.scope.clone(),
             record: record.clone(),
             payload,
         };

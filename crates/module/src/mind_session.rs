@@ -3,8 +3,9 @@ use lutum::{InputMessageRole, ModelInputItem, Session};
 use nuillu_blackboard::{CognitionLogEntryRecord, IdentityMemoryRecord, MemoLogRecord};
 
 use crate::{
-    LlmContextWindow, format_bounded_cognition_log_batch, format_bounded_memo_log_batch,
-    format_identity_memory_seed,
+    ActivateCx, LlmContextWindow, format_bounded_cognition_log_batch,
+    format_bounded_cognition_log_batch_in_context, format_bounded_memo_log_batch,
+    format_identity_seed,
 };
 
 pub const REASONING_SYSTEM_PROMPT: &str = "During reasoning, reason extremely concisely: use at most 4 short sentences or 128 tokens of internal deliberation before deciding.";
@@ -15,11 +16,36 @@ pub fn format_system_seed(
     identity_memories: &[IdentityMemoryRecord],
     now: DateTime<Utc>,
 ) -> String {
+    format_system_seed_with_identity(system_prompt, reasoning, identity_memories, now, None)
+}
+
+pub fn format_system_seed_in_context(
+    system_prompt: impl Into<String>,
+    reasoning: bool,
+    cx: &ActivateCx<'_>,
+) -> String {
+    let scope_display_name = cx.scope_display_name();
+    format_system_seed_with_identity(
+        system_prompt,
+        reasoning,
+        cx.identity_memories(),
+        cx.now(),
+        scope_display_name.as_deref(),
+    )
+}
+
+pub(crate) fn format_system_seed_with_identity(
+    system_prompt: impl Into<String>,
+    reasoning: bool,
+    identity_memories: &[IdentityMemoryRecord],
+    now: DateTime<Utc>,
+    scope_identity: Option<&str>,
+) -> String {
     let mut sections = vec![system_prompt.into().trim_end().to_owned()];
     if reasoning {
         sections.push(REASONING_SYSTEM_PROMPT.to_owned());
     }
-    if let Some(seed) = format_identity_memory_seed(identity_memories, now) {
+    if let Some(seed) = format_identity_seed(scope_identity, identity_memories, now) {
         sections.push(seed);
     }
     sections
@@ -29,6 +55,19 @@ pub fn format_system_seed(
         .join("\n\n")
 }
 
+pub fn push_formatted_cognition_log_batch_in_context(
+    session: &mut Session,
+    records: &[CognitionLogEntryRecord],
+    cx: &ActivateCx<'_>,
+    window: LlmContextWindow,
+) {
+    if let Some(batch) =
+        format_bounded_cognition_log_batch_in_context(records, cx.now(), window, cx)
+    {
+        session.push_user(batch);
+    }
+}
+
 pub fn seed_persistent_faculty_session(
     session: &mut Session,
     system_prompt: impl Into<String>,
@@ -36,9 +75,50 @@ pub fn seed_persistent_faculty_session(
     identity_memories: &[IdentityMemoryRecord],
     now: DateTime<Utc>,
 ) {
+    seed_persistent_faculty_session_with_identity(
+        session,
+        system_prompt,
+        reasoning,
+        identity_memories,
+        now,
+        None,
+    );
+}
+
+pub fn seed_persistent_faculty_session_in_context(
+    session: &mut Session,
+    system_prompt: impl Into<String>,
+    reasoning: bool,
+    cx: &ActivateCx<'_>,
+) {
+    let scope_display_name = cx.scope_display_name();
+    seed_persistent_faculty_session_with_identity(
+        session,
+        system_prompt,
+        reasoning,
+        cx.identity_memories(),
+        cx.now(),
+        scope_display_name.as_deref(),
+    );
+}
+
+pub(crate) fn seed_persistent_faculty_session_with_identity(
+    session: &mut Session,
+    system_prompt: impl Into<String>,
+    reasoning: bool,
+    identity_memories: &[IdentityMemoryRecord],
+    now: DateTime<Utc>,
+    scope_identity: Option<&str>,
+) {
     let seed_item = ModelInputItem::text(
         InputMessageRole::System,
-        format_system_seed(system_prompt, reasoning, identity_memories, now),
+        format_system_seed_with_identity(
+            system_prompt,
+            reasoning,
+            identity_memories,
+            now,
+            scope_identity,
+        ),
     );
     session.input_mut().items_mut().insert(0, seed_item);
 }

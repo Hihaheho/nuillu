@@ -48,6 +48,7 @@ nuillu-sensory = { workspace = true }
 nuillu-speak = { workspace = true }
 nuillu-storage = { workspace = true }
 nuillu-surprise = { workspace = true }
+nuillu-subsystem-gate = { workspace = true }
 nuillu-types = { workspace = true }
 nuillu-interoception = { workspace = true }
 nuillu-visualizer-protocol = { workspace = true }

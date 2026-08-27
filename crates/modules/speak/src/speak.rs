@@ -16,8 +16,8 @@ use nuillu_module::{
     AttentionControlRequest, AttentionControlRequestMailbox, CognitionLogReader,
     CognitionLogUpdated, CognitionLogUpdatedInbox, LlmAccess, LlmContextWindow, Memo, Module,
     SceneReader, SessionAutoCompaction, SessionCompactionConfig, SessionCompactionProtectedPrefix,
-    UtteranceProgress, ensure_persistent_session_seeded, format_new_cognition_log_entries,
-    ports::Clock,
+    UtteranceProgress, ensure_persistent_session_seeded_in_context,
+    format_new_cognition_log_entries, format_new_cognition_log_entries_in_context, ports::Clock,
 };
 use nuillu_types::builtin;
 use schemars::{JsonSchema, Schema, SchemaGenerator};
@@ -246,9 +246,15 @@ fn cognition_context_fallback(now: DateTime<Utc>) -> String {
 fn speech_cognition_context_from_entries(
     records: &[CognitionLogEntryRecord],
     now: DateTime<Utc>,
+    cx: Option<&nuillu_module::ActivateCx<'_>>,
 ) -> Option<String> {
     let records = speech_planning_cognition_records(records);
-    format_new_cognition_log_entries(&records, now, COGNITION_CONTEXT_WINDOW)
+    match cx {
+        Some(cx) => {
+            format_new_cognition_log_entries_in_context(&records, now, COGNITION_CONTEXT_WINDOW, cx)
+        }
+        None => format_new_cognition_log_entries(&records, now, COGNITION_CONTEXT_WINDOW),
+    }
 }
 
 fn speech_planning_cognition_records(
@@ -362,12 +368,7 @@ impl SpeakModule {
 
     fn ensure_planning_session_seeded(&mut self, cx: &nuillu_module::ActivateCx<'_>) {
         let system_prompt = self.plan_prompt(cx).to_owned();
-        ensure_persistent_session_seeded(
-            &mut self.planning_session,
-            system_prompt,
-            cx.identity_memories(),
-            cx.now(),
-        );
+        ensure_persistent_session_seeded_in_context(&mut self.planning_session, system_prompt, cx);
     }
 
     #[tracing::instrument(skip_all, err(Debug, level = "warn"))]
@@ -379,7 +380,7 @@ impl SpeakModule {
         let _update_count = batch.updates.len();
         let now = self.clock.now();
         let Some(planning_context) =
-            speech_cognition_context_from_entries(&batch.cognition_entries, now)
+            speech_cognition_context_from_entries(&batch.cognition_entries, now, Some(cx))
         else {
             return Ok(());
         };
@@ -1264,7 +1265,7 @@ mod tests {
             },
         ];
 
-        let context = speech_cognition_context_from_entries(&records, now).unwrap();
+        let context = speech_cognition_context_from_entries(&records, now, None).unwrap();
 
         assert!(context.contains("sensory evidence"));
         assert!(context.contains("query-memory evidence"));

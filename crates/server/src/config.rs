@@ -3,7 +3,7 @@ use std::{
     fs, io,
     num::NonZeroUsize,
     path::{Path, PathBuf},
-    sync::OnceLock,
+    sync::{Arc, OnceLock},
 };
 
 use chrono::Utc;
@@ -12,8 +12,11 @@ use eure::document::{
     EureDocument,
     parse::{ParseContext, ParseError, ParseErrorKind},
 };
-use nuillu_module::ActionAffordance;
-use nuillu_types::{ModelTier, ModuleGroupId, ModuleId, ReplicaCapRange, builtin};
+use nuillu_module::{ActionAffordance, ScopeLabels};
+use nuillu_types::{
+    ModelTier, ModuleGroupId, ModuleId, ReplicaCapRange, ReplicaIndex, ScopeId, SubsystemId,
+    SubsystemInstanceId, builtin,
+};
 use tracing_subscriber::layer::SubscriberExt as _;
 use uuid::Uuid;
 
@@ -126,6 +129,7 @@ pub enum RuntimeModule {
     Reward,
     Predict,
     Surprise,
+    SubsystemGate,
     Speak,
 }
 
@@ -139,7 +143,57 @@ pub struct ServerBootConfig {
     #[eure(default)]
     pub modules: Vec<ServerModuleSpec>,
     #[eure(default)]
+    pub subsystem_definitions: Vec<ServerSubsystemDef>,
+    #[eure(default)]
+    pub subsystems: Vec<ServerSubsystemRef>,
+    #[eure(default)]
     pub actions: Vec<ServerActionSpec>,
+}
+
+#[derive(Debug, Clone, PartialEq, FromEure)]
+#[eure(crate = ::eure::document, rename_all = "kebab-case")]
+pub struct ServerSubsystemDef {
+    pub id: String,
+    #[eure(default)]
+    pub label: Option<String>,
+    #[eure(default)]
+    pub modules: Vec<ServerModuleSpec>,
+    pub root: String,
+    #[eure(default)]
+    pub memory_scope: ServerMemoryScope,
+    #[eure(default)]
+    pub subsystems: Vec<ServerSubsystemRef>,
+}
+
+impl ServerSubsystemDef {
+    pub fn subsystem_id(&self) -> SubsystemId {
+        SubsystemId::new(self.id.clone()).expect("validated subsystem id")
+    }
+
+    pub fn root_module_id(&self) -> ModuleId {
+        ModuleId::new(self.root.clone()).expect("validated subsystem root module id")
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, FromEure)]
+#[eure(crate = ::eure::document, rename_all = "kebab-case")]
+pub struct ServerSubsystemRef {
+    pub subsystem: String,
+    pub replicas: u8,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, FromEure)]
+#[eure(crate = ::eure::document, rename_all = "kebab-case")]
+pub enum ServerMemoryScope {
+    #[default]
+    Global,
+    Local,
+}
+
+#[derive(Debug, Clone)]
+pub struct ExpandedSubsystem<'a> {
+    pub scope: ScopeId,
+    pub definition: &'a ServerSubsystemDef,
 }
 
 #[derive(Debug, Clone, PartialEq, FromEure)]
@@ -280,6 +334,8 @@ impl Default for ServerBootConfig {
         Self {
             activation_table: default_activation_table_values(),
             modules: default_server_modules(),
+            subsystem_definitions: Vec::new(),
+            subsystems: Vec::new(),
             actions: Vec::new(),
         }
     }
@@ -307,6 +363,7 @@ impl RuntimeModule {
             Self::Reward => "reward",
             Self::Predict => "predict",
             Self::Surprise => "surprise",
+            Self::SubsystemGate => "subsystem-gate",
             Self::Speak => "speak",
         }
     }
@@ -332,6 +389,7 @@ impl RuntimeModule {
             Self::Reward => builtin::reward(),
             Self::Predict => builtin::predict(),
             Self::Surprise => builtin::surprise(),
+            Self::SubsystemGate => builtin::subsystem_gate(),
             Self::Speak => builtin::speak(),
         }
     }
@@ -360,6 +418,7 @@ impl RuntimeModule {
             Self::Reward => &[("main", ModelTier::Default)],
             Self::Predict => &[("main", ModelTier::Cheap)],
             Self::Surprise => &[("main", ModelTier::Default)],
+            Self::SubsystemGate => &[],
             Self::Speak => &[("planning", ModelTier::Premium)],
         }
     }
@@ -514,6 +573,38 @@ impl ServerConfigBuilder {
 }
 
 impl ServerBootConfig {
+    pub fn expanded_subsystems(&self) -> Vec<ExpandedSubsystem<'_>> {
+        let definitions = self
+            .subsystem_definitions
+            .iter()
+            .map(|definition| (definition.id.as_str(), definition))
+            .collect::<BTreeMap<_, _>>();
+        let mut expanded = Vec::new();
+        expand_subsystem_refs(
+            &ScopeId::root(),
+            &self.subsystems,
+            &definitions,
+            &mut expanded,
+        );
+        expanded
+    }
+
+    pub fn scope_labels(&self) -> ScopeLabels {
+        let definitions = self
+            .subsystem_definitions
+            .iter()
+            .map(|definition| (definition.id.as_str(), definition))
+            .collect::<BTreeMap<_, _>>();
+        let mut labels = Vec::new();
+        expand_scope_labels(
+            &ScopeId::root(),
+            &self.subsystems,
+            &definitions,
+            &mut labels,
+        );
+        ScopeLabels::new(labels)
+    }
+
     pub fn active_modules(&self) -> Vec<RuntimeModule> {
         self.modules.iter().map(|module| module.id).collect()
     }
@@ -587,8 +678,259 @@ impl ServerBootConfig {
                 }
             }
         }
+        self.validate_subsystems(path)?;
         validate_config_actions(&self.action_affordances(), path)?;
         Ok(())
+    }
+
+    fn validate_subsystems(&self, path: &Path) -> anyhow::Result<()> {
+        let mut definitions = BTreeMap::new();
+        for definition in &self.subsystem_definitions {
+            SubsystemId::new(definition.id.clone()).map_err(|error| {
+                anyhow::anyhow!(
+                    "server config {} has invalid subsystem id {:?}: {error}",
+                    path.display(),
+                    definition.id
+                )
+            })?;
+            if let Some(label) = &definition.label
+                && (label.trim().is_empty() || label.contains(['\n', '\r']))
+            {
+                anyhow::bail!(
+                    "server config {} has invalid label for subsystem {}: labels must be non-empty single-line text",
+                    path.display(),
+                    definition.id
+                );
+            }
+            if definitions
+                .insert(definition.id.as_str(), definition)
+                .is_some()
+            {
+                anyhow::bail!(
+                    "server config {} declares subsystem {} more than once",
+                    path.display(),
+                    definition.id
+                );
+            }
+            validate_module_set(&definition.modules, path, &definition.id)?;
+            let module_ids = definition
+                .modules
+                .iter()
+                .map(ServerModuleSpec::module_id)
+                .collect::<HashSet<_>>();
+            let root = ModuleId::new(definition.root.clone()).map_err(|error| {
+                anyhow::anyhow!(
+                    "server config {} has invalid root {:?} in subsystem {}: {error}",
+                    path.display(),
+                    definition.root,
+                    definition.id
+                )
+            })?;
+            if !module_ids.contains(&root) {
+                anyhow::bail!(
+                    "server config {} declares unknown root {} in subsystem {}",
+                    path.display(),
+                    root.as_str(),
+                    definition.id
+                );
+            }
+        }
+        validate_subsystem_refs(&self.subsystems, "root", &definitions, path)?;
+        for definition in &self.subsystem_definitions {
+            validate_subsystem_refs(&definition.subsystems, &definition.id, &definitions, path)?;
+        }
+        let mut visiting = Vec::new();
+        let mut visited = HashSet::new();
+        // Validate every definition, including definitions that are not mounted
+        // at the root yet. This keeps the reusable definition catalog valid on
+        // its own and prevents a latent cycle from surfacing only when mounted.
+        for definition in &self.subsystem_definitions {
+            validate_subsystem_cycles(
+                definition.id.as_str(),
+                &definitions,
+                &mut visiting,
+                &mut visited,
+                path,
+            )?;
+        }
+        Ok(())
+    }
+}
+
+fn validate_module_set(
+    modules: &[ServerModuleSpec],
+    path: &Path,
+    owner: &str,
+) -> anyhow::Result<()> {
+    let mut seen = HashSet::new();
+    for module in modules {
+        if !seen.insert(module.id) {
+            anyhow::bail!(
+                "server config {} declares module {} more than once in subsystem {}",
+                path.display(),
+                module.id.as_str(),
+                owner
+            );
+        }
+        module.validate(path)?;
+    }
+    for module in modules {
+        for dependency in &module.depends_on {
+            if !seen.contains(dependency) {
+                anyhow::bail!(
+                    "server config {} declares unknown dependency {} for module {} in subsystem {}",
+                    path.display(),
+                    dependency.as_str(),
+                    module.id.as_str(),
+                    owner
+                );
+            }
+        }
+        if let Some(sources) = &module.memo_sources {
+            let mut seen_sources = HashSet::new();
+            for source in sources {
+                if !seen_sources.insert(source) {
+                    anyhow::bail!(
+                        "server config {} declares memo source {} for module {} more than once in subsystem {}",
+                        path.display(),
+                        source.as_str(),
+                        module.id.as_str(),
+                        owner
+                    );
+                }
+                if !seen.contains(source) {
+                    anyhow::bail!(
+                        "server config {} declares unknown memo source {} for module {} in subsystem {}",
+                        path.display(),
+                        source.as_str(),
+                        module.id.as_str(),
+                        owner
+                    );
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_subsystem_refs<'a>(
+    references: &[ServerSubsystemRef],
+    owner: &str,
+    definitions: &BTreeMap<&'a str, &'a ServerSubsystemDef>,
+    path: &Path,
+) -> anyhow::Result<()> {
+    let mut seen = HashSet::new();
+    for reference in references {
+        if reference.replicas == 0 {
+            anyhow::bail!(
+                "server config {} sets zero replicas for subsystem {} under {}",
+                path.display(),
+                reference.subsystem,
+                owner
+            );
+        }
+        if !definitions.contains_key(reference.subsystem.as_str()) {
+            anyhow::bail!(
+                "server config {} references unknown subsystem {} under {}",
+                path.display(),
+                reference.subsystem,
+                owner
+            );
+        }
+        if !seen.insert(reference.subsystem.as_str()) {
+            anyhow::bail!(
+                "server config {} references subsystem {} more than once under {}",
+                path.display(),
+                reference.subsystem,
+                owner
+            );
+        }
+    }
+    Ok(())
+}
+
+fn validate_subsystem_cycles<'a>(
+    id: &'a str,
+    definitions: &BTreeMap<&'a str, &'a ServerSubsystemDef>,
+    visiting: &mut Vec<&'a str>,
+    visited: &mut HashSet<&'a str>,
+    path: &Path,
+) -> anyhow::Result<()> {
+    if let Some(start) = visiting.iter().position(|candidate| *candidate == id) {
+        let mut cycle = visiting[start..].to_vec();
+        cycle.push(id);
+        anyhow::bail!(
+            "server config {} has recursive subsystem reference: {}",
+            path.display(),
+            cycle.join(" -> ")
+        );
+    }
+    if !visited.insert(id) {
+        return Ok(());
+    }
+    visiting.push(id);
+    let definition = definitions[id];
+    for child in &definition.subsystems {
+        validate_subsystem_cycles(
+            child.subsystem.as_str(),
+            definitions,
+            visiting,
+            visited,
+            path,
+        )?;
+    }
+    visiting.pop();
+    Ok(())
+}
+
+fn expand_subsystem_refs<'a>(
+    parent: &ScopeId,
+    references: &[ServerSubsystemRef],
+    definitions: &BTreeMap<&'a str, &'a ServerSubsystemDef>,
+    expanded: &mut Vec<ExpandedSubsystem<'a>>,
+) {
+    for reference in references {
+        let definition = definitions[reference.subsystem.as_str()];
+        for replica in 0..reference.replicas {
+            let scope = parent.child(SubsystemInstanceId::new(
+                definition.subsystem_id(),
+                ReplicaIndex::new(replica),
+            ));
+            expanded.push(ExpandedSubsystem {
+                scope: scope.clone(),
+                definition,
+            });
+            expand_subsystem_refs(&scope, &definition.subsystems, definitions, expanded);
+        }
+    }
+}
+
+fn expand_scope_labels<'a>(
+    parent: &ScopeId,
+    references: &[ServerSubsystemRef],
+    definitions: &BTreeMap<&'a str, &'a ServerSubsystemDef>,
+    labels: &mut Vec<(ScopeId, Arc<str>)>,
+) {
+    for reference in references {
+        let definition = definitions[reference.subsystem.as_str()];
+        let label = definition
+            .label
+            .as_deref()
+            .unwrap_or(definition.id.as_str())
+            .trim();
+        for replica in 0..reference.replicas {
+            let scope = parent.child(SubsystemInstanceId::new(
+                definition.subsystem_id(),
+                ReplicaIndex::new(replica),
+            ));
+            let segment: Arc<str> = if reference.replicas == 1 {
+                Arc::from(label)
+            } else {
+                Arc::from(format!("{label} {}", u16::from(replica) + 1))
+            };
+            labels.push((scope.clone(), segment));
+            expand_scope_labels(&scope, &definition.subsystems, definitions, labels);
+        }
     }
 }
 
@@ -1641,5 +1983,218 @@ activation-table = [1.0, 0.5]
         .to_string();
 
         assert!(error.contains("invalid replica range"), "{error}");
+    }
+
+    #[test]
+    fn subsystem_topology_expands_finite_nested_replicas() {
+        let config = parse_server_boot_config_content(
+            r#"
+@ subsystem-definitions[] {
+  id = "finger"
+  root: predict
+  memory-scope = "local"
+
+  @ modules[] {
+    id = "predict"
+    replica-min = 1
+    replica-max = 1
+    bpm-min = 1.0
+    bpm-max = 2.0
+    initial-activation = 1.0
+  }
+}
+
+@ subsystem-definitions[] {
+  id = "arm"
+  root: cognition-gate
+
+  @ modules[] {
+    id = "cognition-gate"
+    replica-min = 1
+    replica-max = 1
+    bpm-min = 1.0
+    bpm-max = 2.0
+    initial-activation = 1.0
+  }
+
+  @ subsystems[] {
+    subsystem = "finger"
+    replicas = 2
+  }
+}
+
+@ subsystems[] {
+  subsystem = "arm"
+  replicas = 2
+}
+"#,
+            Path::new(".tmp/server/config.eure"),
+        )
+        .unwrap();
+
+        assert_eq!(
+            config
+                .expanded_subsystems()
+                .into_iter()
+                .map(|expanded| expanded.scope.to_string())
+                .collect::<Vec<_>>(),
+            vec![
+                "/arm[0]",
+                "/arm[0]/finger[0]",
+                "/arm[0]/finger[1]",
+                "/arm[1]",
+                "/arm[1]/finger[0]",
+                "/arm[1]/finger[1]",
+            ]
+        );
+    }
+
+    #[test]
+    fn subsystem_topology_rejects_recursive_reference() {
+        let error = parse_server_boot_config_content(
+            r#"
+@ subsystem-definitions[] {
+  id = "alpha"
+  root: predict
+  @ modules[] {
+    id: predict
+    replica-min = 1
+    replica-max = 1
+    bpm-min = 1.0
+    bpm-max = 1.0
+    initial-activation = 1.0
+  }
+  @ subsystems[] { subsystem = "beta" replicas = 1 }
+}
+@ subsystem-definitions[] {
+  id = "beta"
+  root: predict
+  @ modules[] {
+    id: predict
+    replica-min = 1
+    replica-max = 1
+    bpm-min = 1.0
+    bpm-max = 1.0
+    initial-activation = 1.0
+  }
+  @ subsystems[] { subsystem = "alpha" replicas = 1 }
+}
+@ subsystems[] { subsystem = "alpha" replicas = 1 }
+"#,
+            Path::new(".tmp/server/config.eure"),
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(error.contains("alpha -> beta -> alpha"), "{error}");
+    }
+
+    #[test]
+    fn subsystem_gate_can_root_scopes_with_action_and_speak_modules() {
+        let config = parse_server_boot_config_content(
+            r#"
+@ subsystem-definitions[] {
+  id: arm
+  label: Arm
+  root: subsystem-gate
+  memory-scope: local
+
+  @ modules[] {
+    id: subsystem-gate
+    replica-min = 1
+    replica-max = 1
+    bpm-min = 1.0
+    bpm-max = 2.0
+    initial-activation = 1.0
+  }
+
+  @ modules[] {
+    id: action
+    replica-min = 0
+    replica-max = 1
+    bpm-min = 1.0
+    bpm-max = 2.0
+    initial-activation = 0.0
+  }
+
+  @ modules[] {
+    id: speak
+    replica-min = 0
+    replica-max = 1
+    bpm-min = 1.0
+    bpm-max = 2.0
+    initial-activation = 0.0
+  }
+}
+
+@ subsystems[] {
+  subsystem: arm
+  replicas = 2
+}
+"#,
+            Path::new(".tmp/server/subsystem-gate-test.eure"),
+        )
+        .unwrap();
+
+        assert_eq!(config.subsystem_definitions.len(), 1);
+        assert_eq!(
+            config.subsystem_definitions[0].root_module_id(),
+            builtin::subsystem_gate()
+        );
+        assert!(
+            config.subsystem_definitions[0]
+                .modules
+                .iter()
+                .any(|module| module.id == RuntimeModule::Action)
+        );
+        assert!(
+            config.subsystem_definitions[0]
+                .modules
+                .iter()
+                .any(|module| module.id == RuntimeModule::Speak)
+        );
+        assert_eq!(config.expanded_subsystems().len(), 2);
+        assert_eq!(
+            config.scope_labels().relative_descendant_label(
+                &ScopeId::root(),
+                &config.expanded_subsystems()[0].scope,
+            ),
+            Some("Arm 1".to_owned())
+        );
+    }
+
+    #[test]
+    fn single_subsystem_replica_omits_display_number() {
+        let config = parse_server_boot_config_content(
+            r#"
+@ subsystem-definitions[] {
+  id: arm
+  label: Arm
+  root: predict
+  @ modules[] {
+    id: predict
+    replica-min = 1
+    replica-max = 1
+    bpm-min = 1.0
+    bpm-max = 1.0
+    initial-activation = 1.0
+  }
+}
+@ subsystems[] {
+  subsystem: arm
+  replicas = 1
+}
+"#,
+            Path::new(".tmp/server/config.eure"),
+        )
+        .unwrap();
+        let scope = &config.expanded_subsystems()[0].scope;
+
+        assert_eq!(
+            config
+                .scope_labels()
+                .relative_descendant_label(&ScopeId::root(), scope),
+            Some("Arm".to_string())
+        );
     }
 }

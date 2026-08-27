@@ -4,7 +4,7 @@ use lutum::Session;
 use nuillu_module::{
     BlackboardReader, LlmAccess, LlmContextWindow, Memo, MemoUpdatedInbox, Module,
     SessionAutoCompaction, SessionCompactionConfig, SessionCompactionProtectedPrefix,
-    ensure_persistent_session_seeded, push_formatted_memo_log_batch,
+    ensure_persistent_session_seeded_in_context, push_formatted_memo_log_batch,
 };
 
 mod batch;
@@ -72,12 +72,7 @@ impl SelfModelModule {
 
     fn ensure_session_seeded(&mut self, cx: &nuillu_module::ActivateCx<'_>) {
         let system_prompt = self.system_prompt(cx).to_owned();
-        ensure_persistent_session_seeded(
-            &mut self.session,
-            system_prompt,
-            cx.identity_memories(),
-            cx.now(),
-        );
+        ensure_persistent_session_seeded_in_context(&mut self.session, system_prompt, cx);
     }
 
     fn system_prompt(&self, cx: &nuillu_module::ActivateCx<'_>) -> &str {

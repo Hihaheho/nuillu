@@ -8,6 +8,12 @@ activation-table.$optional = true
 modules = [`$types.server-module`]
 modules.$optional = true
 
+subsystem-definitions = [`$types.subsystem-definition`]
+subsystem-definitions.$optional = true
+
+subsystems = [`$types.subsystem-ref`]
+subsystems.$optional = true
+
 actions = [`$types.server-action`]
 actions.$optional = true
 
@@ -32,6 +38,7 @@ variants.policy-compaction = { = "policy-compaction", $variant => "literal" }
 variants.reward = { = "reward", $variant => "literal" }
 variants.predict = { = "predict", $variant => "literal" }
 variants.surprise = { = "surprise", $variant => "literal" }
+variants.subsystem-gate = { = "subsystem-gate", $variant => "literal" }
 variants.speak = { = "speak", $variant => "literal" }
 
 @ $types.model-tier
@@ -40,6 +47,27 @@ variants.cheap = { = "cheap", $variant => "literal" }
 variants.default = { = "default", $variant => "literal" }
 variants.premium = { = "premium", $variant => "literal" }
 variants.image = { = "image", $variant => "literal" }
+
+@ $types.memory-scope
+$variant: union
+variants.global = { = "global", $variant => "literal" }
+variants.local = { = "local", $variant => "literal" }
+
+@ $types.subsystem-definition
+id = `text`
+label = `text`
+label.$optional = true
+modules = [`$types.server-module`]
+modules.$optional = true
+root = `text`
+memory-scope = `$types.memory-scope`
+memory-scope.$optional = true
+subsystems = [`$types.subsystem-ref`]
+subsystems.$optional = true
+
+@ $types.subsystem-ref
+subsystem = `text`
+replicas = `integer`
 
 @ $types.module-group
 $variant: union

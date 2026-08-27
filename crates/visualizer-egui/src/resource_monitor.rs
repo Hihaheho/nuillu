@@ -39,6 +39,7 @@ impl ResourceMonitorState {
         let allocation = snapshot
             .allocation
             .iter()
+            .filter(|view| view.scope == "/")
             .map(|view| {
                 (
                     view.module.clone(),
@@ -752,6 +753,7 @@ fn aggregate_event_points(
 fn module_capacities(policies: &[ModulePolicyView]) -> BTreeMap<&str, u8> {
     policies
         .iter()
+        .filter(|policy| policy.scope == "/")
         .map(|policy| (policy.module.as_str(), policy.replica_capacity))
         .collect()
 }
@@ -983,6 +985,7 @@ mod tests {
     ) -> BlackboardSnapshot {
         BlackboardSnapshot {
             allocation: vec![AllocationView {
+                scope: "/".to_string(),
                 module: module.to_string(),
                 activation_ratio,
                 active_replicas,
@@ -990,6 +993,7 @@ mod tests {
                 period_ms: Some(period_ms),
             }],
             module_policies: vec![ModulePolicyView {
+                scope: "/".to_string(),
                 module: module.to_string(),
                 replica_min: 0,
                 replica_max: replica_capacity,

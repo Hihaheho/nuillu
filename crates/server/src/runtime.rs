@@ -20,6 +20,7 @@ use nuillu_agent::{
     AgentEventLoopConfig, AgentRunController, run_controlled_with_timer as run_agent,
 };
 use nuillu_blackboard::BlackboardCommand;
+use nuillu_memory::MemoryNamespace;
 use nuillu_module::{
     ActionAffordance, AmbientSensoryEntry, Participant, RuntimeEvent, SensoryInput,
     ports::{Timer, TokioTimer},
@@ -38,7 +39,7 @@ use crate::commands::{
     apply_persisted_module_settings, drive_server_until_shutdown, emit_action_affordances,
     emit_recent_activity_rows, emit_scene_state,
 };
-use crate::config::ServerConfig;
+use crate::config::{ServerConfig, ServerMemoryScope};
 use crate::environment::{build_native_host_ports, build_server_environment};
 use crate::gui::VisualizerHook;
 use crate::llm_db_trace::emit_persisted_llm_transcripts;
@@ -817,7 +818,13 @@ async fn run_server_inner(
             .await;
     }
 
-    emit_visualizer_blackboard_snapshot(SERVER_TAB_ID, &env.blackboard, visualizer).await;
+    emit_visualizer_blackboard_snapshot(
+        SERVER_TAB_ID,
+        &env.blackboard,
+        &config.boot_config,
+        visualizer,
+    )
+    .await;
     emit_persisted_llm_transcripts(
         env.llm_transcript_store.as_ref(),
         SERVER_TAB_ID,
@@ -833,6 +840,20 @@ async fn run_server_inner(
     };
     set_runtime_running(visualizer, &tab_id, &run_controller, !config.start_paused);
     let mut restart_count = 0_u64;
+    for expanded in config.boot_config.expanded_subsystems() {
+        let namespace = match expanded.definition.memory_scope {
+            ServerMemoryScope::Global => MemoryNamespace::Global,
+            ServerMemoryScope::Local => MemoryNamespace::Local(expanded.scope.clone()),
+        };
+        env.memory_caps
+            .with_namespace(namespace)
+            .scoped(env.blackboard.scoped(expanded.scope))
+            .bootstrap_identity_memories()
+            .await
+            .map_err(|error| {
+                anyhow::anyhow!("failed to load subsystem identity memories: {error}")
+            })?;
+    }
     loop {
         let mut registry = server_registry(
             &config.boot_config,

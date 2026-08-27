@@ -18,7 +18,7 @@ use nuillu_module::{
     ports::{Clock, Timer, TokioTimer},
     with_activation_llm_request_metadata,
 };
-use nuillu_types::{ModelTier, ModuleId, ModuleInstanceId, ReplicaIndex, builtin};
+use nuillu_types::{ModelTier, ModuleId, ModuleInstanceId, ReplicaIndex, ScopedModuleId, builtin};
 use thiserror::Error;
 use tokio::sync::{oneshot, watch};
 use tokio::task::{JoinHandle, spawn_local};
@@ -269,17 +269,17 @@ pub async fn run_controlled_with_timer(
         .collect::<Vec<_>>();
     let mut kick_inboxes: Vec<Option<KickInbox>> = Vec::with_capacity(owners.len());
     let mut kick_handles = Vec::with_capacity(owners.len());
-    let mut target_indexes_by_role = HashMap::<ModuleId, Vec<usize>>::new();
-    let mut replica_zero_index_by_role = HashMap::<ModuleId, usize>::new();
+    let mut target_indexes_by_role = HashMap::<ScopedModuleId, Vec<usize>>::new();
+    let mut replica_zero_index_by_role = HashMap::<ScopedModuleId, usize>::new();
     for (index, owner) in owners.iter().enumerate() {
         let (inbox, handle) = KickInbox::new();
         kick_inboxes.push(Some(inbox));
         kick_handles.push(handle);
         if owner.replica == ReplicaIndex::ZERO {
-            replica_zero_index_by_role.insert(owner.module.clone(), index);
+            replica_zero_index_by_role.insert(owner.scoped_module(), index);
         }
         target_indexes_by_role
-            .entry(owner.module.clone())
+            .entry(owner.scoped_module())
             .or_default()
             .push(index);
     }
@@ -782,11 +782,11 @@ impl ZeroReplicaWindowState {
 
 #[derive(Debug, Clone)]
 struct ZeroReplicaWindows {
-    states: HashMap<ModuleId, ZeroReplicaWindowState>,
+    states: HashMap<ScopedModuleId, ZeroReplicaWindowState>,
 }
 
 impl ZeroReplicaWindows {
-    fn new(policies: HashMap<ModuleId, ZeroReplicaWindowPolicy>) -> Self {
+    fn new(policies: HashMap<ScopedModuleId, ZeroReplicaWindowPolicy>) -> Self {
         let states = policies
             .into_iter()
             .filter_map(|(module, policy)| {
@@ -796,7 +796,7 @@ impl ZeroReplicaWindows {
         Self { states }
     }
 
-    fn sync(&mut self, policies: HashMap<ModuleId, ZeroReplicaWindowPolicy>) {
+    fn sync(&mut self, policies: HashMap<ScopedModuleId, ZeroReplicaWindowPolicy>) {
         self.states
             .retain(|module, _| policies.contains_key(module));
         for (module, policy) in policies {
@@ -814,7 +814,7 @@ impl ZeroReplicaWindows {
         owner.replica == ReplicaIndex::ZERO
             && self
                 .states
-                .get(&owner.module)
+                .get(&owner.scoped_module())
                 .is_some_and(|state| state.permit.is_some())
     }
 
@@ -822,7 +822,7 @@ impl ZeroReplicaWindows {
         if owner.replica != ReplicaIndex::ZERO {
             return;
         }
-        if let Some(state) = self.states.get_mut(&owner.module)
+        if let Some(state) = self.states.get_mut(&owner.scoped_module())
             && matches!(state.permit, Some(ZeroReplicaPermit::Open))
         {
             state.permit = Some(ZeroReplicaPermit::InFlight);
@@ -833,7 +833,7 @@ impl ZeroReplicaWindows {
         if owner.replica != ReplicaIndex::ZERO {
             return;
         }
-        if let Some(state) = self.states.get_mut(&owner.module)
+        if let Some(state) = self.states.get_mut(&owner.scoped_module())
             && matches!(state.permit, Some(ZeroReplicaPermit::InFlight))
         {
             state.permit = None;
@@ -842,7 +842,7 @@ impl ZeroReplicaWindows {
 
     fn reset_allocation_active(&mut self, owners: &[ModuleInstanceId], active: &[bool]) {
         for (owner, active) in owners.iter().zip(active.iter().copied()) {
-            if active && let Some(state) = self.states.get_mut(&owner.module) {
+            if active && let Some(state) = self.states.get_mut(&owner.scoped_module()) {
                 state.reset();
             }
         }
@@ -851,11 +851,15 @@ impl ZeroReplicaWindows {
     async fn record_controller_activation(
         &mut self,
         runtime: &AgentRuntimeControl,
-    ) -> Vec<ModuleId> {
+        scope: &nuillu_types::ScopeId,
+    ) -> Vec<ScopedModuleId> {
         self.sync(runtime.zero_replica_window_policies().await);
         let modules = self.states.keys().cloned().collect::<Vec<_>>();
         let mut opened = Vec::new();
         for module in modules {
+            if &module.scope != scope {
+                continue;
+            }
             let active_replicas = runtime.active_replicas(&module).await;
             let Some(state) = self.states.get_mut(&module) else {
                 continue;
@@ -875,11 +879,11 @@ impl ZeroReplicaWindows {
 #[derive(Clone)]
 struct DependencyTargets {
     dependencies: Arc<ModuleDependencies>,
-    target_indexes_by_role: Arc<HashMap<ModuleId, Vec<usize>>>,
+    target_indexes_by_role: Arc<HashMap<ScopedModuleId, Vec<usize>>>,
 }
 
 impl DependencyTargets {
-    fn target_indexes(&self, dependent: &ModuleId) -> Vec<usize> {
+    fn target_indexes(&self, dependent: &ScopedModuleId) -> Vec<usize> {
         let mut indexes = Vec::new();
         for dep_id in self.dependencies.deps_of(dependent) {
             let Some(targets) = self.target_indexes_by_role.get(dep_id) else {
@@ -890,7 +894,7 @@ impl DependencyTargets {
         indexes
     }
 
-    fn has_dependencies(&self, dependent: &ModuleId) -> bool {
+    fn has_dependencies(&self, dependent: &ScopedModuleId) -> bool {
         !self.dependencies.deps_of(dependent).is_empty()
     }
 }
@@ -1023,8 +1027,8 @@ async fn refresh_active_and_schedule(
     }
     zero_windows.reset_allocation_active(owners, &allocation_active);
     for (index, owner) in owners.iter().enumerate() {
-        let self_wake_permit_active = runtime.has_pending_self_wake_permit(owner)
-            && !runtime.is_forced_disabled(&owner.module).await;
+        let self_wake_permit_active =
+            runtime.has_pending_self_wake_permit(owner) && !runtime.is_forced_disabled(owner).await;
         active[index] =
             allocation_active[index] || zero_windows.allows(owner) || self_wake_permit_active;
     }
@@ -1037,7 +1041,7 @@ async fn refresh_active_and_schedule(
                     self_wake_activation_permit: true,
                     ..
                 }
-            ) && !runtime.is_forced_disabled(&owners[index].module).await;
+            ) && !runtime.is_forced_disabled(&owners[index]).await;
         let state_active = active[index] || state_self_wake_activation_active;
         match &states[index] {
             ModuleState::Stored { .. } if state_active => {
@@ -1047,7 +1051,8 @@ async fn refresh_active_and_schedule(
                 let pending_wake = runtime.has_pending_wake(&owners[index]);
                 let has_pending_self_wake_permit =
                     runtime.has_pending_self_wake_permit(&owners[index]);
-                let has_dependencies = dependency_targets.has_dependencies(&owners[index].module);
+                let has_dependencies =
+                    dependency_targets.has_dependencies(&owners[index].scoped_module());
                 if has_dependencies && !pending_wake && !has_pending_self_wake_permit {
                     continue;
                 }
@@ -1206,8 +1211,8 @@ async fn refresh_active_and_schedule(
                     runtime
                         .record_module_status(owners[index].clone(), ModuleRunStatus::Activating)
                         .await;
-                    let peer_contexts = runtime.peer_contexts();
-                    let identity_memories = runtime.identity_memories().await;
+                    let peer_contexts = runtime.peer_contexts(&owners[index]);
+                    let identity_memories = runtime.identity_memories(&owners[index]).await;
                     let core_policies = runtime.core_policies().await;
                     spawn_activate(
                         tasks,
@@ -1382,7 +1387,7 @@ async fn handle_task_message(
     zero_window_wakers: &mut [Option<oneshot::Sender<()>>],
     kick_handles: &[KickHandle],
     dependency_targets: &DependencyTargets,
-    replica_zero_index_by_role: &HashMap<ModuleId, usize>,
+    replica_zero_index_by_role: &HashMap<ScopedModuleId, usize>,
     zero_windows: &mut ZeroReplicaWindows,
     consecutive_failures: &mut [u32],
     scheduling_enabled: bool,
@@ -1578,7 +1583,9 @@ async fn handle_task_message(
                 };
                 zero_windows.finish(&owners[index]);
                 if scheduling_enabled && owners[index].module == builtin::allocation() {
-                    let opened = zero_windows.record_controller_activation(runtime).await;
+                    let opened = zero_windows
+                        .record_controller_activation(runtime, &owners[index].scope)
+                        .await;
                     wake_zero_window_modules(
                         opened,
                         replica_zero_index_by_role,
@@ -1628,8 +1635,8 @@ async fn handle_task_message(
                         .record_module_status(owners[index].clone(), ModuleRunStatus::Activating)
                         .await;
                     states[index] = ModuleState::Activating;
-                    let peer_contexts = runtime.peer_contexts();
-                    let identity_memories = runtime.identity_memories().await;
+                    let peer_contexts = runtime.peer_contexts(&owners[index]);
+                    let identity_memories = runtime.identity_memories(&owners[index]).await;
                     let core_policies = runtime.core_policies().await;
                     spawn_activate(
                         tasks,
@@ -1766,7 +1773,7 @@ async fn scheduling_active(
     owner: &ModuleInstanceId,
     has_self_wake_permit_claim: bool,
 ) -> bool {
-    if runtime.is_forced_disabled(&owner.module).await {
+    if runtime.is_forced_disabled(owner).await {
         return false;
     }
     if has_self_wake_permit_claim || runtime.has_pending_self_wake_permit(owner) {
@@ -1781,8 +1788,8 @@ async fn scheduling_active(
 }
 
 fn wake_zero_window_modules(
-    modules: Vec<ModuleId>,
-    replica_zero_index_by_role: &HashMap<ModuleId, usize>,
+    modules: Vec<ScopedModuleId>,
+    replica_zero_index_by_role: &HashMap<ScopedModuleId, usize>,
     zero_window_wakers: &mut [Option<oneshot::Sender<()>>],
 ) {
     for module in modules {
@@ -1895,7 +1902,7 @@ async fn collect_dependency_settle_completions(
     subscriber: &tracing::Dispatch,
 ) -> Vec<DependencyWait> {
     let mut completions = Vec::new();
-    for target_index in dependency_targets.target_indexes(&sender.module) {
+    for target_index in dependency_targets.target_indexes(&sender.scoped_module()) {
         if target_index == dependent_index {
             continue;
         }
@@ -2144,8 +2151,8 @@ async fn spawn_activation_gate_or_activate(
         runtime
             .record_module_status(owner.clone(), ModuleRunStatus::Activating)
             .await;
-        let peer_contexts = runtime.peer_contexts();
-        let identity_memories = runtime.identity_memories().await;
+        let peer_contexts = runtime.peer_contexts(&owner);
+        let identity_memories = runtime.identity_memories(&owner).await;
         let core_policies = runtime.core_policies().await;
         spawn_activate(
             tasks,
@@ -2718,7 +2725,7 @@ mod tests {
     };
     use nuillu_types::{
         MemoryContent, MemoryIndex, ModelTier, ModuleActivationId, ModuleId, ModuleInstanceId,
-        ReplicaCapRange, ReplicaIndex, builtin,
+        ReplicaCapRange, ReplicaIndex, ScopedModuleId, builtin,
     };
     use tokio::sync::oneshot;
     use tokio::task::LocalSet;
@@ -7272,7 +7279,10 @@ mod tests {
                 }
 
                 let mut target_indexes_by_role = HashMap::new();
-                target_indexes_by_role.insert(dependency_id, vec![dependency_index]);
+                target_indexes_by_role.insert(
+                    ScopedModuleId::new(nuillu_types::ScopeId::root(), dependency_id),
+                    vec![dependency_index],
+                );
                 let dependency_targets = super::DependencyTargets {
                     dependencies: Arc::new(dependencies),
                     target_indexes_by_role: Arc::new(target_indexes_by_role),
@@ -7367,7 +7377,10 @@ mod tests {
                 }
 
                 let mut target_indexes_by_role = HashMap::new();
-                target_indexes_by_role.insert(dependency_id, vec![dependency_index]);
+                target_indexes_by_role.insert(
+                    ScopedModuleId::new(nuillu_types::ScopeId::root(), dependency_id),
+                    vec![dependency_index],
+                );
                 let dependency_targets = super::DependencyTargets {
                     dependencies: Arc::new(dependencies),
                     target_indexes_by_role: Arc::new(target_indexes_by_role),
@@ -7874,7 +7887,7 @@ mod tests {
                 }
                 let mut target_indexes_by_role = HashMap::new();
                 target_indexes_by_role
-                    .insert(dependency_owner.module.clone(), vec![dependency_index]);
+                    .insert(dependency_owner.scoped_module(), vec![dependency_index]);
                 let dependency_targets = super::DependencyTargets {
                     dependencies: Arc::new(dependencies),
                     target_indexes_by_role: Arc::new(target_indexes_by_role),
@@ -8084,7 +8097,10 @@ mod tests {
                     kick_handles.push(kick_handle);
                 }
                 let mut target_indexes_by_role = HashMap::new();
-                target_indexes_by_role.insert(dependency_id, vec![dependency_index]);
+                target_indexes_by_role.insert(
+                    ScopedModuleId::new(nuillu_types::ScopeId::root(), dependency_id),
+                    vec![dependency_index],
+                );
                 let dependency_targets = super::DependencyTargets {
                     dependencies: Arc::new(dependencies),
                     target_indexes_by_role: Arc::new(target_indexes_by_role),
@@ -8278,8 +8294,8 @@ mod tests {
                     batch,
                     test_config(),
                     runtime.clone(),
-                    runtime.peer_contexts(),
-                    runtime.identity_memories().await,
+                    runtime.peer_contexts(&owner),
+                    runtime.identity_memories(&owner).await,
                     runtime.core_policies().await,
                     test_timer(),
                     &parent,

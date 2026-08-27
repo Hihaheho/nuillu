@@ -5,14 +5,15 @@ use nuillu_blackboard::{
     ResourceAllocation, ZeroReplicaWindowPolicy,
 };
 use nuillu_memory::{LinkedMemoryRecord, MemoryRecord};
-use nuillu_types::MemoryRank;
+use nuillu_types::{MemoryRank, ScopeId};
 use nuillu_visualizer_protocol::{
     AllocationView, BlackboardSnapshot, CognitionEntryView, CognitionLogView, InteroceptionView,
     LinkedMemoryRecordView, MemoView, MemoryConceptView, MemoryLinkView, MemoryMetadataView,
-    MemoryRecordView, MemoryTagView, ModulePolicyView, ModuleStatusView, UtteranceProgressView,
-    VisualizerEvent, VisualizerTabId, ZeroReplicaWindowView,
+    MemoryRecordView, MemoryTagView, ModulePolicyView, ModuleStatusView, ScopeView,
+    UtteranceProgressView, VisualizerEvent, VisualizerTabId, ZeroReplicaWindowView,
 };
 
+use super::config::{ServerBootConfig, ServerMemoryScope};
 use super::gui::VisualizerHook;
 
 const VISUALIZER_MEMORY_METADATA_LIMIT: usize = 512;
@@ -20,13 +21,69 @@ const VISUALIZER_MEMORY_METADATA_LIMIT: usize = 512;
 pub(crate) async fn emit_visualizer_blackboard_snapshot(
     tab_id: &str,
     blackboard: &Blackboard,
+    boot_config: &ServerBootConfig,
     visualizer: &VisualizerHook,
 ) {
-    let snapshot = blackboard.read(visualizer_blackboard_snapshot).await;
+    let mut snapshot = BlackboardSnapshot {
+        scopes: scope_views(boot_config),
+        ..BlackboardSnapshot::default()
+    };
+    for scoped_blackboard in blackboard.all_scopes() {
+        let scope = scoped_blackboard.scope().clone();
+        let scoped_snapshot = scoped_blackboard
+            .read(|bb| visualizer_scoped_blackboard_snapshot(&scope, bb))
+            .await;
+        merge_blackboard_snapshot(&mut snapshot, scoped_snapshot, scope.is_root());
+    }
     visualizer.send_event(VisualizerEvent::BlackboardSnapshot {
         tab_id: VisualizerTabId::new(tab_id.to_string()),
         snapshot,
     });
+}
+
+fn scope_views(boot_config: &ServerBootConfig) -> Vec<ScopeView> {
+    let expanded = boot_config.expanded_subsystems();
+    if expanded.is_empty() {
+        return Vec::new();
+    }
+    let mut scopes = vec![ScopeView {
+        id: ScopeId::root().to_string(),
+        parent: None,
+        root_module: None,
+        memory_scope: "global".to_owned(),
+    }];
+    scopes.extend(expanded.into_iter().map(|expanded| {
+        ScopeView {
+            id: expanded.scope.to_string(),
+            parent: expanded.scope.parent().map(|scope| scope.to_string()),
+            root_module: Some(expanded.definition.root_module_id().to_string()),
+            memory_scope: match expanded.definition.memory_scope {
+                ServerMemoryScope::Global => "global",
+                ServerMemoryScope::Local => "local",
+            }
+            .to_owned(),
+        }
+    }));
+    scopes.sort_by(|left, right| left.id.cmp(&right.id));
+    scopes
+}
+
+fn merge_blackboard_snapshot(
+    target: &mut BlackboardSnapshot,
+    mut source: BlackboardSnapshot,
+    root: bool,
+) {
+    target.module_statuses.append(&mut source.module_statuses);
+    target.allocation.append(&mut source.allocation);
+    target.module_policies.append(&mut source.module_policies);
+    if root {
+        target.interoception = source.interoception;
+        target.forced_disabled_modules = source.forced_disabled_modules;
+        target.memos = source.memos;
+        target.cognition_logs = source.cognition_logs;
+        target.utterance_progresses = source.utterance_progresses;
+        target.memory_metadata = source.memory_metadata;
+    }
 }
 
 pub fn memory_record_view(record: MemoryRecord) -> MemoryRecordView {
@@ -77,9 +134,18 @@ pub fn linked_memory_record_view(record: LinkedMemoryRecord) -> LinkedMemoryReco
     }
 }
 
+#[cfg(test)]
 fn visualizer_blackboard_snapshot(bb: &BlackboardInner) -> BlackboardSnapshot {
-    let cognition_log_set = bb.cognition_log_set();
+    visualizer_scoped_blackboard_snapshot(&ScopeId::root(), bb)
+}
+
+fn visualizer_scoped_blackboard_snapshot(
+    scope: &ScopeId,
+    bb: &BlackboardInner,
+) -> BlackboardSnapshot {
+    let include_root_content = scope.is_root();
     BlackboardSnapshot {
+        scopes: Vec::new(),
         module_statuses: bb
             .module_status_records()
             .into_iter()
@@ -90,10 +156,12 @@ fn visualizer_blackboard_snapshot(bb: &BlackboardInner) -> BlackboardSnapshot {
                 status: format!("{:?}", record.status),
             })
             .collect(),
-        allocation: allocation_views(bb.allocation()),
-        interoception: interoception_view(bb.interoception()),
-        module_policies: module_policy_views(bb),
-        forced_disabled_modules: {
+        allocation: allocation_views(scope, bb.allocation()),
+        interoception: include_root_content
+            .then(|| interoception_view(bb.interoception()))
+            .unwrap_or_default(),
+        module_policies: scoped_module_policy_views(scope, bb),
+        forced_disabled_modules: if include_root_content {
             let mut modules = bb
                 .forced_disabled_modules()
                 .iter()
@@ -101,49 +169,65 @@ fn visualizer_blackboard_snapshot(bb: &BlackboardInner) -> BlackboardSnapshot {
                 .collect::<Vec<_>>();
             modules.sort();
             modules
+        } else {
+            Vec::new()
         },
-        memos: bb
-            .recent_memo_logs()
-            .into_iter()
-            .map(|record| MemoView {
-                owner: record.owner.to_string(),
-                module: record.owner.module.as_str().to_owned(),
-                replica: record.owner.replica.get(),
-                index: record.index,
-                written_at: record.written_at,
-                cognitive: record.cognitive,
-                content: record.content,
-            })
-            .collect(),
-        cognition_logs: cognition_log_set
-            .logs()
-            .iter()
-            .map(|record| CognitionLogView {
-                source: record.source.to_string(),
-                entries: record
-                    .entries
-                    .iter()
-                    .map(|entry| CognitionEntryView {
-                        at: entry.at,
-                        origin: entry.origin.owner.to_string(),
-                        text: entry.text.clone(),
-                    })
-                    .collect(),
-            })
-            .collect(),
-        utterance_progresses: bb
-            .utterance_progress_records()
-            .into_iter()
-            .map(|record| UtteranceProgressView {
-                owner: record.owner.to_string(),
-                target: record.progress.target,
-                generation_id: record.progress.generation_id,
-                sequence: record.progress.sequence,
-                state: format!("{:?}", record.progress.state),
-                partial_utterance: record.progress.partial_utterance,
-            })
-            .collect(),
-        memory_metadata: memory_metadata_views(bb),
+        memos: if include_root_content {
+            bb.recent_memo_logs()
+                .into_iter()
+                .map(|record| MemoView {
+                    owner: record.owner.to_string(),
+                    module: record.owner.module.as_str().to_owned(),
+                    replica: record.owner.replica.get(),
+                    index: record.index,
+                    written_at: record.written_at,
+                    cognitive: record.cognitive,
+                    content: record.content,
+                })
+                .collect()
+        } else {
+            Vec::new()
+        },
+        cognition_logs: if include_root_content {
+            bb.cognition_log_set()
+                .logs()
+                .iter()
+                .map(|record| CognitionLogView {
+                    source: record.source.to_string(),
+                    entries: record
+                        .entries
+                        .iter()
+                        .map(|entry| CognitionEntryView {
+                            at: entry.at,
+                            origin: entry.origin.owner.to_string(),
+                            text: entry.text.clone(),
+                        })
+                        .collect(),
+                })
+                .collect()
+        } else {
+            Vec::new()
+        },
+        utterance_progresses: if include_root_content {
+            bb.utterance_progress_records()
+                .into_iter()
+                .map(|record| UtteranceProgressView {
+                    owner: record.owner.to_string(),
+                    target: record.progress.target,
+                    generation_id: record.progress.generation_id,
+                    sequence: record.progress.sequence,
+                    state: format!("{:?}", record.progress.state),
+                    partial_utterance: record.progress.partial_utterance,
+                })
+                .collect()
+        } else {
+            Vec::new()
+        },
+        memory_metadata: if include_root_content {
+            memory_metadata_views(bb)
+        } else {
+            Vec::new()
+        },
     }
 }
 
@@ -168,13 +252,14 @@ fn interoceptive_mode_name(mode: InteroceptiveMode) -> &'static str {
     }
 }
 
-fn allocation_views(allocation: &ResourceAllocation) -> Vec<AllocationView> {
+fn allocation_views(scope: &ScopeId, allocation: &ResourceAllocation) -> Vec<AllocationView> {
     let mut modules = allocation
         .module_ids()
         .into_iter()
         .map(|module| {
             let bpm = allocation.bpm_for(&module);
             AllocationView {
+                scope: scope.to_string(),
                 bpm: bpm.map(|bpm| bpm.as_f64()),
                 period_ms: bpm.map(|bpm| duration_millis_u64(bpm.period())),
                 module: module.as_str().to_owned(),
@@ -188,10 +273,15 @@ fn allocation_views(allocation: &ResourceAllocation) -> Vec<AllocationView> {
 }
 
 pub fn module_policy_views(bb: &BlackboardInner) -> Vec<ModulePolicyView> {
+    scoped_module_policy_views(&ScopeId::root(), bb)
+}
+
+fn scoped_module_policy_views(scope: &ScopeId, bb: &BlackboardInner) -> Vec<ModulePolicyView> {
     let mut policies = bb
         .module_policies()
         .iter()
         .map(|(module, policy)| ModulePolicyView {
+            scope: scope.to_string(),
             module: module.as_str().to_owned(),
             replica_min: policy.replicas_range.min,
             replica_max: policy.replicas_range.max,
@@ -278,6 +368,53 @@ mod tests {
     use nuillu_types::MemoryIndex;
 
     use super::*;
+
+    #[test]
+    fn scope_views_include_parent_root_and_memory_mode() {
+        let config = crate::config::parse_server_boot_config_content(
+            r#"
+@ subsystem-definitions[] {
+  id: arm
+  root: predict
+  memory-scope: local
+
+  @ modules[] {
+    id: predict
+    replica-min = 1
+    replica-max = 1
+    bpm-min = 1.0
+    bpm-max = 2.0
+    initial-activation = 1.0
+  }
+}
+
+@ subsystems[] {
+  subsystem: arm
+  replicas = 2
+}
+"#,
+            std::path::Path::new(".tmp/server/scope-view-test.eure"),
+        )
+        .unwrap();
+
+        let scopes = scope_views(&config);
+        assert_eq!(scopes.len(), 3);
+        assert_eq!(
+            scopes[0],
+            ScopeView {
+                id: "/".to_string(),
+                parent: None,
+                root_module: None,
+                memory_scope: "global".to_string(),
+            }
+        );
+        assert!(scopes.contains(&ScopeView {
+            id: "/arm[0]".to_string(),
+            parent: Some("/".to_string()),
+            root_module: Some("predict".to_string()),
+            memory_scope: "local".to_string(),
+        }));
+    }
 
     #[tokio::test(flavor = "current_thread")]
     async fn visualizer_snapshot_includes_interoception() {

@@ -14,7 +14,9 @@ mod scalars;
 
 pub use ids::{
     ModuleActivationId, ModuleGroupId, ModuleGroupIdParseError, ModuleId, ModuleIdParseError,
-    ModuleInstanceId, ReplicaCapRange, ReplicaCapRangeError, ReplicaIndex, builtin,
+    ModuleInstanceId, ModuleInstanceStorageParseError, ReplicaCapRange, ReplicaCapRangeError,
+    ReplicaIndex, ScopeId, ScopedModuleId, SubsystemId, SubsystemIdParseError, SubsystemInstanceId,
+    builtin,
 };
 pub use memory::{MemoryContent, MemoryIndex, MemoryRank};
 pub use model::{ModelTier, TokenBudget};

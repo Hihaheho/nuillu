@@ -1,12 +1,13 @@
 use anyhow::{Context, Result};
 use async_trait::async_trait;
+#[cfg(test)]
 use chrono::{DateTime, Utc};
 use lutum::{Session, TextStepOutcomeWithTools, ToolResult, Usage};
 use nuillu_module::{
     BlackboardReader, CognitionLogReader, CognitionLogUpdatedInbox, LlmAccess, LlmContextWindow,
     Memo, MemoUpdatedInbox, Module, SessionAutoCompaction, SessionCompactionConfig,
-    SessionCompactionProtectedPrefix, ensure_persistent_session_seeded,
-    format_new_cognition_log_entries, format_source_blind_memo_log_batch,
+    SessionCompactionProtectedPrefix, ensure_persistent_session_seeded_in_context,
+    format_new_cognition_log_entries_in_context, format_source_blind_memo_log_batch,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -71,19 +72,22 @@ pub fn session_auto_compaction() -> SessionAutoCompaction {
     )
 }
 
-fn format_attention_schema_update_input(
+fn format_attention_schema_update_input_in_context(
     batch: &AttentionSchemaBatch,
-    now: DateTime<Utc>,
+    cx: &nuillu_module::ActivateCx<'_>,
 ) -> Option<String> {
     let mut sections = Vec::new();
     if let Some(memos) =
-        format_source_blind_memo_log_batch(&batch.memo_logs, now, MEMO_CONTEXT_WINDOW)
+        format_source_blind_memo_log_batch(&batch.memo_logs, cx.now(), MEMO_CONTEXT_WINDOW)
     {
         sections.push(memos);
     }
-    if let Some(cognition) =
-        format_new_cognition_log_entries(&batch.cognition_log, now, COGNITION_CONTEXT_WINDOW)
-    {
+    if let Some(cognition) = format_new_cognition_log_entries_in_context(
+        &batch.cognition_log,
+        cx.now(),
+        COGNITION_CONTEXT_WINDOW,
+        cx,
+    ) {
         sections.push(cognition);
     }
     if sections.is_empty() {
@@ -208,12 +212,7 @@ impl AttentionSchemaModule {
 
     fn ensure_session_seeded(&mut self, cx: &nuillu_module::ActivateCx<'_>) {
         let model_prompt = self.model_prompt(cx).to_owned();
-        ensure_persistent_session_seeded(
-            &mut self.session,
-            model_prompt,
-            cx.identity_memories(),
-            cx.now(),
-        );
+        ensure_persistent_session_seeded_in_context(&mut self.session, model_prompt, cx);
     }
 
     fn model_prompt(&self, cx: &nuillu_module::ActivateCx<'_>) -> &str {
@@ -230,7 +229,7 @@ impl AttentionSchemaModule {
     ) -> Result<()> {
         self.ensure_session_seeded(cx);
 
-        let Some(update_input) = format_attention_schema_update_input(batch, cx.now()) else {
+        let Some(update_input) = format_attention_schema_update_input_in_context(batch, cx) else {
             return Ok(());
         };
 

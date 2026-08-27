@@ -7,7 +7,7 @@ use lutum::{ModelInput, Session, StagedTextStepOutcomeWithTools, StructuredTurnO
 use nuillu_module::{
     BlackboardReader, CognitionLogUpdatedInbox, LlmAccess, LlmContextWindow, MemoLogRecord, Module,
     SessionAutoCompaction, SessionCompactionConfig, SessionCompactionProtectedPrefix, TypedMemo,
-    ensure_persistent_session_seeded, format_memory_trace_inventory, memory_rank_counts,
+    ensure_persistent_session_seeded_in_context, format_memory_trace_inventory, memory_rank_counts,
     push_formatted_memo_log_batch, render_memory_for_llm,
 };
 use nuillu_types::{MemoryIndex, MemoryRank};
@@ -332,12 +332,7 @@ impl QueryMemoryModule {
 
     fn ensure_session_seeded(&mut self, cx: &nuillu_module::ActivateCx<'_>) {
         let system_prompt = self.system_prompt(cx).to_owned();
-        ensure_persistent_session_seeded(
-            &mut self.session,
-            system_prompt,
-            cx.identity_memories(),
-            cx.now(),
-        );
+        ensure_persistent_session_seeded_in_context(&mut self.session, system_prompt, cx);
     }
 
     #[tracing::instrument(skip_all, err(Debug, level = "warn"))]
@@ -689,11 +684,10 @@ impl QueryMemoryModule {
         retrieval: &QueryMemoryRetrieval,
     ) -> Result<QueryMemoryFilterOutcome> {
         let input = ModelInput::new()
-            .system(nuillu_module::format_system_seed(
+            .system(nuillu_module::format_system_seed_in_context(
                 self.system_prompt(cx),
                 false,
-                cx.identity_memories(),
-                cx.now(),
+                cx,
             ))
             .user(format_evidence_selection_request(requests, retrieval))
             .user(EVIDENCE_SELECTION_INSTRUCTION);

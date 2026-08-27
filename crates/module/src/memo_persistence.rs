@@ -1,10 +1,12 @@
 use async_trait::async_trait;
 use nuillu_blackboard::{MemoLogPayload, MemoLogRecord};
+use nuillu_types::ScopeId;
 
 use crate::ports::PortError;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct PersistedMemoLogEntry {
+    pub scope: ScopeId,
     pub record: MemoLogRecord,
     pub payload: MemoLogPayload,
 }

@@ -126,7 +126,11 @@ impl ActivationGateHub {
         target: &ModuleInstanceId,
         batch: ModuleBatch,
     ) -> Vec<oneshot::Receiver<ActivationGateVote>> {
-        let allocation = self.blackboard.read(|bb| bb.allocation().clone()).await;
+        let allocation = self
+            .blackboard
+            .scoped(target.scope.clone())
+            .read(|bb| bb.allocation().clone())
+            .await;
         let batch_type = batch.type_id();
         let mut receivers = Vec::new();
         let mut inner = self.inner.lock().expect("activation gate hub poisoned");
@@ -137,6 +141,7 @@ impl ActivationGateHub {
 
         for subscriber in inner.subscribers.iter().filter(|subscriber| {
             subscriber.target_module == target.module
+                && subscriber.owner.scope == target.scope
                 && subscriber.batch_type == batch_type
                 && allocation.is_replica_active(&subscriber.owner)
         }) {

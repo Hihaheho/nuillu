@@ -13,12 +13,12 @@ use nuillu_types::ModuleInstanceId;
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Error as _};
 
 use crate::mind_format::IDENTITY_MEMORY_SEED_PREFIX;
+use crate::mind_session::{
+    format_system_seed_with_identity, seed_persistent_faculty_session_with_identity,
+};
 use crate::ports::PortError;
 use crate::session_compaction::{SessionCompactionConfig, SessionCompactionProtectedPrefix};
-use crate::{
-    REASONING_SYSTEM_PROMPT, format_identity_memory_seed, format_system_seed,
-    seed_persistent_faculty_session,
-};
+use crate::{ActivateCx, REASONING_SYSTEM_PROMPT, format_identity_memory_seed};
 
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -224,6 +224,31 @@ pub fn ensure_persistent_session_seeded(
     identity_memories: &[IdentityMemoryRecord],
     now: DateTime<Utc>,
 ) {
+    ensure_persistent_session_seeded_inner(session, system_prompt, identity_memories, now, None);
+}
+
+pub fn ensure_persistent_session_seeded_in_context(
+    session: &mut Session,
+    system_prompt: impl Into<String>,
+    cx: &ActivateCx<'_>,
+) {
+    let scope_display_name = cx.scope_display_name();
+    ensure_persistent_session_seeded_inner(
+        session,
+        system_prompt,
+        cx.identity_memories(),
+        cx.now(),
+        scope_display_name.as_deref(),
+    );
+}
+
+fn ensure_persistent_session_seeded_inner(
+    session: &mut Session,
+    system_prompt: impl Into<String>,
+    identity_memories: &[IdentityMemoryRecord],
+    now: DateTime<Utc>,
+    scope_display_name: Option<&str>,
+) {
     let system_prompt = system_prompt.into();
     let reasoning = persistent_session_metadata(session)
         .map(|metadata| metadata.reasoning)
@@ -236,13 +261,36 @@ pub fn ensure_persistent_session_seeded(
         Some(_) | None => true,
     };
     if !should_seed {
-        ensure_combined_system_seed(session, &system_prompt, reasoning, identity_memories, now);
+        // Existing/restored sessions retain their original scope identity.
+        // Config label changes require an explicit session reset.
+        ensure_combined_system_seed(
+            session,
+            &system_prompt,
+            reasoning,
+            identity_memories,
+            now,
+            None,
+        );
         return;
     }
     if leading_system_text(session.input().items()).is_some() {
-        ensure_combined_system_seed(session, &system_prompt, reasoning, identity_memories, now);
+        ensure_combined_system_seed(
+            session,
+            &system_prompt,
+            reasoning,
+            identity_memories,
+            now,
+            scope_display_name,
+        );
     } else {
-        seed_persistent_faculty_session(session, system_prompt, reasoning, identity_memories, now);
+        seed_persistent_faculty_session_with_identity(
+            session,
+            system_prompt,
+            reasoning,
+            identity_memories,
+            now,
+            scope_display_name,
+        );
     }
     if let Some(metadata) = persistent_session_metadata_mut(session) {
         metadata.seeded = true;
@@ -255,6 +303,7 @@ fn ensure_combined_system_seed(
     reasoning: bool,
     identity_memories: &[IdentityMemoryRecord],
     now: DateTime<Utc>,
+    scope_display_name: Option<&str>,
 ) {
     let items = session.input_mut().items_mut();
     let has_leading_system = leading_system_text(items).is_some();
@@ -262,7 +311,7 @@ fn ensure_combined_system_seed(
         .map(|text| text.contains(REASONING_SYSTEM_PROMPT))
         .unwrap_or(false);
     let leading_system = leading_system_text(items);
-    let has_identity = identity_memories.is_empty()
+    let has_identity = (identity_memories.is_empty() && scope_display_name.is_none())
         || leading_system
             .map(|text| text.contains(IDENTITY_MEMORY_SEED_PREFIX))
             .unwrap_or(false);
@@ -272,7 +321,13 @@ fn ensure_combined_system_seed(
 
     let seed = ModelInputItem::text(
         InputMessageRole::System,
-        format_system_seed(system_prompt.to_owned(), reasoning, identity_memories, now),
+        format_system_seed_with_identity(
+            system_prompt.to_owned(),
+            reasoning,
+            identity_memories,
+            now,
+            scope_display_name,
+        ),
     );
     if has_leading_system {
         items[0] = seed;

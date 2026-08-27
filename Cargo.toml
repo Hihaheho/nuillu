@@ -85,6 +85,7 @@ nuillu-homeostasis = { path = "crates/modules/homeostasis" }
 nuillu-reward = { path = "crates/modules/reward" }
 nuillu-predict = { path = "crates/modules/predict" }
 nuillu-surprise = { path = "crates/modules/surprise" }
+nuillu-subsystem-gate = { path = "crates/modules/subsystem-gate" }
 nuillu-sensory = { path = "crates/modules/sensory" }
 nuillu-speak = { path = "crates/modules/speak" }
 nuillu-visualizer-protocol = { path = "crates/visualizer-protocol" }

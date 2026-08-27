@@ -3,7 +3,7 @@ use std::rc::Rc;
 use nuillu_blackboard::{
     Blackboard, CognitionLogEntry, CognitionLogEntryRecord, CognitionLogOrigin, MemoLogRecord,
 };
-use nuillu_types::ModuleInstanceId;
+use nuillu_types::{ModuleInstanceId, ScopeId};
 
 use crate::ports::{Clock, CognitionLogRepository};
 use crate::{CognitionLogEvictedMailbox, CognitionLogUpdated, CognitionLogUpdatedMailbox};
@@ -14,6 +14,7 @@ use crate::{CognitionLogEvictedMailbox, CognitionLogUpdated, CognitionLogUpdated
 /// Boot-time wiring decides which modules receive this handle.
 pub struct CognitionWriter {
     owner: ModuleInstanceId,
+    scope: ScopeId,
     blackboard: Blackboard,
     cognition_log_port: Rc<dyn CognitionLogRepository>,
     updates: CognitionLogUpdatedMailbox,
@@ -30,8 +31,30 @@ impl CognitionWriter {
         evictions: CognitionLogEvictedMailbox,
         clock: Rc<dyn Clock>,
     ) -> Self {
+        let scope = owner.scope.clone();
+        Self::new_in_scope(
+            owner,
+            scope,
+            blackboard,
+            cognition_log_port,
+            updates,
+            evictions,
+            clock,
+        )
+    }
+
+    pub(crate) fn new_in_scope(
+        owner: ModuleInstanceId,
+        scope: ScopeId,
+        blackboard: Blackboard,
+        cognition_log_port: Rc<dyn CognitionLogRepository>,
+        updates: CognitionLogUpdatedMailbox,
+        evictions: CognitionLogEvictedMailbox,
+        clock: Rc<dyn Clock>,
+    ) -> Self {
         Self {
             owner,
+            scope,
             blackboard,
             cognition_log_port,
             updates,
@@ -71,6 +94,16 @@ impl CognitionWriter {
         &self.owner
     }
 
+    pub fn scope(&self) -> &ScopeId {
+        &self.scope
+    }
+
+    /// Forward an existing cognition entry while preserving its original
+    /// occurrence time and provenance metadata.
+    pub async fn forward(&self, entry: &CognitionLogEntry) {
+        self.append_entry(entry.clone()).await;
+    }
+
     async fn append_entry(&self, entry: CognitionLogEntry) {
         let result = self
             .blackboard
@@ -79,7 +112,7 @@ impl CognitionWriter {
 
         if let Err(e) = self
             .cognition_log_port
-            .append(self.owner.clone(), entry.clone())
+            .append(self.scope.clone(), self.owner.clone(), entry.clone())
             .await
         {
             tracing::warn!(error = ?e, "cognition log port append failed");

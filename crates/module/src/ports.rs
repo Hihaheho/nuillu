@@ -19,7 +19,7 @@ use std::{future::Future, pin::Pin, time::Duration};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use nuillu_blackboard::CognitionLogEntry;
-use nuillu_types::ModuleInstanceId;
+use nuillu_types::{ModuleInstanceId, ScopeId};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -45,6 +45,7 @@ pub trait Embedder {
 /// Append-only persistence for the cognition log.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PersistedCognitionLogEntry {
+    pub scope: ScopeId,
     pub source: ModuleInstanceId,
     pub entry: CognitionLogEntry,
 }
@@ -53,6 +54,7 @@ pub struct PersistedCognitionLogEntry {
 pub struct PersistedCognitionLogPageEntry {
     /// Repository-local, monotonically increasing identity.
     pub id: i64,
+    pub scope: ScopeId,
     pub source: ModuleInstanceId,
     pub entry: CognitionLogEntry,
 }
@@ -77,11 +79,13 @@ pub enum CognitionLogCursor {
 pub trait CognitionLogRepository {
     async fn append(
         &self,
+        scope: ScopeId,
         source: ModuleInstanceId,
         entry: CognitionLogEntry,
     ) -> Result<(), PortError>;
     async fn since(
         &self,
+        scope: &ScopeId,
         source: &ModuleInstanceId,
         from: DateTime<Utc>,
     ) -> Result<Vec<CognitionLogEntry>, PortError>;
@@ -229,6 +233,7 @@ pub struct NoopCognitionLogRepository;
 impl CognitionLogRepository for NoopCognitionLogRepository {
     async fn append(
         &self,
+        _scope: ScopeId,
         _source: ModuleInstanceId,
         _entry: CognitionLogEntry,
     ) -> Result<(), PortError> {
@@ -237,6 +242,7 @@ impl CognitionLogRepository for NoopCognitionLogRepository {
 
     async fn since(
         &self,
+        _scope: &ScopeId,
         _source: &ModuleInstanceId,
         _from: DateTime<Utc>,
     ) -> Result<Vec<CognitionLogEntry>, PortError> {

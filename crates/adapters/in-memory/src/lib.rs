@@ -25,11 +25,11 @@ use nuillu_module::ports::{
     CognitionLogCursor, CognitionLogRepository, PersistedCognitionLogEntry,
     PersistedCognitionLogPageEntry, PortError,
 };
-use nuillu_types::ModuleInstanceId;
+use nuillu_types::{ModuleInstanceId, ScopeId};
 
 #[derive(Debug, Default)]
 pub struct InMemoryCognitionLogRepository {
-    events: Mutex<Vec<(ModuleInstanceId, CognitionLogEntry)>>,
+    events: Mutex<Vec<(ScopeId, ModuleInstanceId, CognitionLogEntry)>>,
 }
 
 impl InMemoryCognitionLogRepository {
@@ -42,18 +42,20 @@ impl InMemoryCognitionLogRepository {
 impl CognitionLogRepository for InMemoryCognitionLogRepository {
     async fn append(
         &self,
+        scope: ScopeId,
         source: ModuleInstanceId,
         entry: CognitionLogEntry,
     ) -> Result<(), PortError> {
         self.events
             .lock()
             .map_err(|_| PortError::Backend("cognition log repository lock poisoned".into()))?
-            .push((source, entry));
+            .push((scope, source, entry));
         Ok(())
     }
 
     async fn since(
         &self,
+        scope: &ScopeId,
         source: &ModuleInstanceId,
         from: DateTime<Utc>,
     ) -> Result<Vec<CognitionLogEntry>, PortError> {
@@ -63,8 +65,10 @@ impl CognitionLogRepository for InMemoryCognitionLogRepository {
             .map_err(|_| PortError::Backend("cognition log repository lock poisoned".into()))?;
         Ok(events
             .iter()
-            .filter(|(owner, entry)| owner == source && entry.at >= from)
-            .map(|(_, entry)| entry.clone())
+            .filter(|(entry_scope, owner, entry)| {
+                entry_scope == scope && owner == source && entry.at >= from
+            })
+            .map(|(_, _, entry)| entry.clone())
             .collect())
     }
 
@@ -80,7 +84,8 @@ impl CognitionLogRepository for InMemoryCognitionLogRepository {
             .iter()
             .rev()
             .take(limit)
-            .map(|(source, entry)| PersistedCognitionLogEntry {
+            .map(|(scope, source, entry)| PersistedCognitionLogEntry {
+                scope: scope.clone(),
                 source: source.clone(),
                 entry: entry.clone(),
             })
@@ -113,11 +118,14 @@ impl CognitionLogRepository for InMemoryCognitionLogRepository {
                 }
             })
             .take(limit)
-            .map(|(index, (source, entry))| PersistedCognitionLogPageEntry {
-                id: i64::try_from(index).unwrap_or(i64::MAX),
-                source: source.clone(),
-                entry: entry.clone(),
-            })
+            .map(
+                |(index, (scope, source, entry))| PersistedCognitionLogPageEntry {
+                    id: i64::try_from(index).unwrap_or(i64::MAX),
+                    scope: scope.clone(),
+                    source: source.clone(),
+                    entry: entry.clone(),
+                },
+            )
             .collect())
     }
 }
@@ -134,6 +142,7 @@ mod tests {
         let stream = ModuleInstanceId::new(builtin::cognition_gate(), ReplicaIndex::ZERO);
         let old = Utc::now();
         repo.append(
+            ScopeId::root(),
             stream.clone(),
             CognitionLogEntry {
                 at: old,
@@ -145,6 +154,7 @@ mod tests {
         .unwrap();
         let cutoff = Utc::now();
         repo.append(
+            ScopeId::root(),
             stream.clone(),
             CognitionLogEntry {
                 at: cutoff,
@@ -155,7 +165,7 @@ mod tests {
         .await
         .unwrap();
 
-        let events = repo.since(&stream, cutoff).await.unwrap();
+        let events = repo.since(&ScopeId::root(), &stream, cutoff).await.unwrap();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].text, "new");
     }
@@ -166,6 +176,7 @@ mod tests {
         let stream = ModuleInstanceId::new(builtin::cognition_gate(), ReplicaIndex::ZERO);
         for text in ["first", "second", "third"] {
             repo.append(
+                ScopeId::root(),
                 stream.clone(),
                 CognitionLogEntry {
                     at: Utc::now(),

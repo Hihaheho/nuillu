@@ -59,8 +59,9 @@ pub use query::{
 pub use store::{
     IndexedMemory, LinkedMemoryQuery, LinkedMemoryRecord, MemoryAssociator, MemoryCompactor,
     MemoryConcept, MemoryContentReader, MemoryDeleter, MemoryKind, MemoryLink, MemoryLinkDirection,
-    MemoryLinkRelation, MemoryQuery, MemoryRecord, MemoryRetriever, MemoryStore, MemoryTag,
-    MemoryUsageTarget, MemoryWriter, NewMemory, NewMemoryLink, NoopMemoryStore,
+    MemoryLinkRelation, MemoryNamespace, MemoryQuery, MemoryRecord, MemoryRetriever, MemoryStore,
+    MemoryTag, MemoryUsageTarget, MemoryWriter, NamespacedMemoryStore, NewMemory, NewMemoryLink,
+    NoopMemoryStore,
 };
 
 /// Domain-scoped capability provider for the memory subsystem.
@@ -93,6 +94,38 @@ impl MemoryCapabilities {
 
     pub fn primary_store(&self) -> &Rc<dyn MemoryStore> {
         &self.primary_store
+    }
+
+    /// Rebind blackboard-backed metadata capabilities to one runtime scope
+    /// while retaining the configured content stores and clock.
+    pub fn scoped(&self, blackboard: Blackboard) -> Self {
+        Self {
+            primary_store: self.primary_store.clone(),
+            replicas: self.replicas.clone(),
+            blackboard,
+            clock: self.clock.clone(),
+        }
+    }
+
+    pub fn with_namespace(&self, namespace: MemoryNamespace) -> Self {
+        let primary_store: Rc<dyn MemoryStore> = Rc::new(NamespacedMemoryStore::new(
+            self.primary_store.clone(),
+            namespace.clone(),
+        ));
+        let replicas = self
+            .replicas
+            .iter()
+            .cloned()
+            .map(|store| {
+                Rc::new(NamespacedMemoryStore::new(store, namespace.clone())) as Rc<dyn MemoryStore>
+            })
+            .collect();
+        Self {
+            primary_store,
+            replicas,
+            blackboard: self.blackboard.clone(),
+            clock: self.clock.clone(),
+        }
     }
 
     pub fn writer(&self) -> MemoryWriter {

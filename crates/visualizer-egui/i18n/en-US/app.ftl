@@ -190,6 +190,7 @@ module-overview-act-err = Act Err
 module-overview-llm-err = LLM Err
 module-overview-latest-llm-out = Latest LLM out
 module-overview-enabled-hover = Allow this module to use allocated replicas
+module-overview-subsystem-read-only-hover = Subsystem controls are read-only in this first visualizer pass
 module-overview-edit = Edit
 module-overview-edit-hover = edit { $module }
 module-config-close-hover = close

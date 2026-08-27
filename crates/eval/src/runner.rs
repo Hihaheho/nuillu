@@ -5864,6 +5864,7 @@ fn visualizer_blackboard_snapshot(bb: &BlackboardInner) -> BlackboardSnapshot {
     memory_metadata.sort_by(|left, right| left.index.cmp(&right.index));
 
     BlackboardSnapshot {
+        scopes: Vec::new(),
         module_statuses: bb
             .module_status_records()
             .into_iter()
@@ -5881,6 +5882,7 @@ fn visualizer_blackboard_snapshot(bb: &BlackboardInner) -> BlackboardSnapshot {
                     .ok()
                     .and_then(|id| bb.allocation().bpm_for(&id));
                 AllocationView {
+                    scope: "/".to_string(),
                     bpm: bpm.map(|bpm| bpm.as_f64()),
                     period_ms: bpm.map(|bpm| duration_millis_u64(bpm.period())),
                     module: module.module,

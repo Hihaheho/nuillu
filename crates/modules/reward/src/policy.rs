@@ -9,8 +9,8 @@ use nuillu_module::{
     BlackboardReader, CognitionLogReader, CognitionLogUpdatedInbox, InteroceptiveReader, LlmAccess,
     LlmContextWindow, Memo, MemoUpdatedInbox, Module, SessionAutoCompaction,
     SessionCompactionConfig, SessionCompactionProtectedPrefix, compact_llm_context_text,
-    ensure_persistent_session_seeded, format_bounded_cognition_log_batch,
-    format_bounded_memo_log_batch, format_policy_system_prompt, format_system_seed,
+    ensure_persistent_session_seeded_in_context, format_bounded_cognition_log_batch_in_context,
+    format_bounded_memo_log_batch, format_policy_system_prompt, format_system_seed_in_context,
 };
 use nuillu_types::{ModuleId, ModuleInstanceId, PolicyIndex, PolicyRank};
 use schemars::JsonSchema;
@@ -233,12 +233,7 @@ impl PolicyModule {
 
     fn ensure_session_seeded(&mut self, cx: &nuillu_module::ActivateCx<'_>) {
         let system_prompt = self.system_prompt(cx).to_owned();
-        ensure_persistent_session_seeded(
-            &mut self.session,
-            system_prompt,
-            cx.identity_memories(),
-            cx.now(),
-        );
+        ensure_persistent_session_seeded_in_context(&mut self.session, system_prompt, cx);
     }
 
     async fn activate(&mut self, cx: &nuillu_module::ActivateCx<'_>) -> Result<()> {
@@ -328,7 +323,7 @@ impl PolicyModule {
             context,
             hits,
             &interoception,
-            cx.now(),
+            cx,
         ));
 
         let outcome = match self
@@ -412,16 +407,13 @@ impl PolicyModule {
         candidate: &ProposePolicyCandidateArgs,
     ) -> bool {
         let input = ModelInput::new()
-            .system(format_system_seed(
+            .system(format_system_seed_in_context(
                 format_policy_system_prompt(POLICY_CANDIDATE_EVALUATION_PROMPT, cx.core_policies()),
                 false,
-                cx.identity_memories(),
-                cx.now(),
+                cx,
             ))
             .user(format_policy_candidate_evaluation_request(
-                context,
-                candidate,
-                cx.now(),
+                context, candidate, cx,
             ));
         let lutum = self.llm.lutum().await;
         let result = lutum
@@ -464,8 +456,9 @@ fn format_policy_candidate_request(
     context: &PolicyActivationContext,
     hits: &[PolicySearchHit],
     interoception: &nuillu_blackboard::InteroceptiveState,
-    now: chrono::DateTime<chrono::Utc>,
+    cx: &nuillu_module::ActivateCx<'_>,
 ) -> String {
+    let now = cx.now();
     format!(
         "Policy consideration request for {owner}\n\nQuery text:\n{}\n\nCurrent interoception:\n{}\n\nExisting policy hits already handled by runtime:\n{}\n\nCurrent memo evidence:\n{}\n\nCurrent cognition evidence:\n{}\n\nInstruction:\nOnly call propose_policy_candidate if the existing hits are insufficient and a reusable new trigger/behavior policy is needed.\nA policy candidate must be trigger-conditioned behavioral guidance. Put only the situation in trigger, only the action rule in behavior, and only behavior-derived guidance in advice. Do not introduce factual, capability, identity, or state claims as policy content.",
         context.query_text,
@@ -473,10 +466,11 @@ fn format_policy_candidate_request(
         format_policy_hits(hits),
         format_bounded_memo_log_batch(&context.memos, now, POLICY_MEMO_CONTEXT_WINDOW)
             .unwrap_or_else(|| "none".to_owned()),
-        format_bounded_cognition_log_batch(
+        format_bounded_cognition_log_batch_in_context(
             &context.cognition,
             now,
             POLICY_COGNITION_CONTEXT_WINDOW,
+            cx,
         )
         .unwrap_or_else(|| "none".to_owned()),
     )
@@ -485,8 +479,9 @@ fn format_policy_candidate_request(
 fn format_policy_candidate_evaluation_request(
     context: &PolicyActivationContext,
     candidate: &ProposePolicyCandidateArgs,
-    now: chrono::DateTime<chrono::Utc>,
+    cx: &nuillu_module::ActivateCx<'_>,
 ) -> String {
+    let now = cx.now();
     serde_json::to_string(&PolicyCandidateEvaluationInput {
         query_text: &context.query_text,
         current_memo_evidence: format_bounded_memo_log_batch(
@@ -495,10 +490,11 @@ fn format_policy_candidate_evaluation_request(
             POLICY_MEMO_CONTEXT_WINDOW,
         )
         .unwrap_or_else(|| "none".to_owned()),
-        current_cognition_evidence: format_bounded_cognition_log_batch(
+        current_cognition_evidence: format_bounded_cognition_log_batch_in_context(
             &context.cognition,
             now,
             POLICY_COGNITION_CONTEXT_WINDOW,
+            cx,
         )
         .unwrap_or_else(|| "none".to_owned()),
         candidate: PolicyCandidateEvaluationCandidate {

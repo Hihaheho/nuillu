@@ -90,11 +90,10 @@ impl DreamingModule {
         }
 
         let input = ModelInput::new()
-            .system(nuillu_module::format_system_seed(
+            .system(nuillu_module::format_system_seed_in_context(
                 format_policy_system_prompt(SYSTEM_PROMPT, cx.core_policies()),
                 false,
-                cx.identity_memories(),
-                cx.now(),
+                cx,
             ))
             .user(format_dreaming_context(
                 &seed_memos,

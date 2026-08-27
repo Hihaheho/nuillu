@@ -44,6 +44,7 @@ mod readers;
 mod runtime_events;
 mod runtime_policy;
 mod scene;
+mod scope_labels;
 mod session;
 mod session_compaction;
 mod tiers;
@@ -100,16 +101,20 @@ pub use memory_render::render_memory_for_llm;
 pub use mind_format::{
     CognitionLogBatchFormat, LlmContextWindow, MemoLogBatchFormat, MemoryRankCounts,
     compact_llm_context_text, format_available_faculties, format_bounded_cognition_log_batch,
-    format_bounded_cognition_log_batch_with_format, format_bounded_memo_log_batch,
+    format_bounded_cognition_log_batch_in_context, format_bounded_cognition_log_batch_with_format,
+    format_bounded_cognition_log_batch_with_format_in_context, format_bounded_memo_log_batch,
     format_bounded_memo_log_batch_with_format, format_cognition_log_batch,
-    format_current_allocation_state, format_identity_memory_seed, format_memo_log_batch,
+    format_cognition_log_batch_in_context, format_current_allocation_state,
+    format_identity_memory_seed, format_identity_seed, format_memo_log_batch,
     format_memory_trace_inventory, format_new_cognition_log_entries,
-    format_source_blind_memo_log_batch, format_stuckness, format_time_division_guidance,
-    memory_rank_counts,
+    format_new_cognition_log_entries_in_context, format_source_blind_memo_log_batch,
+    format_stuckness, format_time_division_guidance, memory_rank_counts,
 };
 pub use mind_session::{
-    REASONING_SYSTEM_PROMPT, format_system_seed, push_formatted_cognition_log_batch,
+    REASONING_SYSTEM_PROMPT, format_system_seed, format_system_seed_in_context,
+    push_formatted_cognition_log_batch, push_formatted_cognition_log_batch_in_context,
     push_formatted_memo_log_batch, seed_persistent_faculty_session,
+    seed_persistent_faculty_session_in_context,
 };
 pub use nuillu_types::{ModuleGroupId, ModuleId};
 pub use ports::Embedder;
@@ -121,10 +126,12 @@ pub use readers::{
 pub use runtime_events::{NoopRuntimeEventSink, RuntimeEvent, RuntimeEventSink};
 pub use runtime_policy::{InteroceptionRuntimePolicy, RuntimePolicy};
 pub use scene::{Participant, SceneReader, SceneRegistry, TARGET_EVERYONE, TARGET_SELF};
+pub use scope_labels::ScopeLabels;
 pub use session::{
     ModuleSessionMetadata, NoopSessionStore, PersistedModelInputItem, PersistedSessionSnapshot,
     SessionAutoCompaction, SessionCheckpointError, SessionKey, SessionStore,
-    ensure_persistent_session_seeded, push_persistent_identity_seed_if_absent,
+    ensure_persistent_session_seeded, ensure_persistent_session_seeded_in_context,
+    push_persistent_identity_seed_if_absent,
 };
 pub use session_compaction::{
     DEFAULT_SESSION_COMPACTION_INPUT_TOKEN_THRESHOLD, DEFAULT_SESSION_COMPACTION_MAX_OUTPUT_TOKENS,

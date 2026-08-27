@@ -12,9 +12,10 @@ use nuillu_blackboard::{
 use nuillu_module::{
     BlackboardReader, CognitionLogUpdatedInbox, InteroceptionRuntimePolicy, InteroceptiveWriter,
     LlmAccess, LlmContextWindow, MemoUpdatedInbox, Module, SessionAutoCompaction,
-    SessionCompactionConfig, SessionCompactionProtectedPrefix, ensure_persistent_session_seeded,
-    format_bounded_cognition_log_batch, format_bounded_memo_log_batch, format_policy_system_prompt,
-    ports::Timer,
+    SessionCompactionConfig, SessionCompactionProtectedPrefix,
+    ensure_persistent_session_seeded_in_context, format_bounded_cognition_log_batch,
+    format_bounded_cognition_log_batch_in_context, format_bounded_memo_log_batch,
+    format_policy_system_prompt, ports::Timer,
 };
 use nuillu_types::builtin;
 use schemars::JsonSchema;
@@ -211,12 +212,7 @@ impl InteroceptionModule {
 
     fn ensure_session_seeded(&mut self, cx: &nuillu_module::ActivateCx<'_>) {
         let system_prompt = self.system_prompt(cx).to_owned();
-        ensure_persistent_session_seeded(
-            &mut self.session,
-            system_prompt,
-            cx.identity_memories(),
-            cx.now(),
-        );
+        ensure_persistent_session_seeded_in_context(&mut self.session, system_prompt, cx);
     }
 
     async fn activate(
@@ -335,6 +331,7 @@ impl InteroceptionModule {
             unread_memos,
             unread_cognition,
             cx.now(),
+            Some(cx),
         ));
 
         let outcome = match self
@@ -426,14 +423,23 @@ fn format_affect_assessment_input(
     unread_memos: &[MemoLogRecord],
     unread_cognition: &[CognitionLogEntryRecord],
     now: DateTime<Utc>,
+    cx: Option<&nuillu_module::ActivateCx<'_>>,
 ) -> String {
+    let cognition = match cx {
+        Some(cx) => format_bounded_cognition_log_batch_in_context(
+            unread_cognition,
+            now,
+            COGNITION_CONTEXT_WINDOW,
+            cx,
+        ),
+        None => format_bounded_cognition_log_batch(unread_cognition, now, COGNITION_CONTEXT_WINDOW),
+    };
     format!(
         "Interoception affect appraisal request\n\nCurrent interoceptive state:\n{}\n\nUnread memo evidence:\n{}\n\nUnread cognition evidence:\n{}\n\nInstruction:\nCall report_affect once. Use structured salience levels and valence polarity, not numeric arousal or valence deltas. Use off/no-change salience, neutral polarity, and preserve current emotion when evidence is weak.",
         format_interoceptive_state(current),
         format_bounded_memo_log_batch(unread_memos, now, MEMO_CONTEXT_WINDOW)
             .unwrap_or_else(|| "none".to_owned()),
-        format_bounded_cognition_log_batch(unread_cognition, now, COGNITION_CONTEXT_WINDOW)
-            .unwrap_or_else(|| "none".to_owned()),
+        cognition.unwrap_or_else(|| "none".to_owned()),
     )
 }
 

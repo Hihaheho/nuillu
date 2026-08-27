@@ -4,12 +4,15 @@ use anyhow::{Context, Result};
 use async_trait::async_trait;
 use lutum::{Session, TextStepOutcomeWithTools, ToolResult};
 use nuillu_blackboard::{AllocationCommand, AllocationEffectLevel};
+#[cfg(test)]
+use nuillu_module::format_bounded_cognition_log_batch_with_format;
 use nuillu_module::{
     AllocationReader, AllocationWriter, AttentionControlRequest, AttentionControlRequestInbox,
     AttentionControlRequestKind, BlackboardReader, CognitionLogBatchFormat, CognitionLogReader,
     InteroceptiveReader, LlmAccess, LlmContextWindow, MemoLogBatchFormat, MemoUpdatedInbox, Module,
     SessionAutoCompaction, SessionCompactionConfig, SessionCompactionProtectedPrefix,
-    ensure_persistent_session_seeded, format_bounded_cognition_log_batch_with_format,
+    ensure_persistent_session_seeded_in_context,
+    format_bounded_cognition_log_batch_with_format_in_context,
     format_bounded_memo_log_batch_with_format, format_current_allocation_state,
     format_memory_trace_inventory, format_stuckness, memory_rank_counts, ports::Timer,
 };
@@ -315,12 +318,7 @@ impl AllocationModule {
 
     fn ensure_session_seeded(&mut self, cx: &nuillu_module::ActivateCx<'_>) {
         let system_prompt = self.system_prompt(cx).to_owned();
-        ensure_persistent_session_seeded(
-            &mut self.session,
-            system_prompt,
-            cx.identity_memories(),
-            cx.now(),
-        );
+        ensure_persistent_session_seeded_in_context(&mut self.session, system_prompt, cx);
     }
 
     #[tracing::instrument(skip_all, err(Debug, level = "warn"))]
@@ -366,11 +364,12 @@ impl AllocationModule {
                         MEMO_CONTEXT_WINDOW,
                         ALLOCATION_MEMO_LOG_FORMAT,
                     ),
-                    format_bounded_cognition_log_batch_with_format(
+                    format_bounded_cognition_log_batch_with_format_in_context(
                         &unread_cognition,
                         cx.now(),
                         COGNITION_CONTEXT_WINDOW,
                         ALLOCATION_COGNITION_LOG_FORMAT,
+                        cx,
                     ),
                     requests,
                 ) {

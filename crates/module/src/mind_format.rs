@@ -8,7 +8,7 @@ use nuillu_blackboard::{
 };
 use nuillu_types::{MemoryIndex, MemoryRank, ModuleId};
 
-use crate::TimeDivision;
+use crate::{ActivateCx, TimeDivision};
 
 pub type MemoryRankCounts = BTreeMap<&'static str, usize>;
 
@@ -89,9 +89,46 @@ pub fn format_identity_memory_seed(
     Some(output)
 }
 
+pub fn format_identity_seed(
+    scope_display_name: Option<&str>,
+    memories: &[IdentityMemoryRecord],
+    now: DateTime<Utc>,
+) -> Option<String> {
+    let memory_seed = format_identity_memory_seed(memories, now);
+    let Some(scope_display_name) = scope_display_name
+        .map(single_line)
+        .filter(|line| !line.is_empty())
+    else {
+        return memory_seed;
+    };
+    let mut output = format!("{IDENTITY_MEMORY_SEED_PREFIX}\n- Here, I am {scope_display_name}.");
+    if let Some(memory_seed) = memory_seed
+        && let Some(memory_lines) = memory_seed.strip_prefix(IDENTITY_MEMORY_SEED_PREFIX)
+    {
+        output.push_str(memory_lines);
+    }
+    Some(output)
+}
+
 pub fn format_cognition_log_batch(
     records: &[CognitionLogEntryRecord],
     now: DateTime<Utc>,
+) -> Option<String> {
+    format_cognition_log_batch_inner(records, now, None)
+}
+
+pub fn format_cognition_log_batch_in_context(
+    records: &[CognitionLogEntryRecord],
+    now: DateTime<Utc>,
+    cx: &ActivateCx<'_>,
+) -> Option<String> {
+    format_cognition_log_batch_inner(records, now, Some(cx))
+}
+
+fn format_cognition_log_batch_inner(
+    records: &[CognitionLogEntryRecord],
+    now: DateTime<Utc>,
+    cx: Option<&ActivateCx<'_>>,
 ) -> Option<String> {
     let mut records = records
         .iter()
@@ -108,7 +145,7 @@ pub fn format_cognition_log_batch(
         output.push_str("- ");
         output.push_str(&age_label(record.entry.at, now));
         output.push_str(": ");
-        output.push_str(&single_line(&record.entry.text));
+        output.push_str(&cognition_entry_text(record, cx));
     }
     Some(output)
 }
@@ -131,6 +168,41 @@ pub fn format_bounded_cognition_log_batch_with_format(
     now: DateTime<Utc>,
     window: LlmContextWindow,
     format: CognitionLogBatchFormat<'_>,
+) -> Option<String> {
+    format_bounded_cognition_log_batch_inner(records, now, window, format, None)
+}
+
+pub fn format_bounded_cognition_log_batch_in_context(
+    records: &[CognitionLogEntryRecord],
+    now: DateTime<Utc>,
+    window: LlmContextWindow,
+    cx: &ActivateCx<'_>,
+) -> Option<String> {
+    format_bounded_cognition_log_batch_inner(
+        records,
+        now,
+        window,
+        DEFAULT_COGNITION_LOG_BATCH_FORMAT,
+        Some(cx),
+    )
+}
+
+pub fn format_bounded_cognition_log_batch_with_format_in_context(
+    records: &[CognitionLogEntryRecord],
+    now: DateTime<Utc>,
+    window: LlmContextWindow,
+    format: CognitionLogBatchFormat<'_>,
+    cx: &ActivateCx<'_>,
+) -> Option<String> {
+    format_bounded_cognition_log_batch_inner(records, now, window, format, Some(cx))
+}
+
+fn format_bounded_cognition_log_batch_inner(
+    records: &[CognitionLogEntryRecord],
+    now: DateTime<Utc>,
+    window: LlmContextWindow,
+    format: CognitionLogBatchFormat<'_>,
+    cx: Option<&ActivateCx<'_>>,
 ) -> Option<String> {
     let mut records = records
         .iter()
@@ -159,7 +231,10 @@ pub fn format_bounded_cognition_log_batch_with_format(
             format!(
                 "- {}: {}",
                 age_label(record.entry.at, now),
-                compact_llm_context_text(&record.entry.text, window.max_chars_per_record)
+                compact_llm_context_text(
+                    &cognition_entry_text(record, cx),
+                    window.max_chars_per_record,
+                )
             )
         })
         .collect::<Vec<_>>();
@@ -175,6 +250,24 @@ pub fn format_new_cognition_log_entries(
     records: &[CognitionLogEntryRecord],
     now: DateTime<Utc>,
     window: LlmContextWindow,
+) -> Option<String> {
+    format_new_cognition_log_entries_inner(records, now, window, None)
+}
+
+pub fn format_new_cognition_log_entries_in_context(
+    records: &[CognitionLogEntryRecord],
+    now: DateTime<Utc>,
+    window: LlmContextWindow,
+    cx: &ActivateCx<'_>,
+) -> Option<String> {
+    format_new_cognition_log_entries_inner(records, now, window, Some(cx))
+}
+
+fn format_new_cognition_log_entries_inner(
+    records: &[CognitionLogEntryRecord],
+    now: DateTime<Utc>,
+    window: LlmContextWindow,
+    cx: Option<&ActivateCx<'_>>,
 ) -> Option<String> {
     let mut records = records
         .iter()
@@ -203,7 +296,10 @@ pub fn format_new_cognition_log_entries(
             format!(
                 "- {}: {}",
                 age_label(record.entry.at, now),
-                compact_llm_context_text(&record.entry.text, window.max_chars_per_record)
+                compact_llm_context_text(
+                    &cognition_entry_text(record, cx),
+                    window.max_chars_per_record,
+                )
             )
         })
         .collect::<Vec<_>>();
@@ -213,6 +309,16 @@ pub fn format_new_cognition_log_entries(
         lines,
         window.max_total_chars,
     )
+}
+
+fn cognition_entry_text(record: &CognitionLogEntryRecord, cx: Option<&ActivateCx<'_>>) -> String {
+    let text = single_line(&record.entry.text);
+    let Some(label) =
+        cx.and_then(|cx| cx.relative_subsystem_label(&record.entry.origin.owner.scope))
+    else {
+        return text;
+    };
+    format!("{label}: {text}")
 }
 
 pub fn format_memo_log_batch(records: &[MemoLogRecord], now: DateTime<Utc>) -> Option<String> {
@@ -661,13 +767,39 @@ fn format_bounded_lines(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ScopeLabels;
     use chrono::TimeZone as _;
     use nuillu_blackboard::{CognitionLogEntry, CognitionLogOrigin, MemoLogRecord};
-    use nuillu_types::{MemoryContent, ReplicaIndex, builtin};
+    use nuillu_types::{
+        MemoryContent, ModelTier, ModuleInstanceId, ReplicaIndex, ScopeId, SubsystemId,
+        SubsystemInstanceId, builtin,
+    };
+    use std::rc::Rc;
     use std::sync::Arc;
 
     fn now() -> DateTime<Utc> {
         Utc.with_ymd_and_hms(2026, 5, 11, 6, 23, 0).unwrap()
+    }
+
+    fn activation_cx(owner: ModuleInstanceId, labels: ScopeLabels) -> ActivateCx<'static> {
+        let lutum = lutum::Lutum::new(
+            Arc::new(lutum::MockLlmAdapter::new()),
+            lutum::SharedPoolBudgetManager::new(lutum::SharedPoolBudgetOptions::default()),
+        );
+        ActivateCx::new(
+            &[],
+            &[],
+            &[],
+            crate::SessionCompactionRuntime::new(
+                lutum,
+                crate::LlmConcurrencyLimiter::new(None),
+                ModelTier::Cheap,
+                crate::SessionCompactionPolicy::default(),
+            ),
+            Rc::new(crate::ports::SystemClock),
+        )
+        .with_scope_labels(Rc::new(labels))
+        .with_owner(owner)
     }
 
     #[test]
@@ -692,6 +824,25 @@ mod tests {
                     .to_owned()
             )
         );
+    }
+
+    #[test]
+    fn identity_seed_prepends_the_scope_display_name() {
+        let memories = vec![IdentityMemoryRecord {
+            index: MemoryIndex::new("identity-1"),
+            content: MemoryContent::new("I'm Nui."),
+            occurred_at: None,
+        }];
+
+        assert_eq!(
+            format_identity_seed(Some("Arm 1"), &memories, now()),
+            Some("Your identity:\n- Here, I am Arm 1.\n- I'm Nui.".to_owned())
+        );
+        assert_eq!(
+            format_identity_seed(Some("Arm"), &[], now()),
+            Some("Your identity:\n- Here, I am Arm.".to_owned())
+        );
+        assert_eq!(format_identity_seed(None, &[], now()), None);
     }
 
     #[test]
@@ -723,6 +874,59 @@ mod tests {
             Some(
                 "What you are currently thinking at 2026-05-11T06:23:00Z:\n- About 4 minutes ago: older\n- Just now: newer"
                     .to_owned()
+            )
+        );
+    }
+
+    #[test]
+    fn cognition_batch_labels_descendant_scope_but_not_local_scope() {
+        let arm = ScopeId::root().child(SubsystemInstanceId::new(
+            SubsystemId::new("arm").unwrap(),
+            ReplicaIndex::ZERO,
+        ));
+        let origin =
+            ModuleInstanceId::in_scope(arm.clone(), builtin::cognition_gate(), ReplicaIndex::ZERO);
+        let record = CognitionLogEntryRecord {
+            index: 0,
+            source: origin.clone(),
+            entry: CognitionLogEntry {
+                at: now(),
+                text: "inspect the object".into(),
+                origin: CognitionLogOrigin::direct(origin),
+            },
+        };
+        let labels = ScopeLabels::new([(arm.clone(), Arc::from("Arm"))]);
+        let root_cx = activation_cx(
+            ModuleInstanceId::new(builtin::allocation(), ReplicaIndex::ZERO),
+            labels.clone(),
+        );
+        let local_cx = activation_cx(
+            ModuleInstanceId::in_scope(arm, builtin::allocation(), ReplicaIndex::ZERO),
+            labels,
+        );
+
+        assert_eq!(
+            format_bounded_cognition_log_batch_in_context(
+                std::slice::from_ref(&record),
+                now(),
+                LlmContextWindow::new(1, 100, 500),
+                &root_cx,
+            ),
+            Some(
+                "What you are currently thinking at 2026-05-11T06:23:00Z:\n- Just now: Arm: inspect the object"
+                    .to_string()
+            )
+        );
+        assert_eq!(
+            format_bounded_cognition_log_batch_in_context(
+                &[record],
+                now(),
+                LlmContextWindow::new(1, 100, 500),
+                &local_cx,
+            ),
+            Some(
+                "What you are currently thinking at 2026-05-11T06:23:00Z:\n- Just now: inspect the object"
+                    .to_string()
             )
         );
     }

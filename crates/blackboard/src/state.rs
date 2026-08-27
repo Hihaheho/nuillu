@@ -1,4 +1,5 @@
 use std::any::Any;
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::marker::PhantomData;
@@ -6,7 +7,7 @@ use std::rc::Rc;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use chrono::{DateTime, Utc};
-use nuillu_types::{MemoryIndex, ModuleId, ModuleInstanceId, PolicyIndex};
+use nuillu_types::{MemoryIndex, ModuleId, ModuleInstanceId, PolicyIndex, ScopeId};
 use serde::de::DeserializeOwned;
 use tokio::sync::{RwLock, oneshot};
 
@@ -32,10 +33,20 @@ type PeerContexts = Vec<(ModuleId, Arc<str>)>;
 /// without taking the async lock.
 #[derive(Debug, Clone)]
 pub struct Blackboard {
+    scope: ScopeId,
     inner: Rc<RwLock<BlackboardInner>>,
     activation_waiters: Arc<Mutex<Vec<ActivationWaiter>>>,
     activation_increase_waiters: Arc<Mutex<Vec<ActivationIncreaseWaiter>>>,
     allocation_change_waiters: Arc<Mutex<Vec<oneshot::Sender<()>>>>,
+    peer_contexts: Arc<OnceLock<PeerContexts>>,
+    scopes: Rc<RefCell<HashMap<ScopeId, BlackboardScopeResources>>>,
+}
+
+#[derive(Debug, Clone)]
+struct BlackboardScopeResources {
+    inner: Rc<RwLock<BlackboardInner>>,
+    activation_waiters: Arc<Mutex<Vec<ActivationWaiter>>>,
+    activation_increase_waiters: Arc<Mutex<Vec<ActivationIncreaseWaiter>>>,
     peer_contexts: Arc<OnceLock<PeerContexts>>,
 }
 
@@ -331,13 +342,7 @@ impl std::fmt::Debug for ActivationIncreaseWaiter {
 
 impl Blackboard {
     pub fn new() -> Self {
-        Self {
-            inner: Rc::new(RwLock::new(BlackboardInner::default())),
-            activation_waiters: Arc::new(Mutex::new(Vec::new())),
-            activation_increase_waiters: Arc::new(Mutex::new(Vec::new())),
-            allocation_change_waiters: Arc::new(Mutex::new(Vec::new())),
-            peer_contexts: Arc::new(OnceLock::new()),
-        }
+        Self::with_allocation(ResourceAllocation::default())
     }
 
     pub fn with_allocation(allocation: ResourceAllocation) -> Self {
@@ -346,13 +351,64 @@ impl Blackboard {
             ..BlackboardInner::default()
         };
         inner.recompute_effective_allocation();
-        Self {
+        let root = ScopeId::root();
+        let resources = BlackboardScopeResources {
             inner: Rc::new(RwLock::new(inner)),
             activation_waiters: Arc::new(Mutex::new(Vec::new())),
             activation_increase_waiters: Arc::new(Mutex::new(Vec::new())),
-            allocation_change_waiters: Arc::new(Mutex::new(Vec::new())),
             peer_contexts: Arc::new(OnceLock::new()),
+        };
+        let scopes = Rc::new(RefCell::new(HashMap::from([(
+            root.clone(),
+            resources.clone(),
+        )])));
+        Self {
+            scope: root,
+            inner: resources.inner,
+            activation_waiters: resources.activation_waiters,
+            activation_increase_waiters: resources.activation_increase_waiters,
+            allocation_change_waiters: Arc::new(Mutex::new(Vec::new())),
+            peer_contexts: resources.peer_contexts,
+            scopes,
         }
+    }
+
+    /// Return the blackboard surface for one runtime scope, creating an empty
+    /// isolated surface on first use. Allocation-change waiters are shared so
+    /// the single scheduler wakes when any scope changes.
+    pub fn scoped(&self, scope: ScopeId) -> Self {
+        if scope == self.scope {
+            return self.clone();
+        }
+        let resources = self
+            .scopes
+            .borrow_mut()
+            .entry(scope.clone())
+            .or_insert_with(|| BlackboardScopeResources {
+                inner: Rc::new(RwLock::new(BlackboardInner::default())),
+                activation_waiters: Arc::new(Mutex::new(Vec::new())),
+                activation_increase_waiters: Arc::new(Mutex::new(Vec::new())),
+                peer_contexts: Arc::new(OnceLock::new()),
+            })
+            .clone();
+        Self {
+            scope,
+            inner: resources.inner,
+            activation_waiters: resources.activation_waiters,
+            activation_increase_waiters: resources.activation_increase_waiters,
+            allocation_change_waiters: self.allocation_change_waiters.clone(),
+            peer_contexts: resources.peer_contexts,
+            scopes: self.scopes.clone(),
+        }
+    }
+
+    pub fn scope(&self) -> &ScopeId {
+        &self.scope
+    }
+
+    pub fn all_scopes(&self) -> Vec<Self> {
+        let scopes = self.scopes.borrow().keys().cloned().collect::<Vec<_>>();
+        scopes.into_iter().map(|scope| self.scoped(scope)).collect()
     }
 
     /// Install the registered-module peer context catalog.
@@ -1337,8 +1393,44 @@ mod tests {
 
     use chrono::TimeZone;
     use nuillu_types::{
-        MemoryContent, MemoryIndex, ModuleId, ReplicaCapRange, ReplicaIndex, builtin,
+        MemoryContent, MemoryIndex, ModuleId, ReplicaCapRange, ReplicaIndex, ScopeId, SubsystemId,
+        SubsystemInstanceId, builtin,
     };
+
+    #[tokio::test]
+    async fn scoped_blackboards_isolate_memos_and_cognition() {
+        let universe = Blackboard::default();
+        let left_scope = ScopeId::root().child(SubsystemInstanceId::new(
+            SubsystemId::new("arm").unwrap(),
+            ReplicaIndex::ZERO,
+        ));
+        let right_scope = ScopeId::root().child(SubsystemInstanceId::new(
+            SubsystemId::new("arm").unwrap(),
+            ReplicaIndex::new(1),
+        ));
+        let left = universe.scoped(left_scope.clone());
+        let right = universe.scoped(right_scope.clone());
+        let left_owner =
+            ModuleInstanceId::in_scope(left_scope, builtin::predict(), ReplicaIndex::ZERO);
+
+        left.update_memo(left_owner.clone(), "left memo".into(), Utc::now())
+            .await;
+        left.append_cognition_log(
+            left_owner.clone(),
+            crate::CognitionLogEntry {
+                at: Utc::now(),
+                text: "left cognition".into(),
+                origin: crate::CognitionLogOrigin::direct(left_owner),
+            },
+        )
+        .await;
+
+        assert_eq!(left.read(|bb| bb.recent_memo_logs().len()).await, 1);
+        assert_eq!(left.read(|bb| bb.cognition_log().len()).await, 1);
+        assert!(right.read(|bb| bb.recent_memo_logs().is_empty()).await);
+        assert!(right.read(|bb| bb.cognition_log().is_empty()).await);
+        assert!(universe.read(|bb| bb.recent_memo_logs().is_empty()).await);
+    }
 
     fn memo_time(seconds: i64) -> DateTime<Utc> {
         Utc.timestamp_opt(seconds, 0).unwrap()

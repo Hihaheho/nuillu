@@ -184,7 +184,7 @@ impl DbLlmTraceSink {
             status: TranscriptTurnStatus::InProgress,
             turn_id,
             owner: metadata.owner.to_string(),
-            module: metadata.owner.module.to_string(),
+            module: metadata.owner.scoped_module().to_string(),
             replica: metadata.owner.replica.get(),
             tier: format!("{:?}", metadata.tier),
             source: observation_source(metadata.source),

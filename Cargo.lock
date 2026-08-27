@@ -3562,6 +3562,7 @@ dependencies = [
  "nuillu-sensory",
  "nuillu-speak",
  "nuillu-storage",
+ "nuillu-subsystem-gate",
  "nuillu-surprise",
  "nuillu-types",
  "nuillu-visualizer-protocol",
@@ -3608,6 +3609,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "nuillu-subsystem-gate"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "chrono",
+ "nuillu-blackboard",
+ "nuillu-module",
+ "nuillu-types",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tokio",
+]
+
+[[package]]
 name = "nuillu-surprise"
 version = "0.1.0"
 dependencies = [
@@ -3631,6 +3648,7 @@ version = "0.1.0"
 dependencies = [
  "schemars",
  "serde",
+ "serde_json",
  "thiserror 2.0.18",
 ]
 

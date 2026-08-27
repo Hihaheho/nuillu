@@ -38,9 +38,11 @@ pub use nuillu_storage::{
     OneShotSensoryInputRecord, UtteranceEventKind, UtteranceEventRecord,
 };
 use nuillu_types::{
-    MemoryContent, MemoryIndex, MemoryRank, ModuleId, ModuleInstanceId, PolicyIndex, PolicyRank,
-    ReplicaIndex, SignedUnitF32, UnitF32,
+    MemoryContent, MemoryIndex, MemoryRank, ModuleInstanceId, PolicyIndex, PolicyRank,
+    ReplicaIndex, ScopeId, SignedUnitF32, UnitF32,
 };
+#[cfg(test)]
+use nuillu_types::{ModuleId, SubsystemId, SubsystemInstanceId};
 use uuid::Uuid;
 
 mod migrations;
@@ -322,6 +324,7 @@ impl LibsqlConversationHistoryStore {
                        server_session_id,
                        occurred_at_ms,
                        speaker,
+                       speaker_replica,
                        target,
                        content,
                        generation_id
@@ -332,6 +335,7 @@ impl LibsqlConversationHistoryStore {
                            server_session_id,
                            observed_at_ms AS occurred_at_ms,
                            TRIM(direction) AS speaker,
+                           NULL AS speaker_replica,
                            NULL AS target,
                            content,
                            NULL AS generation_id,
@@ -347,6 +351,7 @@ impl LibsqlConversationHistoryStore {
                            server_session_id,
                            occurred_at_ms,
                            sender_module AS speaker,
+                           sender_replica AS speaker_replica,
                            target,
                            content,
                            generation_id,
@@ -359,10 +364,8 @@ impl LibsqlConversationHistoryStore {
                            id AS source_id,
                            server_session_id,
                            requested_at_ms AS occurred_at_ms,
-                           CASE
-                             WHEN invoked_by_replica = 0 THEN invoked_by_module
-                             ELSE invoked_by_module || '[' || invoked_by_replica || ']'
-                           END AS speaker,
+                           invoked_by_module AS speaker,
+                           invoked_by_replica AS speaker_replica,
                            action_id AS target,
                            'action: ' || action_id
                              || char(10) || 'arguments: ' || arguments_json
@@ -444,6 +447,7 @@ impl LibsqlConversationHistoryStore {
 impl CognitionLogRepository for LibsqlCognitionLogRepository {
     async fn append(
         &self,
+        scope: ScopeId,
         source: ModuleInstanceId,
         entry: CognitionLogEntry,
     ) -> Result<(), PortError> {
@@ -460,9 +464,9 @@ impl CognitionLogRepository for LibsqlCognitionLogRepository {
                     created_at_ms
                  ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
                 params![
-                    source.module.as_str(),
+                    source.cognition_storage_module_key(&scope),
                     i64::from(source.replica.get()),
-                    entry.origin.owner.module.as_str(),
+                    entry.origin.owner.storage_module_key(),
                     i64::from(entry.origin.owner.replica.get()),
                     entry
                         .origin
@@ -480,6 +484,7 @@ impl CognitionLogRepository for LibsqlCognitionLogRepository {
 
     async fn since(
         &self,
+        scope: &ScopeId,
         source: &ModuleInstanceId,
         from: chrono::DateTime<chrono::Utc>,
     ) -> Result<Vec<CognitionLogEntry>, PortError> {
@@ -497,7 +502,7 @@ impl CognitionLogRepository for LibsqlCognitionLogRepository {
                     AND occurred_at_ms >= ?3
                   ORDER BY occurred_at_ms ASC, id ASC",
                 params![
-                    source.module.as_str(),
+                    source.cognition_storage_module_key(scope),
                     i64::from(source.replica.get()),
                     from.timestamp_millis(),
                 ],
@@ -565,8 +570,10 @@ impl CognitionLogRepository for LibsqlCognitionLogRepository {
             let origin_module: String = row.get(4).map_err(map_libsql_error)?;
             let origin_replica: i64 = row.get(5).map_err(map_libsql_error)?;
             let origin_memo_index: Option<i64> = row.get(6).map_err(map_libsql_error)?;
+            let (scope, source) = cognition_owner_from_row(owner_module, owner_replica)?;
             entries.push(PersistedCognitionLogEntry {
-                source: module_instance_from_row(owner_module, owner_replica)?,
+                scope,
+                source,
                 entry: CognitionLogEntry {
                     at: datetime_from_millis("cognition log occurred_at", occurred_at_ms)?,
                     text,
@@ -637,9 +644,11 @@ impl CognitionLogRepository for LibsqlCognitionLogRepository {
             let origin_module: String = row.get(5).map_err(map_libsql_error)?;
             let origin_replica: i64 = row.get(6).map_err(map_libsql_error)?;
             let origin_memo_index: Option<i64> = row.get(7).map_err(map_libsql_error)?;
+            let (scope, source) = cognition_owner_from_row(owner_module, owner_replica)?;
             entries.push(PersistedCognitionLogPageEntry {
                 id,
-                source: module_instance_from_row(owner_module, owner_replica)?,
+                scope,
+                source,
                 entry: CognitionLogEntry {
                     at: datetime_from_millis("cognition log occurred_at", occurred_at_ms)?,
                     text,
@@ -673,7 +682,7 @@ impl MemoLogRepository for LibsqlMemoLogRepository {
                     created_at_ms
                  ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
                 params![
-                    entry.record.owner.module.as_str(),
+                    entry.record.owner.memo_storage_module_key(&entry.scope),
                     i64::from(entry.record.owner.replica.get()),
                     i64::try_from(entry.record.index).map_err(|_| {
                         PortError::InvalidInput(format!(
@@ -750,7 +759,7 @@ impl AllocationStore for LibsqlAllocationStore {
             let snapshot: PersistedAllocationSnapshot = serde_json::from_str(&json)
                 .map_err(|error| PortError::InvalidData(error.to_string()))?;
             snapshot.validate_version()?;
-            if snapshot.owner.module.as_str() != owner_module
+            if snapshot.owner.storage_module_key() != owner_module
                 || i64::from(snapshot.owner.replica.get()) != owner_replica
             {
                 return Err(PortError::InvalidData(format!(
@@ -779,7 +788,7 @@ impl AllocationStore for LibsqlAllocationStore {
                     snapshot_json = excluded.snapshot_json,
                     updated_at_ms = excluded.updated_at_ms",
                 params![
-                    snapshot.owner.module.as_str(),
+                    snapshot.owner.storage_module_key(),
                     i64::from(snapshot.owner.replica.get()),
                     snapshot_json,
                     now_ms(),
@@ -807,7 +816,7 @@ impl SessionStore for LibsqlSessionStore {
                     AND owner_replica = ?2
                     AND session_key = ?3",
                 params![
-                    owner.module.as_str(),
+                    owner.storage_module_key(),
                     i64::from(owner.replica.get()),
                     key.as_str()
                 ],
@@ -844,7 +853,7 @@ impl SessionStore for LibsqlSessionStore {
                     snapshot_json = excluded.snapshot_json,
                     updated_at_ms = excluded.updated_at_ms",
                 params![
-                    owner.module.as_str(),
+                    owner.storage_module_key(),
                     i64::from(owner.replica.get()),
                     key.as_str(),
                     snapshot_json,
@@ -863,7 +872,7 @@ impl SessionStore for LibsqlSessionStore {
                 "DELETE FROM llm_sessions
                   WHERE owner_module = ?1
                     AND owner_replica = ?2",
-                params![owner.module.as_str(), i64::from(owner.replica.get())],
+                params![owner.storage_module_key(), i64::from(owner.replica.get())],
             )
             .await
             .map_err(map_libsql_error)?;
@@ -1214,7 +1223,7 @@ impl LibsqlUtteranceEventStore {
                 params![
                     event.server_session_id,
                     event.event_kind.as_str(),
-                    event.sender.module.as_str(),
+                    event.sender.storage_module_key(),
                     i64::from(event.sender.replica.get()),
                     event.target,
                     generation_id,
@@ -1326,7 +1335,7 @@ impl LibsqlExternalActionEventStore {
                 params![
                     event.server_session_id,
                     event.invocation_id,
-                    event.invoked_by.module.as_str(),
+                    event.invoked_by.storage_module_key(),
                     i64::from(event.invoked_by.replica.get()),
                     event.action_id,
                     arguments_json,
@@ -3691,9 +3700,16 @@ fn memo_log_entry_from_row(row: &libsql::Row) -> Result<PersistedMemoLogEntry, P
             ));
         }
     };
+    let replica = u8::try_from(owner_replica).map_err(|_| {
+        PortError::InvalidData(format!("invalid memo log owner replica: {owner_replica}"))
+    })?;
+    let (scope, owner) =
+        ModuleInstanceId::from_memo_storage_parts(&owner_module, ReplicaIndex::new(replica))
+            .map_err(|error| PortError::InvalidData(format!("invalid memo owner: {error}")))?;
     Ok(PersistedMemoLogEntry {
+        scope,
         record: MemoLogRecord {
-            owner: module_instance_from_row(owner_module, owner_replica)?,
+            owner,
             index: u64::try_from(memo_index)
                 .map_err(|_| PortError::InvalidData(format!("invalid memo index: {memo_index}")))?,
             written_at: datetime_from_millis("memo written_at", written_at_ms)?,
@@ -3785,16 +3801,33 @@ fn conversation_history_entry_from_row(
     row: &libsql::Row,
 ) -> Result<ConversationHistoryEntryRecord, PortError> {
     let role: String = row.get(0).map_err(map_libsql_error)?;
-    let generation_id: Option<i64> = row.get(8).map_err(map_libsql_error)?;
+    let role = conversation_history_role_from_str(&role)?;
+    let stored_speaker: String = row.get(5).map_err(map_libsql_error)?;
+    let speaker_replica: Option<i64> = row.get(6).map_err(map_libsql_error)?;
+    let speaker = match role {
+        ConversationHistoryRole::User => stored_speaker,
+        ConversationHistoryRole::Agent | ConversationHistoryRole::ExternalAction => {
+            module_instance_from_row(
+                stored_speaker,
+                speaker_replica.ok_or_else(|| {
+                    PortError::InvalidData(
+                        "module conversation speaker is missing its replica".to_owned(),
+                    )
+                })?,
+            )?
+            .to_string()
+        }
+    };
+    let generation_id: Option<i64> = row.get(9).map_err(map_libsql_error)?;
     Ok(ConversationHistoryEntryRecord {
         source_table: row.get(1).map_err(map_libsql_error)?,
         source_id: row.get(2).map_err(map_libsql_error)?,
         server_session_id: row.get(3).map_err(map_libsql_error)?,
         occurred_at_ms: row.get(4).map_err(map_libsql_error)?,
-        role: conversation_history_role_from_str(&role)?,
-        speaker: row.get(5).map_err(map_libsql_error)?,
-        target: row.get(6).map_err(map_libsql_error)?,
-        content: row.get(7).map_err(map_libsql_error)?,
+        role,
+        speaker,
+        target: row.get(7).map_err(map_libsql_error)?,
+        content: row.get(8).map_err(map_libsql_error)?,
         generation_id: generation_id
             .map(|value| u64_from_i64("conversation generation_id", value))
             .transpose()?,
@@ -4097,14 +4130,26 @@ fn module_instance_from_row(
     owner_module: String,
     owner_replica: i64,
 ) -> Result<ModuleInstanceId, PortError> {
-    let module = ModuleId::new(owner_module)
-        .map_err(|error| PortError::InvalidData(format!("invalid cognition log owner: {error}")))?;
     let replica = u8::try_from(owner_replica).map_err(|_| {
         PortError::InvalidData(format!(
             "invalid cognition log owner replica: {owner_replica}"
         ))
     })?;
-    Ok(ModuleInstanceId::new(module, ReplicaIndex::new(replica)))
+    ModuleInstanceId::from_storage_parts(&owner_module, ReplicaIndex::new(replica))
+        .map_err(|error| PortError::InvalidData(format!("invalid module owner: {error}")))
+}
+
+fn cognition_owner_from_row(
+    owner_module: String,
+    owner_replica: i64,
+) -> Result<(ScopeId, ModuleInstanceId), PortError> {
+    let replica = u8::try_from(owner_replica).map_err(|_| {
+        PortError::InvalidData(format!(
+            "invalid cognition log owner replica: {owner_replica}"
+        ))
+    })?;
+    ModuleInstanceId::from_cognition_storage_parts(&owner_module, ReplicaIndex::new(replica))
+        .map_err(|error| PortError::InvalidData(format!("invalid cognition log owner: {error}")))
 }
 
 fn cognition_origin_from_row(
@@ -6103,6 +6148,7 @@ mod tests {
         let new = chrono::Utc.with_ymd_and_hms(2025, 6, 1, 12, 2, 0).unwrap();
 
         repo.append(
+            ScopeId::root(),
             owner_a.clone(),
             CognitionLogEntry {
                 at: old,
@@ -6113,6 +6159,7 @@ mod tests {
         .await
         .unwrap();
         repo.append(
+            ScopeId::root(),
             owner_b.clone(),
             CognitionLogEntry {
                 at: new,
@@ -6123,6 +6170,7 @@ mod tests {
         .await
         .unwrap();
         repo.append(
+            ScopeId::root(),
             owner_a.clone(),
             CognitionLogEntry {
                 at: new,
@@ -6133,7 +6181,10 @@ mod tests {
         .await
         .unwrap();
 
-        let entries = repo.since(&owner_a, cutoff).await.unwrap();
+        let entries = repo
+            .since(&ScopeId::root(), &owner_a, cutoff)
+            .await
+            .unwrap();
         assert_eq!(
             entries,
             vec![CognitionLogEntry {
@@ -6161,6 +6212,7 @@ mod tests {
             (owner_a.clone(), "third"),
         ] {
             repo.append(
+                ScopeId::root(),
                 owner.clone(),
                 CognitionLogEntry {
                     at,
@@ -6268,6 +6320,7 @@ mod tests {
             ),
         ] {
             repo.append(&PersistedMemoLogEntry {
+                scope: ScopeId::root(),
                 record: MemoLogRecord {
                     owner,
                     index,
@@ -6286,6 +6339,7 @@ mod tests {
             entries,
             vec![
                 PersistedMemoLogEntry {
+                    scope: ScopeId::root(),
                     record: MemoLogRecord {
                         owner: owner_b,
                         index: 0,
@@ -6299,6 +6353,7 @@ mod tests {
                     },
                 },
                 PersistedMemoLogEntry {
+                    scope: ScopeId::root(),
                     record: MemoLogRecord {
                         owner: owner_a,
                         index: 1,
@@ -6310,6 +6365,54 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn memo_log_repository_separates_target_scope_from_owner_scope() {
+        let repo = memo_log_repository().await;
+        let child_scope = ScopeId::root().child(SubsystemInstanceId::new(
+            SubsystemId::new("arm").unwrap(),
+            ReplicaIndex::ZERO,
+        ));
+        let owner = ModuleInstanceId::in_scope(
+            child_scope.clone(),
+            ModuleId::new("subsystem-gate").unwrap(),
+            ReplicaIndex::ZERO,
+        );
+        let at = chrono::Utc.with_ymd_and_hms(2025, 6, 1, 12, 0, 0).unwrap();
+        let entries = vec![
+            PersistedMemoLogEntry {
+                scope: child_scope,
+                record: MemoLogRecord {
+                    owner: owner.clone(),
+                    index: 0,
+                    written_at: at,
+                    content: "parent cognition".to_owned(),
+                    cognitive: true,
+                },
+                payload: MemoLogPayload::Plain,
+            },
+            PersistedMemoLogEntry {
+                scope: ScopeId::root(),
+                record: MemoLogRecord {
+                    owner,
+                    index: 0,
+                    written_at: at,
+                    content: "child cognition".to_owned(),
+                    cognitive: true,
+                },
+                payload: MemoLogPayload::Plain,
+            },
+        ];
+        for entry in &entries {
+            repo.append(entry).await.unwrap();
+        }
+
+        let mut actual = repo.recent_per_owner(1).await.unwrap();
+        actual.sort_by(|left, right| left.scope.cmp(&right.scope));
+        let mut expected = entries;
+        expected.sort_by(|left, right| left.scope.cmp(&right.scope));
+        assert_eq!(actual, expected);
     }
 
     async fn store() -> LibsqlMemoryStore {

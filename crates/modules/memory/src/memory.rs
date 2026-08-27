@@ -10,8 +10,9 @@ use nuillu_module::{
     BlackboardReader, CognitionLogEntryRecord, CognitionLogReader, CognitionLogUpdatedInbox,
     LlmAccess, LlmContextWindow, MemoLogRecord, MemoUpdatedInbox, MemoryMetadataReader, Module,
     SessionAutoCompaction, SessionCompactionConfig, SessionCompactionProtectedPrefix,
-    compact_llm_context_text, ensure_persistent_session_seeded, format_memory_trace_inventory,
-    memory_rank_counts, push_formatted_cognition_log_batch, push_formatted_memo_log_batch,
+    compact_llm_context_text, ensure_persistent_session_seeded_in_context,
+    format_memory_trace_inventory, memory_rank_counts,
+    push_formatted_cognition_log_batch_in_context, push_formatted_memo_log_batch,
     render_memory_for_llm,
 };
 use nuillu_types::{MemoryIndex, MemoryRank};
@@ -250,12 +251,7 @@ impl MemoryModule {
 
     fn ensure_session_seeded(&mut self, cx: &nuillu_module::ActivateCx<'_>) {
         let system_prompt = self.system_prompt(cx).to_owned();
-        ensure_persistent_session_seeded(
-            &mut self.session,
-            system_prompt,
-            cx.identity_memories(),
-            cx.now(),
-        );
+        ensure_persistent_session_seeded_in_context(&mut self.session, system_prompt, cx);
     }
 
     #[tracing::instrument(skip_all, err(Debug, level = "warn"))]
@@ -274,10 +270,10 @@ impl MemoryModule {
             cx.now(),
             MEMO_CONTEXT_WINDOW,
         );
-        push_formatted_cognition_log_batch(
+        push_formatted_cognition_log_batch_in_context(
             &mut self.session,
             &batch.cognition_log,
-            cx.now(),
+            cx,
             COGNITION_CONTEXT_WINDOW,
         );
         let rank_counts = self.memory_metadata.read(memory_rank_counts).await;

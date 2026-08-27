@@ -120,7 +120,7 @@ impl MemoryAssociationModule {
 
     fn system_prompt(&self, cx: &nuillu_module::ActivateCx<'_>) -> &str {
         self.system_prompt.get_or_init(|| {
-            nuillu_module::format_system_seed(
+            nuillu_module::format_system_seed_in_context(
                 nuillu_module::format_system_prompt(
                     SYSTEM_PROMPT,
                     cx.peer_contexts(),
@@ -128,8 +128,7 @@ impl MemoryAssociationModule {
                     cx.core_policies(),
                 ),
                 false,
-                cx.identity_memories(),
-                cx.now(),
+                cx,
             )
         })
     }

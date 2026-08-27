@@ -12,7 +12,7 @@ This document is the implementation source of truth. It describes the desired ar
 1. **Runtime shape** — The scheduler/event loop starts `next_batch()` for active module replicas, keeps the returned batch, runs `activate(&batch)` with configured retry of that same batch, and waits for shutdown on a single-threaded `LocalSet`. `next_batch()` itself is not retried by the runtime.
 2. **Single-thread / WASM-compatible futures** — Module futures use `#[async_trait(?Send)]`; the runtime is current-thread / `LocalSet` oriented.
 3. **Capability-based design** — A module's possible side effects are exactly the capability handles passed to its constructor. Without a capability, there is no API path to the operation.
-4. **Owner-stamped operations** — Identity-bearing capabilities bake a hidden `ModuleInstanceId = (ModuleId, replica)` in at construction. Module constructors receive only a replica-scoped capability factory, so modules cannot claim to send, memo-write, append, or request as another module instance.
+4. **Owner-stamped operations** — Identity-bearing capabilities bake a hidden `ModuleInstanceId = (ScopeId, ModuleId, replica)` in at construction. Module constructors receive only an instance-scoped capability factory, so modules cannot claim to send, memo-write, append, or request as another module instance.
 5. **Typed channels, not generic payloads** — Module communication uses typed channel capabilities. There is no central `MailboxPayload`, no `serde_json::Value` mailbox, and no request/response correlation protocol.
 6. **Memo-authoritative results** — Query-module and self-model answers are written to the producing module's indexed `Memo` queue. Channel messages wake modules or submit work; they are not durable output.
 7. **Kebab-case module ids** — `ModuleId(String)` accepts only `^[a-z][a-z0-9]*(?:-[a-z0-9]+)*$`. Builtins live in `nuillu_types::builtin::*`.
@@ -35,6 +35,8 @@ This document is the implementation source of truth. It describes the desired ar
 24. **Whether recall is useful is a semantic decision** — Query-memory wakes from admitted cognition while allocation controls whether it is active. Rust may coalesce wake signals and exclude evidence already surfaced, but it must not pretend that keyword rules can decide whether memory would clarify the current cognition. The query-memory planning turn must be able to choose either a concrete retrieval plan or an explicit semantic no-retrieval decision; only the latter avoids search and evidence-selection work for that activation.
 25. **Memory ingest gates durable relevance, not scheduler freshness** — A concurrent cognitive system cannot generally determine from version numbers alone that an LLM-produced memory statement is semantically stale. The memory LLM gate decides whether evidence is worth preserving and should reject incidental in-flight progress/absence claims such as "has not answered yet" or "is still waiting" unless that unresolved state is itself the remembered event. When both are available, prefer the settled interaction or durable decision.
 26. **Self-model is an embodied and mental-state snapshot** — Self-model integrates the agent's body/form, abilities and limitations, interoceptive and affective condition, attention, intention, uncertainty, and agency. It does not preserve a conversation transcript, action chronology, poem history, or every question and answer. New output integrates and replaces superseded self-state instead of appending a recap.
+27. **Subsystems are finite hierarchical runtime scopes** — Boot config defines reusable subsystem templates and mounts any finite number of replicas at root or beneath another template. Recursive definition cycles are rejected before expansion. Each expanded scope has exactly one configured root module; the builtin `subsystem-gate` is the conventional outer/inner bridge, while a user-defined module role may be selected instead. Root selection affects subsystem allocation and scope wiring, not the module's ordinary capability set. The builtin bridge performs no LLM call and makes no admission decision: it mechanically writes outer cognition as an inner cognitive memo and inner cognition as an outer cognitive memo, leaving each side's cognition-gate as the sole promotion boundary.
+28. **Subsystem state boundaries are explicit** — Cognition logs, memos, and allocation are isolated per scope. Memory is either global or local per subsystem definition. Local memory is namespaced by the complete `ScopeId`; global memory is shared. Persisted module-owner keys and memory records always carry explicit scope metadata. Data written before this representation must be reset or regenerated; runtime readers do not infer a missing scope from stale records.
 
 ---
 
@@ -48,6 +50,7 @@ crates/
   modules/
     sensory/                  # observations -> deterministic salience + LLM-filtered memo logs
     cognition-gate/           # cognitive memo candidates -> cognition log
+    subsystem-gate/           # deterministic parent/child cognition-to-memo bridge
     allocation/     # cognition log -> resource allocation
     attention-schema/         # source-blind cognitive memo/cognition deltas -> first-person attention memos
     interpreter/              # cognition log -> interpretation/hypothesis/story-seed cognition-log entries
@@ -106,10 +109,16 @@ pub struct ReplicaCapRange {
 }
 
 pub struct ModuleInstanceId {
+    pub scope: ScopeId,
     pub module: ModuleId,
     pub replica: ReplicaIndex,
 }
 ```
+
+`ScopeId` is the ordered path of `(SubsystemId, ReplicaIndex)` segments from the agent root. The
+empty path denotes root. A `ModuleId` may therefore have independent instances in root and in any
+number of expanded subsystem scopes. Persistent owner keys encode the scope explicitly even for
+root; unscoped legacy keys are invalid rather than being silently interpreted as root.
 
 `ReplicaCapRange` is boot-time policy. It must satisfy `min <= max`, and v1 caps should stay within `0..=3` unless a later runtime design explicitly raises the global limit. The runtime creates `max` module instances for the registration. Allocation chooses the effective active replica count and is clamped to `min..=max`.
 
@@ -410,6 +419,26 @@ Cognition log:
 
 Memory metadata remains keyed by `MemoryIndex`. Storage-level memory replicas are external persistence mirrors and are unrelated to module replicas.
 
+### Subsystem scope boundaries
+
+Each expanded subsystem scope receives its own blackboard view, cognition log, memo owners, and
+allocation snapshot. Its configured root module is wired in the inner scope and may receive explicit
+outer cognition-reader and outer memo capabilities. The builtin `subsystem-gate` copies every new
+outer cognition entry into its cognitive memo in the inner scope and every new inner cognition entry
+into its cognitive memo targeted at the immediate parent. It preserves the cognition text exactly,
+does not call an LLM, and never writes a cognition log directly. The cognition-gate in each target
+scope independently decides whether to promote the bridged memo. Multiple hierarchy levels are
+expanded normally, but recursive template references are rejected.
+
+Because one gate owner writes memo logs in two scopes, memo persistence records the target memo
+scope independently from the owner stamp. The storage key encodes that target scope when it differs
+from the owner's scope, so indexes and restoration remain isolated without inventing a second module
+identity.
+
+Memory uses one physical agent store with explicit namespace tags. A `global` view can see only
+records tagged `global`; a `local` view can see only records tagged with its complete scope path.
+Missing namespace tags are invalid for all views and are never treated as global compatibility data.
+
 ### Other capability handles
 
 All capabilities are non-exclusive: capability issuers do not enforce uniqueness on any handle. The "Owner-stamped" column indicates capabilities whose hidden `ModuleInstanceId` is baked in at construction so it cannot be forged by module code.
@@ -603,6 +632,22 @@ that applies time-division rounding: it converts the detailed memo age into the 
 
 The module may summarize content as part of its multi-candidate decision, but its architectural job
 is gating: selecting which cognitive memo candidate becomes admitted cognitive evidence.
+
+### Subsystem Gate
+
+Capabilities: inner and outer `CognitionLogUpdatedInbox`, inner and outer
+`CognitionLogReader`, and inner- and outer-targeted `TypedMemo<SubsystemGateMemo>` handles.
+
+Bridges cognition across one parent/child scope boundary without using an LLM or making an
+admission decision. Each unseen outer cognition-log entry is copied verbatim into a cognitive memo
+targeted at the inner scope, and each unseen inner cognition-log entry is copied verbatim into a
+cognitive memo targeted at the outer scope. The module retains fingerprints in its typed memo state
+so replay after restart does not duplicate already bridged entries. Its own bridged entries are
+excluded by owner-stamped cognition readers, preventing a direct echo loop.
+
+The module has no `CognitionWriter` or `LlmAccess`. The cognition-gate in the memo's target scope is
+the sole component that decides whether the bridged candidate is promoted into that scope's
+cognition log.
 
 ### Allocation
 

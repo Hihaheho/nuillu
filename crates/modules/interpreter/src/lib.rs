@@ -1,11 +1,12 @@
 use anyhow::{Context, Result};
 use async_trait::async_trait;
+#[cfg(test)]
 use chrono::{DateTime, Utc};
 use lutum::{Session, TextStepOutcomeWithTools, ToolResult};
 use nuillu_module::{
     CognitionLogReader, CognitionLogUpdatedInbox, CognitionWriter, LlmAccess, LlmContextWindow,
     Module, SessionAutoCompaction, SessionCompactionConfig, SessionCompactionProtectedPrefix,
-    ensure_persistent_session_seeded, format_new_cognition_log_entries,
+    ensure_persistent_session_seeded_in_context, format_new_cognition_log_entries_in_context,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -48,11 +49,16 @@ pub fn session_auto_compaction() -> SessionAutoCompaction {
     )
 }
 
-fn format_interpreter_update_input(
+fn format_interpreter_update_input_in_context(
     cognition_log: &[nuillu_module::CognitionLogEntryRecord],
-    now: DateTime<Utc>,
+    cx: &nuillu_module::ActivateCx<'_>,
 ) -> Option<String> {
-    let cognition = format_new_cognition_log_entries(cognition_log, now, COGNITION_CONTEXT_WINDOW)?;
+    let cognition = format_new_cognition_log_entries_in_context(
+        cognition_log,
+        cx.now(),
+        COGNITION_CONTEXT_WINDOW,
+        cx,
+    )?;
     Some(format!(
         "{cognition}\n\nInstruction: Interpret the new cognition above only when useful for the current conscious state."
     ))
@@ -118,12 +124,7 @@ impl InterpreterModule {
 
     fn ensure_session_seeded(&mut self, cx: &nuillu_module::ActivateCx<'_>) {
         let model_prompt = self.model_prompt(cx).to_owned();
-        ensure_persistent_session_seeded(
-            &mut self.session,
-            model_prompt,
-            cx.identity_memories(),
-            cx.now(),
-        );
+        ensure_persistent_session_seeded_in_context(&mut self.session, model_prompt, cx);
     }
 
     fn model_prompt(&self, cx: &nuillu_module::ActivateCx<'_>) -> &str {
@@ -140,7 +141,8 @@ impl InterpreterModule {
     ) -> Result<()> {
         self.ensure_session_seeded(cx);
 
-        let Some(update_input) = format_interpreter_update_input(&batch.cognition_log, cx.now())
+        let Some(update_input) =
+            format_interpreter_update_input_in_context(&batch.cognition_log, cx)
         else {
             return Ok(());
         };

@@ -11,7 +11,7 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use nuillu_blackboard::{Blackboard, BlackboardCommand, MemoryMetaPatch};
 use nuillu_module::ports::{Clock, PortError};
-use nuillu_types::{MemoryContent, MemoryIndex, MemoryRank};
+use nuillu_types::{MemoryContent, MemoryIndex, MemoryRank, ScopeId};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -75,6 +75,221 @@ pub trait MemoryStore {
         updated_at: DateTime<Utc>,
     ) -> Result<MemoryLink, PortError>;
     async fn delete(&self, index: &MemoryIndex) -> Result<(), PortError>;
+}
+
+const MEMORY_SCOPE_TAG_NAMESPACE: &str = "nuillu-memory-scope";
+
+/// Visibility namespace applied by the host to one set of memory capabilities.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MemoryNamespace {
+    Global,
+    Local(ScopeId),
+}
+
+impl MemoryNamespace {
+    fn label(&self) -> String {
+        match self {
+            Self::Global => "global".to_owned(),
+            Self::Local(scope) => format!("local:{scope}"),
+        }
+    }
+}
+
+/// Backend-neutral namespace view over a memory store.
+///
+/// Namespace metadata is persisted as an internal tag, allowing the existing
+/// single agent database and every MemoryStore implementation to support
+/// local subsystem memory without exposing cross-scope records.
+pub struct NamespacedMemoryStore {
+    inner: Rc<dyn MemoryStore>,
+    namespace: MemoryNamespace,
+}
+
+impl NamespacedMemoryStore {
+    pub fn new(inner: Rc<dyn MemoryStore>, namespace: MemoryNamespace) -> Self {
+        Self { inner, namespace }
+    }
+
+    fn stamp_new(&self, mut memory: NewMemory) -> NewMemory {
+        stamp_scope_tag(&mut memory.tags, &self.namespace.label());
+        memory
+    }
+
+    fn stamp_indexed(&self, mut memory: IndexedMemory) -> IndexedMemory {
+        stamp_scope_tag(&mut memory.tags, &self.namespace.label());
+        memory
+    }
+
+    fn visible(&self, record: &MemoryRecord) -> bool {
+        let stored = record
+            .tags
+            .iter()
+            .find(|tag| tag.namespace == MEMORY_SCOPE_TAG_NAMESPACE)
+            .map(|tag| tag.label.as_str());
+        match &self.namespace {
+            MemoryNamespace::Global => stored == Some("global"),
+            MemoryNamespace::Local(_) => {
+                let label = self.namespace.label();
+                stored == Some(label.as_str())
+            }
+        }
+    }
+
+    fn clean(&self, mut record: MemoryRecord) -> MemoryRecord {
+        record
+            .tags
+            .retain(|tag| tag.namespace != MEMORY_SCOPE_TAG_NAMESPACE);
+        record
+    }
+
+    async fn checked_sources(&self, sources: &[MemoryIndex]) -> Result<(), PortError> {
+        for source in sources {
+            if self.get(source).await?.is_none() {
+                return Err(PortError::InvalidInput(format!(
+                    "memory {} is outside the active memory namespace",
+                    source.as_str()
+                )));
+            }
+        }
+        Ok(())
+    }
+}
+
+fn stamp_scope_tag(tags: &mut Vec<MemoryTag>, label: &str) {
+    tags.retain(|tag| tag.namespace != MEMORY_SCOPE_TAG_NAMESPACE);
+    tags.push(MemoryTag {
+        label: label.to_owned(),
+        namespace: MEMORY_SCOPE_TAG_NAMESPACE.to_owned(),
+        confidence: 1.0,
+    });
+}
+
+#[async_trait(?Send)]
+impl MemoryStore for NamespacedMemoryStore {
+    async fn insert(
+        &self,
+        mem: NewMemory,
+        stored_at: DateTime<Utc>,
+    ) -> Result<MemoryRecord, PortError> {
+        self.inner
+            .insert(self.stamp_new(mem), stored_at)
+            .await
+            .map(|record| self.clean(record))
+    }
+
+    async fn put(&self, mem: IndexedMemory) -> Result<MemoryRecord, PortError> {
+        self.inner
+            .put(self.stamp_indexed(mem))
+            .await
+            .map(|record| self.clean(record))
+    }
+
+    async fn compact(
+        &self,
+        mem: NewMemory,
+        sources: &[MemoryIndex],
+        stored_at: DateTime<Utc>,
+    ) -> Result<MemoryRecord, PortError> {
+        self.checked_sources(sources).await?;
+        self.inner
+            .compact(self.stamp_new(mem), sources, stored_at)
+            .await
+            .map(|record| self.clean(record))
+    }
+
+    async fn put_compacted(
+        &self,
+        mem: IndexedMemory,
+        sources: &[MemoryIndex],
+    ) -> Result<MemoryRecord, PortError> {
+        self.checked_sources(sources).await?;
+        self.inner
+            .put_compacted(self.stamp_indexed(mem), sources)
+            .await
+            .map(|record| self.clean(record))
+    }
+
+    async fn get(&self, index: &MemoryIndex) -> Result<Option<MemoryRecord>, PortError> {
+        Ok(self
+            .inner
+            .get(index)
+            .await?
+            .filter(|record| self.visible(record))
+            .map(|record| self.clean(record)))
+    }
+
+    async fn list_by_rank(&self, rank: MemoryRank) -> Result<Vec<MemoryRecord>, PortError> {
+        Ok(self
+            .inner
+            .list_by_rank(rank)
+            .await?
+            .into_iter()
+            .filter(|record| self.visible(record))
+            .map(|record| self.clean(record))
+            .collect())
+    }
+
+    async fn search(&self, q: &MemoryQuery) -> Result<Vec<MemoryRecord>, PortError> {
+        if q.limit == 0 {
+            return Ok(Vec::new());
+        }
+        let batch_size = q.limit.saturating_add(q.offset).max(64);
+        let mut raw_offset = 0;
+        let mut visible = Vec::new();
+        loop {
+            let mut page_query = q.clone();
+            page_query.offset = raw_offset;
+            page_query.limit = batch_size;
+            let page = self.inner.search(&page_query).await?;
+            let page_len = page.len();
+            visible.extend(
+                page.into_iter()
+                    .filter(|record| self.visible(record))
+                    .map(|record| self.clean(record)),
+            );
+            if visible.len() >= q.offset.saturating_add(q.limit) || page_len < batch_size {
+                break;
+            }
+            raw_offset = raw_offset.saturating_add(page_len);
+        }
+        Ok(visible.into_iter().skip(q.offset).take(q.limit).collect())
+    }
+
+    async fn linked(&self, q: &LinkedMemoryQuery) -> Result<Vec<LinkedMemoryRecord>, PortError> {
+        let mut raw = q.clone();
+        raw.offset = 0;
+        raw.limit = usize::MAX;
+        Ok(self
+            .inner
+            .linked(&raw)
+            .await?
+            .into_iter()
+            .filter(|linked| self.visible(&linked.record))
+            .skip(q.offset)
+            .take(q.limit)
+            .map(|mut linked| {
+                linked.record = self.clean(linked.record);
+                linked
+            })
+            .collect())
+    }
+
+    async fn upsert_link(
+        &self,
+        link: NewMemoryLink,
+        updated_at: DateTime<Utc>,
+    ) -> Result<MemoryLink, PortError> {
+        self.checked_sources(&[link.from_memory.clone(), link.to_memory.clone()])
+            .await?;
+        self.inner.upsert_link(link, updated_at).await
+    }
+
+    async fn delete(&self, index: &MemoryIndex) -> Result<(), PortError> {
+        if self.get(index).await?.is_some() {
+            self.inner.delete(index).await?;
+        }
+        Ok(())
+    }
 }
 
 fn all_memory_ranks() -> [MemoryRank; 5] {
@@ -989,6 +1204,7 @@ mod tests {
 
     use super::*;
     use nuillu_module::ports::FixedClock;
+    use nuillu_types::{ReplicaIndex, SubsystemId, SubsystemInstanceId};
 
     #[derive(Clone)]
     struct StaticMemoryStore {
@@ -1234,6 +1450,90 @@ mod tests {
         async fn delete(&self, _index: &MemoryIndex) -> Result<(), PortError> {
             Ok(())
         }
+    }
+
+    #[tokio::test]
+    async fn namespaced_store_separates_global_and_each_local_scope() {
+        let now = DateTime::from_timestamp(1_700_000_000, 0).unwrap();
+        let inner = Rc::new(StatefulMemoryStore::default());
+        let left_scope = ScopeId::root().child(SubsystemInstanceId::new(
+            SubsystemId::new("arm").unwrap(),
+            ReplicaIndex::ZERO,
+        ));
+        let right_scope = ScopeId::root().child(SubsystemInstanceId::new(
+            SubsystemId::new("arm").unwrap(),
+            ReplicaIndex::new(1),
+        ));
+        let global = NamespacedMemoryStore::new(inner.clone(), MemoryNamespace::Global);
+        let left =
+            NamespacedMemoryStore::new(inner.clone(), MemoryNamespace::Local(left_scope.clone()));
+        let right = NamespacedMemoryStore::new(inner.clone(), MemoryNamespace::Local(right_scope));
+
+        let unscoped_record = inner
+            .insert(
+                NewMemory::statement(
+                    MemoryContent::new("missing namespace"),
+                    MemoryRank::LongTerm,
+                    Some(now),
+                ),
+                now,
+            )
+            .await
+            .unwrap();
+
+        let global_record = global
+            .insert(
+                NewMemory::statement(
+                    MemoryContent::new("global"),
+                    MemoryRank::LongTerm,
+                    Some(now),
+                ),
+                now,
+            )
+            .await
+            .unwrap();
+        let left_record = left
+            .insert(
+                NewMemory::statement(MemoryContent::new("left"), MemoryRank::LongTerm, Some(now)),
+                now,
+            )
+            .await
+            .unwrap();
+        let right_record = right
+            .insert(
+                NewMemory::statement(MemoryContent::new("right"), MemoryRank::LongTerm, Some(now)),
+                now,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            global.list_by_rank(MemoryRank::LongTerm).await.unwrap(),
+            vec![global_record.clone()]
+        );
+        assert_eq!(
+            left.list_by_rank(MemoryRank::LongTerm).await.unwrap(),
+            vec![left_record.clone()]
+        );
+        assert_eq!(
+            right.list_by_rank(MemoryRank::LongTerm).await.unwrap(),
+            vec![right_record]
+        );
+        assert_eq!(global.get(&left_record.index).await.unwrap(), None);
+        assert_eq!(global.get(&unscoped_record.index).await.unwrap(), None);
+        assert_eq!(left.get(&global_record.index).await.unwrap(), None);
+        assert!(
+            left_record
+                .tags
+                .iter()
+                .all(|tag| tag.namespace != MEMORY_SCOPE_TAG_NAMESPACE)
+        );
+
+        let raw_left = inner.get(&left_record.index).await.unwrap().unwrap();
+        assert!(raw_left.tags.iter().any(|tag| {
+            tag.namespace == MEMORY_SCOPE_TAG_NAMESPACE
+                && tag.label == format!("local:{left_scope}")
+        }));
     }
 
     #[async_trait(?Send)]

@@ -19,7 +19,7 @@ use lutum_libsql_adapter::{LibsqlAgentStore, LibsqlAgentStoreConfig};
 use lutum_openai::{FeatureFlags, HttpClient, OpenAiAdapter, OpenAiReasoningEffort};
 use nuillu_blackboard::{AllocationLimits, Blackboard};
 use nuillu_llm_trace_file::{FileLlmTraceSink, LlmLogContext};
-use nuillu_memory::{MemoryCapabilities, MemoryStore};
+use nuillu_memory::{MemoryCapabilities, MemoryNamespace, MemoryStore};
 use nuillu_module::ports::{
     Clock, CognitionLogRepository, Embedder, PortError, SystemClock, Timer,
     timeout as timer_timeout,
@@ -342,6 +342,7 @@ pub(super) async fn build_server_environment(
             external_action_executor: external_actions.clone(),
         },
     });
+    caps.set_scope_labels(config.boot_config.scope_labels());
 
     let memory_caps = MemoryCapabilities::new(
         blackboard.clone(),
@@ -349,10 +350,11 @@ pub(super) async fn build_server_environment(
         memory.clone(),
         Vec::new(),
     );
+    let startup_memory_caps = memory_caps.with_namespace(MemoryNamespace::Global);
     emit_startup_progress(&visualizer, "seeding startup memories");
     let seeded_memories = host_ports
         .memory_seed()
-        .seed(&memory_caps)
+        .seed(&startup_memory_caps)
         .await
         .context("seed startup memories")?;
     if seeded_memories > 0 {
@@ -363,7 +365,7 @@ pub(super) async fn build_server_environment(
         format!("startup memories seeded count={seeded_memories}"),
     );
     emit_startup_progress(&visualizer, "bootstrapping identity memories");
-    memory_caps
+    startup_memory_caps
         .bootstrap_identity_memories()
         .await
         .map_err(|error| anyhow::anyhow!("failed to load identity memories: {error}"))?;

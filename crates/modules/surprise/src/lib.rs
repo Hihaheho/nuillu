@@ -4,8 +4,9 @@ use lutum::{Session, TextStepOutcomeWithTools, ToolResult};
 use nuillu_module::{
     AttentionControlRequest, AttentionControlRequestMailbox, BlackboardReader, CognitionLogReader,
     CognitionLogUpdatedInbox, LlmAccess, LlmContextWindow, Memo, Module, SessionAutoCompaction,
-    SessionCompactionConfig, SessionCompactionProtectedPrefix, ensure_persistent_session_seeded,
-    push_formatted_cognition_log_batch, push_formatted_memo_log_batch,
+    SessionCompactionConfig, SessionCompactionProtectedPrefix,
+    ensure_persistent_session_seeded_in_context, push_formatted_cognition_log_batch_in_context,
+    push_formatted_memo_log_batch,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -134,12 +135,7 @@ impl SurpriseModule {
 
     fn ensure_session_seeded(&mut self, cx: &nuillu_module::ActivateCx<'_>) {
         let system_prompt = self.system_prompt(cx).to_owned();
-        ensure_persistent_session_seeded(
-            &mut self.session,
-            system_prompt,
-            cx.identity_memories(),
-            cx.now(),
-        );
+        ensure_persistent_session_seeded_in_context(&mut self.session, system_prompt, cx);
     }
 
     fn system_prompt(&self, cx: &nuillu_module::ActivateCx<'_>) -> &str {
@@ -163,10 +159,10 @@ impl SurpriseModule {
                 cx.now(),
                 MEMO_CONTEXT_WINDOW,
             );
-            push_formatted_cognition_log_batch(
+            push_formatted_cognition_log_batch_in_context(
                 &mut self.session,
                 &unread_cognition,
-                cx.now(),
+                cx,
                 COGNITION_CONTEXT_WINDOW,
             );
             self.session.push_ephemeral_developer(ACTIVATION_INPUT);

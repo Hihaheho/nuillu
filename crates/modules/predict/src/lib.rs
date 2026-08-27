@@ -4,8 +4,8 @@ use lutum::Session;
 use nuillu_module::{
     CognitionLogReader, CognitionLogUpdatedInbox, LlmAccess, LlmContextWindow, Memo, Module,
     SessionAutoCompaction, SessionCompactionConfig, SessionCompactionProtectedPrefix,
-    ensure_persistent_session_seeded, format_policy_system_prompt,
-    push_formatted_cognition_log_batch,
+    ensure_persistent_session_seeded_in_context, format_policy_system_prompt,
+    push_formatted_cognition_log_batch_in_context,
 };
 
 mod batch;
@@ -74,12 +74,7 @@ impl PredictModule {
 
     fn ensure_session_seeded(&mut self, cx: &nuillu_module::ActivateCx<'_>) {
         let system_prompt = self.system_prompt(cx).to_owned();
-        ensure_persistent_session_seeded(
-            &mut self.session,
-            system_prompt,
-            cx.identity_memories(),
-            cx.now(),
-        );
+        ensure_persistent_session_seeded_in_context(&mut self.session, system_prompt, cx);
     }
 
     #[tracing::instrument(skip_all, err(Debug, level = "warn"))]
@@ -89,10 +84,10 @@ impl PredictModule {
         self.ensure_session_seeded(cx);
         let lutum = self.llm.lutum().await;
         let memo = {
-            push_formatted_cognition_log_batch(
+            push_formatted_cognition_log_batch_in_context(
                 &mut self.session,
                 &unread_cognition,
-                cx.now(),
+                cx,
                 COGNITION_CONTEXT_WINDOW,
             );
             self.session

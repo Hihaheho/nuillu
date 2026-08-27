@@ -16,7 +16,7 @@ use crate::session::{
     NoopSessionStore, SessionCheckpointError, SessionStore, persistent_session_metadata,
     restore_persistent_session_metadata, strip_reasoning_blocks_from_session,
 };
-use crate::{PersistedSessionSnapshot, SessionCompactionRuntime, compact_session};
+use crate::{PersistedSessionSnapshot, ScopeLabels, SessionCompactionRuntime, compact_session};
 
 /// Read-only context passed to `Module::activate` carrying agent-wide
 /// information that is shared across all modules. **Capabilities are
@@ -31,6 +31,7 @@ pub struct ActivateCx<'a> {
     session_store: Rc<dyn SessionStore>,
     runtime_events: RuntimeEventEmitter,
     owner: Option<ModuleInstanceId>,
+    scope_labels: Rc<ScopeLabels>,
     clock: Rc<dyn Clock>,
 }
 
@@ -50,6 +51,7 @@ impl<'a> ActivateCx<'a> {
             session_store: Rc::new(NoopSessionStore),
             runtime_events: RuntimeEventEmitter::new(Rc::new(NoopRuntimeEventSink)),
             owner: None,
+            scope_labels: Rc::new(ScopeLabels::default()),
             clock,
         }
     }
@@ -70,6 +72,29 @@ impl<'a> ActivateCx<'a> {
     pub fn with_owner(mut self, owner: ModuleInstanceId) -> Self {
         self.owner = Some(owner);
         self
+    }
+
+    pub(crate) fn with_scope_labels(mut self, scope_labels: Rc<ScopeLabels>) -> Self {
+        self.scope_labels = scope_labels;
+        self
+    }
+
+    /// Human-facing label for a cognition origin in a descendant subsystem.
+    /// Returns `None` for the activating module's own scope and outer scopes.
+    pub fn relative_subsystem_label(&self, origin: &nuillu_types::ScopeId) -> Option<String> {
+        let current = self
+            .owner
+            .as_ref()
+            .map(|owner| owner.scope.clone())
+            .unwrap_or_default();
+        self.scope_labels
+            .relative_descendant_label(&current, origin)
+    }
+
+    /// Human-facing name for the activating module's scope.
+    pub fn scope_display_name(&self) -> Option<String> {
+        let scope = &self.owner.as_ref()?.scope;
+        self.scope_labels.label(scope)
     }
 
     /// Emit a module-scoped activation warning to runtime observers and tracing.

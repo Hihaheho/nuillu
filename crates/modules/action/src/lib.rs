@@ -11,9 +11,10 @@ use nuillu_module::{
     ExternalActionInvocationResult, ExternalActionInvoker, InteroceptiveReader,
     InteroceptiveUpdatedInbox, InteroceptiveWriter, LlmAccess, LlmContextWindow, Memo,
     MemoLogBatchFormat, MemoUpdatedInbox, Module, SessionAutoCompaction, SessionCompactionConfig,
-    SessionCompactionProtectedPrefix, ensure_persistent_session_seeded,
-    format_bounded_cognition_log_batch_with_format, format_bounded_memo_log_batch_with_format,
-    format_current_allocation_state, format_memory_trace_inventory, memory_rank_counts,
+    SessionCompactionProtectedPrefix, ensure_persistent_session_seeded_in_context,
+    format_bounded_cognition_log_batch_with_format_in_context,
+    format_bounded_memo_log_batch_with_format, format_current_allocation_state,
+    format_memory_trace_inventory, memory_rank_counts,
 };
 use nuillu_types::builtin;
 use schemars::JsonSchema;
@@ -165,12 +166,7 @@ impl ActionModule {
 
     fn ensure_session_seeded(&mut self, cx: &nuillu_module::ActivateCx<'_>) {
         let system_prompt = self.system_prompt().to_owned();
-        ensure_persistent_session_seeded(
-            &mut self.session,
-            system_prompt,
-            cx.identity_memories(),
-            cx.now(),
-        );
+        ensure_persistent_session_seeded_in_context(&mut self.session, system_prompt, cx);
     }
 
     #[tracing::instrument(skip_all, err(Debug, level = "warn"))]
@@ -213,11 +209,12 @@ impl ActionModule {
                     MEMO_CONTEXT_WINDOW,
                     ACTION_MEMO_LOG_FORMAT,
                 ),
-                format_bounded_cognition_log_batch_with_format(
+                format_bounded_cognition_log_batch_with_format_in_context(
                     &unread_cognition,
                     cx.now(),
                     COGNITION_CONTEXT_WINDOW,
                     ACTION_COGNITION_LOG_FORMAT,
+                    cx,
                 ),
             ) {
                 self.session.push_user(observation);
