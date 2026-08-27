@@ -49,6 +49,11 @@ section-memo = メモ
 section-memory = 記憶
 section-scene = シーン
 
+cognition-follow = Follow
+cognition-follow-hover = 新しい認知ログを自動で読み込み、最新の項目を表示し続けます。
+cognition-load-newest-hover = 新しい認知ログを読み込み、最新の項目へ移動します。
+cognition-loading-newest = 最新を読み込み中…
+
 window-scene-title = シーン - { $title }
 window-blackboard-title = ブラックボード - { $title }
 window-memory-title = 記憶 - { $title }

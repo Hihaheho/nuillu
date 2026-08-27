@@ -5,8 +5,10 @@ use std::{
 
 use crate::{
     CognitionLogCursor, CognitionLogView, PersistedCognitionEntryView, VisualizerClientMessage,
-    VisualizerCommand, VisualizerTabId, i18n::localized_module_name_with_id,
-    text::hard_wrap_long_segments, time::format_jst_datetime,
+    VisualizerCommand, VisualizerTabId,
+    i18n::{EguiI18nExt as _, localized_module_name_with_id},
+    text::hard_wrap_long_segments,
+    time::format_jst_datetime,
 };
 
 pub(crate) const COGNITION_CHUNK_SIZE: usize = 100;
@@ -38,6 +40,11 @@ pub struct CognitionState {
     loading: bool,
     requested_initial: bool,
     refresh_needed: bool,
+    /// Monotonically increasing snapshot generation used to avoid losing an
+    /// update that arrives while a persisted page is in flight.
+    snapshot_revision: u64,
+    requested_snapshot_revision: Option<u64>,
+    jump_to_newest: bool,
     panes: HashMap<&'static str, PaneLayout>,
 }
 
@@ -76,6 +83,9 @@ impl CognitionState {
             loading: false,
             requested_initial: false,
             refresh_needed: false,
+            snapshot_revision: 0,
+            requested_snapshot_revision: None,
+            jump_to_newest: true,
             panes: HashMap::new(),
         }
     }
@@ -85,7 +95,10 @@ impl CognitionState {
         if self.snapshot_fingerprint == Some(fingerprint) {
             return;
         }
-        if self.snapshot_fingerprint.is_some() {
+        self.snapshot_revision = self.snapshot_revision.wrapping_add(1);
+        if self.snapshot_fingerprint.is_some()
+            || (self.loaded_initial && snapshot_has_unloaded_entry(logs, &self.entries))
+        {
             self.refresh_needed = true;
         }
         self.snapshot_fingerprint = Some(fingerprint);
@@ -120,10 +133,13 @@ impl CognitionState {
         has_more: bool,
     ) {
         self.loading = false;
+        let requested_snapshot_revision = self.requested_snapshot_revision.take();
         match cursor {
             CognitionLogCursor::Newest => {
                 self.loaded_initial = true;
-                self.refresh_needed = false;
+                self.refresh_needed = requested_snapshot_revision
+                    .is_some_and(|revision| revision != self.snapshot_revision);
+                self.jump_to_newest = true;
                 self.entries = entries;
                 self.has_older = has_more;
             }
@@ -137,7 +153,9 @@ impl CognitionState {
                 self.has_older = has_more;
             }
             CognitionLogCursor::Newer { .. } => {
-                self.refresh_needed = false;
+                self.refresh_needed = requested_snapshot_revision
+                    .is_some_and(|revision| revision != self.snapshot_revision);
+                self.jump_to_newest = true;
                 if entries.is_empty() {
                     return;
                 }
@@ -209,6 +227,22 @@ fn snapshot_fingerprint(logs: &[CognitionLogView]) -> u64 {
     hasher.finish()
 }
 
+fn snapshot_has_unloaded_entry(
+    logs: &[CognitionLogView],
+    loaded: &[PersistedCognitionEntryView],
+) -> bool {
+    logs.iter().any(|log| {
+        log.entries.iter().any(|snapshot| {
+            !loaded.iter().any(|entry| {
+                entry.source == log.source
+                    && entry.at == snapshot.at
+                    && entry.origin == snapshot.origin
+                    && entry.text == snapshot.text
+            })
+        })
+    })
+}
+
 /// Stand-in identity for a snapshot entry, which carries no persisted id.
 fn synthetic_id(source: &str, entry: &crate::CognitionEntryView) -> i64 {
     let mut hasher = DefaultHasher::new();
@@ -230,22 +264,9 @@ pub fn ui(
     id_salt: &'static str,
     tab_id: &VisualizerTabId,
     state: &mut CognitionState,
+    follow: &mut bool,
     messages: &mut Vec<VisualizerClientMessage>,
 ) {
-    if !state.loading {
-        if !state.requested_initial {
-            request_page(tab_id, state, messages, CognitionLogCursor::Newest);
-        } else if state.refresh_needed {
-            let cursor = match state.entries.first() {
-                Some(newest) => CognitionLogCursor::Newer {
-                    after_id: newest.id,
-                },
-                None => CognitionLogCursor::Newest,
-            };
-            request_page(tab_id, state, messages, cursor);
-        }
-    }
-
     let id = ui.make_persistent_id(id_salt);
     let available_width = ui.available_width().max(120.0);
     let width_bits = available_width.to_bits();
@@ -268,13 +289,24 @@ pub fn ui(
         data.get_temp::<ViewportAnchor>(anchor_key)
             .unwrap_or_default()
     });
-    let corrected_offset = corrected_scroll_offset(old_anchor, &state.index_by_id, offsets);
+    let corrected_offset = if *follow || state.jump_to_newest {
+        Some(0.0)
+    } else {
+        corrected_scroll_offset(old_anchor, &state.index_by_id, offsets)
+    };
 
-    let mut scroll = egui::ScrollArea::vertical().id_salt(id);
+    let mut scroll = egui::ScrollArea::vertical()
+        .id_salt(id)
+        .auto_shrink([false, false]);
     if let Some(offset) = corrected_offset {
         scroll = scroll.vertical_scroll_offset(offset);
     }
     let output = scroll.show_viewport(ui, |ui, viewport| {
+        // Virtualized children are placed with explicit rectangles and do not
+        // advance the content cursor horizontally. Pin the virtual content to
+        // the viewport width so the scroll bar stays at the pane's right edge.
+        ui.set_min_width(available_width);
+        ui.set_width(available_width);
         ui.set_height(total_height);
         let start = offsets
             .partition_point(|offset| *offset <= viewport.min.y)
@@ -296,6 +328,9 @@ pub fn ui(
         viewport.max.y + viewport.height() >= total_height
     });
     let reached_end = output.inner;
+    if should_disable_follow(*follow, output.state.offset.y) {
+        *follow = false;
+    }
 
     ui.ctx().data_mut(|data| {
         data.insert_temp(
@@ -306,7 +341,31 @@ pub fn ui(
             },
         );
     });
+    state.jump_to_newest = false;
     state.panes.insert(id_salt, pane);
+
+    // Decide whether to refresh only after processing scroll input. If the
+    // user scrolls away on the same frame as a snapshot update, Follow turns
+    // off first and the update remains pending behind the floating button.
+    if let Some(cursor) = automatic_page_cursor(state, *follow) {
+        request_page(tab_id, state, messages, cursor);
+    }
+
+    if should_show_load_newest(*follow, state) {
+        let button_size = egui::vec2(32.0, 24.0);
+        let button_pos = egui::pos2(
+            output.inner_rect.center().x - button_size.x / 2.0,
+            output.inner_rect.top() + 8.0,
+        );
+        let button_rect = egui::Rect::from_min_size(button_pos, button_size);
+        let clicked = ui
+            .put(button_rect, egui::Button::new("↑").min_size(button_size))
+            .on_hover_text(ui.ctx().tr("cognition-load-newest-hover"))
+            .clicked();
+        if clicked {
+            request_page(tab_id, state, messages, latest_page_cursor(state));
+        }
+    }
 
     if reached_end
         && !state.loading
@@ -317,6 +376,47 @@ pub fn ui(
             before_id: oldest.id,
         };
         request_page(tab_id, state, messages, cursor);
+    }
+}
+
+pub fn follow_toggle(ui: &mut egui::Ui, state: &mut CognitionState, follow: &mut bool) {
+    if ui
+        .checkbox(follow, ui.ctx().tr("cognition-follow"))
+        .on_hover_text(ui.ctx().tr("cognition-follow-hover"))
+        .changed()
+        && *follow
+    {
+        state.jump_to_newest = true;
+    }
+    if state.loading && state.requested_snapshot_revision.is_some() {
+        ui.small(ui.ctx().tr("cognition-loading-newest"));
+    }
+}
+
+fn automatic_page_cursor(state: &CognitionState, follow: bool) -> Option<CognitionLogCursor> {
+    if state.loading {
+        return None;
+    }
+    if !state.requested_initial {
+        return Some(CognitionLogCursor::Newest);
+    }
+    (follow && state.refresh_needed).then(|| latest_page_cursor(state))
+}
+
+fn should_disable_follow(follow: bool, scroll_offset: f32) -> bool {
+    follow && scroll_offset > 0.5
+}
+
+fn should_show_load_newest(follow: bool, state: &CognitionState) -> bool {
+    !follow && state.refresh_needed && !state.loading
+}
+
+fn latest_page_cursor(state: &CognitionState) -> CognitionLogCursor {
+    match state.entries.first() {
+        Some(newest) => CognitionLogCursor::Newer {
+            after_id: newest.id,
+        },
+        None => CognitionLogCursor::Newest,
     }
 }
 
@@ -369,6 +469,15 @@ fn request_page(
 ) {
     state.loading = true;
     state.requested_initial = true;
+    if matches!(
+        cursor,
+        CognitionLogCursor::Newest | CognitionLogCursor::Newer { .. }
+    ) {
+        state.requested_snapshot_revision = Some(state.snapshot_revision);
+        state.jump_to_newest = true;
+    } else {
+        state.requested_snapshot_revision = None;
+    }
     messages.push(VisualizerClientMessage::Command {
         command: VisualizerCommand::LoadCognitionLogEntries {
             tab_id: tab_id.clone(),
@@ -441,7 +550,7 @@ fn cognition_header_label(ctx: &egui::Context, source: &str, origin: &str) -> St
 mod tests {
     use chrono::{TimeZone, Utc};
 
-    use crate::i18n::{EguiI18nExt as _, I18nCatalog, Locale};
+    use crate::i18n::{I18nCatalog, Locale};
 
     use super::*;
 
@@ -544,6 +653,111 @@ mod tests {
         assert_eq!(offset, Some(90.0));
     }
 
+    #[test]
+    fn initial_page_is_automatic_even_when_follow_is_off() {
+        let state = CognitionState::default();
+
+        assert_eq!(
+            automatic_page_cursor(&state, false),
+            Some(CognitionLogCursor::Newest)
+        );
+    }
+
+    #[test]
+    fn snapshot_update_waits_for_user_when_follow_is_off() {
+        let mut state = CognitionState::default();
+        state.apply_page(CognitionLogCursor::Newest, vec![entry(1)], false);
+        state.requested_initial = true;
+        state.observe_snapshot(&snapshot(1));
+        state.observe_snapshot(&snapshot(2));
+
+        assert!(state.refresh_needed);
+        assert_eq!(automatic_page_cursor(&state, false), None);
+        assert_eq!(
+            automatic_page_cursor(&state, true),
+            Some(CognitionLogCursor::Newer { after_id: 1 })
+        );
+    }
+
+    #[test]
+    fn first_snapshot_after_initial_page_detects_an_unloaded_entry() {
+        let mut state = CognitionState::default();
+        state.apply_page(CognitionLogCursor::Newest, vec![entry(1)], false);
+
+        state.observe_snapshot(&snapshot(2));
+
+        assert!(state.refresh_needed);
+        assert!(should_show_load_newest(false, &state));
+    }
+
+    #[test]
+    fn first_snapshot_matching_initial_page_does_not_report_an_update() {
+        let mut state = CognitionState::default();
+        state.apply_page(CognitionLogCursor::Newest, vec![entry(1)], false);
+
+        state.observe_snapshot(&snapshot_with_text(1, "entry 1"));
+
+        assert!(!state.refresh_needed);
+    }
+
+    #[test]
+    fn snapshot_update_during_refresh_remains_pending() {
+        let mut state = CognitionState::default();
+        state.observe_snapshot(&snapshot(1));
+        let mut messages = Vec::new();
+        request_page(
+            &VisualizerTabId::new("tab"),
+            &mut state,
+            &mut messages,
+            CognitionLogCursor::Newest,
+        );
+        state.observe_snapshot(&snapshot(2));
+
+        state.apply_page(CognitionLogCursor::Newest, vec![entry(2), entry(1)], false);
+
+        assert!(state.refresh_needed);
+        assert_eq!(
+            automatic_page_cursor(&state, true),
+            Some(CognitionLogCursor::Newer { after_id: 2 })
+        );
+    }
+
+    #[test]
+    fn completed_refresh_requests_a_jump_to_the_newest_entry() {
+        let mut state = CognitionState::default();
+        state.apply_page(CognitionLogCursor::Newest, vec![entry(1)], false);
+        state.jump_to_newest = false;
+
+        state.apply_page(
+            CognitionLogCursor::Newer { after_id: 1 },
+            vec![entry(2)],
+            false,
+        );
+
+        assert!(state.jump_to_newest);
+        assert_eq!(loaded_ids(&state), vec![2, 1]);
+    }
+
+    #[test]
+    fn scrolling_away_from_the_newest_entry_disables_follow() {
+        assert!(!should_disable_follow(true, 0.0));
+        assert!(!should_disable_follow(true, 0.5));
+        assert!(should_disable_follow(true, 1.0));
+        assert!(!should_disable_follow(false, 100.0));
+    }
+
+    #[test]
+    fn pending_update_shows_the_load_newest_button_only_outside_follow() {
+        let mut state = CognitionState::default();
+        state.refresh_needed = true;
+
+        assert!(!should_show_load_newest(true, &state));
+        assert!(should_show_load_newest(false, &state));
+
+        state.loading = true;
+        assert!(!should_show_load_newest(false, &state));
+    }
+
     fn loaded_ids(state: &CognitionState) -> Vec<i64> {
         state.entries.iter().map(|entry| entry.id).collect()
     }
@@ -556,5 +770,20 @@ mod tests {
             origin: "sensory".to_owned(),
             text: format!("entry {id}"),
         }
+    }
+
+    fn snapshot(id: i64) -> Vec<CognitionLogView> {
+        snapshot_with_text(id, &format!("snapshot {id}"))
+    }
+
+    fn snapshot_with_text(id: i64, text: &str) -> Vec<CognitionLogView> {
+        vec![CognitionLogView {
+            source: "cognition-gate".to_owned(),
+            entries: vec![crate::CognitionEntryView {
+                at: Utc.timestamp_opt(id, 0).unwrap(),
+                origin: "sensory".to_owned(),
+                text: text.to_owned(),
+            }],
+        }]
     }
 }

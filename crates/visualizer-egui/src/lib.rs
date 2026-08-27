@@ -95,6 +95,7 @@ const NOTO_SANS_JP_FONT_WEIGHT: Weight = Weight::MEDIUM;
 const NOTO_SANS_JP_FONT_WEIGHT_VALUE: f32 = 500.0;
 const THEME_PERSISTENCE_KEY: &str = "visualizer-theme";
 const ZOOM_FACTOR_PERSISTENCE_KEY: &str = "visualizer-zoom-factor";
+const COGNITION_FOLLOW_PERSISTENCE_KEY: &str = "visualizer-cognition-follow";
 const DEFAULT_ZOOM_FACTOR: f32 = 1.0;
 const MIN_ZOOM_FACTOR: f32 = 0.5;
 const MAX_ZOOM_FACTOR: f32 = 2.0;
@@ -978,6 +979,9 @@ impl Visualizer {
         ui.ctx().set_theme(egui::Theme::from(theme));
         let persisted_zoom =
             ui.use_persisted_state(default_zoom_factor, ZOOM_FACTOR_PERSISTENCE_KEY);
+        let persisted_cognition_follow =
+            ui.use_persisted_state(|| true, COGNITION_FOLLOW_PERSISTENCE_KEY);
+        let mut cognition_follow = *persisted_cognition_follow;
         let mut zoom_factor = normalize_zoom_factor(*persisted_zoom);
         if zoom_factors_differ(zoom_factor, *persisted_zoom) {
             persisted_zoom.set_next(zoom_factor);
@@ -1043,7 +1047,7 @@ impl Visualizer {
                 self.state.selected = Some(tab_id.clone());
                 if let Some(tab) = self.state.tabs.get_mut(&tab_id) {
                     ui.push_id(tab_id.as_str(), |ui| {
-                        tab.ui(ui, messages);
+                        tab.ui(ui, messages, &mut cognition_follow);
                     });
                 }
             } else {
@@ -1056,6 +1060,9 @@ impl Visualizer {
                 });
             }
         });
+        if cognition_follow != *persisted_cognition_follow {
+            persisted_cognition_follow.set_next(cognition_follow);
+        }
 
         next_locale
     }
@@ -1533,13 +1540,18 @@ impl RuntimeTab {
         }
     }
 
-    fn ui(&mut self, ui: &mut egui::Ui, messages: &mut Vec<VisualizerClientMessage>) {
+    fn ui(
+        &mut self,
+        ui: &mut egui::Ui,
+        messages: &mut Vec<VisualizerClientMessage>,
+        cognition_follow: &mut bool,
+    ) {
         let now = ui.input(|input| input.time);
         self.resource_monitor_started_at.get_or_insert(now);
         self.resource_monitor_now = now;
         match self.view_mode {
-            RuntimeTabViewMode::Simplified => self.simplified_ui(ui, messages),
-            RuntimeTabViewMode::Windowed => self.windows_ui(ui, messages),
+            RuntimeTabViewMode::Simplified => self.simplified_ui(ui, messages, cognition_follow),
+            RuntimeTabViewMode::Windowed => self.windows_ui(ui, messages, cognition_follow),
         }
     }
 
@@ -1694,7 +1706,12 @@ impl RuntimeTab {
         }
     }
 
-    fn simplified_ui(&mut self, ui: &mut egui::Ui, messages: &mut Vec<VisualizerClientMessage>) {
+    fn simplified_ui(
+        &mut self,
+        ui: &mut egui::Ui,
+        messages: &mut Vec<VisualizerClientMessage>,
+        cognition_follow: &mut bool,
+    ) {
         let available = ui.available_size();
         if available.x <= 1.0 || available.y <= 1.0 {
             return;
@@ -1738,7 +1755,13 @@ impl RuntimeTab {
                             ui,
                             None,
                             egui::vec2(column_width, lower_height),
-                            |ui| self.render_simplified_cognition_pane_contents(ui, messages),
+                            |ui| {
+                                self.render_simplified_cognition_pane_contents(
+                                    ui,
+                                    messages,
+                                    cognition_follow,
+                                )
+                            },
                         );
                         ui.add_space(SIMPLIFIED_PANE_GAP);
                         simplified_section(
@@ -1809,8 +1832,9 @@ impl RuntimeTab {
         &mut self,
         ui: &mut egui::Ui,
         messages: &mut Vec<VisualizerClientMessage>,
+        cognition_follow: &mut bool,
     ) {
-        ui.horizontal_wrapped(|ui| {
+        ui.horizontal(|ui| {
             if ui
                 .selectable_label(
                     self.simplified_cognition_pane_tab == SimplifiedCognitionPaneTab::CognitionLog,
@@ -1829,12 +1853,17 @@ impl RuntimeTab {
             {
                 self.simplified_cognition_pane_tab = SimplifiedCognitionPaneTab::Memo;
             }
+            if self.simplified_cognition_pane_tab == SimplifiedCognitionPaneTab::CognitionLog {
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    cognition::follow_toggle(ui, &mut self.cognition, cognition_follow);
+                });
+            }
         });
         ui.separator();
 
         match self.simplified_cognition_pane_tab {
             SimplifiedCognitionPaneTab::CognitionLog => {
-                self.render_cognition_contents(ui, "simplified", messages)
+                self.render_cognition_contents(ui, "simplified", messages, cognition_follow, false)
             }
             SimplifiedCognitionPaneTab::Memo => {
                 let memo_filter_modules = self.memo_filter_modules();
@@ -1853,8 +1882,22 @@ impl RuntimeTab {
         ui: &mut egui::Ui,
         id_salt: &'static str,
         messages: &mut Vec<VisualizerClientMessage>,
+        cognition_follow: &mut bool,
+        show_follow_toggle: bool,
     ) {
-        cognition::ui(ui, id_salt, &self.id, &mut self.cognition, messages);
+        if show_follow_toggle {
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                cognition::follow_toggle(ui, &mut self.cognition, cognition_follow);
+            });
+        }
+        cognition::ui(
+            ui,
+            id_salt,
+            &self.id,
+            &mut self.cognition,
+            cognition_follow,
+            messages,
+        );
     }
 
     fn render_modules_overview_contents(
@@ -2000,7 +2043,12 @@ impl RuntimeTab {
         }
     }
 
-    fn windows_ui(&mut self, ui: &mut egui::Ui, messages: &mut Vec<VisualizerClientMessage>) {
+    fn windows_ui(
+        &mut self,
+        ui: &mut egui::Ui,
+        messages: &mut Vec<VisualizerClientMessage>,
+        cognition_follow: &mut bool,
+    ) {
         let base = self.id.as_str().to_string();
         let mut window_requests = std::mem::take(&mut self.window_requests);
 
@@ -2075,7 +2123,7 @@ impl RuntimeTab {
             .default_pos(1384.0, 636.0)
             .default_size(560.0, 360.0)
             .show(ui, |ui| {
-                self.render_cognition_contents(ui, "window", messages)
+                self.render_cognition_contents(ui, "window", messages, cognition_follow, true)
             });
         self.record_window_open(cognition_id, open);
 

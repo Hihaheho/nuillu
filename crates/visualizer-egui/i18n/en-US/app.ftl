@@ -50,6 +50,11 @@ section-memo = Memo
 section-memory = Memory
 section-scene = Scene
 
+cognition-follow = Follow
+cognition-follow-hover = Keep loading new cognition entries and stay at the newest entry.
+cognition-load-newest-hover = Load new cognition entries and jump to the newest entry.
+cognition-loading-newest = Loading latest…
+
 window-scene-title = Scene - { $title }
 window-blackboard-title = Blackboard - { $title }
 window-memory-title = Memory - { $title }
