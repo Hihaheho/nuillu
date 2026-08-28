@@ -8,9 +8,7 @@ use std::time::Duration;
 
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use futures::stream::{FuturesUnordered, StreamExt};
-use nuillu_blackboard::{
-    ActivationRatio, CorePolicyRecord, IdentityMemoryRecord, ZeroReplicaWindowPolicy,
-};
+use nuillu_blackboard::{CorePolicyRecord, IdentityMemoryRecord, ZeroReplicaWindowPolicy};
 use nuillu_module::{
     ActivateCx, ActivationGateVote, AgentRuntimeControl, AllocatedModule, AllocatedModules,
     LlmBatchDebug, LlmRequestMetadata, LlmRequestSource, ModuleBatch, ModuleDependencies,
@@ -735,7 +733,6 @@ enum TaskMessage {
 struct NextBatchThrottle {
     baseline: DateTime<Utc>,
     not_before: DateTime<Utc>,
-    activation_threshold: ActivationRatio,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1070,59 +1067,37 @@ async fn refresh_active_and_schedule(
                 let wake_claim = pending_wake
                     .then(|| runtime.claim_wake(&owners[index]))
                     .flatten();
-                let throttle = if has_pending_self_wake_permit {
-                    None
+                let (throttle, allocation_change) = if has_pending_self_wake_permit {
+                    (None, None)
                 } else {
+                    let allocation_change = runtime.allocation_change_waiter().await;
                     let now = runtime.clock().now();
-                    current_next_batch_throttle(runtime, &owners[index], next_batch_throttle, now)
-                        .await
+                    (
+                        current_next_batch_throttle(
+                            runtime,
+                            &owners[index],
+                            next_batch_throttle,
+                            now,
+                        )
+                        .await,
+                        Some(allocation_change),
+                    )
                 };
                 if let Some(throttle) = throttle {
-                    if let Some(activation_increase) = runtime
-                        .activation_increase_waiter(&owners[index], throttle.activation_threshold)
-                        .await
-                    {
-                        states[index] = ModuleState::Throttling;
-                        let allocation_change = runtime.allocation_change_waiter().await;
-                        spawn_batch_throttle(
-                            tasks,
-                            index,
-                            module,
-                            kick_inbox,
-                            throttle,
-                            runtime.clone(),
-                            owners[index].clone(),
-                            activation_increase,
-                            allocation_change,
-                            timer.clone(),
-                            parent,
-                            subscriber,
-                        );
-                    } else {
-                        let scheduled = schedule_dependency_settle_or_next_batch(
-                            runtime,
-                            tasks,
-                            index,
-                            owners[index].clone(),
-                            module,
-                            kick_inbox,
-                            Vec::new(),
-                            wake_claim,
-                            DEPENDENCY_SETTLE_MAX_WAVES,
-                            states,
-                            kick_inboxes,
-                            kick_handles,
-                            dependency_targets,
-                            owners,
-                            zero_windows,
-                            timer,
-                            config,
-                            parent,
-                            subscriber,
-                        )
-                        .await;
-                        states[index] = scheduled.module_state();
-                    }
+                    states[index] = ModuleState::Throttling;
+                    spawn_batch_throttle(
+                        tasks,
+                        index,
+                        module,
+                        kick_inbox,
+                        throttle,
+                        runtime.clone(),
+                        owners[index].clone(),
+                        allocation_change.expect("allocation waiter registered with throttle"),
+                        timer.clone(),
+                        parent,
+                        subscriber,
+                    );
                 } else {
                     let scheduled = schedule_dependency_settle_or_next_batch(
                         runtime,
@@ -1355,7 +1330,7 @@ async fn failed_retry_after(
     runtime: &AgentRuntimeControl,
     owner: &ModuleInstanceId,
 ) -> Option<DateTime<Utc>> {
-    let (bpm, _) = runtime.module_batch_throttle_baseline(owner).await?;
+    let bpm = runtime.module_batch_throttle_baseline(owner).await?;
     chrono::Duration::from_std(bpm.period())
         .ok()
         .map(|duration| runtime.clock().now() + duration)
@@ -1368,12 +1343,11 @@ async fn current_next_batch_throttle(
     now: DateTime<Utc>,
 ) -> Option<NextBatchThrottle> {
     let throttle = throttle?;
-    let (bpm, activation_threshold) = runtime.module_batch_throttle_baseline(owner).await?;
+    let bpm = runtime.module_batch_throttle_baseline(owner).await?;
     let not_before = throttle.baseline + ChronoDuration::from_std(bpm.period()).ok()?;
     (not_before > now).then_some(NextBatchThrottle {
         baseline: throttle.baseline,
         not_before,
-        activation_threshold,
     })
 }
 
@@ -1562,7 +1536,7 @@ async fn handle_task_message(
                 let next_batch_throttle = runtime
                     .module_batch_throttle_baseline(&owners[index])
                     .await
-                    .and_then(|(bpm, activation_threshold)| {
+                    .and_then(|bpm| {
                         let remaining = bpm.sleep_after_turn(activation_elapsed);
                         if remaining.is_zero() {
                             None
@@ -1574,7 +1548,6 @@ async fn handle_task_message(
                                         - ChronoDuration::from_std(activation_elapsed)
                                             .unwrap_or_default(),
                                     not_before: now + d,
-                                    activation_threshold,
                                 })
                         }
                     });
@@ -1998,35 +1971,32 @@ async fn schedule_stored_dependency_for_wake(
         .take()
         .expect("kick inbox available for stored dependency");
     let has_pending_self_wake_permit = runtime.has_pending_self_wake_permit(&target_owner);
-    let throttle = if has_pending_self_wake_permit {
-        None
+    let (throttle, allocation_change) = if has_pending_self_wake_permit {
+        (None, None)
     } else {
+        let allocation_change = runtime.allocation_change_waiter().await;
         let now = runtime.clock().now();
-        current_next_batch_throttle(runtime, &target_owner, next_batch_throttle, now).await
+        (
+            current_next_batch_throttle(runtime, &target_owner, next_batch_throttle, now).await,
+            Some(allocation_change),
+        )
     };
     if let Some(throttle) = throttle {
-        if let Some(activation_increase) = runtime
-            .activation_increase_waiter(&target_owner, throttle.activation_threshold)
-            .await
-        {
-            states[target_index] = ModuleState::Throttling;
-            let allocation_change = runtime.allocation_change_waiter().await;
-            spawn_batch_throttle(
-                tasks,
-                target_index,
-                module,
-                kick_inbox,
-                throttle,
-                runtime.clone(),
-                target_owner.clone(),
-                activation_increase,
-                allocation_change,
-                timer.clone(),
-                parent,
-                subscriber,
-            );
-            return kick_handles[target_index].send(sender);
-        }
+        states[target_index] = ModuleState::Throttling;
+        spawn_batch_throttle(
+            tasks,
+            target_index,
+            module,
+            kick_inbox,
+            throttle,
+            runtime.clone(),
+            target_owner.clone(),
+            allocation_change.expect("allocation waiter registered with throttle"),
+            timer.clone(),
+            parent,
+            subscriber,
+        );
+        return kick_handles[target_index].send(sender);
     }
 
     let wake_claim = runtime.claim_wake(&target_owner);
@@ -2414,7 +2384,6 @@ fn spawn_batch_throttle(
     throttle: NextBatchThrottle,
     runtime: AgentRuntimeControl,
     owner: ModuleInstanceId,
-    activation_increase: tokio::sync::oneshot::Receiver<()>,
     allocation_change: tokio::sync::oneshot::Receiver<()>,
     timer: Rc<dyn Timer>,
     parent: &tracing::Span,
@@ -2427,7 +2396,6 @@ fn spawn_batch_throttle(
             let deadline = throttle.not_before;
             let mut next_batch_throttle = None;
             let mut record_event = true;
-            let mut activation_increase = pin!(activation_increase);
             let mut allocation_change = pin!(allocation_change);
             let remaining = (deadline - clock.now()).to_std().unwrap_or_default();
             let mut deadline_sleep = timer.sleep(remaining);
@@ -2438,7 +2406,6 @@ fn spawn_batch_throttle(
                 loop {
                     tokio::select! {
                         biased;
-                        _ = &mut activation_increase => break,
                         _ = &mut allocation_change => {
                             next_batch_throttle = Some(throttle.clone());
                             break;
@@ -6069,7 +6036,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread", start_paused = false)]
-    async fn runtime_batch_throttle_wakes_when_activation_increases() {
+    async fn runtime_batch_throttle_keeps_fixed_bpm_deadline_when_activation_increases() {
         let local = LocalSet::new();
         local
             .run_until(async {
@@ -6084,11 +6051,11 @@ mod tests {
                 let (second_tx, second_rx) = oneshot::channel();
                 let first_tx = Rc::new(RefCell::new(Some(first_tx)));
                 let second_tx = Rc::new(RefCell::new(Some(second_tx)));
-                // Fixed 120 BPM = 500ms period. The test bumps activation
-                // during throttling and expects the second batch before deadline.
+                // Fixed 600 BPM = 100ms period. Raising activation must not
+                // bypass the unchanged BPM deadline.
                 let modules = ModuleRegistry::new()
                     .register_sync(
-                        test_policy(1..=1, Bpm::from_f64(60.0)..=Bpm::from_f64(60.0)),
+                        test_policy(1..=1, Bpm::from_f64(600.0)..=Bpm::from_f64(600.0)),
                         {
                             let batches = Rc::clone(&batches);
                             let first_tx = Rc::clone(&first_tx);
@@ -6118,7 +6085,7 @@ mod tests {
                         .publish(AttentionControlRequest::new("second"))
                         .await
                         .expect("second attention request should route");
-                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    tokio::time::sleep(Duration::from_millis(10)).await;
 
                     let mut raised = ResourceAllocation::default();
                     raised.set_activation(module_id, ActivationRatio::ONE);
@@ -6127,8 +6094,15 @@ mod tests {
                         .apply(BlackboardCommand::SetAllocation(raised))
                         .await;
 
-                    let _ = second_rx.await;
-                    assert!(started.elapsed() < Duration::from_millis(120));
+                    let mut second_rx = second_rx;
+                    assert_oneshot_pending(
+                        &mut second_rx,
+                        "activation increase must not bypass a fixed BPM deadline",
+                    );
+                    let _ = tokio::time::timeout(Duration::from_millis(150), second_rx)
+                        .await
+                        .expect("second batch should run at the fixed BPM deadline");
+                    assert!(started.elapsed() >= Duration::from_millis(60));
                 })
                 .await
                 .expect("scheduler returned err");
@@ -6137,6 +6111,148 @@ mod tests {
                     batches.borrow().as_slice(),
                     &[vec!["first".to_string()], vec!["second".to_string()]]
                 );
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = false)]
+    async fn runtime_batch_throttle_recomputes_deadline_from_increased_bpm() {
+        let local = LocalSet::new();
+        local
+            .run_until(async {
+                let module_id = ModuleId::new(QueryBatchRecorder::id()).unwrap();
+                let mut alloc = ResourceAllocation::default();
+                alloc.set_activation(module_id.clone(), ActivationRatio::ZERO);
+
+                let blackboard = Blackboard::with_allocation(alloc);
+                let caps = test_caps_with_real_clock(blackboard.clone());
+                let batches = Rc::new(RefCell::new(Vec::<Vec<String>>::new()));
+                let (first_tx, first_rx) = oneshot::channel();
+                let (second_tx, second_rx) = oneshot::channel();
+                let first_tx = Rc::new(RefCell::new(Some(first_tx)));
+                let second_tx = Rc::new(RefCell::new(Some(second_tx)));
+                // 120..=600 BPM maps activation zero to 500ms and one to
+                // 100ms. The update should advance the existing baseline's
+                // deadline to 100ms, without turning it into an immediate wake.
+                let modules = ModuleRegistry::new()
+                    .register_sync(
+                        test_policy(1..=1, Bpm::from_f64(120.0)..=Bpm::from_f64(600.0)),
+                        {
+                            let batches = Rc::clone(&batches);
+                            let first_tx = Rc::clone(&first_tx);
+                            let second_tx = Rc::clone(&second_tx);
+                            move |caps| QueryBatchRecorder {
+                                attention_control_inbox: caps.attention_control_inbox(),
+                                batches: Rc::clone(&batches),
+                                first_done: first_tx.borrow_mut().take(),
+                                second_done: second_tx.borrow_mut().take(),
+                            }
+                        },
+                    )
+                    .unwrap()
+                    .build(&caps)
+                    .await
+                    .unwrap();
+                let mailbox = caps.internal_harness_io().attention_control_mailbox();
+
+                super::run(modules, test_config(), async move {
+                    mailbox
+                        .publish(AttentionControlRequest::new("first"))
+                        .await
+                        .expect("first attention request should route");
+                    let _ = first_rx.await;
+                    mailbox
+                        .publish(AttentionControlRequest::new("second"))
+                        .await
+                        .expect("second attention request should route");
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+
+                    let mut raised = ResourceAllocation::default();
+                    raised.set_activation(module_id, ActivationRatio::ONE);
+                    let started = tokio::time::Instant::now();
+                    blackboard
+                        .apply(BlackboardCommand::SetAllocation(raised))
+                        .await;
+
+                    let mut second_rx = second_rx;
+                    assert_oneshot_pending(
+                        &mut second_rx,
+                        "a faster BPM should still preserve its recomputed deadline",
+                    );
+                    let _ = tokio::time::timeout(Duration::from_millis(150), second_rx)
+                        .await
+                        .expect("second batch should use the shortened BPM deadline");
+                    assert!(started.elapsed() >= Duration::from_millis(50));
+                    assert!(started.elapsed() < Duration::from_millis(140));
+                })
+                .await
+                .expect("scheduler returned err");
+
+                assert_eq!(
+                    batches.borrow().as_slice(),
+                    &[vec!["first".to_string()], vec!["second".to_string()]]
+                );
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = false)]
+    async fn runtime_batch_throttle_runs_immediately_when_recomputed_deadline_has_passed() {
+        let local = LocalSet::new();
+        local
+            .run_until(async {
+                let module_id = ModuleId::new(QueryBatchRecorder::id()).unwrap();
+                let mut alloc = ResourceAllocation::default();
+                alloc.set_activation(module_id.clone(), ActivationRatio::ZERO);
+
+                let blackboard = Blackboard::with_allocation(alloc);
+                let caps = test_caps_with_real_clock(blackboard.clone());
+                let (first_tx, first_rx) = oneshot::channel();
+                let (second_tx, second_rx) = oneshot::channel();
+                let first_tx = Rc::new(RefCell::new(Some(first_tx)));
+                let second_tx = Rc::new(RefCell::new(Some(second_tx)));
+                let modules = ModuleRegistry::new()
+                    .register_sync(
+                        test_policy(1..=1, Bpm::from_f64(120.0)..=Bpm::from_f64(600.0)),
+                        move |caps| QueryBatchRecorder {
+                            attention_control_inbox: caps.attention_control_inbox(),
+                            batches: Rc::new(RefCell::new(Vec::new())),
+                            first_done: first_tx.borrow_mut().take(),
+                            second_done: second_tx.borrow_mut().take(),
+                        },
+                    )
+                    .unwrap()
+                    .build(&caps)
+                    .await
+                    .unwrap();
+                let mailbox = caps.internal_harness_io().attention_control_mailbox();
+
+                super::run(modules, test_config(), async move {
+                    mailbox
+                        .publish(AttentionControlRequest::new("first"))
+                        .await
+                        .expect("first attention request should route");
+                    let _ = first_rx.await;
+                    mailbox
+                        .publish(AttentionControlRequest::new("second"))
+                        .await
+                        .expect("second attention request should route");
+                    tokio::time::sleep(Duration::from_millis(140)).await;
+
+                    let mut raised = ResourceAllocation::default();
+                    raised.set_activation(module_id, ActivationRatio::ONE);
+                    let started = tokio::time::Instant::now();
+                    blackboard
+                        .apply(BlackboardCommand::SetAllocation(raised))
+                        .await;
+
+                    let _ = tokio::time::timeout(Duration::from_millis(60), second_rx)
+                        .await
+                        .expect("a passed recomputed deadline should run immediately");
+                    assert!(started.elapsed() < Duration::from_millis(50));
+                })
+                .await
+                .expect("scheduler returned err");
             })
             .await;
     }

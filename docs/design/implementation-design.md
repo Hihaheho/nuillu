@@ -161,6 +161,11 @@ composition is `module_effective = scope_effective × module_local`. Projection 
 axis. Config exposes standard linear and threshold curves; Rust registration may provide custom
 replica/rate functions with local, scope, and effective inputs. BPM is interpolated from its range
 after effective activation is projected, rather than multiplying maximum BPM by scope activation.
+When allocation changes while a module is waiting for its next batch, the scheduler preserves the
+previous activation baseline and recomputes the deadline as `baseline + current_bpm.period()`.
+An increased activation ratio therefore advances work only as far as the newly projected BPM
+allows; it does not bypass the throttle as an independent wake signal. If the recomputed deadline
+has already passed, the queued batch may start immediately.
 Active replicas are derived from the effective ratio and boot-time cap range:
 
 ```rust

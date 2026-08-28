@@ -187,6 +187,11 @@ A module can be activated by any inbox capability it holds:
 
 Allocation changes do not publish wake signals. Allocation is the controller's durable priority plane: modules become active or inactive through activation ratios, but decide what work to perform from their natural activation payloads and existing blackboard context. Allocation is not a notification, request, or transport path.
 
+For already-active modules, an allocation update may change the projected BPM while a batch is
+throttled. The scheduler then recalculates the existing deadline from the prior activation baseline
+and the latest BPM. A ratio increase does not independently clear the throttle; it starts work
+immediately only when the recalculated deadline is already due.
+
 The allocation model is **tonic availability plus inhibitory control**. The boot/base allocation is
 background cortical availability: a module remains generally available unless a controller or
 homeostatic cap suppresses it. Controller targets add salience and drive through higher activation

@@ -1098,17 +1098,12 @@ impl AgentRuntimeControl {
             .await;
     }
 
-    pub async fn module_batch_throttle_baseline(
-        &self,
-        owner: &ModuleInstanceId,
-    ) -> Option<(Bpm, ActivationRatio)> {
+    pub async fn module_batch_throttle_baseline(&self, owner: &ModuleInstanceId) -> Option<Bpm> {
         let allocation = self
             .blackboard
             .effective_module_allocation(&owner.scope)
             .await;
-        allocation
-            .bpm_for(&owner.module)
-            .map(|bpm| (bpm, allocation.effective_activation_for(&owner.module)))
+        allocation.bpm_for(&owner.module)
     }
 
     pub async fn active_replicas(&self, module: &ScopedModuleId) -> u8 {
@@ -1154,27 +1149,6 @@ impl AgentRuntimeControl {
             );
         }
         policies
-    }
-
-    pub async fn activation_increase_waiter(
-        &self,
-        owner: &ModuleInstanceId,
-        threshold: ActivationRatio,
-    ) -> Option<tokio::sync::oneshot::Receiver<()>> {
-        if !owner.scope.is_root() {
-            // Effective activation in a child scope may increase because of
-            // either its local module allocation or any ancestor mount. The
-            // local threshold waiter cannot observe the latter, so wake on
-            // the shared allocation-change signal and let the scheduler
-            // re-evaluate the effective threshold. This intentionally permits
-            // spurious wakeups from unrelated scopes in exchange for keeping
-            // the waiter path correct across the full hierarchy.
-            return Some(self.blackboard.allocation_change_waiter().await);
-        }
-        self.blackboard
-            .scoped(owner.scope.clone())
-            .activation_increase_waiter(owner.module.clone(), threshold)
-            .await
     }
 
     pub async fn activation_waiter(
@@ -4477,7 +4451,8 @@ mod tests {
                 ],
             })
             .await;
-        let caps = test_caps(blackboard.clone());
+        let store = RecordingAllocationStore::default();
+        let caps = test_caps_with_allocation_store(blackboard.clone(), Rc::new(store.clone()));
         let controller = scoped(&caps, builtin::allocation(), 0);
         let writer = controller.allocation_writer(vec![builtin::cognition_gate()], Vec::new());
 
@@ -4486,12 +4461,46 @@ mod tests {
             AllocationEffectLevel::Max,
         )];
 
-        writer.submit(commands).await.unwrap();
+        writer.submit(commands.clone()).await.unwrap();
 
         let allocation = blackboard.read(|bb| bb.allocation().clone()).await;
         assert_eq!(
             allocation.activation_for(&builtin::cognition_gate()),
             ActivationRatio::ONE
+        );
+
+        let mut unchanged = blackboard.allocation_change_waiter().await;
+        writer.submit(commands).await.unwrap();
+        assert!(
+            unchanged.try_recv().is_err(),
+            "an identical proposal should not notify allocation change waiters"
+        );
+        assert_eq!(store.saves().len(), 1);
+
+        let changed = blackboard.allocation_change_waiter().await;
+        writer
+            .submit([AllocationCommand::target(
+                builtin::cognition_gate(),
+                AllocationEffectLevel::High,
+            )])
+            .await
+            .unwrap();
+        assert_eq!(changed.await, Ok(()));
+        assert_eq!(store.saves().len(), 2);
+        assert_eq!(
+            blackboard
+                .read(|bb| {
+                    bb.allocation_proposals()
+                        .get(&ModuleInstanceId::new(
+                            builtin::allocation(),
+                            ReplicaIndex::ZERO,
+                        ))
+                        .cloned()
+                })
+                .await
+                .expect("allocation proposal should be recorded")
+                .activation_for(&builtin::cognition_gate()),
+            ActivationRatio::from_f64(0.85)
         );
     }
 

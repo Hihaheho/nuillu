@@ -48,6 +48,7 @@ impl AllocationWriter {
     /// The command payload is semantic: modules choose an effect kind and
     /// level, while runtime policy resolves those levels to concrete activation
     /// ratios before the blackboard deterministically combines active writers.
+    /// Re-submitting the owner's current complete effects is a no-op.
     pub async fn submit(
         &self,
         commands: impl IntoIterator<Item = AllocationCommand>,
@@ -82,20 +83,31 @@ impl AllocationWriter {
             }
         }
 
+        let unchanged = self
+            .blackboard
+            .read(|bb| {
+                bb.allocation_proposals().get(&self.owner) == Some(&targets)
+                    && bb.allocation_caps().get(&self.owner) == Some(&suppressions)
+            })
+            .await;
+        if unchanged {
+            return Ok(());
+        }
+
+        let snapshot = PersistedAllocationSnapshot::new(
+            self.owner.clone(),
+            targets.clone(),
+            suppressions.clone(),
+        );
+        self.store.save(&snapshot).await?;
         self.blackboard
             .apply(BlackboardCommand::RecordAllocationEffects {
                 writer: self.owner.clone(),
-                targets: targets.clone(),
-                suppressions: suppressions.clone(),
-            })
-            .await;
-        self.store
-            .save(&PersistedAllocationSnapshot::new(
-                self.owner.clone(),
                 targets,
                 suppressions,
-            ))
-            .await
+            })
+            .await;
+        Ok(())
     }
 
     pub fn allowed_target_modules(&self) -> &[ModuleId] {
