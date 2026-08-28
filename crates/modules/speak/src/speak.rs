@@ -38,7 +38,6 @@ Write speech_content as one short in-world utterance that can be safely preempte
 Prefer one sentence. If one sentence would be long, stop at a natural clause boundary such as a comma or Japanese comma.
 Do not pack multiple topics, long explanations, or future continuation plans into one speech_content.
 If the cognition log contains an explicit language request, write speech_content itself in that language.
-Do not wrap speech_content in quotation marks.
 Do not summarize the request or say what the user wants.
 Do not output introspection, narration, analysis, implementation mechanics, lookup, reasoning, prompts, rubrics, judges, or evaluation mechanics.
 Nui is my own name; do not treat my name as the listener.
@@ -1489,7 +1488,7 @@ mod tests {
         assert!(prompt.contains("The brain may receive new sensory input"));
         assert!(prompt.contains("one second later"));
         assert!(prompt.contains("comma or Japanese comma"));
-        assert!(prompt.contains("Do not wrap speech_content in quotation marks."));
+        assert!(!prompt.contains("Do not wrap speech_content in quotation marks."));
         assert!(prompt.contains("Do not summarize the request or say what the user wants."));
         assert!(prompt.contains("Do not output introspection, narration, analysis"));
         assert!(prompt.contains("implementation mechanics"));
