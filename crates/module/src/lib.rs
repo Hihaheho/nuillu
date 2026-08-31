@@ -72,10 +72,10 @@ pub use allocation_persistence::{
 };
 pub use allocation_writer::AllocationWriter;
 pub use capabilities::{
-    AgentRuntimeControl, AllocatedModule, AllocatedModules, CapabilityProviderConfig,
-    CapabilityProviderPorts, CapabilityProviderRuntime, CapabilityProviders, HostIo,
-    InternalHarnessIo, LlmCapabilityRequest, ModuleCapabilityFactory, ModuleCatalog,
-    ModuleDependencies, ModuleRegisterer, ModuleRegistrationSpec, ModuleRegistry,
+    ActivationBarrier, AgentRuntimeControl, AllocatedModule, AllocatedModules,
+    CapabilityProviderConfig, CapabilityProviderPorts, CapabilityProviderRuntime,
+    CapabilityProviders, HostIo, InternalHarnessIo, LlmCapabilityRequest, ModuleCapabilityFactory,
+    ModuleCatalog, ModuleDependencies, ModuleRegisterer, ModuleRegistrationSpec, ModuleRegistry,
     ModuleRegistryError, SelfWake, SelfWakePermitClaim, SubsystemCatalogItem, SubsystemCatalogView,
     SubsystemRegistrationSpec,
 };

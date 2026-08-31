@@ -16,6 +16,8 @@ use nuillu_reward::PolicyCapabilities;
 use nuillu_speak::{UtteranceSink, UtteranceWriter};
 use nuillu_types::{ModuleId, ScopeId};
 
+#[cfg(test)]
+use super::config::ServerActivationBarrierSpec;
 use super::config::{
     RuntimeModule, ServerBootConfig, ServerMemoryScope, ServerModuleGroup, ServerModuleSpec,
     ServerProjectionCurve, ServerProjectionSpec,
@@ -71,6 +73,11 @@ pub(super) fn server_registry(
         .into_iter()
         .fold(registry, |registry, (dependent, dependency)| {
             registry.scoped_depends_on(ScopeId::root(), dependent, dependency)
+        });
+    registry = configured_activation_barriers(&boot_config.modules)
+        .into_iter()
+        .fold(registry, |registry, (dependent, prerequisites, timeout)| {
+            registry.scoped_activation_barrier(ScopeId::root(), dependent, prerequisites, timeout)
         });
     for expanded in boot_config.expanded_subsystems() {
         let mut subsystem_spec = SubsystemRegistrationSpec::new(
@@ -132,6 +139,16 @@ pub(super) fn server_registry(
             .into_iter()
             .fold(registry, |registry, (dependent, dependency)| {
                 registry.scoped_depends_on(expanded.scope.clone(), dependent, dependency)
+            });
+        registry = configured_activation_barriers(&expanded.definition.modules)
+            .into_iter()
+            .fold(registry, |registry, (dependent, prerequisites, timeout)| {
+                registry.scoped_activation_barrier(
+                    expanded.scope.clone(),
+                    dependent,
+                    prerequisites,
+                    timeout,
+                )
             });
     }
     registry.with_registration_scope(ScopeId::root())
@@ -668,6 +685,26 @@ fn configured_dependency_edges(modules: &[ServerModuleSpec]) -> Vec<(ModuleId, M
     edges
 }
 
+fn configured_activation_barriers(
+    modules: &[ServerModuleSpec],
+) -> Vec<(ModuleId, Vec<ModuleId>, Option<std::time::Duration>)> {
+    modules
+        .iter()
+        .filter_map(|module| {
+            let barrier = module.activation_barrier.as_ref()?;
+            Some((
+                module.module_id(),
+                barrier
+                    .prerequisites
+                    .iter()
+                    .map(|module| module.module_id())
+                    .collect(),
+                barrier.timeout(),
+            ))
+        })
+        .collect()
+}
+
 #[cfg(test)]
 fn group_modules(boot_config: &ServerBootConfig, group: ServerModuleGroup) -> Vec<ModuleId> {
     boot_config
@@ -793,6 +830,29 @@ mod tests {
 
         assert!(!edges.contains(&(builtin::cognition_gate(), builtin::policy())));
         assert!(edges.contains(&(builtin::cognition_gate(), builtin::sensory())));
+    }
+
+    #[test]
+    fn configured_activation_barriers_preserve_prerequisites_and_timeout() {
+        let mut boot_config = ServerBootConfig::default();
+        let speak = boot_config
+            .modules
+            .iter_mut()
+            .find(|module| module.id == RuntimeModule::Speak)
+            .unwrap();
+        speak.activation_barrier = Some(ServerActivationBarrierSpec {
+            prerequisites: vec![RuntimeModule::Sensory, RuntimeModule::CognitionGate],
+            timeout_seconds: Some(4.5),
+        });
+
+        assert_eq!(
+            configured_activation_barriers(&boot_config.modules),
+            vec![(
+                builtin::speak(),
+                vec![builtin::sensory(), builtin::cognition_gate()],
+                Some(std::time::Duration::from_millis(4_500)),
+            )]
+        );
     }
 
     #[test]

@@ -4,6 +4,7 @@ use std::{
     num::NonZeroUsize,
     path::{Path, PathBuf},
     sync::{Arc, OnceLock},
+    time::Duration,
 };
 
 use chrono::Utc;
@@ -287,6 +288,8 @@ pub struct ServerModuleSpec {
     pub groups: Vec<ServerModuleGroup>,
     #[eure(default)]
     pub depends_on: Vec<RuntimeModule>,
+    #[eure(default)]
+    pub activation_barrier: Option<ServerActivationBarrierSpec>,
     /// Module roles whose memo updates this module observes. Omitting the key
     /// keeps the default of every role; an explicit empty list subscribes to
     /// none. Every listed role must also be registered in this config.
@@ -297,6 +300,23 @@ pub struct ServerModuleSpec {
     /// written to the broadcast utterance target metadata.
     #[eure(default)]
     pub scope_targets: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, PartialEq, FromEure)]
+#[eure(crate = ::eure::document, rename_all = "kebab-case")]
+pub struct ServerActivationBarrierSpec {
+    pub prerequisites: Vec<RuntimeModule>,
+    #[eure(default)]
+    pub timeout_seconds: Option<f64>,
+}
+
+impl ServerActivationBarrierSpec {
+    pub fn timeout(&self) -> Option<Duration> {
+        self.timeout_seconds.map(|seconds| {
+            Duration::try_from_secs_f64(seconds)
+                .expect("validated activation-barrier timeout should fit Duration")
+        })
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, FromEure)]
@@ -854,6 +874,19 @@ fn validate_module_set(
                 );
             }
         }
+        if let Some(barrier) = &module.activation_barrier {
+            for prerequisite in &barrier.prerequisites {
+                if !seen.contains(prerequisite) {
+                    anyhow::bail!(
+                        "server config {} declares unknown activation-barrier prerequisite {} for module {} in subsystem {}",
+                        path.display(),
+                        prerequisite.as_str(),
+                        module.id.as_str(),
+                        owner
+                    );
+                }
+            }
+        }
         if let Some(sources) = &module.memo_sources {
             let mut seen_sources = HashSet::new();
             for source in sources {
@@ -1178,6 +1211,45 @@ impl ServerModuleSpec {
                 path.display(),
                 self.id.as_str()
             );
+        }
+        if let Some(barrier) = &self.activation_barrier {
+            if barrier.prerequisites.is_empty() {
+                anyhow::bail!(
+                    "server config {} declares an empty activation-barrier for module {}",
+                    path.display(),
+                    self.id.as_str()
+                );
+            }
+            let mut seen = HashSet::new();
+            for prerequisite in &barrier.prerequisites {
+                if *prerequisite == self.id {
+                    anyhow::bail!(
+                        "server config {} declares module {} as its own activation-barrier prerequisite",
+                        path.display(),
+                        self.id.as_str()
+                    );
+                }
+                if !seen.insert(prerequisite) {
+                    anyhow::bail!(
+                        "server config {} declares activation-barrier prerequisite {} for module {} more than once",
+                        path.display(),
+                        prerequisite.as_str(),
+                        self.id.as_str()
+                    );
+                }
+            }
+            if let Some(timeout) = barrier.timeout_seconds
+                && (!timeout.is_finite()
+                    || timeout <= 0.0
+                    || Duration::try_from_secs_f64(timeout).is_err())
+            {
+                anyhow::bail!(
+                    "server config {} has invalid activation-barrier timeout-seconds for {}: {}",
+                    path.display(),
+                    self.id.as_str(),
+                    timeout
+                );
+            }
         }
         for (label, logical_path) in &self.scope_targets {
             if label.trim() != label
@@ -1575,6 +1647,7 @@ fn module_spec<const G: usize, const D: usize>(
         sessions: Vec::new(),
         groups: groups.to_vec(),
         depends_on: depends_on.to_vec(),
+        activation_barrier: None,
         memo_sources: None,
         scope_targets: BTreeMap::new(),
     }
@@ -1834,6 +1907,133 @@ activation-table = [1.0, 0.5]
         .unwrap();
 
         assert_eq!(config.modules[0].memo_sources, Some(Vec::new()));
+    }
+
+    #[test]
+    fn parse_server_boot_config_reads_activation_barrier_with_optional_timeout() {
+        let config = parse_server_boot_config_content(
+            r#"
+@ modules[] {
+  id: sensory
+  replica-min = 1
+  replica-max = 1
+  bpm-min = 3.0
+  bpm-max = 6.0
+  initial-activation = 1.0
+}
+
+@ modules[] {
+  id: speak
+  replica-min = 0
+  replica-max = 1
+  bpm-min = 3.0
+  bpm-max = 6.0
+  initial-activation = 0.0
+
+  activation-barrier {
+    prerequisites = ["sensory"]
+    timeout-seconds = 2.5
+  }
+}
+"#,
+            Path::new(".tmp/server/config.eure"),
+        )
+        .unwrap();
+
+        let barrier = config.modules[1].activation_barrier.as_ref().unwrap();
+        assert_eq!(barrier.prerequisites, vec![RuntimeModule::Sensory]);
+        assert_eq!(barrier.timeout(), Some(Duration::from_millis(2_500)));
+    }
+
+    #[test]
+    fn parse_server_boot_config_rejects_invalid_activation_barrier() {
+        let error = parse_server_boot_config_content(
+            r#"
+@ modules[] {
+  id: sensory
+  replica-min = 1
+  replica-max = 1
+  bpm-min = 3.0
+  bpm-max = 6.0
+  initial-activation = 1.0
+  activation-barrier {
+    prerequisites = ["sensory"]
+    timeout-seconds = 0.0
+  }
+}
+"#,
+            Path::new(".tmp/server/config.eure"),
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(
+            error.contains("own activation-barrier prerequisite"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn activation_barrier_validation_rejects_empty_duplicate_unknown_and_invalid_timeout() {
+        let path = Path::new(".tmp/server/config.eure");
+        let speak = || {
+            default_server_modules()
+                .into_iter()
+                .find(|module| module.id == RuntimeModule::Speak)
+                .unwrap()
+        };
+
+        let mut empty = speak();
+        empty.activation_barrier = Some(ServerActivationBarrierSpec {
+            prerequisites: Vec::new(),
+            timeout_seconds: None,
+        });
+        assert!(
+            empty
+                .validate(path)
+                .unwrap_err()
+                .to_string()
+                .contains("empty")
+        );
+
+        let mut duplicate = speak();
+        duplicate.activation_barrier = Some(ServerActivationBarrierSpec {
+            prerequisites: vec![RuntimeModule::Sensory, RuntimeModule::Sensory],
+            timeout_seconds: None,
+        });
+        assert!(
+            duplicate
+                .validate(path)
+                .unwrap_err()
+                .to_string()
+                .contains("more than once")
+        );
+
+        let mut invalid_timeout = speak();
+        invalid_timeout.activation_barrier = Some(ServerActivationBarrierSpec {
+            prerequisites: vec![RuntimeModule::Sensory],
+            timeout_seconds: Some(0.0),
+        });
+        assert!(
+            invalid_timeout
+                .validate(path)
+                .unwrap_err()
+                .to_string()
+                .contains("timeout-seconds")
+        );
+
+        let mut unknown = speak();
+        unknown.depends_on.clear();
+        unknown.activation_barrier = Some(ServerActivationBarrierSpec {
+            prerequisites: vec![RuntimeModule::Sensory],
+            timeout_seconds: None,
+        });
+        assert!(
+            validate_module_set(&[unknown], path, "root")
+                .unwrap_err()
+                .to_string()
+                .contains("unknown activation-barrier prerequisite sensory")
+        );
     }
 
     #[test]

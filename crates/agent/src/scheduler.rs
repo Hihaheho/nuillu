@@ -1,3 +1,4 @@
+use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
 use std::future::Future;
 use std::pin::pin;
@@ -281,8 +282,10 @@ pub async fn run_controlled_with_timer(
             .or_default()
             .push(index);
     }
+    let dependencies = Arc::new(dependencies);
     let dependency_targets = DependencyTargets {
-        dependencies: Arc::new(dependencies),
+        activation_barriers: ActivationBarrierTracker::new(Arc::clone(&dependencies)),
+        dependencies,
         target_indexes_by_role: Arc::new(target_indexes_by_role),
     };
     let mut states = modules
@@ -654,11 +657,13 @@ enum ModuleState {
     PendingBatch {
         module: AllocatedModule,
         batch: ModuleBatch,
+        barrier_approved: bool,
         gate_approved: bool,
         self_wake_activation_permit: bool,
         pending_kicks: Vec<Kick>,
     },
     PendingDependencySettle,
+    PendingActivationBarrier,
     PendingActivationGate,
     Activating,
     FailedUntilActivation {
@@ -715,6 +720,16 @@ enum TaskMessage {
         pending_kicks: Vec<Kick>,
         self_wake_activation_permit: bool,
         outcome: ActivationGateOutcome,
+    },
+    ActivationBarrier {
+        index: usize,
+        module: AllocatedModule,
+        kick_inbox: KickInbox,
+        batch: ModuleBatch,
+        pending_kicks: Vec<Kick>,
+        self_wake_activation_permit: bool,
+        timed_out: bool,
+        unmet_prerequisites: Vec<ScopedModuleId>,
     },
     ActivationWaitReady {
         index: usize,
@@ -877,22 +892,115 @@ impl ZeroReplicaWindows {
 struct DependencyTargets {
     dependencies: Arc<ModuleDependencies>,
     target_indexes_by_role: Arc<HashMap<ScopedModuleId, Vec<usize>>>,
+    activation_barriers: ActivationBarrierTracker,
 }
 
 impl DependencyTargets {
     fn target_indexes(&self, dependent: &ScopedModuleId) -> Vec<usize> {
         let mut indexes = Vec::new();
-        for dep_id in self.dependencies.deps_of(dependent) {
+        let settle_dependencies = self.dependencies.deps_of(dependent).iter().chain(
+            self.dependencies
+                .activation_barrier_for(dependent)
+                .into_iter()
+                .flat_map(|barrier| barrier.prerequisites()),
+        );
+        for dep_id in settle_dependencies {
             let Some(targets) = self.target_indexes_by_role.get(dep_id) else {
                 continue;
             };
-            indexes.extend(targets.iter().copied());
+            for target in targets {
+                if !indexes.contains(target) {
+                    indexes.push(*target);
+                }
+            }
         }
         indexes
     }
 
     fn has_dependencies(&self, dependent: &ScopedModuleId) -> bool {
         !self.dependencies.deps_of(dependent).is_empty()
+            || self
+                .dependencies
+                .activation_barrier_for(dependent)
+                .is_some()
+    }
+}
+
+#[derive(Clone)]
+struct ActivationBarrierTracker {
+    inner: Rc<RefCell<ActivationBarrierTrackerInner>>,
+    changed: watch::Sender<u64>,
+    dependencies: Arc<ModuleDependencies>,
+}
+
+#[derive(Default)]
+struct ActivationBarrierTrackerInner {
+    generations: HashMap<ScopedModuleId, u64>,
+    watermarks: HashMap<ModuleInstanceId, HashMap<ScopedModuleId, u64>>,
+}
+
+impl ActivationBarrierTracker {
+    fn new(dependencies: Arc<ModuleDependencies>) -> Self {
+        let (changed, _) = watch::channel(0);
+        Self {
+            inner: Rc::new(RefCell::new(ActivationBarrierTrackerInner::default())),
+            changed,
+            dependencies,
+        }
+    }
+
+    fn barrier_for(&self, owner: &ModuleInstanceId) -> Option<&nuillu_module::ActivationBarrier> {
+        self.dependencies
+            .activation_barrier_for(&owner.scoped_module())
+    }
+
+    fn unmet(&self, owner: &ModuleInstanceId) -> Vec<ScopedModuleId> {
+        let Some(barrier) = self.barrier_for(owner) else {
+            return Vec::new();
+        };
+        let inner = self.inner.borrow();
+        let watermark = inner.watermarks.get(owner);
+        barrier
+            .prerequisites()
+            .iter()
+            .filter(|prerequisite| {
+                let generation = inner.generations.get(*prerequisite).copied().unwrap_or(0);
+                let consumed = watermark
+                    .and_then(|values| values.get(*prerequisite))
+                    .copied()
+                    .unwrap_or(0);
+                generation <= consumed
+            })
+            .cloned()
+            .collect()
+    }
+
+    fn record_success(&self, owner: &ModuleInstanceId) {
+        let scoped = owner.scoped_module();
+        let mut inner = self.inner.borrow_mut();
+        let generation = inner.generations.entry(scoped).or_default();
+        *generation = generation.saturating_add(1);
+
+        if let Some(barrier) = self.barrier_for(owner) {
+            let watermark = barrier
+                .prerequisites()
+                .iter()
+                .map(|prerequisite| {
+                    (
+                        prerequisite.clone(),
+                        inner.generations.get(prerequisite).copied().unwrap_or(0),
+                    )
+                })
+                .collect();
+            inner.watermarks.insert(owner.clone(), watermark);
+        }
+        drop(inner);
+        self.changed
+            .send_modify(|revision| *revision = revision.saturating_add(1));
+    }
+
+    fn subscribe(&self) -> watch::Receiver<u64> {
+        self.changed.subscribe()
     }
 }
 
@@ -1173,6 +1281,7 @@ async fn refresh_active_and_schedule(
                 let ModuleState::PendingBatch {
                     module,
                     batch,
+                    barrier_approved,
                     gate_approved,
                     self_wake_activation_permit,
                     pending_kicks,
@@ -1207,22 +1316,42 @@ async fn refresh_active_and_schedule(
                         subscriber,
                     );
                 } else {
-                    let scheduled = spawn_activation_gate_or_activate(
-                        runtime,
-                        tasks,
-                        index,
-                        owners[index].clone(),
-                        module,
-                        kick_inbox,
-                        pending_kicks,
-                        batch,
-                        self_wake_activation_permit,
-                        timer,
-                        config,
-                        parent,
-                        subscriber,
-                    )
-                    .await;
+                    let scheduled = if barrier_approved {
+                        spawn_activation_gate_or_activate(
+                            runtime,
+                            tasks,
+                            index,
+                            owners[index].clone(),
+                            module,
+                            kick_inbox,
+                            pending_kicks,
+                            batch,
+                            self_wake_activation_permit,
+                            timer,
+                            config,
+                            parent,
+                            subscriber,
+                        )
+                        .await
+                    } else {
+                        spawn_activation_barrier_or_gate(
+                            runtime,
+                            tasks,
+                            index,
+                            owners[index].clone(),
+                            module,
+                            kick_inbox,
+                            pending_kicks,
+                            batch,
+                            self_wake_activation_permit,
+                            &dependency_targets.activation_barriers,
+                            timer,
+                            config,
+                            parent,
+                            subscriber,
+                        )
+                        .await
+                    };
                     states[index] = scheduled.module_state();
                 }
             }
@@ -1243,6 +1372,10 @@ async fn refresh_active_and_schedule(
                 runtime
                     .record_module_status(owners[index].clone(), status)
                     .await;
+            }
+            ModuleState::PendingActivationBarrier => {
+                // The barrier task owns the ready batch and continues to
+                // observe prerequisite completions while allocation changes.
             }
             ModuleState::PendingActivationGate => {
                 let status = if state_active {
@@ -1416,7 +1549,7 @@ async fn handle_task_message(
                     .await
                 {
                     zero_windows.mark_batch_accepted(&owners[index]);
-                    let scheduled = spawn_activation_gate_or_activate(
+                    let scheduled = spawn_activation_barrier_or_gate(
                         runtime,
                         tasks,
                         index,
@@ -1426,6 +1559,7 @@ async fn handle_task_message(
                         pending_kicks,
                         batch,
                         has_self_wake_permit_claim,
+                        &dependency_targets.activation_barriers,
                         timer,
                         config,
                         parent,
@@ -1442,6 +1576,7 @@ async fn handle_task_message(
                     states[index] = ModuleState::PendingBatch {
                         module,
                         batch,
+                        barrier_approved: false,
                         gate_approved: false,
                         self_wake_activation_permit: false,
                         pending_kicks: Vec::new(),
@@ -1529,6 +1664,9 @@ async fn handle_task_message(
             result,
         } => match result {
             Ok(()) => {
+                dependency_targets
+                    .activation_barriers
+                    .record_success(&owners[index]);
                 consecutive_failures[index] = 0;
                 notify_pending_and_ready(pending_kicks, &mut kick_inbox);
                 kick_inboxes[index] = Some(kick_inbox);
@@ -1586,6 +1724,71 @@ async fn handle_task_message(
                 Ok(())
             }
         },
+        TaskMessage::ActivationBarrier {
+            index,
+            module,
+            mut kick_inbox,
+            batch,
+            pending_kicks,
+            self_wake_activation_permit,
+            timed_out,
+            unmet_prerequisites,
+        } => {
+            if timed_out {
+                let unmet = unmet_prerequisites
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let message = format!(
+                    "activation barrier timed out; proceeding with unmet prerequisites: {unmet}"
+                );
+                tracing::warn!(owner = %owners[index], %unmet, "{message}");
+                runtime.record_module_warning(owners[index].clone(), message);
+            }
+            if scheduling_enabled
+                && scheduling_active(
+                    runtime,
+                    zero_windows,
+                    &owners[index],
+                    self_wake_activation_permit,
+                )
+                .await
+            {
+                let scheduled = spawn_activation_gate_or_activate(
+                    runtime,
+                    tasks,
+                    index,
+                    owners[index].clone(),
+                    module,
+                    kick_inbox,
+                    pending_kicks,
+                    batch,
+                    self_wake_activation_permit,
+                    timer,
+                    config,
+                    parent,
+                    subscriber,
+                )
+                .await;
+                states[index] = scheduled.module_state();
+            } else {
+                runtime
+                    .record_module_status(owners[index].clone(), ModuleRunStatus::PendingBatch)
+                    .await;
+                notify_pending_and_ready(pending_kicks, &mut kick_inbox);
+                kick_inboxes[index] = Some(kick_inbox);
+                states[index] = ModuleState::PendingBatch {
+                    module,
+                    batch,
+                    barrier_approved: true,
+                    gate_approved: false,
+                    self_wake_activation_permit: false,
+                    pending_kicks: Vec::new(),
+                };
+            }
+            Ok(())
+        }
         TaskMessage::ActivationGate {
             index,
             module,
@@ -1637,6 +1840,7 @@ async fn handle_task_message(
                     states[index] = ModuleState::PendingBatch {
                         module,
                         batch,
+                        barrier_approved: true,
                         gate_approved: true,
                         self_wake_activation_permit: false,
                         pending_kicks: Vec::new(),
@@ -1921,6 +2125,7 @@ async fn collect_dependency_settle_completions(
             }
             ModuleState::Throttling
             | ModuleState::PendingDependencySettle
+            | ModuleState::PendingActivationBarrier
             | ModuleState::PendingActivationGate
             | ModuleState::Activating => completions.push(DependencyWait::kick(
                 target_owner,
@@ -2090,6 +2295,140 @@ enum PreBatchScheduling {
     PendingDependencySettle,
 }
 
+#[allow(clippy::too_many_arguments)]
+async fn spawn_activation_barrier_or_gate(
+    runtime: &AgentRuntimeControl,
+    tasks: &mut FuturesUnordered<JoinHandle<TaskMessage>>,
+    index: usize,
+    owner: ModuleInstanceId,
+    module: AllocatedModule,
+    kick_inbox: KickInbox,
+    pending_kicks: Vec<Kick>,
+    batch: ModuleBatch,
+    self_wake_activation_permit: bool,
+    barrier_tracker: &ActivationBarrierTracker,
+    timer: &Rc<dyn Timer>,
+    config: AgentEventLoopConfig,
+    parent: &tracing::Span,
+    subscriber: &tracing::Dispatch,
+) -> ActivationScheduling {
+    let unmet = barrier_tracker.unmet(&owner);
+    if unmet.is_empty() {
+        return spawn_activation_gate_or_activate(
+            runtime,
+            tasks,
+            index,
+            owner,
+            module,
+            kick_inbox,
+            pending_kicks,
+            batch,
+            self_wake_activation_permit,
+            timer,
+            config,
+            parent,
+            subscriber,
+        )
+        .await;
+    }
+
+    let timeout = barrier_tracker
+        .barrier_for(&owner)
+        .and_then(nuillu_module::ActivationBarrier::timeout);
+    runtime
+        .record_module_status(
+            owner.clone(),
+            ModuleRunStatus::PendingActivationBarrier {
+                unmet_prerequisites: unmet,
+            },
+        )
+        .await;
+    spawn_activation_barrier_wait(
+        tasks,
+        index,
+        owner,
+        module,
+        kick_inbox,
+        pending_kicks,
+        batch,
+        self_wake_activation_permit,
+        barrier_tracker.clone(),
+        timeout,
+        timer.clone(),
+        parent,
+        subscriber,
+    );
+    ActivationScheduling::PendingActivationBarrier
+}
+
+#[allow(clippy::too_many_arguments)]
+fn spawn_activation_barrier_wait(
+    tasks: &mut FuturesUnordered<JoinHandle<TaskMessage>>,
+    index: usize,
+    owner: ModuleInstanceId,
+    module: AllocatedModule,
+    kick_inbox: KickInbox,
+    pending_kicks: Vec<Kick>,
+    batch: ModuleBatch,
+    self_wake_activation_permit: bool,
+    tracker: ActivationBarrierTracker,
+    timeout: Option<Duration>,
+    timer: Rc<dyn Timer>,
+    parent: &tracing::Span,
+    subscriber: &tracing::Dispatch,
+) {
+    tasks.push(spawn_local(
+        async move {
+            let (timed_out, unmet_prerequisites) =
+                wait_for_activation_barrier(&owner, &tracker, timeout, timer).await;
+            TaskMessage::ActivationBarrier {
+                index,
+                module,
+                kick_inbox,
+                batch,
+                pending_kicks,
+                self_wake_activation_permit,
+                timed_out,
+                unmet_prerequisites,
+            }
+        }
+        .instrument(parent.clone())
+        .with_subscriber(subscriber.clone()),
+    ));
+}
+
+async fn wait_for_activation_barrier(
+    owner: &ModuleInstanceId,
+    tracker: &ActivationBarrierTracker,
+    timeout: Option<Duration>,
+    timer: Rc<dyn Timer>,
+) -> (bool, Vec<ScopedModuleId>) {
+    let mut changed = tracker.subscribe();
+    let timed_out = if let Some(timeout) = timeout {
+        let mut deadline = timer.sleep(timeout);
+        loop {
+            if tracker.unmet(owner).is_empty() {
+                break false;
+            }
+            tokio::select! {
+                _ = changed.changed() => {}
+                _ = &mut deadline => break true,
+            }
+        }
+    } else {
+        loop {
+            if tracker.unmet(owner).is_empty() {
+                break false;
+            }
+            if changed.changed().await.is_err() {
+                std::future::pending::<()>().await;
+            }
+        }
+    };
+    let unmet = tracker.unmet(owner);
+    (timed_out && !unmet.is_empty(), unmet)
+}
+
 impl PreBatchScheduling {
     fn module_state(self) -> ModuleState {
         match self {
@@ -2164,6 +2503,7 @@ async fn spawn_activation_gate_or_activate(
 
 enum ActivationScheduling {
     Activating,
+    PendingActivationBarrier,
     PendingActivationGate,
 }
 
@@ -2171,6 +2511,7 @@ impl ActivationScheduling {
     fn module_state(self) -> ModuleState {
         match self {
             Self::Activating => ModuleState::Activating,
+            Self::PendingActivationBarrier => ModuleState::PendingActivationBarrier,
             Self::PendingActivationGate => ModuleState::PendingActivationGate,
         }
     }
@@ -3692,6 +4033,160 @@ mod tests {
     silent_dependency_stub!(SilentDependencyA, "silent-dependency-a");
     silent_dependency_stub!(SilentDependencyB, "silent-dependency-b");
     silent_dependency_stub!(SilentDependencyC, "silent-dependency-c");
+
+    #[tokio::test]
+    async fn activation_barrier_tracks_fresh_successes_per_dependent_replica() {
+        let policy = || test_policy(0..=1, Bpm::from_f64(60.0)..=Bpm::from_f64(60.0));
+        let dependency_a = ModuleId::new(SilentDependencyA::id()).unwrap();
+        let dependency_b = ModuleId::new(SilentDependencyB::id()).unwrap();
+        let dependent = ModuleId::new(SilentDependencyC::id()).unwrap();
+        let allocated = ModuleRegistry::new()
+            .register_sync::<SilentDependencyA, _>(policy(), |_| SilentDependencyA)
+            .unwrap()
+            .register_sync::<SilentDependencyB, _>(policy(), |_| SilentDependencyB)
+            .unwrap()
+            .register_sync::<SilentDependencyC, _>(policy(), |_| SilentDependencyC)
+            .unwrap()
+            .activation_barrier(
+                dependent.clone(),
+                [dependency_a.clone(), dependency_b.clone()],
+                None,
+            )
+            .build(&test_caps(Blackboard::default()))
+            .await
+            .unwrap();
+        let (_, _, dependencies) = allocated.into_parts_with_dependencies();
+        let tracker = super::ActivationBarrierTracker::new(Arc::new(dependencies));
+        let dependent_owner = ModuleInstanceId::new(dependent, ReplicaIndex::ZERO);
+        let dependency_a_owner = ModuleInstanceId::new(dependency_a.clone(), ReplicaIndex::ZERO);
+        let dependency_b_owner = ModuleInstanceId::new(dependency_b.clone(), ReplicaIndex::ZERO);
+
+        assert_eq!(
+            tracker.unmet(&dependent_owner),
+            vec![
+                ScopedModuleId::new(ScopeId::root(), dependency_a.clone()),
+                ScopedModuleId::new(ScopeId::root(), dependency_b.clone()),
+            ]
+        );
+        let mut wait = Box::pin(super::wait_for_activation_barrier(
+            &dependent_owner,
+            &tracker,
+            None,
+            Rc::new(TokioTimer::new()),
+        ));
+        tokio::select! {
+            result = &mut wait => panic!("barrier resolved before prerequisites: {result:?}"),
+            _ = tokio::task::yield_now() => {}
+        }
+        tracker.record_success(&dependency_a_owner);
+        assert_eq!(
+            tracker.unmet(&dependent_owner),
+            vec![ScopedModuleId::new(ScopeId::root(), dependency_b.clone())]
+        );
+        tokio::select! {
+            result = &mut wait => panic!("barrier resolved with one unmet prerequisite: {result:?}"),
+            _ = tokio::task::yield_now() => {}
+        }
+        tracker.record_success(&dependency_b_owner);
+        assert_eq!(wait.await, (false, Vec::new()));
+        assert!(tracker.unmet(&dependent_owner).is_empty());
+
+        tracker.record_success(&dependent_owner);
+        assert_eq!(tracker.unmet(&dependent_owner).len(), 2);
+        let (timed_out, unmet) = super::wait_for_activation_barrier(
+            &dependent_owner,
+            &tracker,
+            Some(Duration::from_millis(1)),
+            Rc::new(TokioTimer::new()),
+        )
+        .await;
+        assert!(timed_out);
+        assert_eq!(unmet.len(), 2);
+        tracker.record_success(&dependency_b_owner);
+        assert_eq!(
+            tracker.unmet(&dependent_owner),
+            vec![ScopedModuleId::new(ScopeId::root(), dependency_a)]
+        );
+        tracker.record_success(&dependency_a_owner);
+        assert!(tracker.unmet(&dependent_owner).is_empty());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn activation_barrier_timeout_releases_ready_batch_and_emits_warning() {
+        LocalSet::new()
+            .run_until(async {
+                let dependency = ModuleId::new(SilentDependencyA::id()).unwrap();
+                let dependent = ModuleId::new(GatedEchoModule::id()).unwrap();
+                let mut allocation = ResourceAllocation::default();
+                allocation.set_activation(dependency.clone(), ActivationRatio::ONE);
+                allocation.set_activation(dependent.clone(), ActivationRatio::ONE);
+                let sink = RecordingRuntimeEventSink::default();
+                let blackboard = Blackboard::with_allocation(allocation);
+                let caps = test_caps_with_event_sink(blackboard.clone(), Rc::new(sink.clone()));
+                let activations = Rc::new(Cell::new(0));
+                let (done_tx, done_rx) = oneshot::channel();
+                let done_tx = Rc::new(RefCell::new(Some(done_tx)));
+                let modules = ModuleRegistry::new()
+                    .register_sync::<SilentDependencyA, _>(
+                        test_policy(1..=1, Bpm::from_f64(60.0)..=Bpm::from_f64(60.0)),
+                        |_| SilentDependencyA,
+                    )
+                    .unwrap()
+                    .register_sync::<GatedEchoModule, _>(
+                        test_policy(1..=1, Bpm::from_f64(60.0)..=Bpm::from_f64(60.0)),
+                        {
+                            let activations = Rc::clone(&activations);
+                            let done_tx = Rc::clone(&done_tx);
+                            move |caps| GatedEchoModule {
+                                attention_control_inbox: caps.attention_control_inbox(),
+                                memo: caps.memo(),
+                                activations: Rc::clone(&activations),
+                                on_done: done_tx.borrow_mut().take(),
+                            }
+                        },
+                    )
+                    .unwrap()
+                    .activation_barrier(
+                        dependent.clone(),
+                        [dependency.clone()],
+                        Some(Duration::from_millis(50)),
+                    )
+                    .build(&caps)
+                    .await
+                    .unwrap();
+                let mailbox = caps.internal_harness_io().attention_control_mailbox();
+                let started = tokio::time::Instant::now();
+                let dependent_owner = ModuleInstanceId::new(dependent, ReplicaIndex::ZERO);
+                let unmet = ScopedModuleId::new(ScopeId::root(), dependency);
+
+                super::run(modules, test_config(), async move {
+                    mailbox
+                        .publish(AttentionControlRequest::new("barrier timeout"))
+                        .await
+                        .unwrap();
+                    wait_for_status(
+                        &blackboard,
+                        &dependent_owner,
+                        ModuleRunStatus::PendingActivationBarrier {
+                            unmet_prerequisites: vec![unmet],
+                        },
+                    )
+                    .await;
+                    done_rx.await.unwrap();
+                })
+                .await
+                .unwrap();
+
+                assert_eq!(activations.get(), 1);
+                assert!(started.elapsed() >= Duration::from_millis(50));
+                assert!(sink.events().iter().any(|event| matches!(
+                    event,
+                    RuntimeEvent::ModuleWarning { message, .. }
+                        if message.contains("activation barrier timed out")
+                )));
+            })
+            .await;
+    }
 
     struct BlockingActivateStub {
         entered: Option<oneshot::Sender<()>>,
@@ -7506,6 +8001,9 @@ mod tests {
                     vec![dependency_index],
                 );
                 let dependency_targets = super::DependencyTargets {
+                    activation_barriers: super::ActivationBarrierTracker::new(Arc::new(
+                        dependencies.clone(),
+                    )),
                     dependencies: Arc::new(dependencies),
                     target_indexes_by_role: Arc::new(target_indexes_by_role),
                 };
@@ -7604,6 +8102,9 @@ mod tests {
                     vec![dependency_index],
                 );
                 let dependency_targets = super::DependencyTargets {
+                    activation_barriers: super::ActivationBarrierTracker::new(Arc::new(
+                        dependencies.clone(),
+                    )),
                     dependencies: Arc::new(dependencies),
                     target_indexes_by_role: Arc::new(target_indexes_by_role),
                 };
@@ -7993,6 +8494,9 @@ mod tests {
                 let mut kick_inboxes = vec![None];
                 let mut zero_window_wakers = vec![None];
                 let dependency_targets = super::DependencyTargets {
+                    activation_barriers: super::ActivationBarrierTracker::new(Arc::new(
+                        ModuleDependencies::default(),
+                    )),
                     dependencies: Arc::new(ModuleDependencies::default()),
                     target_indexes_by_role: Arc::new(HashMap::new()),
                 };
@@ -8111,6 +8615,9 @@ mod tests {
                 target_indexes_by_role
                     .insert(dependency_owner.scoped_module(), vec![dependency_index]);
                 let dependency_targets = super::DependencyTargets {
+                    activation_barriers: super::ActivationBarrierTracker::new(Arc::new(
+                        dependencies.clone(),
+                    )),
                     dependencies: Arc::new(dependencies),
                     target_indexes_by_role: Arc::new(target_indexes_by_role),
                 };
@@ -8324,6 +8831,9 @@ mod tests {
                     vec![dependency_index],
                 );
                 let dependency_targets = super::DependencyTargets {
+                    activation_barriers: super::ActivationBarrierTracker::new(Arc::new(
+                        dependencies.clone(),
+                    )),
                     dependencies: Arc::new(dependencies),
                     target_indexes_by_role: Arc::new(target_indexes_by_role),
                 };
@@ -8536,6 +9046,9 @@ mod tests {
                 let mut kick_inboxes = Vec::new();
                 kick_inboxes.push(None);
                 let dependency_targets = super::DependencyTargets {
+                    activation_barriers: super::ActivationBarrierTracker::new(Arc::new(
+                        ModuleDependencies::default(),
+                    )),
                     dependencies: Arc::new(ModuleDependencies::default()),
                     target_indexes_by_role: Arc::new(HashMap::new()),
                 };

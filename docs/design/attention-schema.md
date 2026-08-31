@@ -229,6 +229,14 @@ self-model, and surprise, plus direct cognition writers such as interpreter and 
 allowed to flush before `speak` runs, so overt speech reflects the current admitted surface rather
 than racing ahead of late evidence memos or newly generated inner interpretations.
 
+Module config may additionally declare an `activation-barrier`. Before each activation, every
+listed prerequisite role must have completed successfully at least once since that dependent
+replica's previous successful activation. The barrier is all-of and scoped to the module's runtime
+scope; any successful prerequisite replica advances its role. A ready batch waits without
+synthesizing input for idle prerequisites. Omitting `timeout-seconds` waits indefinitely, while a
+configured timeout releases that candidate activation with a runtime warning naming the unmet
+prerequisites. Ordinary `depends-on` retains its softer pending-work settling semantics.
+
 ## Capabilities
 
 | Module | Read blackboard | Read cognition log | Read allocation | Memo | Clock | LLM | Special capabilities |

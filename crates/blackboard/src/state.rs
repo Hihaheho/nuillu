@@ -7,7 +7,7 @@ use std::rc::Rc;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use chrono::{DateTime, Utc};
-use nuillu_types::{MemoryIndex, ModuleId, ModuleInstanceId, PolicyIndex, ScopeId};
+use nuillu_types::{MemoryIndex, ModuleId, ModuleInstanceId, PolicyIndex, ScopeId, ScopedModuleId};
 use serde::de::DeserializeOwned;
 use tokio::sync::{RwLock, oneshot};
 
@@ -271,6 +271,9 @@ pub enum ModuleRunStatus {
     Inactive,
     AwaitingBatch,
     PendingActivationGate,
+    PendingActivationBarrier {
+        unmet_prerequisites: Vec<ScopedModuleId>,
+    },
     PendingBatch,
     Activating,
     Failed {

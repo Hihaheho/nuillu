@@ -59,7 +59,14 @@ pub struct ModuleRegistrationSpec {
     initial_activation: ActivationRatio,
     groups: BTreeSet<ModuleGroupId>,
     dependencies: Vec<ModuleId>,
+    activation_barrier: Option<ModuleActivationBarrierSpec>,
     memo_subscription: MemoSubscription,
+}
+
+#[derive(Debug, Clone)]
+struct ModuleActivationBarrierSpec {
+    prerequisites: Vec<ModuleId>,
+    timeout: Option<Duration>,
 }
 
 /// Immutable boot-time description of an immediate child subsystem mount.
@@ -136,6 +143,7 @@ impl ModuleRegistrationSpec {
             initial_activation,
             groups: BTreeSet::new(),
             dependencies: Vec::new(),
+            activation_barrier: None,
             memo_subscription: MemoSubscription::All,
         }
     }
@@ -188,6 +196,20 @@ impl ModuleRegistrationSpec {
         if !self.dependencies.contains(&dependency) {
             self.dependencies.push(dependency);
         }
+        self
+    }
+
+    /// Require every prerequisite role to complete successfully after this
+    /// replica's previous successful activation before its next activation.
+    pub fn with_activation_barrier(
+        mut self,
+        prerequisites: impl IntoIterator<Item = ModuleId>,
+        timeout: Option<Duration>,
+    ) -> Self {
+        self.activation_barrier = Some(ModuleActivationBarrierSpec {
+            prerequisites: prerequisites.into_iter().collect(),
+            timeout,
+        });
         self
     }
 
@@ -1221,6 +1243,10 @@ impl AgentRuntimeControl {
             .module_activation_completed(activation_id, owner, duration, succeeded);
     }
 
+    pub fn record_module_warning(&self, owner: ModuleInstanceId, message: String) {
+        self.runtime_events.module_warning(owner, message);
+    }
+
     pub fn record_module_activation_attempt_failed(
         &self,
         activation_id: ModuleActivationId,
@@ -1989,6 +2015,23 @@ impl AllocatedModules {
 pub struct ModuleDependencies {
     deps_of: HashMap<ScopedModuleId, Vec<ScopedModuleId>>,
     dependents_of: HashMap<ScopedModuleId, Vec<ScopedModuleId>>,
+    activation_barriers: HashMap<ScopedModuleId, ActivationBarrier>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActivationBarrier {
+    prerequisites: Vec<ScopedModuleId>,
+    timeout: Option<Duration>,
+}
+
+impl ActivationBarrier {
+    pub fn prerequisites(&self) -> &[ScopedModuleId] {
+        &self.prerequisites
+    }
+
+    pub fn timeout(&self) -> Option<Duration> {
+        self.timeout
+    }
 }
 
 impl ModuleDependencies {
@@ -2002,11 +2045,16 @@ impl ModuleDependencies {
             .map(Vec::as_slice)
             .unwrap_or(&[])
     }
+
+    pub fn activation_barrier_for(&self, module: &ScopedModuleId) -> Option<&ActivationBarrier> {
+        self.activation_barriers.get(module)
+    }
 }
 
 pub struct ModuleRegistry {
     registrations: Vec<ModuleRegistration>,
     dependencies: Vec<(ScopedModuleId, ScopedModuleId)>,
+    activation_barriers: Vec<(ScopedModuleId, Vec<ScopedModuleId>, Option<Duration>)>,
     registration_scope: ScopeId,
     subsystems: Vec<SubsystemRegistrationSpec>,
 }
@@ -2057,6 +2105,7 @@ impl ModuleRegistry {
         Self {
             registrations: Vec::new(),
             dependencies: Vec::new(),
+            activation_barriers: Vec::new(),
             registration_scope: ScopeId::root(),
             subsystems: Vec::new(),
         }
@@ -2099,6 +2148,33 @@ impl ModuleRegistry {
         self
     }
 
+    pub fn activation_barrier(
+        self,
+        dependent: ModuleId,
+        prerequisites: impl IntoIterator<Item = ModuleId>,
+        timeout: Option<Duration>,
+    ) -> Self {
+        self.scoped_activation_barrier(ScopeId::root(), dependent, prerequisites, timeout)
+    }
+
+    pub fn scoped_activation_barrier(
+        mut self,
+        scope: ScopeId,
+        dependent: ModuleId,
+        prerequisites: impl IntoIterator<Item = ModuleId>,
+        timeout: Option<Duration>,
+    ) -> Self {
+        self.activation_barriers.push((
+            ScopedModuleId::new(scope.clone(), dependent),
+            prerequisites
+                .into_iter()
+                .map(|module| ScopedModuleId::new(scope.clone(), module))
+                .collect(),
+            timeout,
+        ));
+        self
+    }
+
     /// Remove a registered module role and any dependency edges touching it.
     ///
     /// Removing an absent module is a no-op. This is intended for host boot
@@ -2122,6 +2198,14 @@ impl ModuleRegistry {
         self.dependencies.retain(|(dependent, dependency)| {
             !removed.contains(&dependent.module) && !removed.contains(&dependency.module)
         });
+        self.activation_barriers
+            .retain_mut(|(dependent, prerequisites, _)| {
+                if removed.contains(&dependent.module) {
+                    return false;
+                }
+                prerequisites.retain(|prerequisite| !removed.contains(&prerequisite.module));
+                !prerequisites.is_empty()
+            });
         self
     }
 
@@ -2172,6 +2256,18 @@ impl ModuleRegistry {
                     ScopedModuleId::new(spec.scope.clone(), dependency),
                 )
             }));
+        if let Some(barrier) = &spec.activation_barrier {
+            self.activation_barriers.push((
+                spec.scoped_module(),
+                barrier
+                    .prerequisites
+                    .iter()
+                    .cloned()
+                    .map(|module| ScopedModuleId::new(spec.scope.clone(), module))
+                    .collect(),
+                barrier.timeout,
+            ));
+        }
         self.registrations.push(ModuleRegistration {
             spec,
             builder: Rc::new(move |caps| {
@@ -2341,6 +2437,7 @@ impl ModuleRegistry {
             .collect::<HashSet<_>>();
         let mut deps_of = HashMap::<ScopedModuleId, Vec<ScopedModuleId>>::new();
         let mut dependents_of = HashMap::<ScopedModuleId, Vec<ScopedModuleId>>::new();
+        let mut activation_barriers = HashMap::<ScopedModuleId, ActivationBarrier>::new();
 
         for (dependent, dependency) in &self.dependencies {
             if !registered.contains(dependent) {
@@ -2369,6 +2466,63 @@ impl ModuleRegistry {
             }
         }
 
+        let mut cycle_edges = deps_of.clone();
+        for (dependent, prerequisites, timeout) in &self.activation_barriers {
+            if !registered.contains(dependent) {
+                return Err(ModuleRegistryError::UnknownBarrierDependent {
+                    dependent: dependent.clone(),
+                });
+            }
+            if prerequisites.is_empty() {
+                return Err(ModuleRegistryError::EmptyActivationBarrier {
+                    dependent: dependent.clone(),
+                });
+            }
+            if timeout.is_some_and(|timeout| timeout.is_zero()) {
+                return Err(ModuleRegistryError::ZeroActivationBarrierTimeout {
+                    dependent: dependent.clone(),
+                });
+            }
+            let mut seen = HashSet::new();
+            for prerequisite in prerequisites {
+                if !registered.contains(prerequisite) {
+                    return Err(ModuleRegistryError::UnknownBarrierPrerequisite {
+                        dependent: dependent.clone(),
+                        prerequisite: prerequisite.clone(),
+                    });
+                }
+                if dependent == prerequisite {
+                    return Err(ModuleRegistryError::DependencyCycle {
+                        cycle: vec![dependent.clone()],
+                    });
+                }
+                if !seen.insert(prerequisite.clone()) {
+                    return Err(ModuleRegistryError::DuplicateBarrierPrerequisite {
+                        dependent: dependent.clone(),
+                        prerequisite: prerequisite.clone(),
+                    });
+                }
+                let edges = cycle_edges.entry(dependent.clone()).or_default();
+                if !edges.contains(prerequisite) {
+                    edges.push(prerequisite.clone());
+                }
+            }
+            if activation_barriers
+                .insert(
+                    dependent.clone(),
+                    ActivationBarrier {
+                        prerequisites: prerequisites.clone(),
+                        timeout: *timeout,
+                    },
+                )
+                .is_some()
+            {
+                return Err(ModuleRegistryError::DuplicateActivationBarrier {
+                    dependent: dependent.clone(),
+                });
+            }
+        }
+
         let mut visiting = HashSet::<ScopedModuleId>::new();
         let mut visited = HashSet::<ScopedModuleId>::new();
         for module in registered {
@@ -2378,7 +2532,7 @@ impl ModuleRegistry {
             let mut stack = Vec::new();
             dfs_check_dependencies(
                 module.clone(),
-                &deps_of,
+                &cycle_edges,
                 &mut visiting,
                 &mut visited,
                 &mut stack,
@@ -2388,6 +2542,7 @@ impl ModuleRegistry {
         Ok(ModuleDependencies {
             deps_of,
             dependents_of,
+            activation_barriers,
         })
     }
 
@@ -2475,6 +2630,26 @@ pub enum ModuleRegistryError {
     UnknownDependent { dependent: ScopedModuleId },
     #[error("dependency {dependency} declared in depends_on() but not registered")]
     UnknownDependency { dependency: ScopedModuleId },
+    #[error("activation barrier dependent {dependent} is not registered")]
+    UnknownBarrierDependent { dependent: ScopedModuleId },
+    #[error("activation barrier prerequisite {prerequisite} for {dependent} is not registered")]
+    UnknownBarrierPrerequisite {
+        dependent: ScopedModuleId,
+        prerequisite: ScopedModuleId,
+    },
+    #[error("activation barrier for {dependent} must declare at least one prerequisite")]
+    EmptyActivationBarrier { dependent: ScopedModuleId },
+    #[error("activation barrier for {dependent} must have a timeout greater than zero")]
+    ZeroActivationBarrierTimeout { dependent: ScopedModuleId },
+    #[error("activation barrier for {dependent} is declared more than once")]
+    DuplicateActivationBarrier { dependent: ScopedModuleId },
+    #[error(
+        "activation barrier prerequisite {prerequisite} is declared more than once for {dependent}"
+    )]
+    DuplicateBarrierPrerequisite {
+        dependent: ScopedModuleId,
+        prerequisite: ScopedModuleId,
+    },
     #[error("module {subscriber} subscribes to memos from unregistered module {memo_source}")]
     UnknownMemoSource {
         subscriber: ModuleId,
@@ -3503,6 +3678,77 @@ mod tests {
                 .members(&group),
             vec![ModuleId::new("mcp-alpha").unwrap(), beta]
         );
+    }
+
+    #[tokio::test]
+    async fn registry_compiles_activation_barrier_separately_from_settle_dependencies() {
+        let caps = test_caps(Blackboard::default());
+        let prerequisite = ModuleId::new("barrier-prerequisite").unwrap();
+        let dependent = ModuleId::new("barrier-dependent").unwrap();
+        let allocated = ModuleRegistry::new()
+            .register(
+                ModuleRegistrationSpec::new(
+                    prerequisite.clone(),
+                    test_policy(0..=1),
+                    ActivationRatio::ONE,
+                ),
+                noop_builder,
+            )
+            .unwrap()
+            .register(
+                ModuleRegistrationSpec::new(
+                    dependent.clone(),
+                    test_policy(0..=1),
+                    ActivationRatio::ONE,
+                )
+                .with_activation_barrier([prerequisite.clone()], Some(Duration::from_secs(7))),
+                noop_builder,
+            )
+            .unwrap()
+            .build(&caps)
+            .await
+            .unwrap();
+
+        let dependent = ScopedModuleId::new(ScopeId::root(), dependent);
+        let prerequisite = ScopedModuleId::new(ScopeId::root(), prerequisite);
+        assert!(allocated.dependencies().deps_of(&dependent).is_empty());
+        let barrier = allocated
+            .dependencies()
+            .activation_barrier_for(&dependent)
+            .unwrap();
+        assert_eq!(barrier.prerequisites(), std::slice::from_ref(&prerequisite));
+        assert_eq!(barrier.timeout(), Some(Duration::from_secs(7)));
+    }
+
+    #[tokio::test]
+    async fn registry_rejects_cycle_across_dependency_and_activation_barrier_edges() {
+        let caps = test_caps(Blackboard::default());
+        let alpha = ModuleId::new("barrier-cycle-alpha").unwrap();
+        let beta = ModuleId::new("barrier-cycle-beta").unwrap();
+        let result = ModuleRegistry::new()
+            .register(
+                ModuleRegistrationSpec::new(
+                    alpha.clone(),
+                    test_policy(0..=1),
+                    ActivationRatio::ONE,
+                )
+                .depends_on(beta.clone()),
+                noop_builder,
+            )
+            .unwrap()
+            .register(
+                ModuleRegistrationSpec::new(beta, test_policy(0..=1), ActivationRatio::ONE)
+                    .with_activation_barrier([alpha], None),
+                noop_builder,
+            )
+            .unwrap()
+            .build(&caps)
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(ModuleRegistryError::DependencyCycle { .. })
+        ));
     }
 
     #[tokio::test]
