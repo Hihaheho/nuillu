@@ -223,16 +223,20 @@ impl LlmConcurrencyLimiter {
         let Some(key) = task_key else {
             return Some(LlmConcurrencyPermit::unscoped(permit));
         };
-        held_concurrency_permits()
+        let mut held = held_concurrency_permits()
             .lock()
-            .expect("LLM concurrency permit map mutex poisoned")
-            .insert(
+            .expect("LLM concurrency permit map mutex poisoned");
+        if let Some(entry) = held.get_mut(&key) {
+            entry.count += 1;
+        } else {
+            held.insert(
                 key,
                 HeldConcurrencyPermit {
                     count: 1,
                     _permit: permit,
                 },
             );
+        }
         Some(LlmConcurrencyPermit::task_scoped(key))
     }
 }
@@ -764,5 +768,62 @@ mod tests {
         drop(first);
         let second = tokio::time::timeout(Duration::from_millis(50), &mut second).await;
         assert!(matches!(second, Ok(Ok(Some(_)))));
+    }
+
+    #[tokio::test]
+    async fn concurrent_waiters_in_one_task_share_the_reentrant_permit() {
+        let limiter = LlmConcurrencyLimiter::new(Some(NonZeroUsize::new(2).unwrap()));
+        let (first_ready_tx, first_ready_rx) = tokio::sync::oneshot::channel();
+        let (release_first_tx, release_first_rx) = tokio::sync::oneshot::channel();
+        let first_holder = tokio::spawn({
+            let limiter = limiter.clone();
+            async move {
+                let permit = limiter.acquire().await;
+                first_ready_tx.send(()).unwrap();
+                release_first_rx.await.unwrap();
+                drop(permit);
+            }
+        });
+        let (second_ready_tx, second_ready_rx) = tokio::sync::oneshot::channel();
+        let (release_second_tx, release_second_rx) = tokio::sync::oneshot::channel();
+        let second_holder = tokio::spawn({
+            let limiter = limiter.clone();
+            async move {
+                let permit = limiter.acquire().await;
+                second_ready_tx.send(()).unwrap();
+                release_second_rx.await.unwrap();
+                drop(permit);
+            }
+        });
+        first_ready_rx.await.unwrap();
+        second_ready_rx.await.unwrap();
+
+        let (waiters_ready_tx, waiters_ready_rx) = tokio::sync::oneshot::channel();
+        let waiter = tokio::spawn({
+            let limiter = limiter.clone();
+            async move {
+                let acquisitions = async { tokio::join!(limiter.acquire(), limiter.acquire()) };
+                tokio::pin!(acquisitions);
+                assert!(
+                    tokio::time::timeout(Duration::from_millis(5), &mut acquisitions)
+                        .await
+                        .is_err()
+                );
+                waiters_ready_tx.send(()).unwrap();
+
+                let (first, second) = tokio::time::timeout(Duration::from_millis(50), acquisitions)
+                    .await
+                    .expect("same-task waiters should acquire after both slots are released");
+                drop(first);
+                drop(second);
+            }
+        });
+        waiters_ready_rx.await.unwrap();
+
+        release_first_tx.send(()).unwrap();
+        release_second_tx.send(()).unwrap();
+        first_holder.await.unwrap();
+        second_holder.await.unwrap();
+        waiter.await.unwrap();
     }
 }
