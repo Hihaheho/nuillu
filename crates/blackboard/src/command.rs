@@ -34,6 +34,11 @@ pub struct RegisteredSubsystemPolicy {
 /// the design invariants at the type level: a module without
 /// [`CognitionWriter`](nuillu_module::CognitionWriter) cannot construct
 /// `AppendCognitionLog`, etc.
+// Commands are never queued or collected: each is built at the call site and moved straight into
+// `apply`, so the enum size costs one stack move that boxing would trade for a heap alloc/free.
+// Boxing one `ResourceAllocation` would not shrink the enum anyway, since `RecordAllocationProposal`
+// carries one too.
+#[expect(clippy::large_enum_variant)]
 #[derive(Debug, Clone)]
 pub enum BlackboardCommand {
     UpdateMemo {
@@ -123,3 +128,8 @@ pub enum BlackboardCommand {
         suppressions: ResourceAllocation,
     },
 }
+
+// `large_enum_variant` is suppressed above, so this bounds what that exemption covers: a new
+// variant substantially larger than today's `RecordAllocationEffects` must box its payload rather
+// than silently widening every command move.
+const _: () = assert!(size_of::<BlackboardCommand>() <= 512);

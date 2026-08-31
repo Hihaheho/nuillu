@@ -1,3 +1,7 @@
+// Probe trial plumbing threads many independent knobs through single call sites; bundling them
+// into parameter structs buys nothing here.
+#![allow(clippy::too_many_arguments)]
+
 use std::{
     collections::{BTreeMap, HashSet},
     fs,
@@ -579,9 +583,11 @@ async fn main() -> anyhow::Result<()> {
     let concurrency_limit = backend
         .max_concurrent_llm_calls
         .map_or(1, NonZeroUsize::get);
-    let mut generation = GenerationParams::default();
-    generation.temperature = Some(temperature);
-    generation.max_output_tokens = Some(MaxOutputTokens::new(args.max_output_tokens));
+    let generation = GenerationParams {
+        temperature: Some(temperature),
+        max_output_tokens: Some(MaxOutputTokens::new(args.max_output_tokens)),
+        ..Default::default()
+    };
 
     let mut trials = Vec::new();
     let mut trial_specs = Vec::new();
@@ -1798,9 +1804,9 @@ mod tests {
             },
         );
 
-        assert_eq!(report.success, false);
+        assert!(!report.success);
         assert_eq!(report.failure, Some("incomplete_rank_all".to_owned()));
-        assert_eq!(report.incomplete_rank_all, true);
+        assert!(report.incomplete_rank_all);
     }
 
     #[test]
@@ -1819,7 +1825,7 @@ mod tests {
                     ids: vec![id.to_owned()],
                 },
             );
-            assert_eq!(report.success, true);
+            assert!(report.success);
             assert_eq!(report.top_id, Some(id.to_owned()));
         }
     }
@@ -1859,7 +1865,7 @@ mod tests {
             },
         );
 
-        assert_eq!(report.success, true);
+        assert!(report.success);
         assert_eq!(report.top_id, Some("sensory-C".to_owned()));
     }
 
@@ -1878,12 +1884,12 @@ mod tests {
             },
         );
 
-        assert_eq!(report.success, false);
+        assert!(!report.success);
         assert_eq!(
             report.failure,
             Some("first_position_distractor_top".to_owned())
         );
-        assert_eq!(report.first_position_top, true);
+        assert!(report.first_position_top);
     }
 
     #[test]
@@ -1901,7 +1907,7 @@ mod tests {
             },
         );
 
-        assert_eq!(report.success, false);
+        assert!(!report.success);
         assert_eq!(report.failure, Some("duplicate_id".to_owned()));
     }
 }

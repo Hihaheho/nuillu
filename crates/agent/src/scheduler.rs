@@ -539,6 +539,9 @@ async fn apply_pending_session_resets(
     consecutive_failures: &mut [u32],
     pending_session_resets: &mut [VecDeque<ModuleSessionResetResponder>],
 ) {
+    // The index is passed on to `try_reset_module_session`, which mutably borrows the sibling
+    // slices, so the queue cannot be held as an iterator borrow across the call.
+    #[allow(clippy::needless_range_loop)]
     for index in 0..pending_session_resets.len() {
         while let Some(response) = pending_session_resets[index].pop_front() {
             let Some(result) = try_reset_module_session(
@@ -1011,13 +1014,17 @@ struct DependencyWait {
 
 enum DependencyWaitCompletion {
     Kick(oneshot::Receiver<()>),
-    Inactive {
-        runtime: AgentRuntimeControl,
-        kick_handle: KickHandle,
-        sender: ModuleInstanceId,
-        activation_waiter: Option<oneshot::Receiver<()>>,
-        idle_timeout: Duration,
-    },
+    /// Boxed so the common `Kick` case does not pay for this variant: dependency waits are
+    /// collected into a `Vec<DependencyWait>` and `Kick` carries only a receiver.
+    Inactive(Box<InactiveDependencyWait>),
+}
+
+struct InactiveDependencyWait {
+    runtime: AgentRuntimeControl,
+    kick_handle: KickHandle,
+    sender: ModuleInstanceId,
+    activation_waiter: Option<oneshot::Receiver<()>>,
+    idle_timeout: Duration,
 }
 
 impl DependencyWait {
@@ -1038,13 +1045,13 @@ impl DependencyWait {
     ) -> Self {
         Self {
             owner,
-            completion: DependencyWaitCompletion::Inactive {
+            completion: DependencyWaitCompletion::Inactive(Box::new(InactiveDependencyWait {
                 runtime,
                 kick_handle,
                 sender,
                 activation_waiter,
                 idle_timeout,
-            },
+            })),
         }
     }
 
@@ -1054,13 +1061,14 @@ impl DependencyWait {
             DependencyWaitCompletion::Kick(completion) => {
                 let _ = completion.await;
             }
-            DependencyWaitCompletion::Inactive {
-                runtime,
-                kick_handle,
-                sender,
-                activation_waiter,
-                idle_timeout,
-            } => {
+            DependencyWaitCompletion::Inactive(inactive) => {
+                let InactiveDependencyWait {
+                    runtime,
+                    kick_handle,
+                    sender,
+                    activation_waiter,
+                    idle_timeout,
+                } = *inactive;
                 wait_for_inactive_dependency(
                     owner.clone(),
                     runtime,
@@ -2628,6 +2636,7 @@ fn spawn_failure_wait(
     ));
 }
 
+#[allow(clippy::too_many_arguments)]
 fn spawn_next_batch(
     runtime: AgentRuntimeControl,
     tasks: &mut FuturesUnordered<JoinHandle<TaskMessage>>,
@@ -2884,6 +2893,7 @@ async fn collect_activation_gate_votes(
     ActivationGateOutcome { allow, suppress }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn activate_with_retries(
     mut module: AllocatedModule,
     runtime: &AgentRuntimeControl,

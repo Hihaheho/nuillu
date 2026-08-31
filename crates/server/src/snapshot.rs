@@ -194,7 +194,11 @@ fn visualizer_scoped_blackboard_snapshot(
             effective_allocation,
             scope_activation,
         ),
-        interoception: if include_root_content { interoception_view(bb.interoception()) } else { Default::default() },
+        interoception: if include_root_content {
+            interoception_view(bb.interoception())
+        } else {
+            Default::default()
+        },
         module_policies: scoped_module_policy_views(scope, bb),
         forced_disabled_modules: if include_root_content {
             let mut modules = bb

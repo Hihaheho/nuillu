@@ -82,17 +82,17 @@ struct PreparedOneShotObservation {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum AmbientObservationKind {
-    AmbientAdded,
-    AmbientUpdated,
-    AmbientRemoved,
+    Added,
+    Updated,
+    Removed,
 }
 
 impl AmbientObservationKind {
     fn label(self) -> &'static str {
         match self {
-            Self::AmbientAdded => "ambient added",
-            Self::AmbientUpdated => "ambient updated",
-            Self::AmbientRemoved => "ambient removed",
+            Self::Added => "ambient added",
+            Self::Updated => "ambient updated",
+            Self::Removed => "ambient removed",
         }
     }
 }
@@ -233,6 +233,7 @@ impl Default for SensoryBurstConfig {
 }
 
 impl SensoryModule {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         inbox: SensoryInputInbox,
         memo: Memo,
@@ -734,7 +735,7 @@ impl SensoryModule {
         match diff {
             AmbientDiff::Added { id, entry } => self.prepare_ambient_observation(
                 now,
-                AmbientObservationKind::AmbientAdded,
+                AmbientObservationKind::Added,
                 entry.modality,
                 id,
                 entry.content,
@@ -746,7 +747,7 @@ impl SensoryModule {
                 current,
             } => self.prepare_ambient_observation(
                 now,
-                AmbientObservationKind::AmbientUpdated,
+                AmbientObservationKind::Updated,
                 current.modality.clone(),
                 id,
                 format!(
@@ -760,7 +761,7 @@ impl SensoryModule {
             ),
             AmbientDiff::Removed { id, previous } => self.prepare_ambient_observation(
                 now,
-                AmbientObservationKind::AmbientRemoved,
+                AmbientObservationKind::Removed,
                 previous.modality.clone(),
                 id,
                 format!(
@@ -1715,7 +1716,7 @@ mod tests {
     #[test]
     fn ambient_snapshot_format_marks_host_context_records() {
         let observations = vec![PreparedAmbientObservation {
-            kind: AmbientObservationKind::AmbientAdded,
+            kind: AmbientObservationKind::Added,
             modality: SensoryModality::Smell,
             ambient_id: "row-1".to_string(),
             content: "wet stone smell".to_string(),

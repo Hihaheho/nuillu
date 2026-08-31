@@ -530,12 +530,13 @@ async fn connect_agent_store(config: &ServerConfig) -> anyhow::Result<Rc<dyn Age
         && let Some(path) = backup_agent_db_with_timestamp(
             &config.state_dir,
             &Local::now().format("%Y%m%d%H%M").to_string(),
-        )? {
-            eprintln!(
-                "nuillu-server backed up existing agent db to {}",
-                path.display()
-            );
-        }
+        )?
+    {
+        eprintln!(
+            "nuillu-server backed up existing agent db to {}",
+            path.display()
+        );
+    }
     let store = LibsqlAgentStore::connect(
         LibsqlAgentStoreConfig::local(
             config.agent_db_path.clone(),
@@ -705,6 +706,7 @@ pub fn build_embedder_with_api_key(
     Ok((Box::new(embedder), profile, embedding.dimensions))
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn build_tiers(
     cheap: &LlmBackendConfig,
     default: &LlmBackendConfig,

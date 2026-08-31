@@ -260,6 +260,7 @@ mod tests {
 
     use chrono::TimeZone as _;
 
+    #[allow(clippy::too_many_arguments)]
     fn record(
         source_id: i64,
         session: &str,

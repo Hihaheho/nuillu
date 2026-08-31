@@ -58,6 +58,10 @@ impl VisualizerTabId {
     }
 }
 
+// Every message is JSON-serialized on send, which allocates well past the 320-byte in-memory size,
+// so boxing `Event` would add churn across the crates that construct and match these messages
+// without a measurable win.
+#[expect(clippy::large_enum_variant)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum VisualizerServerMessage {
@@ -66,6 +70,9 @@ pub enum VisualizerServerMessage {
     OfferAction { action: VisualizerAction },
     RevokeAction { action_id: String },
 }
+
+// Bounds the exemption above: a new variant much larger than `Event` must box its payload.
+const _: () = assert!(size_of::<VisualizerServerMessage>() <= 384);
 
 impl VisualizerServerMessage {
     pub fn hello() -> Self {

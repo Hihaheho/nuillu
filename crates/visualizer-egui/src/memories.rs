@@ -539,9 +539,7 @@ fn preserve_scroll_after_soft_refresh(
     state: &mut MemoriesState,
     output: &ScrollAreaOutput<()>,
 ) -> Option<f32> {
-    let Some(restore) = state.pending_scroll_restore.take() else {
-        return None;
-    };
+    let restore = state.pending_scroll_restore.take()?;
     let delta = output.content_size.y - restore.content_height;
     if delta <= 0.0 {
         return None;
@@ -575,10 +573,12 @@ mod tests {
 
     #[test]
     fn latest_refresh_merges_records_without_clearing_existing_list() {
-        let mut state = MemoriesState::default();
-        state.records = vec![record("old", "old content")];
-        state.main_scroll_offset_y = 120.0;
-        state.main_content_height = 1_000.0;
+        let mut state = MemoriesState {
+            records: vec![record("old", "old content")],
+            main_scroll_offset_y: 120.0,
+            main_content_height: 1_000.0,
+            ..Default::default()
+        };
 
         state.apply_records_loaded(
             MemoryRecordScope::Latest,
@@ -601,10 +601,12 @@ mod tests {
 
     #[test]
     fn latest_refresh_at_top_does_not_schedule_scroll_restore() {
-        let mut state = MemoriesState::default();
-        state.records = vec![record("old", "old content")];
-        state.main_scroll_offset_y = 0.0;
-        state.main_content_height = 1_000.0;
+        let mut state = MemoriesState {
+            records: vec![record("old", "old content")],
+            main_scroll_offset_y: 0.0,
+            main_content_height: 1_000.0,
+            ..Default::default()
+        };
 
         state.apply_records_loaded(
             MemoryRecordScope::Latest,

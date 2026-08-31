@@ -130,6 +130,9 @@ impl std::fmt::Display for SchemaKind {
     Clone, Copy, Debug, Eq, PartialEq, Hash, Ord, PartialOrd, Serialize, Deserialize, ValueEnum,
 )]
 #[serde(rename_all = "kebab-case")]
+// The shared `System` prefix is semantic: every variant names a message-role layout that opens
+// with a system message, and the contrast is with layouts that do not.
+#[expect(clippy::enum_variant_names)]
 enum ContextKind {
     #[value(name = "system-user-current")]
     SystemUserCurrent,
@@ -440,9 +443,11 @@ async fn main() -> anyhow::Result<()> {
     let concurrency_limit = backend
         .max_concurrent_llm_calls
         .map_or(1, NonZeroUsize::get);
-    let mut generation = GenerationParams::default();
-    generation.temperature = Some(temperature);
-    generation.max_output_tokens = Some(MaxOutputTokens::new(args.max_output_tokens));
+    let generation = GenerationParams {
+        temperature: Some(temperature),
+        max_output_tokens: Some(MaxOutputTokens::new(args.max_output_tokens)),
+        ..Default::default()
+    };
 
     let target_schema = speech_target_schema(target_schema_values.iter().map(String::as_str));
     let mut trials = Vec::new();

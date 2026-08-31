@@ -124,13 +124,19 @@ impl RubricJudge for LlmRubricJudge {
         } else {
             request.judge_max_output_tokens
         };
-        let mut generation = GenerationParams::default();
-        generation.max_output_tokens = Some(MaxOutputTokens::new(max_output_tokens));
-        if let Some(temperature) = self.options.temperature {
-            let temperature = Temperature::new(temperature)
-                .map_err(|_| RubricJudgeError::InvalidTemperature(temperature))?;
-            generation.temperature = Some(temperature);
-        }
+        let temperature = self
+            .options
+            .temperature
+            .map(|temperature| {
+                Temperature::new(temperature)
+                    .map_err(|_| RubricJudgeError::InvalidTemperature(temperature))
+            })
+            .transpose()?;
+        let generation = GenerationParams {
+            max_output_tokens: Some(MaxOutputTokens::new(max_output_tokens)),
+            temperature,
+            ..Default::default()
+        };
 
         let output_schema = rubric_judge_output_schema(&request)?;
         let _permit = self.concurrency.acquire().await;

@@ -39,6 +39,7 @@ use crate::state::{ActionAffordanceState, ModuleSettingsState, SceneState};
 const SNAPSHOT_INTERVAL: Duration = Duration::from_millis(100);
 const RECENT_ACTIVITY_ROW_LIMIT: usize = 512;
 
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn drive_server_until_shutdown(
     visualizer: &mut VisualizerHook,
     tab_id: &VisualizerTabId,
@@ -74,9 +75,9 @@ pub(super) async fn drive_server_until_shutdown(
                 run_controller,
             )
             .await
-            {
-                break;
-            }
+        {
+            break;
+        }
         while let Some(message) = visualizer.try_recv_command() {
             if handle_server_visualizer_message(
                 message,

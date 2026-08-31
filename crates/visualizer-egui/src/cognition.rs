@@ -748,8 +748,10 @@ mod tests {
 
     #[test]
     fn pending_update_shows_the_load_newest_button_only_outside_follow() {
-        let mut state = CognitionState::default();
-        state.refresh_needed = true;
+        let mut state = CognitionState {
+            refresh_needed: true,
+            ..Default::default()
+        };
 
         assert!(!should_show_load_newest(true, &state));
         assert!(should_show_load_newest(false, &state));

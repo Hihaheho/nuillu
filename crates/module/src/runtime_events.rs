@@ -278,6 +278,7 @@ impl RuntimeEventEmitter {
         });
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn session_compaction_completed(
         &self,
         owner: ModuleInstanceId,

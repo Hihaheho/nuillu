@@ -399,9 +399,11 @@ async fn main() -> anyhow::Result<()> {
     let concurrency_limit = backend
         .max_concurrent_llm_calls
         .map_or(1, NonZeroUsize::get);
-    let mut generation = GenerationParams::default();
-    generation.temperature = Some(temperature);
-    generation.max_output_tokens = Some(MaxOutputTokens::new(args.max_output_tokens));
+    let generation = GenerationParams {
+        temperature: Some(temperature),
+        max_output_tokens: Some(MaxOutputTokens::new(args.max_output_tokens)),
+        ..Default::default()
+    };
 
     fs::create_dir_all(&args.output)
         .with_context(|| format!("create output directory {}", args.output.display()))?;
@@ -905,10 +907,11 @@ fn append_generated_json_strings(value: &serde_json::Value, output: &mut String)
         serde_json::Value::Object(map) => {
             for (key, child) in map {
                 if generated_text_key(key)
-                    && let Some(text) = child.as_str() {
-                        output.push_str(text);
-                        continue;
-                    }
+                    && let Some(text) = child.as_str()
+                {
+                    output.push_str(text);
+                    continue;
+                }
                 append_generated_json_strings(child, output);
             }
         }

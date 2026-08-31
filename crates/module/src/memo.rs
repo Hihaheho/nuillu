@@ -49,6 +49,7 @@ struct MemoCore {
 }
 
 impl Memo {
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         owner: ModuleInstanceId,
         scope: ScopeId,
@@ -90,6 +91,7 @@ impl<T> TypedMemo<T>
 where
     T: Serialize + DeserializeOwned + 'static,
 {
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         owner: ModuleInstanceId,
         scope: ScopeId,
@@ -149,6 +151,7 @@ where
 }
 
 impl MemoCore {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         owner: ModuleInstanceId,
         scope: ScopeId,

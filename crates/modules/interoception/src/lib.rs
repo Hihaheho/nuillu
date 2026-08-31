@@ -179,6 +179,7 @@ pub struct InteroceptionModule {
 }
 
 impl InteroceptionModule {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         memo_updates: MemoUpdatedInbox,
         cognition_updates: CognitionLogUpdatedInbox,

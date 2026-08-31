@@ -2894,7 +2894,7 @@ mod tests {
             }
             let mut records = Vec::new();
             for group in grouped.values_mut() {
-                group.sort_by(|left, right| left.record.index.cmp(&right.record.index));
+                group.sort_by_key(|entry| entry.record.index);
                 let keep_from = group.len().saturating_sub(retained_per_owner);
                 records.extend(group[keep_from..].iter().cloned());
             }

@@ -1622,6 +1622,7 @@ fn default_server_modules() -> Vec<ServerModuleSpec> {
     ]
 }
 
+#[allow(clippy::too_many_arguments)]
 fn module_spec<const G: usize, const D: usize>(
     id: RuntimeModule,
     replica_min: u8,

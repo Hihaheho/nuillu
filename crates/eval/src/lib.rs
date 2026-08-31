@@ -4,6 +4,10 @@
 //! Public API surface is limited to case parsing, scoring primitives, and
 //! the runner configuration used by the binary.
 
+// Eval harness plumbing threads many independent knobs (fixtures, seeds, budgets, reporting
+// sinks) through single call sites; bundling them into parameter structs buys nothing here.
+#![allow(clippy::too_many_arguments)]
+
 pub mod artifact;
 pub mod cases;
 pub mod evaluation;

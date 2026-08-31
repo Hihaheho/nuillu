@@ -3053,7 +3053,7 @@ async fn attention_schema_memo_output(blackboard: &Blackboard) -> String {
         .read(|bb| {
             bb.recent_memo_logs()
                 .into_iter()
-                .filter(|record| &record.owner.module == &module)
+                .filter(|record| record.owner.module == module)
                 .map(|record| record.content)
                 .collect::<Vec<_>>()
                 .join("\n\n")

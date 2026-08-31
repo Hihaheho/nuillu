@@ -242,7 +242,6 @@ impl PolicyUpserter {
                     reward_tokens: Some(record.reward_tokens),
                     decay_remaining_secs: Some(record.decay_remaining_secs),
                     reinforced_at,
-                    ..Default::default()
                 },
             })
             .await;
@@ -1440,11 +1439,14 @@ mod tests {
         );
     }
 
+    /// `(index, value_delta, reward_tokens_delta, expected_reward_delta, confidence_delta)`
+    type ReinforceCall = (PolicyIndex, f32, u32, f32, f32);
+
     #[derive(Default)]
     struct RecordingPolicyStore {
         inserts: RefCell<Vec<NewPolicy>>,
         records: RefCell<Vec<PolicyRecord>>,
-        reinforces: RefCell<Vec<(PolicyIndex, f32, u32, f32, f32)>>,
+        reinforces: RefCell<Vec<ReinforceCall>>,
         deletes: RefCell<Vec<PolicyIndex>>,
     }
 

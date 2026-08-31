@@ -1638,12 +1638,13 @@ fn validate_common(
             })?;
         }
         if let Some(explicit_index) = &memory.index
-            && explicit_index.trim().is_empty() {
-                return Err(CaseFileError::Validation {
-                    path: path.to_path_buf(),
-                    message: format!("memories[{index}].index must not be empty"),
-                });
-            }
+            && explicit_index.trim().is_empty()
+        {
+            return Err(CaseFileError::Validation {
+                path: path.to_path_buf(),
+                message: format!("memories[{index}].index must not be empty"),
+            });
+        }
     }
 
     for (index, link) in memory_links.iter().enumerate() {
@@ -1775,15 +1776,16 @@ fn validate_check(path: &Path, check: &Check) -> Result<(), CaseFileError> {
             });
         }
         if let (Some(min), Some(max)) = (min, max)
-            && min > max {
-                return Err(CaseFileError::Validation {
-                    path: path.to_path_buf(),
-                    message: format!(
-                        "json-pointer-numeric-in-range check '{}' has min ({min}) greater than max ({max})",
-                        check.display_name()
-                    ),
-                });
-            }
+            && min > max
+        {
+            return Err(CaseFileError::Validation {
+                path: path.to_path_buf(),
+                message: format!(
+                    "json-pointer-numeric-in-range check '{}' has min ({min}) greater than max ({max})",
+                    check.display_name()
+                ),
+            });
+        }
     }
 
     if let Check::Rubric {
