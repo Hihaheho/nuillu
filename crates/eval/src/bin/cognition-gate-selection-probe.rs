@@ -1649,9 +1649,9 @@ fn summarize_usage<'a>(usage: impl IntoIterator<Item = &'a lutum::Usage>) -> Usa
     let samples = usage.into_iter().collect::<Vec<_>>();
     UsageSummary {
         sample_count: samples.len(),
-        input_tokens: numeric_stats(samples.iter().map(|usage| usage.input_tokens as u64)),
-        output_tokens: numeric_stats(samples.iter().map(|usage| usage.output_tokens as u64)),
-        total_tokens: numeric_stats(samples.iter().map(|usage| usage.total_tokens as u64)),
+        input_tokens: numeric_stats(samples.iter().map(|usage| usage.input_tokens)),
+        output_tokens: numeric_stats(samples.iter().map(|usage| usage.output_tokens)),
+        total_tokens: numeric_stats(samples.iter().map(|usage| usage.total_tokens)),
         cache_creation_tokens: numeric_stats(
             samples.iter().map(|usage| usage.cache_creation_tokens),
         ),

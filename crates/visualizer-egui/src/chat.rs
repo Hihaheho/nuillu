@@ -517,8 +517,8 @@ fn rebuild_activity_messages(
             }
             ActivitySourceRow::Ambient(row) => {
                 let current = ambient_entry_map(&row.entries);
-                if let Some(previous) = &ambient_baseline {
-                    if let Some(content) = ambient_diff_content(previous, &current) {
+                if let Some(previous) = &ambient_baseline
+                    && let Some(content) = ambient_diff_content(previous, &current) {
                         interrupt_streaming_messages(activity, streaming_utterances);
                         let mut message = ActivityMessage::new(ActivityRole::Environment, content);
                         message.id = Some(format!("ambient:{}", row.id));
@@ -528,7 +528,6 @@ fn rebuild_activity_messages(
                         ));
                         activity.push(message);
                     }
-                }
                 ambient_baseline = Some(current);
             }
             ActivitySourceRow::Utterance(row) => apply_utterance_event_row(

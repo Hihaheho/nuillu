@@ -212,14 +212,13 @@ impl SurpriseModule {
             match call {
                 SurpriseToolsCall::PreserveUnexpectedEvent(call) => {
                     let first_decision = memo.is_none();
-                    if first_decision {
-                        if let Some(args) = normalize_preserve_args(call.input.clone()) {
+                    if first_decision
+                        && let Some(args) = normalize_preserve_args(call.input.clone()) {
                             memo = Some((
                                 render_surprise_memo(&args),
                                 Some(render_cognitive_surprise_memo(&args)),
                             ));
                         }
-                    }
                     let output = if first_decision {
                         self.preserve_unexpected_event(call.input.clone()).await
                     } else {

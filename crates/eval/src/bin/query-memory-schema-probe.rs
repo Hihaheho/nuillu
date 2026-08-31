@@ -904,12 +904,11 @@ fn append_generated_json_strings(value: &serde_json::Value, output: &mut String)
         }
         serde_json::Value::Object(map) => {
             for (key, child) in map {
-                if generated_text_key(key) {
-                    if let Some(text) = child.as_str() {
+                if generated_text_key(key)
+                    && let Some(text) = child.as_str() {
                         output.push_str(text);
                         continue;
                     }
-                }
                 append_generated_json_strings(child, output);
             }
         }

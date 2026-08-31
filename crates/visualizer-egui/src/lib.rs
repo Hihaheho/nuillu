@@ -104,21 +104,11 @@ const ZOOM_BUTTON_DOUBLE_CLICK_TOTAL_PERCENT: f32 = 10.0;
 const ZOOM_SYNC_EPSILON: f32 = 0.000_1;
 
 /// Configuration for an embeddable [`Visualizer`] component.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct VisualizerConfig {
     pub default_locale: Locale,
     pub install_fonts: bool,
     pub install_theme_styles: bool,
-}
-
-impl Default for VisualizerConfig {
-    fn default() -> Self {
-        Self {
-            default_locale: Locale::default(),
-            install_fonts: false,
-            install_theme_styles: false,
-        }
-    }
 }
 
 impl VisualizerConfig {
@@ -262,7 +252,7 @@ fn install_visualizer_theme_styles(ctx: &egui::Context) {
                 visualizer_text_alpha_from_coverage(theme);
             style.visuals.selection.bg_fill = visualizer_selection_fill(theme);
             style.visuals.selection.stroke =
-                egui::Stroke::new(1.0, visualizer_selection_text_color(theme));
+                egui::Stroke::new(1.0_f32, visualizer_selection_text_color(theme));
             style.visuals.hyperlink_color = visualizer_hyperlink_color(theme);
             style.visuals.warn_fg_color = visualizer_warning_text_color(theme);
             style.visuals.error_fg_color = visualizer_error_text_color(theme);
@@ -2218,15 +2208,14 @@ impl RuntimeTab {
                 window_requests.remove(&module_id)
             };
             let open = {
-                let window_open = window::PersistedWindow::new(&module_id, &module_title)
+                window::PersistedWindow::new(&module_id, &module_title)
                     .open_override(requested)
                     .default_open(false)
                     .default_pos(x, y)
                     .default_size(520.0, 360.0)
                     .show(ui, |ui| {
                         self.render_module_contents(ui, &owner, messages);
-                    });
-                window_open
+                    })
             };
             self.record_window_open(module_id, open);
         }

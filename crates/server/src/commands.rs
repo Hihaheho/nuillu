@@ -60,8 +60,7 @@ pub(super) async fn drive_server_until_shutdown(
         if let Some(message) = visualizer
             .recv_command_timeout_with_timer(timer, SNAPSHOT_INTERVAL)
             .await
-        {
-            if handle_server_visualizer_message(
+            && handle_server_visualizer_message(
                 message,
                 visualizer,
                 tab_id,
@@ -78,7 +77,6 @@ pub(super) async fn drive_server_until_shutdown(
             {
                 break;
             }
-        }
         while let Some(message) = visualizer.try_recv_command() {
             if handle_server_visualizer_message(
                 message,

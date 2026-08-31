@@ -1344,7 +1344,7 @@ impl BlackboardInner {
             MemoPayload::from_persisted(payload),
         ));
         let mut sorted = records.drain(..).collect::<Vec<_>>();
-        sorted.sort_by(|left, right| left.record.index.cmp(&right.record.index));
+        sorted.sort_by_key(|left| left.record.index);
         records.extend(sorted);
 
         let retained = self.memo_retained_per_owner.max(1);

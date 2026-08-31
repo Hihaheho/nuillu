@@ -1637,14 +1637,13 @@ fn validate_common(
                 }
             })?;
         }
-        if let Some(explicit_index) = &memory.index {
-            if explicit_index.trim().is_empty() {
+        if let Some(explicit_index) = &memory.index
+            && explicit_index.trim().is_empty() {
                 return Err(CaseFileError::Validation {
                     path: path.to_path_buf(),
                     message: format!("memories[{index}].index must not be empty"),
                 });
             }
-        }
     }
 
     for (index, link) in memory_links.iter().enumerate() {
@@ -1775,8 +1774,8 @@ fn validate_check(path: &Path, check: &Check) -> Result<(), CaseFileError> {
                 ),
             });
         }
-        if let (Some(min), Some(max)) = (min, max) {
-            if min > max {
+        if let (Some(min), Some(max)) = (min, max)
+            && min > max {
                 return Err(CaseFileError::Validation {
                     path: path.to_path_buf(),
                     message: format!(
@@ -1785,7 +1784,6 @@ fn validate_check(path: &Path, check: &Check) -> Result<(), CaseFileError> {
                     ),
                 });
             }
-        }
     }
 
     if let Check::Rubric {

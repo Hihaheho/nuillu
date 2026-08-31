@@ -21,25 +21,13 @@ use crate::{
 const MODULE_HISTORY_RETAINED_COMPLETED_ACTIVATIONS: usize = 200;
 const LLM_TRANSCRIPT_HISTORY_PAGE_SIZE: usize = 200;
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct ModulesState {
     modules: BTreeMap<String, ModuleState>,
     activation_to_owner: BTreeMap<u64, String>,
     activation_order: Vec<u64>,
     turn_to_owner: BTreeMap<String, String>,
     history_omitted: bool,
-}
-
-impl Default for ModulesState {
-    fn default() -> Self {
-        Self {
-            modules: BTreeMap::new(),
-            activation_to_owner: BTreeMap::new(),
-            activation_order: Vec::new(),
-            turn_to_owner: BTreeMap::new(),
-            history_omitted: false,
-        }
-    }
 }
 
 impl ModulesState {
@@ -2120,7 +2108,7 @@ fn render_error_banner(ui: &mut egui::Ui, label: String, message: &str) {
     let display = hard_wrap_long_segments(message, 96);
     egui::Frame::new()
         .fill(visualizer_error_banner_fill(ui.visuals()))
-        .stroke(egui::Stroke::new(1.0, ui.visuals().error_fg_color))
+        .stroke(egui::Stroke::new(1.0_f32, ui.visuals().error_fg_color))
         .corner_radius(egui::CornerRadius::same(6))
         .inner_margin(egui::Margin::same(8))
         .show(ui, |ui| {
@@ -2559,7 +2547,7 @@ fn overview_replica_cell(ui: &mut egui::Ui, row: &ModuleOverviewRow) {
         ),
         ActiveReplicaHighlight::MinReplicaDriven => (
             None,
-            egui::Stroke::new(1.0, visuals.weak_text_color()),
+            egui::Stroke::new(1.0_f32, visuals.weak_text_color()),
             "Minimum replica kept active",
         ),
     };
@@ -3119,10 +3107,10 @@ fn turn_by_id<'a>(
     Some((turn_index, module, &module.turns[turn_index]))
 }
 
-fn activation_by_id<'a>(
-    state: &'a ModulesState,
+fn activation_by_id(
+    state: &ModulesState,
     activation_id: u64,
-) -> Option<(usize, &'a ModuleState, &'a ActivationState)> {
+) -> Option<(usize, &ModuleState, &ActivationState)> {
     let owner = state.activation_to_owner.get(&activation_id)?;
     let module = state.modules.get(owner)?;
     let activation_index = module

@@ -526,8 +526,8 @@ async fn connect_agent_store(config: &ServerConfig) -> anyhow::Result<Rc<dyn Age
         build_embedder(&config.embedding_backend)?;
     let (policy_embedder, policy_profile, policy_dimensions) =
         build_embedder(&config.embedding_backend)?;
-    if config.fresh_agent_db {
-        if let Some(path) = backup_agent_db_with_timestamp(
+    if config.fresh_agent_db
+        && let Some(path) = backup_agent_db_with_timestamp(
             &config.state_dir,
             &Local::now().format("%Y%m%d%H%M").to_string(),
         )? {
@@ -536,7 +536,6 @@ async fn connect_agent_store(config: &ServerConfig) -> anyhow::Result<Rc<dyn Age
                 path.display()
             );
         }
-    }
     let store = LibsqlAgentStore::connect(
         LibsqlAgentStoreConfig::local(
             config.agent_db_path.clone(),

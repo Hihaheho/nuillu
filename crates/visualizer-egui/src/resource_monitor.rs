@@ -345,7 +345,7 @@ fn render_module_activity_plot(
                     plot_ui.line(
                         Line::new(allocation_series_names[index].clone(), activation)
                             .color(color)
-                            .width(1.4),
+                            .width(1.4_f32),
                     );
                 }
 
@@ -354,7 +354,7 @@ fn render_module_activity_plot(
                     plot_ui.line(
                         Line::new(runtime_load_series_names[index].clone(), activity)
                             .color(translucent(color))
-                            .width(0.9),
+                            .width(0.9_f32),
                     );
                 }
             }
@@ -417,7 +417,7 @@ pub fn render_interoception_plot_contents(
             plot_ui.set_plot_bounds_y(0.0..=1.0);
             for (name, color, points) in lines {
                 if !points.is_empty() {
-                    plot_ui.line(Line::new(name, points).color(color).width(1.5));
+                    plot_ui.line(Line::new(name, points).color(color).width(1.5_f32));
                 }
             }
         });
@@ -490,7 +490,7 @@ fn render_throughput_plot(
             plot_ui.set_plot_bounds_y(0.0..=y_max);
             for (name, color, points) in lines {
                 if !points.is_empty() {
-                    plot_ui.line(Line::new(name, points).color(color).width(1.5));
+                    plot_ui.line(Line::new(name, points).color(color).width(1.5_f32));
                 }
             }
         });

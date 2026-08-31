@@ -852,7 +852,7 @@ fn select_case_paths(config: &RunnerConfig, gui_only: bool) -> Result<CaseSelect
             source,
         })?;
     if let Some(failed_cases) = failed_cases.as_ref() {
-        case_paths = filter_failed_only_case_paths(case_paths, &failed_cases)?;
+        case_paths = filter_failed_only_case_paths(case_paths, failed_cases)?;
     }
     if !case_paths.is_empty() || failed_from.is_none() {
         case_paths = filter_case_paths(case_paths, &config.case_patterns)?;

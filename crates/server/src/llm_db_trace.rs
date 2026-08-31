@@ -270,7 +270,6 @@ impl DbLlmTraceSink {
             .await
         {
             tracing::warn!(?error, "failed to persist completed LLM trace");
-            return;
         }
     }
 
