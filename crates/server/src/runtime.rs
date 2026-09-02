@@ -107,11 +107,11 @@ impl Server {
         let addr = listener
             .local_addr()
             .context("read visualizer RPC listener address")?;
-        eprintln!("nuillu-server visualizer RPC listening on {addr}");
+        tracing::info!("nuillu-server visualizer RPC listening on {addr}");
         let (stream, _) = listener
             .accept()
             .context("accept visualizer RPC connection")?;
-        eprintln!("visualizer RPC connected");
+        tracing::info!("visualizer RPC connected");
         let port = VisualizerServerPort::from_stream(stream).context("open visualizer RPC port")?;
         port.send(VisualizerServerMessage::hello())
             .context("send visualizer protocol hello")?;
@@ -183,7 +183,7 @@ impl Server {
                 .await
         }));
         if let Err(error) = &result {
-            eprintln!("nuillu-server runtime failed: {error:#}");
+            tracing::error!("nuillu-server runtime failed: {error:#}");
         }
         result
     }
@@ -890,7 +890,7 @@ async fn run_server_inner(
                     let message = format!(
                         "agent runtime ended without a GUI shutdown {restart_count} consecutive times; stopping"
                     );
-                    eprintln!("nuillu-server {message}");
+                    tracing::error!("nuillu-server {message}");
                     visualizer.send_event(VisualizerEvent::Log {
                         tab_id: tab_id.clone(),
                         message: message.clone(),
@@ -905,7 +905,7 @@ async fn run_server_inner(
                     "agent runtime ended without a GUI shutdown; restarting attempt={restart_count} next_retry_ms={}",
                     delay.as_millis()
                 );
-                eprintln!("nuillu-server {message}");
+                tracing::warn!("nuillu-server {message}");
                 visualizer.send_event(VisualizerEvent::Log {
                     tab_id: tab_id.clone(),
                     message,
@@ -917,7 +917,7 @@ async fn run_server_inner(
                     let message = format!(
                         "agent runtime error {restart_count} consecutive times; stopping: {error}"
                     );
-                    eprintln!("nuillu-server {message}");
+                    tracing::error!("nuillu-server {message}");
                     visualizer.send_event(VisualizerEvent::Log {
                         tab_id: tab_id.clone(),
                         message: message.clone(),
@@ -932,7 +932,7 @@ async fn run_server_inner(
                     "agent runtime error; restarting attempt={restart_count} next_retry_ms={}: {error}",
                     delay.as_millis()
                 );
-                eprintln!("nuillu-server {message}");
+                tracing::warn!("nuillu-server {message}");
                 visualizer.send_event(VisualizerEvent::Log {
                     tab_id: tab_id.clone(),
                     message,

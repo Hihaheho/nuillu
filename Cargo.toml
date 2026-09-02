@@ -52,7 +52,7 @@ sha2 = "0.10"
 thiserror = "2"
 tokio = { version = "1", default-features = false, features = ["sync", "time", "rt", "macros"] }
 tracing = "0.1"
-tracing-subscriber = "0.3"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { version = "1", features = ["v4", "v7", "serde"] }
 eure = { git = "https://github.com/Hihaheho/eure" }
 eure-document = { git = "https://github.com/Hihaheho/eure" }

@@ -385,7 +385,7 @@ pub(super) async fn build_server_environment(
         memory_seed_targets.len()
     );
     if seeded.memories > 0 {
-        eprintln!("nuillu-server seeded memory entries {seeded_summary}");
+        tracing::info!("nuillu-server seeded memory entries {seeded_summary}");
     }
     emit_startup_progress(
         &visualizer,
@@ -449,7 +449,7 @@ pub(crate) async fn build_native_host_ports(
             config.state_dir.display()
         )
     })?;
-    eprintln!(
+    tracing::info!(
         "nuillu-server runtime-event-log path={}",
         runtime_event_log.path().display()
     );
@@ -490,7 +490,7 @@ pub fn build_in_memory_host_ports(config: &ServerConfig) -> anyhow::Result<Serve
 
 fn emit_startup_progress(visualizer: &VisualizerEventSink, message: impl Into<String>) {
     let message = format!("nuillu-server startup: {}", message.into());
-    eprintln!("{message}");
+    tracing::info!("{message}");
     visualizer.send(VisualizerEvent::Log {
         tab_id: VisualizerTabId::new(SERVER_TAB_ID.to_string()),
         message,
@@ -532,7 +532,7 @@ async fn connect_agent_store(config: &ServerConfig) -> anyhow::Result<Rc<dyn Age
             &Local::now().format("%Y%m%d%H%M").to_string(),
         )?
     {
-        eprintln!(
+        tracing::info!(
             "nuillu-server backed up existing agent db to {}",
             path.display()
         );
@@ -1139,16 +1139,19 @@ impl RuntimeEventSink for ServerRuntimeEventSink {
             });
         }
         let message = runtime_event_message(&self.tab_id, &event);
-        eprintln!("{message}");
+        match &event {
+            RuntimeEvent::ModuleActivationAttemptFailed { .. }
+            | RuntimeEvent::ModuleTaskFailed { .. }
+            | RuntimeEvent::ModuleWarning { .. }
+            | RuntimeEvent::SessionCompactionFailed { .. } => tracing::warn!("{message}"),
+            _ => tracing::debug!("{message}"),
+        }
         if let Err(error) = self.runtime_event_log.append(&message, &event) {
             let destination = self
                 .runtime_event_log
                 .destination()
                 .unwrap_or_else(|| "<disabled>".to_string());
             tracing::warn!(%destination, ?error, "failed to append runtime event log");
-            eprintln!(
-                "nuillu-server runtime-event-log-write-failed destination={destination} error={error}"
-            );
         }
         self.visualizer.send(VisualizerEvent::RuntimeEvent {
             tab_id: VisualizerTabId::new(self.tab_id.clone()),

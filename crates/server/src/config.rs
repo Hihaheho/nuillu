@@ -18,7 +18,7 @@ use nuillu_types::{
     ModelTier, ModuleGroupId, ModuleId, ReplicaCapRange, ReplicaIndex, ScopeId, SubsystemId,
     SubsystemInstanceId, builtin,
 };
-use tracing_subscriber::layer::SubscriberExt as _;
+use tracing_subscriber::{EnvFilter, Layer as _, layer::SubscriberExt as _};
 use uuid::Uuid;
 
 use crate::model_set::{
@@ -1729,7 +1729,14 @@ pub fn resolve_embedding(role: &EmbeddingRole) -> anyhow::Result<EmbeddingBacken
 pub fn install_lutum_trace_subscriber() -> anyhow::Result<()> {
     static INSTALL_RESULT: OnceLock<Result<(), String>> = OnceLock::new();
     let result = INSTALL_RESULT.get_or_init(|| {
-        let subscriber = tracing_subscriber::registry().with(lutum_trace::layer());
+        let stderr_layer = tracing_subscriber::fmt::layer()
+            .with_writer(io::stderr)
+            .with_filter(
+                EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+            );
+        let subscriber = tracing_subscriber::registry()
+            .with(lutum_trace::layer())
+            .with(stderr_layer);
         tracing::subscriber::set_global_default(subscriber).map_err(|error| error.to_string())
     });
     result
