@@ -14,9 +14,11 @@ use eure::document::{
     parse::{ParseContext, ParseError, ParseErrorKind},
 };
 use nuillu_module::{ActionAffordance, ScopeLabels};
+#[cfg(test)]
+use nuillu_types::builtin;
 use nuillu_types::{
-    ModelTier, ModuleGroupId, ModuleId, ReplicaCapRange, ReplicaIndex, ScopeId, SubsystemId,
-    SubsystemInstanceId, builtin,
+    ModelTier, ModuleGroupId, ModuleGroupIdParseError, ModuleId, ModuleIdParseError,
+    ReplicaCapRange, ReplicaIndex, ScopeId, SubsystemId, SubsystemInstanceId,
 };
 use tracing_subscriber::{EnvFilter, Layer as _, layer::SubscriberExt as _};
 use uuid::Uuid;
@@ -43,7 +45,7 @@ pub struct ServerConfig {
     pub image_backend: LlmBackendConfig,
     pub embedding_backend: EmbeddingBackendConfig,
     pub boot_config: ServerBootConfig,
-    pub disabled_modules: Vec<RuntimeModule>,
+    pub disabled_modules: Vec<ModuleId>,
     pub participants: Vec<String>,
     pub fresh_agent_db: bool,
     /// Starts the agent stopped, without activating modules, until Run or sensory input resumes it.
@@ -57,7 +59,7 @@ pub struct ServerRunOptions {
     pub session_id: Option<String>,
     pub llm_log_root: PathBuf,
     pub model_set: Option<PathBuf>,
-    pub disabled_modules: Vec<RuntimeModule>,
+    pub disabled_modules: Vec<ModuleId>,
     pub participants: Vec<String>,
     pub fresh_agent_db: bool,
     pub agent_db: Option<PathBuf>,
@@ -108,34 +110,192 @@ pub struct EmbeddingBackendConfig {
     pub dimensions: usize,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, clap::ValueEnum, FromEure)]
-#[eure(crate = ::eure::document, rename_all = "kebab-case")]
-pub enum RuntimeModule {
-    Sensory,
-    CognitionGate,
-    Allocation,
-    Action,
-    AttentionSchema,
-    Interpreter,
-    SelfModel,
-    QueryMemory,
-    Memory,
-    MemoryCompaction,
-    MemoryAssociation,
-    Dreaming,
-    Interoception,
-    Homeostasis,
-    Policy,
-    PolicyCompaction,
-    Reward,
-    Predict,
-    Surprise,
-    SubsystemGate,
-    SubsystemAllocation,
-    Speak,
+macro_rules! runtime_modules {
+    ($($variant:ident => $name:literal),+ $(,)?) => {
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+        pub enum RuntimeModule {
+            $($variant,)+
+        }
+
+        impl RuntimeModule {
+            pub const ALL: &'static [Self] = &[$(Self::$variant,)+];
+
+            pub fn as_str(self) -> &'static str {
+                match self {
+                    $(Self::$variant => $name,)+
+                }
+            }
+
+            pub fn from_module_id(id: &ModuleId) -> Option<Self> {
+                match id.as_str() {
+                    $($name => Some(Self::$variant),)+
+                    _ => None,
+                }
+            }
+
+            pub fn module_id(self) -> ModuleId {
+                ModuleId::new(self.as_str()).expect("built-in module id is kebab-case")
+            }
+        }
+    };
 }
 
-const SERVER_BOOT_CONFIG_FILE: &str = "config.eure";
+runtime_modules! {
+    Sensory => "sensory",
+    CognitionGate => "cognition-gate",
+    Allocation => "allocation",
+    Action => "action",
+    AttentionSchema => "attention-schema",
+    Interpreter => "interpreter",
+    SelfModel => "self-model",
+    QueryMemory => "query-memory",
+    Memory => "memory",
+    MemoryCompaction => "memory-compaction",
+    MemoryAssociation => "memory-association",
+    Dreaming => "dreaming",
+    Interoception => "interoception",
+    Homeostasis => "homeostasis",
+    Policy => "policy",
+    PolicyCompaction => "policy-compaction",
+    Reward => "reward",
+    Predict => "predict",
+    Surprise => "surprise",
+    SubsystemGate => "subsystem-gate",
+    SubsystemAllocation => "subsystem-allocation",
+    Speak => "speak",
+}
+
+/// A module id parsed and validated at the server configuration boundary.
+///
+/// This adapter keeps the generic `nuillu-types` crate independent of Eure.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ConfiguredModuleId(ModuleId);
+
+impl ConfiguredModuleId {
+    pub fn new(value: impl Into<String>) -> Result<Self, ModuleIdParseError> {
+        ModuleId::new(value).map(Self)
+    }
+
+    pub fn as_module_id(&self) -> &ModuleId {
+        &self.0
+    }
+
+    pub fn into_module_id(self) -> ModuleId {
+        self.0
+    }
+
+    pub fn as_str(&self) -> &str {
+        self.0.as_str()
+    }
+}
+
+impl From<RuntimeModule> for ConfiguredModuleId {
+    fn from(value: RuntimeModule) -> Self {
+        Self(value.module_id())
+    }
+}
+
+impl From<RuntimeModule> for ModuleId {
+    fn from(value: RuntimeModule) -> Self {
+        value.module_id()
+    }
+}
+
+impl From<ConfiguredModuleId> for ModuleId {
+    fn from(value: ConfiguredModuleId) -> Self {
+        value.into_module_id()
+    }
+}
+
+impl std::fmt::Display for ConfiguredModuleId {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(formatter)
+    }
+}
+
+impl PartialEq<RuntimeModule> for ConfiguredModuleId {
+    fn eq(&self, other: &RuntimeModule) -> bool {
+        self.0 == other.module_id()
+    }
+}
+
+impl eure::document::parse::FromEure<'_> for ConfiguredModuleId {
+    type Error = ParseError;
+
+    fn parse(ctx: &ParseContext<'_>) -> Result<Self, Self::Error> {
+        let value: String = ctx.parse()?;
+        Self::new(value.clone()).map_err(|error| ParseError {
+            node_id: ctx.node_id(),
+            kind: ParseErrorKind::InvalidPattern {
+                kind: "module-id".to_owned(),
+                reason: format!("invalid module id {value:?}: {error}"),
+            },
+        })
+    }
+}
+
+/// A module group id parsed and validated at the server configuration boundary.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ConfiguredModuleGroupId(ModuleGroupId);
+
+impl ConfiguredModuleGroupId {
+    pub fn new(value: impl Into<String>) -> Result<Self, ModuleGroupIdParseError> {
+        ModuleGroupId::new(value).map(Self)
+    }
+
+    pub fn as_module_group_id(&self) -> &ModuleGroupId {
+        &self.0
+    }
+
+    pub fn into_module_group_id(self) -> ModuleGroupId {
+        self.0
+    }
+
+    pub fn as_str(&self) -> &str {
+        self.0.as_str()
+    }
+}
+
+impl From<ServerModuleGroup> for ConfiguredModuleGroupId {
+    fn from(value: ServerModuleGroup) -> Self {
+        Self(value.module_group_id())
+    }
+}
+
+impl From<ConfiguredModuleGroupId> for ModuleGroupId {
+    fn from(value: ConfiguredModuleGroupId) -> Self {
+        value.into_module_group_id()
+    }
+}
+
+impl std::fmt::Display for ConfiguredModuleGroupId {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(formatter)
+    }
+}
+
+impl PartialEq<ServerModuleGroup> for ConfiguredModuleGroupId {
+    fn eq(&self, other: &ServerModuleGroup) -> bool {
+        self.0 == other.module_group_id()
+    }
+}
+
+impl eure::document::parse::FromEure<'_> for ConfiguredModuleGroupId {
+    type Error = ParseError;
+
+    fn parse(ctx: &ParseContext<'_>) -> Result<Self, Self::Error> {
+        let value: String = ctx.parse()?;
+        Self::new(value.clone()).map_err(|error| ParseError {
+            node_id: ctx.node_id(),
+            kind: ParseErrorKind::InvalidPattern {
+                kind: "module-group-id".to_owned(),
+                reason: format!("invalid module group id {value:?}: {error}"),
+            },
+        })
+    }
+}
+
+pub const SERVER_BOOT_CONFIG_FILE: &str = "config.eure";
 
 #[derive(Debug, Clone, FromEure)]
 #[eure(crate = ::eure::document, rename_all = "kebab-case")]
@@ -266,7 +426,7 @@ pub struct ExpandedSubsystem<'a> {
 #[derive(Debug, Clone, PartialEq, FromEure)]
 #[eure(crate = ::eure::document, rename_all = "kebab-case")]
 pub struct ServerModuleSpec {
-    pub id: RuntimeModule,
+    pub id: ConfiguredModuleId,
     pub replica_min: u8,
     pub replica_max: u8,
     #[eure(default = "default_replica_capacity")]
@@ -283,18 +443,18 @@ pub struct ServerModuleSpec {
     #[eure(default)]
     pub rate_threshold: Option<f64>,
     #[eure(default)]
-    pub sessions: Vec<ServerModuleSessionSpec>,
+    pub model_slots: Vec<ServerModelSlotSpec>,
     #[eure(default)]
-    pub groups: Vec<ServerModuleGroup>,
+    pub groups: Vec<ConfiguredModuleGroupId>,
     #[eure(default)]
-    pub depends_on: Vec<RuntimeModule>,
+    pub depends_on: Vec<ConfiguredModuleId>,
     #[eure(default)]
     pub activation_barrier: Option<ServerActivationBarrierSpec>,
     /// Module roles whose memo updates this module observes. Omitting the key
     /// keeps the default of every role; an explicit empty list subscribes to
     /// none. Every listed role must also be registered in this config.
     #[eure(default)]
-    pub memo_sources: Option<Vec<RuntimeModule>>,
+    pub memo_sources: Option<Vec<ConfiguredModuleId>>,
     /// Human-facing listener label to stable logical target path mappings
     /// available to Speak. The labels are shown to the model; paths are only
     /// written to the broadcast utterance target metadata.
@@ -305,7 +465,7 @@ pub struct ServerModuleSpec {
 #[derive(Debug, Clone, PartialEq, FromEure)]
 #[eure(crate = ::eure::document, rename_all = "kebab-case")]
 pub struct ServerActivationBarrierSpec {
-    pub prerequisites: Vec<RuntimeModule>,
+    pub prerequisites: Vec<ConfiguredModuleId>,
     #[eure(default)]
     pub timeout_seconds: Option<f64>,
 }
@@ -321,7 +481,7 @@ impl ServerActivationBarrierSpec {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, FromEure)]
 #[eure(crate = ::eure::document, rename_all = "kebab-case")]
-pub enum ServerSessionTier {
+pub enum ServerModelTier {
     Cheap,
     #[default]
     Default,
@@ -329,22 +489,22 @@ pub enum ServerSessionTier {
     Image,
 }
 
-impl From<ServerSessionTier> for ModelTier {
-    fn from(value: ServerSessionTier) -> Self {
+impl From<ServerModelTier> for ModelTier {
+    fn from(value: ServerModelTier) -> Self {
         match value {
-            ServerSessionTier::Cheap => Self::Cheap,
-            ServerSessionTier::Default => Self::Default,
-            ServerSessionTier::Premium => Self::Premium,
-            ServerSessionTier::Image => Self::Image,
+            ServerModelTier::Cheap => Self::Cheap,
+            ServerModelTier::Default => Self::Default,
+            ServerModelTier::Premium => Self::Premium,
+            ServerModelTier::Image => Self::Image,
         }
     }
 }
 
 #[derive(Debug, Clone, PartialEq, FromEure)]
 #[eure(crate = ::eure::document, rename_all = "kebab-case")]
-pub struct ServerModuleSessionSpec {
+pub struct ServerModelSlotSpec {
     pub key: String,
-    pub tier: ServerSessionTier,
+    pub tier: ServerModelTier,
 }
 
 #[derive(Debug, Clone, PartialEq, FromEure)]
@@ -441,61 +601,7 @@ impl Default for ServerBootConfig {
 }
 
 impl RuntimeModule {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Sensory => "sensory",
-            Self::CognitionGate => "cognition-gate",
-            Self::Allocation => "allocation",
-            Self::Action => "action",
-            Self::AttentionSchema => "attention-schema",
-            Self::Interpreter => "interpreter",
-            Self::SelfModel => "self-model",
-            Self::QueryMemory => "query-memory",
-            Self::Memory => "memory",
-            Self::MemoryCompaction => "memory-compaction",
-            Self::MemoryAssociation => "memory-association",
-            Self::Dreaming => "dreaming",
-            Self::Interoception => "interoception",
-            Self::Homeostasis => "homeostasis",
-            Self::Policy => "policy",
-            Self::PolicyCompaction => "policy-compaction",
-            Self::Reward => "reward",
-            Self::Predict => "predict",
-            Self::Surprise => "surprise",
-            Self::SubsystemGate => "subsystem-gate",
-            Self::SubsystemAllocation => "subsystem-allocation",
-            Self::Speak => "speak",
-        }
-    }
-
-    pub fn module_id(self) -> ModuleId {
-        match self {
-            Self::Sensory => builtin::sensory(),
-            Self::CognitionGate => builtin::cognition_gate(),
-            Self::Allocation => builtin::allocation(),
-            Self::Action => builtin::action(),
-            Self::AttentionSchema => builtin::attention_schema(),
-            Self::Interpreter => builtin::interpreter(),
-            Self::SelfModel => builtin::self_model(),
-            Self::QueryMemory => builtin::query_memory(),
-            Self::Memory => builtin::memory(),
-            Self::MemoryCompaction => builtin::memory_compaction(),
-            Self::MemoryAssociation => builtin::memory_association(),
-            Self::Dreaming => builtin::dreaming(),
-            Self::Interoception => builtin::interoception(),
-            Self::Homeostasis => builtin::homeostasis(),
-            Self::Policy => builtin::policy(),
-            Self::PolicyCompaction => builtin::policy_compaction(),
-            Self::Reward => builtin::reward(),
-            Self::Predict => builtin::predict(),
-            Self::Surprise => builtin::surprise(),
-            Self::SubsystemGate => builtin::subsystem_gate(),
-            Self::SubsystemAllocation => builtin::subsystem_allocation(),
-            Self::Speak => builtin::speak(),
-        }
-    }
-
-    pub fn session_defaults(self) -> &'static [(&'static str, ModelTier)] {
+    pub fn model_slot_defaults(self) -> &'static [(&'static str, ModelTier)] {
         match self {
             Self::Sensory => &[
                 ("one-shot", ModelTier::Cheap),
@@ -533,12 +639,16 @@ impl ServerConfig {
     }
 
     /// Builds a minimal configuration without reading configuration files.
-    pub fn from_memory(
+    pub fn from_memory<I>(
         model_set: ModelSet,
-        enabled_modules: impl IntoIterator<Item = RuntimeModule>,
+        enabled_modules: I,
         participants: impl IntoIterator<Item = String>,
         session_id: impl Into<String>,
-    ) -> anyhow::Result<Self> {
+    ) -> anyhow::Result<Self>
+    where
+        I: IntoIterator,
+        I::Item: Into<ModuleId>,
+    {
         Self::builder(model_set)
             .enabled_modules(enabled_modules)
             .participants(participants)
@@ -546,7 +656,7 @@ impl ServerConfig {
             .build()
     }
 
-    pub fn active_modules(&self) -> Vec<RuntimeModule> {
+    pub fn active_modules(&self) -> Vec<ModuleId> {
         self.boot_config.active_modules()
     }
 }
@@ -560,8 +670,8 @@ pub struct ServerConfigBuilder {
     session_id: Option<String>,
     llm_log_root: Option<PathBuf>,
     boot_config: ServerBootConfig,
-    enabled_modules: Option<HashSet<RuntimeModule>>,
-    disabled_modules: Vec<RuntimeModule>,
+    enabled_modules: Option<HashSet<ModuleId>>,
+    disabled_modules: Vec<ModuleId>,
     participants: Vec<String>,
     fresh_agent_db: bool,
     start_paused: bool,
@@ -614,13 +724,21 @@ impl ServerConfigBuilder {
         self
     }
 
-    pub fn enabled_modules(mut self, modules: impl IntoIterator<Item = RuntimeModule>) -> Self {
-        self.enabled_modules = Some(modules.into_iter().collect());
+    pub fn enabled_modules<I>(mut self, modules: I) -> Self
+    where
+        I: IntoIterator,
+        I::Item: Into<ModuleId>,
+    {
+        self.enabled_modules = Some(modules.into_iter().map(Into::into).collect());
         self
     }
 
-    pub fn disabled_modules(mut self, modules: impl IntoIterator<Item = RuntimeModule>) -> Self {
-        self.disabled_modules = modules.into_iter().collect();
+    pub fn disabled_modules<I>(mut self, modules: I) -> Self
+    where
+        I: IntoIterator,
+        I::Item: Into<ModuleId>,
+    {
+        self.disabled_modules = modules.into_iter().map(Into::into).collect();
         self
     }
 
@@ -646,7 +764,7 @@ impl ServerConfigBuilder {
         if let Some(enabled) = self.enabled_modules {
             self.boot_config
                 .modules
-                .retain(|module| enabled.contains(&module.id));
+                .retain(|module| enabled.contains(module.id.as_module_id()));
         }
         self.boot_config.validate(Path::new("<memory>"))?;
         let backends = resolve_llm_backends(&self.model_set)?;
@@ -707,8 +825,11 @@ impl ServerBootConfig {
         ScopeLabels::new(labels)
     }
 
-    pub fn active_modules(&self) -> Vec<RuntimeModule> {
-        self.modules.iter().map(|module| module.id).collect()
+    pub fn active_modules(&self) -> Vec<ModuleId> {
+        self.modules
+            .iter()
+            .map(ServerModuleSpec::module_id)
+            .collect()
     }
 
     pub fn active_module_ids(&self) -> HashSet<ModuleId> {
@@ -721,7 +842,7 @@ impl ServerBootConfig {
     pub fn specs_in_group(&self, group: ServerModuleGroup) -> Vec<&ServerModuleSpec> {
         self.modules
             .iter()
-            .filter(|module| module.groups.contains(&group))
+            .filter(|module| module.groups.iter().any(|candidate| candidate == &group))
             .collect()
     }
 
@@ -745,41 +866,7 @@ impl ServerBootConfig {
 
     fn validate(&self, path: &Path) -> anyhow::Result<()> {
         validate_activation_table(&self.activation_table, path)?;
-        let mut seen = HashSet::new();
-        for module in &self.modules {
-            if !seen.insert(module.id) {
-                anyhow::bail!(
-                    "server config {} declares module {} more than once",
-                    path.display(),
-                    module.id.as_str()
-                );
-            }
-            module.validate(path)?;
-        }
-        for module in &self.modules {
-            let Some(sources) = &module.memo_sources else {
-                continue;
-            };
-            let mut seen_sources = HashSet::new();
-            for source in sources {
-                if !seen_sources.insert(*source) {
-                    anyhow::bail!(
-                        "server config {} declares memo source {} for module {} more than once",
-                        path.display(),
-                        source.as_str(),
-                        module.id.as_str()
-                    );
-                }
-                if !seen.contains(source) {
-                    anyhow::bail!(
-                        "server config {} declares unknown memo source {} for module {}",
-                        path.display(),
-                        source.as_str(),
-                        module.id.as_str()
-                    );
-                }
-            }
-        }
+        validate_module_set(&self.modules, path, ModuleSetScope::Root)?;
         self.validate_subsystems(path)?;
         validate_config_actions(&self.action_affordances(), path)?;
         Ok(())
@@ -821,7 +908,11 @@ impl ServerBootConfig {
                     definition.id
                 );
             }
-            validate_module_set(&definition.modules, path, &definition.id)?;
+            validate_module_set(
+                &definition.modules,
+                path,
+                ModuleSetScope::Subsystem(&definition.id),
+            )?;
         }
         validate_subsystem_refs(&self.subsystems, "root", &definitions, path)?;
         for definition in &self.subsystem_definitions {
@@ -845,19 +936,34 @@ impl ServerBootConfig {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+enum ModuleSetScope<'a> {
+    Root,
+    Subsystem(&'a str),
+}
+
+impl std::fmt::Display for ModuleSetScope<'_> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Root => formatter.write_str("root"),
+            Self::Subsystem(id) => write!(formatter, "subsystem {id}"),
+        }
+    }
+}
+
 fn validate_module_set(
     modules: &[ServerModuleSpec],
     path: &Path,
-    owner: &str,
+    scope: ModuleSetScope<'_>,
 ) -> anyhow::Result<()> {
     let mut seen = HashSet::new();
     for module in modules {
-        if !seen.insert(module.id) {
+        if !seen.insert(module.id.clone()) {
             anyhow::bail!(
-                "server config {} declares module {} more than once in subsystem {}",
+                "server config {} declares module {} more than once in {}",
                 path.display(),
                 module.id.as_str(),
-                owner
+                scope
             );
         }
         module.validate(path)?;
@@ -866,11 +972,11 @@ fn validate_module_set(
         for dependency in &module.depends_on {
             if !seen.contains(dependency) {
                 anyhow::bail!(
-                    "server config {} declares unknown dependency {} for module {} in subsystem {}",
+                    "server config {} declares unknown dependency {} for module {} in {}",
                     path.display(),
                     dependency.as_str(),
                     module.id.as_str(),
-                    owner
+                    scope
                 );
             }
         }
@@ -878,11 +984,11 @@ fn validate_module_set(
             for prerequisite in &barrier.prerequisites {
                 if !seen.contains(prerequisite) {
                     anyhow::bail!(
-                        "server config {} declares unknown activation-barrier prerequisite {} for module {} in subsystem {}",
+                        "server config {} declares unknown activation-barrier prerequisite {} for module {} in {}",
                         path.display(),
                         prerequisite.as_str(),
                         module.id.as_str(),
-                        owner
+                        scope
                     );
                 }
             }
@@ -892,20 +998,20 @@ fn validate_module_set(
             for source in sources {
                 if !seen_sources.insert(source) {
                     anyhow::bail!(
-                        "server config {} declares memo source {} for module {} more than once in subsystem {}",
+                        "server config {} declares memo source {} for module {} more than once in {}",
                         path.display(),
                         source.as_str(),
                         module.id.as_str(),
-                        owner
+                        scope
                     );
                 }
                 if !seen.contains(source) {
                     anyhow::bail!(
-                        "server config {} declares unknown memo source {} for module {} in subsystem {}",
+                        "server config {} declares unknown memo source {} for module {} in {}",
                         path.display(),
                         source.as_str(),
                         module.id.as_str(),
-                        owner
+                        scope
                     );
                 }
             }
@@ -1077,24 +1183,27 @@ fn expand_scope_labels<'a>(
 
 impl ServerModuleSpec {
     pub fn module_id(&self) -> ModuleId {
-        self.id.module_id()
+        self.id.as_module_id().clone()
     }
 
-    pub fn session_tier(&self, key: &str) -> ModelTier {
-        self.sessions
+    pub fn model_tier(&self, key: &str) -> ModelTier {
+        self.model_slots
             .iter()
             .find(|session| session.key == key)
             .map(|session| session.tier.into())
             .or_else(|| {
-                self.id
-                    .session_defaults()
-                    .iter()
-                    .find(|(candidate, _)| *candidate == key)
-                    .map(|(_, tier)| *tier)
+                RuntimeModule::from_module_id(self.id.as_module_id())
+                    .and_then(|module| {
+                        module
+                            .model_slot_defaults()
+                            .iter()
+                            .find(|(candidate, _)| *candidate == key)
+                            .map(|(_, tier)| *tier)
+                    })
             })
             .unwrap_or_else(|| {
                 panic!(
-                    "unknown session key {key:?} for module {}; config validation should reject this",
+                    "unknown model slot {key:?} for module {}; catalog validation should reject this",
                     self.id.as_str()
                 )
             })
@@ -1151,7 +1260,12 @@ impl ServerModuleSpec {
                 self.replica_max.max(1)
             );
         }
-        validate_finite_ratio(self.initial_activation, "initial-activation", self.id, path)?;
+        validate_finite_ratio(
+            self.initial_activation,
+            "initial-activation",
+            self.id.as_module_id(),
+            path,
+        )?;
         self.replica_projection()
             .validate(&format!("module {} replicas", self.id.as_str()), path)?;
         self.rate_projection()
@@ -1172,36 +1286,14 @@ impl ServerModuleSpec {
                 self.id.as_str()
             );
         }
-        let defaults = self.id.session_defaults();
-        let mut seen_sessions = HashSet::new();
-        for session in &self.sessions {
-            if !seen_sessions.insert(session.key.as_str()) {
+        let mut seen_slots = HashSet::new();
+        for slot in &self.model_slots {
+            if !seen_slots.insert(slot.key.as_str()) {
                 anyhow::bail!(
-                    "server config {} declares session {} for module {} more than once",
+                    "server config {} declares model slot {} for module {} more than once",
                     path.display(),
-                    session.key,
+                    slot.key,
                     self.id.as_str()
-                );
-            }
-            if defaults
-                .iter()
-                .all(|(default_key, _)| *default_key != session.key.as_str())
-            {
-                let expected = defaults
-                    .iter()
-                    .map(|(key, _)| *key)
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                anyhow::bail!(
-                    "server config {} declares unknown session {} for module {}; expected one of: {}",
-                    path.display(),
-                    session.key,
-                    self.id.as_str(),
-                    if expected.is_empty() {
-                        "(none)"
-                    } else {
-                        &expected
-                    }
                 );
             }
         }
@@ -1222,7 +1314,7 @@ impl ServerModuleSpec {
             }
             let mut seen = HashSet::new();
             for prerequisite in &barrier.prerequisites {
-                if *prerequisite == self.id {
+                if prerequisite == &self.id {
                     anyhow::bail!(
                         "server config {} declares module {} as its own activation-barrier prerequisite",
                         path.display(),
@@ -1264,7 +1356,7 @@ impl ServerModuleSpec {
                     self.id.as_str()
                 );
             }
-            validate_logical_speech_target_path(logical_path, self.id, path)?;
+            validate_logical_speech_target_path(logical_path, self.id.as_module_id(), path)?;
         }
         Ok(())
     }
@@ -1272,7 +1364,7 @@ impl ServerModuleSpec {
 
 fn validate_logical_speech_target_path(
     logical_path: &str,
-    module: RuntimeModule,
+    module: &ModuleId,
     config_path: &Path,
 ) -> anyhow::Result<()> {
     let valid = logical_path.trim() == logical_path
@@ -1369,7 +1461,7 @@ fn validate_activation_table(values: &[f64], path: &Path) -> anyhow::Result<()> 
 fn validate_finite_ratio(
     value: f64,
     field: &str,
-    module: RuntimeModule,
+    module: &ModuleId,
     path: &Path,
 ) -> anyhow::Result<()> {
     if value.is_finite() && (0.0..=1.0).contains(&value) {
@@ -1634,7 +1726,7 @@ fn module_spec<const G: usize, const D: usize>(
     depends_on: [RuntimeModule; D],
 ) -> ServerModuleSpec {
     ServerModuleSpec {
-        id,
+        id: id.into(),
         replica_min,
         replica_max,
         replica_capacity: default_replica_capacity(),
@@ -1645,9 +1737,9 @@ fn module_spec<const G: usize, const D: usize>(
         replica_threshold: None,
         rate_curve: ServerProjectionCurve::Linear,
         rate_threshold: None,
-        sessions: Vec::new(),
-        groups: groups.to_vec(),
-        depends_on: depends_on.to_vec(),
+        model_slots: Vec::new(),
+        groups: groups.into_iter().map(Into::into).collect(),
+        depends_on: depends_on.into_iter().map(Into::into).collect(),
         activation_barrier: None,
         memo_sources: None,
         scope_targets: BTreeMap::new(),
@@ -1777,7 +1869,7 @@ embedding {
         )
         .unwrap();
 
-        assert_eq!(config.active_modules(), vec![RuntimeModule::Sensory]);
+        assert_eq!(config.active_modules(), vec![builtin::sensory()]);
         assert_eq!(config.participants, vec!["person"]);
         assert_eq!(config.session_id, "browser-session");
         assert_eq!(config.agent_db_path, PathBuf::from("./agent.db"));
@@ -1818,7 +1910,14 @@ embedding {
         let missing = PathBuf::from(format!(".tmp/missing-server-config-{}", Uuid::now_v7()));
         let config = load_server_boot_config(&missing).unwrap();
 
-        assert_eq!(config.active_modules(), DEFAULT_MODULES.to_vec());
+        assert_eq!(
+            config.active_modules(),
+            DEFAULT_MODULES
+                .iter()
+                .copied()
+                .map(RuntimeModule::module_id)
+                .collect::<Vec<_>>()
+        );
         assert_eq!(config.activation_table, default_activation_table_values());
         let speak = config
             .modules
@@ -1827,7 +1926,7 @@ embedding {
             .expect("default config includes speak");
         assert_eq!(speak.bpm_min, 6.0);
         assert_eq!(speak.bpm_max, 18.0);
-        assert_eq!(speak.session_tier("planning"), ModelTier::Premium);
+        assert_eq!(speak.model_tier("planning"), ModelTier::Premium);
     }
 
     #[test]
@@ -1855,10 +1954,10 @@ activation-table = [1.0, 0.5]
   bpm-max = 6.0
   initial-activation = 0.0
   groups = ["voluntary", "sleep-suppressed"]
-  depends-on = ["cognition-gate"]
+  depends-on = ["sensory"]
   memo-sources = ["sensory"]
 
-  @ sessions[] {
+  @ model-slots[] {
     key = "planning"
     tier = "premium"
   }
@@ -1872,12 +1971,9 @@ activation-table = [1.0, 0.5]
         assert_eq!(config.activation_table, vec![1.0, 0.5]);
         assert_eq!(
             config.active_modules(),
-            vec![RuntimeModule::Sensory, RuntimeModule::Speak]
+            vec![builtin::sensory(), builtin::speak()]
         );
-        assert_eq!(
-            config.modules[1].session_tier("planning"),
-            ModelTier::Premium
-        );
+        assert_eq!(config.modules[1].model_tier("planning"), ModelTier::Premium);
         assert_eq!(
             config.modules[1].groups,
             vec![
@@ -1885,15 +1981,48 @@ activation-table = [1.0, 0.5]
                 ServerModuleGroup::SleepSuppressed
             ]
         );
-        assert_eq!(
-            config.modules[1].depends_on,
-            vec![RuntimeModule::CognitionGate]
-        );
+        assert_eq!(config.modules[1].depends_on, vec![RuntimeModule::Sensory]);
         assert_eq!(
             config.modules[1].memo_sources,
-            Some(vec![RuntimeModule::Sensory])
+            Some(vec![RuntimeModule::Sensory.into()])
         );
         assert_eq!(config.modules[0].memo_sources, None);
+    }
+
+    #[test]
+    fn parse_server_boot_config_accepts_host_module_and_open_group_ids() {
+        let config = parse_server_boot_config_content(
+            r#"
+@ modules[] {
+  id: code
+  replica-min = 1
+  replica-max = 1
+  replica-capacity = 1
+  bpm-min = 6.0
+  bpm-max = 18.0
+  initial-activation = 0.0
+  groups = ["voluntary", "workspace-tools"]
+
+  @ model-slots[] {
+    key: conflict
+    tier: premium
+  }
+}
+"#,
+            Path::new(".tmp/server/config.eure"),
+        )
+        .unwrap();
+
+        assert_eq!(config.modules[0].id.as_str(), "code");
+        assert_eq!(
+            config.modules[0]
+                .groups
+                .iter()
+                .map(ConfiguredModuleGroupId::as_str)
+                .collect::<Vec<_>>(),
+            vec!["voluntary", "workspace-tools"]
+        );
+        assert_eq!(config.modules[0].model_slots[0].key, "conflict");
     }
 
     #[test]
@@ -2006,7 +2135,7 @@ activation-table = [1.0, 0.5]
 
         let mut duplicate = speak();
         duplicate.activation_barrier = Some(ServerActivationBarrierSpec {
-            prerequisites: vec![RuntimeModule::Sensory, RuntimeModule::Sensory],
+            prerequisites: vec![RuntimeModule::Sensory.into(), RuntimeModule::Sensory.into()],
             timeout_seconds: None,
         });
         assert!(
@@ -2019,7 +2148,7 @@ activation-table = [1.0, 0.5]
 
         let mut invalid_timeout = speak();
         invalid_timeout.activation_barrier = Some(ServerActivationBarrierSpec {
-            prerequisites: vec![RuntimeModule::Sensory],
+            prerequisites: vec![RuntimeModule::Sensory.into()],
             timeout_seconds: Some(0.0),
         });
         assert!(
@@ -2033,11 +2162,11 @@ activation-table = [1.0, 0.5]
         let mut unknown = speak();
         unknown.depends_on.clear();
         unknown.activation_barrier = Some(ServerActivationBarrierSpec {
-            prerequisites: vec![RuntimeModule::Sensory],
+            prerequisites: vec![RuntimeModule::Sensory.into()],
             timeout_seconds: None,
         });
         assert!(
-            validate_module_set(&[unknown], path, "root")
+            validate_module_set(&[unknown], path, ModuleSetScope::Root)
                 .unwrap_err()
                 .to_string()
                 .contains("unknown activation-barrier prerequisite sensory")
@@ -2326,35 +2455,21 @@ activation-table = [1.0, 0.5]
     }
 
     #[test]
-    fn runtime_module_parses_kebab_case_eure_names() {
-        let config = parse_server_boot_config_content(
-            r#"
-@ modules[] {
-  id = "query-memory"
-  replica-min = 1
-  replica-max = 1
-  bpm-min = 12.0
-  bpm-max = 30.0
-  initial-activation = 0.0
-}
+    fn runtime_module_ids_are_complete_unique_and_round_trip() {
+        let ids = RuntimeModule::ALL
+            .iter()
+            .copied()
+            .map(RuntimeModule::module_id)
+            .collect::<HashSet<_>>();
 
-@ modules[] {
-  id = "policy-compaction"
-  replica-min = 0
-  replica-max = 1
-  bpm-min = 2.0
-  bpm-max = 6.0
-  initial-activation = 0.0
-}
-"#,
-            Path::new(".tmp/server/config.eure"),
-        )
-        .unwrap();
-
-        assert_eq!(
-            config.active_modules(),
-            vec![RuntimeModule::QueryMemory, RuntimeModule::PolicyCompaction]
-        );
+        assert_eq!(RuntimeModule::ALL.len(), 22);
+        assert_eq!(ids.len(), RuntimeModule::ALL.len());
+        for module in RuntimeModule::ALL {
+            assert_eq!(
+                RuntimeModule::from_module_id(&module.module_id()),
+                Some(*module)
+            );
+        }
     }
 
     #[test]
@@ -2388,8 +2503,8 @@ activation-table = [1.0, 0.5]
     }
 
     #[test]
-    fn parse_server_boot_config_rejects_unknown_session_key() {
-        let error = parse_server_boot_config_content(
+    fn parse_server_boot_config_defers_unknown_model_slot_to_catalog_validation() {
+        let config = parse_server_boot_config_content(
             r#"
 @ modules[] {
   id = "speak"
@@ -2399,7 +2514,7 @@ activation-table = [1.0, 0.5]
   bpm-max = 6.0
   initial-activation = 0.0
 
-  @ sessions[] {
+  @ model-slots[] {
     key = "draft"
     tier = "premium"
   }
@@ -2407,17 +2522,13 @@ activation-table = [1.0, 0.5]
 "#,
             Path::new(".tmp/server/config.eure"),
         )
-        .unwrap_err()
-        .to_string();
+        .unwrap();
 
-        assert!(
-            error.contains("unknown session draft for module speak"),
-            "{error}"
-        );
+        assert_eq!(config.modules[0].model_slots[0].key, "draft");
     }
 
     #[test]
-    fn parse_server_boot_config_rejects_duplicate_session_keys() {
+    fn parse_server_boot_config_rejects_duplicate_model_slot_keys() {
         let error = parse_server_boot_config_content(
             r#"
 @ modules[] {
@@ -2428,12 +2539,12 @@ activation-table = [1.0, 0.5]
   bpm-max = 6.0
   initial-activation = 0.0
 
-  @ sessions[] {
+  @ model-slots[] {
     key = "planning"
     tier = "premium"
   }
 
-  @ sessions[] {
+  @ model-slots[] {
     key = "planning"
     tier = "default"
   }
@@ -2445,7 +2556,7 @@ activation-table = [1.0, 0.5]
         .to_string();
 
         assert!(
-            error.contains("session planning for module speak more than once"),
+            error.contains("model slot planning for module speak more than once"),
             "{error}"
         );
     }

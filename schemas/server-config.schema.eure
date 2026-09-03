@@ -17,30 +17,8 @@ subsystems.$optional = true
 actions = [`$types.server-action`]
 actions.$optional = true
 
-@ $types.runtime-module
-$variant: union
-variants.sensory = { = "sensory", $variant => "literal" }
-variants.cognition-gate = { = "cognition-gate", $variant => "literal" }
-variants.allocation = { = "allocation", $variant => "literal" }
-variants.action = { = "action", $variant => "literal" }
-variants.attention-schema = { = "attention-schema", $variant => "literal" }
-variants.interpreter = { = "interpreter", $variant => "literal" }
-variants.self-model = { = "self-model", $variant => "literal" }
-variants.query-memory = { = "query-memory", $variant => "literal" }
-variants.memory = { = "memory", $variant => "literal" }
-variants.memory-compaction = { = "memory-compaction", $variant => "literal" }
-variants.memory-association = { = "memory-association", $variant => "literal" }
-variants.dreaming = { = "dreaming", $variant => "literal" }
-variants.interoception = { = "interoception", $variant => "literal" }
-variants.homeostasis = { = "homeostasis", $variant => "literal" }
-variants.policy = { = "policy", $variant => "literal" }
-variants.policy-compaction = { = "policy-compaction", $variant => "literal" }
-variants.reward = { = "reward", $variant => "literal" }
-variants.predict = { = "predict", $variant => "literal" }
-variants.surprise = { = "surprise", $variant => "literal" }
-variants.subsystem-gate = { = "subsystem-gate", $variant => "literal" }
-variants.subsystem-allocation = { = "subsystem-allocation", $variant => "literal" }
-variants.speak = { = "speak", $variant => "literal" }
+@ $types.module-id
+= `text`
 
 @ $types.model-tier
 $variant: union
@@ -90,15 +68,11 @@ $variant: union
 variants.linear = { = "linear", $variant => "literal" }
 variants.threshold = { = "threshold", $variant => "literal" }
 
-@ $types.module-group
-$variant: union
-variants.voluntary = { = "voluntary", $variant => "literal" }
-variants.sleep-suppressed = { = "sleep-suppressed", $variant => "literal" }
-variants.homeostatic-drive = { = "homeostatic-drive", $variant => "literal" }
-variants.action-target = { = "action-target", $variant => "literal" }
+@ $types.module-group-id
+= `text`
 
 @ $types.server-module
-id = `$types.runtime-module`
+id = `$types.module-id`
 replica-min = `integer`
 replica-max = `integer`
 replica-capacity = `integer`
@@ -114,21 +88,21 @@ rate-curve = `$types.projection-curve`
 rate-curve.$optional = true
 rate-threshold = `float`
 rate-threshold.$optional = true
-groups = [`$types.module-group`]
+groups = [`$types.module-group-id`]
 groups.$optional = true
-depends-on = [`$types.runtime-module`]
+depends-on = [`$types.module-id`]
 depends-on.$optional = true
 activation-barrier = `$types.activation-barrier`
 activation-barrier.$optional = true
-memo-sources = [`$types.runtime-module`]
+memo-sources = [`$types.module-id`]
 memo-sources.$optional = true
 scope-targets = `$types.speech-target-map`
 scope-targets.$optional = true
-sessions = [`$types.server-module-session`]
-sessions.$optional = true
+model-slots = [`$types.server-model-slot`]
+model-slots.$optional = true
 
 @ $types.activation-barrier
-prerequisites = [`$types.runtime-module`]
+prerequisites = [`$types.module-id`]
 timeout-seconds = `float`
 timeout-seconds.$optional = true
 
@@ -137,7 +111,7 @@ $variant: map
 key = `text`
 value = `text`
 
-@ $types.server-module-session
+@ $types.server-model-slot
 key = `text`
 tier = `$types.model-tier`
 

@@ -44,7 +44,8 @@ use crate::gui::VisualizerHook;
 use crate::llm_db_trace::emit_persisted_llm_transcripts;
 use crate::ports::ServerHostPorts;
 use crate::registry::{
-    ServerModuleRegistrar, apply_server_module_registrars, full_agent_allocation, server_registry,
+    ServerModuleCatalog, ServerModuleFactory, full_agent_allocation, server_registry,
+    validate_configured_modules,
 };
 use crate::snapshot::emit_visualizer_blackboard_snapshot;
 use crate::state::{ActionAffordanceState, ModuleSettingsState, SceneState};
@@ -61,7 +62,7 @@ const AGENT_RESTART_STABLE_AFTER: Duration = Duration::from_secs(30);
 /// [`Server::run`] lets an async host supply all runtime capabilities directly.
 pub struct Server {
     config: ServerConfig,
-    registrars: Vec<Arc<dyn ServerModuleRegistrar>>,
+    factories: Vec<Arc<dyn ServerModuleFactory>>,
 }
 
 /// Capabilities owned by an async server host.
@@ -85,16 +86,16 @@ impl Server {
     pub fn new(config: ServerConfig) -> Self {
         Self {
             config,
-            registrars: Vec::new(),
+            factories: Vec::new(),
         }
     }
 
-    /// Adds host-provided module registrars.
-    pub fn module_registrars(
+    /// Adds host-provided module implementation factories.
+    pub fn module_factories(
         mut self,
-        registrars: impl IntoIterator<Item = Arc<dyn ServerModuleRegistrar>>,
+        factories: impl IntoIterator<Item = Arc<dyn ServerModuleFactory>>,
     ) -> Self {
-        self.registrars.extend(registrars);
+        self.factories.extend(factories);
         self
     }
 
@@ -150,7 +151,7 @@ impl Server {
         } = host;
         send_visualizer_startup_to_hook(&visualizer, self.config.start_paused);
         let result =
-            run_server_inner(self.config, &self.registrars, &mut visualizer, timer, ports).await;
+            run_server_inner(self.config, &self.factories, &mut visualizer, timer, ports).await;
         if let Err(error) = &result {
             let tab_id = server_tab_id();
             visualizer.send_event(VisualizerEvent::Log {
@@ -763,11 +764,18 @@ fn send_visualizer_startup_to_hook(visualizer: &VisualizerHook, start_paused: bo
 
 async fn run_server_inner(
     config: ServerConfig,
-    registrars: &[Arc<dyn ServerModuleRegistrar>],
+    factories: &[Arc<dyn ServerModuleFactory>],
     visualizer: &mut VisualizerHook,
     timer: Rc<dyn Timer>,
     host_ports: ServerHostPorts,
 ) -> anyhow::Result<()> {
+    let config_path = config
+        .state_dir
+        .join(crate::config::SERVER_BOOT_CONFIG_FILE);
+    let module_catalog = ServerModuleCatalog::new(&config_path, factories)
+        .context("build configured module catalog")?;
+    validate_configured_modules(&config_path, &config.boot_config, &module_catalog)
+        .context("validate configured module factories")?;
     let tab_id = VisualizerTabId::new(SERVER_TAB_ID.to_string());
     visualizer.send_event(VisualizerEvent::Log {
         tab_id: tab_id.clone(),
@@ -811,7 +819,7 @@ async fn run_server_inner(
     {
         env.blackboard
             .apply(BlackboardCommand::SetModuleForcedDisabled {
-                module: module.module_id(),
+                module: module.clone(),
                 disabled: true,
             })
             .await;
@@ -840,14 +848,14 @@ async fn run_server_inner(
     set_runtime_running(visualizer, &tab_id, &run_controller, !config.start_paused);
     let mut restart_count = 0_u64;
     loop {
-        let mut registry = server_registry(
+        let registry = server_registry(
+            &config_path,
             &config.boot_config,
+            &module_catalog,
             &env.memory_caps,
             &env.policy_caps,
             &env.utterance_sink,
-        );
-        registry = apply_server_module_registrars(registry, registrars)
-            .context("register host-provided server modules")?;
+        )?;
         let allocated = registry.build(&env.caps).await?;
         apply_persisted_module_settings(&module_settings, visualizer, &tab_id, &env.blackboard)
             .await;

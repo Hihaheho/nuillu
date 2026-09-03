@@ -6,7 +6,7 @@ use std::{
 
 use clap::{Args as ClapArgs, Parser};
 use nuillu_server::{
-    RuntimeModule, Server, ServerRunOptions, install_lutum_trace_subscriber,
+    ModuleId, Server, ServerRunOptions, install_lutum_trace_subscriber,
     load_server_config_from_options,
 };
 use nuillu_visualizer_egui::{Visualizer, VisualizerConfig};
@@ -170,8 +170,8 @@ struct ServerArgs {
     model_set: Option<PathBuf>,
 
     /// Modules to force-disable at startup.
-    #[arg(long = "disable-module", value_enum, value_name = "MODULE")]
-    disable_module: Vec<RuntimeModule>,
+    #[arg(long = "disable-module", value_parser = parse_module_id, value_name = "MODULE")]
+    disable_module: Vec<ModuleId>,
 
     /// Participants currently available to the speak module as targets.
     #[arg(long = "participant", value_name = "NAME")]
@@ -184,6 +184,10 @@ struct ServerArgs {
     /// Override the persistent agent DB path. Defaults to <state>/agent.db.
     #[arg(long, value_name = "PATH", conflicts_with = "fresh_agent_db")]
     agent_db: Option<PathBuf>,
+}
+
+fn parse_module_id(value: &str) -> Result<ModuleId, String> {
+    ModuleId::new(value).map_err(|error| error.to_string())
 }
 
 impl ServerArgs {

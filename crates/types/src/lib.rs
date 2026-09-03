@@ -16,7 +16,7 @@ pub use ids::{
     ModuleActivationId, ModuleGroupId, ModuleGroupIdParseError, ModuleId, ModuleIdParseError,
     ModuleInstanceId, ModuleInstanceStorageParseError, ReplicaCapRange, ReplicaCapRangeError,
     ReplicaIndex, ScopeId, ScopedModuleId, SubsystemId, SubsystemIdParseError, SubsystemInstanceId,
-    builtin,
+    builtin, is_kebab_case,
 };
 pub use memory::{MemoryContent, MemoryIndex, MemoryRank};
 pub use model::{ModelTier, TokenBudget};

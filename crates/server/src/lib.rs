@@ -18,11 +18,12 @@ pub mod state;
 pub const SERVER_TAB_ID: &str = "server";
 
 pub use config::{
-    DEFAULT_MODULES, EmbeddingBackendConfig, LlmBackendConfig, LlmGenerationConfig, RuntimeModule,
-    ServerActivationBarrierSpec, ServerBootConfig, ServerConfig, ServerConfigBuilder,
-    ServerModuleGroup, ServerModuleSessionSpec, ServerModuleSpec, ServerRunOptions,
-    ServerSessionTier, default_run_id, default_server_session_id, install_lutum_trace_subscriber,
-    load_server_boot_config, load_server_config_from_options,
+    ConfiguredModuleGroupId, ConfiguredModuleId, DEFAULT_MODULES, EmbeddingBackendConfig,
+    LlmBackendConfig, LlmGenerationConfig, RuntimeModule, ServerActivationBarrierSpec,
+    ServerBootConfig, ServerConfig, ServerConfigBuilder, ServerModelSlotSpec, ServerModelTier,
+    ServerModuleGroup, ServerModuleSpec, ServerRunOptions, default_run_id,
+    default_server_session_id, install_lutum_trace_subscriber, load_server_boot_config,
+    load_server_config_from_options,
 };
 pub use environment::{
     build_embedder, build_embedder_with_api_key, build_in_memory_host_ports, build_lutum,
@@ -38,11 +39,16 @@ pub use model_set::{
     parse_model_set_str, resolve_llm_backends, resolve_token_fields,
 };
 pub use nuillu_llm_trace_file::{FileLlmTraceSink, LlmLogContext};
+pub use nuillu_types::ModuleId;
 pub use ports::{
     MemorySeedPort, MemorySeedSummary, MemorySeedTarget, NoopMemorySeed, NoopRuntimeEventLog,
     RuntimeEventLogPort, ServerHostPorts, ServerStatePort,
 };
-pub use registry::ServerModuleRegistrar;
+pub use registry::{
+    FilledServerModuleSlot, ResolvedServerModuleConfig, ServerModelSlotDescriptor,
+    ServerModuleConfigError, ServerModuleDescriptor, ServerModuleFactory, ServerModuleFactoryError,
+    ServerModuleFactoryFn, ServerModuleSlot,
+};
 pub use runtime::{
     Server, ServerAmbientSensorySnapshotRecord, ServerEvent, ServerExternalActionEventRecord,
     ServerExternalActionEventStatus, ServerHost, ServerLlmCall, ServerLlmCallSource,

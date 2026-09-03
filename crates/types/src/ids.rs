@@ -94,7 +94,8 @@ impl fmt::Display for ModuleGroupId {
     }
 }
 
-fn is_kebab_case(value: &str) -> bool {
+/// Returns whether `value` is a valid kebab-case identifier.
+pub fn is_kebab_case(value: &str) -> bool {
     let bytes = value.as_bytes();
     if !bytes.first().is_some_and(|b| b.is_ascii_lowercase()) {
         return false;
@@ -552,6 +553,9 @@ mod tests {
 
     #[test]
     fn accepts_kebab_case() {
+        assert!(is_kebab_case("query2"));
+        assert!(is_kebab_case("attention-schema"));
+        assert!(!is_kebab_case("attention_schema"));
         assert_eq!(ModuleId::new("query2").unwrap().as_str(), "query2");
         assert_eq!(
             ModuleId::new("attention-schema").unwrap().as_str(),

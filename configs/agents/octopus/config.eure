@@ -19,7 +19,7 @@ activation-table = [1.0, 0.85, 0.7, 0.5, 0.3, 0.0]
   bpm-max = 30.0
   initial-activation = 1.0
 
-  @ sessions[]
+  @ model-slots[]
   key: main
   tier: premium
 }
@@ -77,7 +77,7 @@ activation-table = [1.0, 0.85, 0.7, 0.5, 0.3, 0.0]
   initial-activation = 0.0
   groups = ["voluntary", "sleep-suppressed"]
 
-  @ sessions[]
+  @ model-slots[]
   key: main
   tier: premium
 }
@@ -104,7 +104,7 @@ activation-table = [1.0, 0.85, 0.7, 0.5, 0.3, 0.0]
   initial-activation = 0.0
   groups = ["voluntary", "sleep-suppressed"]
 
-  @ sessions[]
+  @ model-slots[]
   key: main
   tier: premium
 }
@@ -179,7 +179,7 @@ activation-table = [1.0, 0.85, 0.7, 0.5, 0.3, 0.0]
     "Right leg" => "right-leg"
   }
 
-  @ sessions[]
+  @ model-slots[]
   key: planning
   tier: premium
 }
@@ -210,7 +210,7 @@ activation-table = [1.0, 0.85, 0.7, 0.5, 0.3, 0.0]
     bpm-max = 30.0
     initial-activation = 1.0
 
-    @ sessions[]
+    @ model-slots[]
     key: main
     tier: premium
   }
@@ -258,7 +258,7 @@ activation-table = [1.0, 0.85, 0.7, 0.5, 0.3, 0.0]
     initial-activation = 0.0
     groups = ["voluntary", "sleep-suppressed"]
 
-    @ sessions[]
+    @ model-slots[]
     key: main
     tier: premium
   }
@@ -285,7 +285,7 @@ activation-table = [1.0, 0.85, 0.7, 0.5, 0.3, 0.0]
     initial-activation = 0.0
     groups = ["voluntary", "sleep-suppressed"]
 
-    @ sessions[]
+    @ model-slots[]
     key: main
     tier: premium
   }
@@ -327,7 +327,7 @@ activation-table = [1.0, 0.85, 0.7, 0.5, 0.3, 0.0]
       "Whole octopus" => "main"
     }
 
-    @ sessions[]
+    @ model-slots[]
     key: planning
     tier: premium
   }
@@ -358,7 +358,7 @@ activation-table = [1.0, 0.85, 0.7, 0.5, 0.3, 0.0]
     bpm-max = 30.0
     initial-activation = 1.0
 
-    @ sessions[]
+    @ model-slots[]
     key: main
     tier: premium
   }
@@ -406,7 +406,7 @@ activation-table = [1.0, 0.85, 0.7, 0.5, 0.3, 0.0]
     initial-activation = 0.0
     groups = ["voluntary", "sleep-suppressed"]
 
-    @ sessions[]
+    @ model-slots[]
     key: main
     tier: premium
   }
@@ -433,7 +433,7 @@ activation-table = [1.0, 0.85, 0.7, 0.5, 0.3, 0.0]
     initial-activation = 0.0
     groups = ["voluntary", "sleep-suppressed"]
 
-    @ sessions[]
+    @ model-slots[]
     key: main
     tier: premium
   }
@@ -475,7 +475,7 @@ activation-table = [1.0, 0.85, 0.7, 0.5, 0.3, 0.0]
       "Whole octopus" => "main"
     }
 
-    @ sessions[]
+    @ model-slots[]
     key: planning
     tier: premium
   }
@@ -506,7 +506,7 @@ activation-table = [1.0, 0.85, 0.7, 0.5, 0.3, 0.0]
     bpm-max = 30.0
     initial-activation = 1.0
 
-    @ sessions[]
+    @ model-slots[]
     key: main
     tier: premium
   }
@@ -554,7 +554,7 @@ activation-table = [1.0, 0.85, 0.7, 0.5, 0.3, 0.0]
     initial-activation = 0.0
     groups = ["voluntary", "sleep-suppressed"]
 
-    @ sessions[]
+    @ model-slots[]
     key: main
     tier: premium
   }
@@ -581,7 +581,7 @@ activation-table = [1.0, 0.85, 0.7, 0.5, 0.3, 0.0]
     initial-activation = 0.0
     groups = ["voluntary", "sleep-suppressed"]
 
-    @ sessions[]
+    @ model-slots[]
     key: main
     tier: premium
   }
@@ -623,7 +623,7 @@ activation-table = [1.0, 0.85, 0.7, 0.5, 0.3, 0.0]
       "Whole octopus" => "main"
     }
 
-    @ sessions[]
+    @ model-slots[]
     key: planning
     tier: premium
   }

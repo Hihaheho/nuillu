@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use anyhow::Context as _;
 use clap::{Args as ClapArgs, Parser, Subcommand, ValueEnum};
 use nuillu_server::{
-    RuntimeModule, Server, ServerRunOptions,
+    ModuleId, Server, ServerRunOptions,
     history::{export_conversation_history, render_conversation_history_markdown},
     install_lutum_trace_subscriber, load_server_config_from_options,
 };
@@ -54,8 +54,8 @@ struct RunArgs {
     model_set: Option<PathBuf>,
 
     /// Modules to force-disable at startup.
-    #[arg(long = "disable-module", value_enum, value_name = "MODULE")]
-    disable_module: Vec<RuntimeModule>,
+    #[arg(long = "disable-module", value_parser = parse_module_id, value_name = "MODULE")]
+    disable_module: Vec<ModuleId>,
 
     /// Participants currently available to the speak module as targets.
     #[arg(long = "participant", value_name = "NAME")]
@@ -97,6 +97,10 @@ struct HistoryArgs {
 enum HistoryOutputFormat {
     Json,
     Markdown,
+}
+
+fn parse_module_id(value: &str) -> Result<ModuleId, String> {
+    ModuleId::new(value).map_err(|error| error.to_string())
 }
 
 fn main() -> anyhow::Result<()> {
@@ -305,6 +309,19 @@ mod tests {
         assert!(!args.run.fresh_agent_db);
         assert_eq!(args.run.agent_db, None);
         assert!(args.command.is_none());
+    }
+
+    #[test]
+    fn args_accept_open_module_id_for_startup_disable() {
+        let args = Args::parse_from(["nuillu-server", "--disable-module", "code"]);
+
+        assert_eq!(
+            args.run.disable_module,
+            vec![ModuleId::new("code").unwrap()]
+        );
+        assert!(
+            Args::try_parse_from(["nuillu-server", "--disable-module", "Not-Kebab-Case",]).is_err()
+        );
     }
 
     #[test]

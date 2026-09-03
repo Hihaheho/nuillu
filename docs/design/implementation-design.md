@@ -541,31 +541,32 @@ capability-provider environment fails and requires a fresh environment.
 
 ### Boot-time dynamic roles
 
-The implementation type does not determine dynamic identity. A host may parse
-an immutable runtime file and register the same compiled module type once per
-MCP server. Each file entry must provide a stable kebab-case `module-id`:
+The server boot config is the sole source of module topology. Module ids,
+policies, groups, dependencies, activation barriers, memo subscriptions, and
+model-tier overrides are parsed from `config.eure`; built-in and host code only
+provide implementations for those configured ids.
 
 ```rust
-for server in mcp_servers {
-    let spec = ModuleRegistrationSpec::new(
-        ModuleId::new(server.module_id)?,
-        mcp_policy(),
-        ActivationRatio::ONE,
-    )
-    .with_peer_context(server.peer_context)
-    .in_group(ModuleGroupId::new("voluntary")?);
-    let config = server.config.clone();
-    registry = registry.register(spec, move |caps| {
-        let config = config.clone();
-        async move { McpServerModule::new(config, caps).await }
-    })?;
-}
+let descriptor = ServerModuleDescriptor::new(ModuleId::new("mcp-server")?)
+    .with_peer_context("Uses the configured MCP server tools.")
+    .with_model_slot("main", ModelTier::Default);
+let factory = ServerModuleFactoryFn::new(descriptor, |slot, config| {
+    let tier = config.model_tier("main").expect("validated model slot");
+    Ok(slot.with_builder(move |caps| async move {
+        McpServerModule::new(caps.llm("main").with_tier(tier)).await
+    })?)
+});
 ```
 
-The parsed list is captured by `ServerModuleRegistrar`, which is invoked again
-only to create fresh builders after a scheduler restart. It must reproduce the
-same catalog. Changing the file requires constructing a new agent environment;
-live add/remove is outside v1.
+Catalog-aware validation runs after host factories are attached and rejects
+missing or duplicate factories, unknown model slots, and descriptor placement
+limits with config path, scope, and module-id context. A factory receives a
+single-use `ServerModuleSlot`, not `ModuleRegistry`, so it can fill exactly one
+server-owned registration with a typed `ModuleRegisterer` but cannot alter
+topology. Factories may be invoked for every configured scope and again after a
+scheduler restart, so captured construction inputs must be reusable. Changing
+the file still requires constructing a new agent environment; live add/remove
+is outside v1.
 
 The scheduler owns the loop over built modules:
 
