@@ -1,0 +1,380 @@
+// Focused octopus runtime for distributed local-knowledge integration.
+// Keeps cognition, allocation, interpretation, action, and speech while
+// omitting unrelated memory maintenance and homeostatic faculties.
+activation-table = [1.0, 0.85, 0.7, 0.5, 0.3, 0.0]
+
+@ modules[] {
+  id: sensory
+  replica-min = 1
+  replica-max = 1
+  replica-capacity = 2
+  bpm-min = 20.0
+  bpm-max = 30.0
+  initial-activation = 1.0
+}
+
+@ modules[] {
+  id: cognition-gate
+  replica-min = 1
+  replica-max = 1
+  replica-capacity = 2
+  bpm-min = 20.0
+  bpm-max = 30.0
+  initial-activation = 1.0
+
+  @ model-slots[]
+  key: main
+  tier: premium
+}
+
+@ modules[] {
+  id: allocation
+  replica-min = 1
+  replica-max = 1
+  replica-capacity = 2
+  bpm-min = 10.0
+  bpm-max = 10.0
+  initial-activation = 1.0
+}
+
+@ modules[] {
+  id: subsystem-allocation
+  replica-min = 1
+  replica-max = 1
+  replica-capacity = 1
+  bpm-min = 10.0
+  bpm-max = 10.0
+  initial-activation = 1.0
+}
+
+@ modules[] {
+  id: action
+  replica-min = 1
+  replica-max = 1
+  replica-capacity = 2
+  bpm-min = 3.0
+  bpm-max = 9.0
+  initial-activation = 0.0
+  groups = ["voluntary", "sleep-suppressed"]
+  depends-on = ["interpreter", "cognition-gate"]
+}
+
+@ modules[] {
+  id: attention-schema
+  replica-min = 1
+  replica-max = 1
+  replica-capacity = 2
+  bpm-min = 2.0
+  bpm-max = 5.0
+  initial-activation = 0.0
+  groups = ["voluntary", "sleep-suppressed"]
+}
+
+@ modules[] {
+  id: interpreter
+  replica-min = 0
+  replica-max = 1
+  replica-capacity = 2
+  bpm-min = 1.0
+  bpm-max = 5.0
+  initial-activation = 0.0
+  groups = ["voluntary", "sleep-suppressed"]
+
+  @ model-slots[]
+  key: main
+  tier: premium
+}
+
+@ modules[] {
+  id: speak
+  replica-min = 0
+  replica-max = 1
+  replica-capacity = 2
+  bpm-min = 6.0
+  bpm-max = 15.0
+  initial-activation = 0.0
+  groups = ["sleep-suppressed", "action-target"]
+  scope-targets = {
+    "Center leg" => "center-leg"
+    "Left leg" => "left-leg"
+    "Right leg" => "right-leg"
+  }
+
+  @ model-slots[]
+  key: planning
+  tier: premium
+}
+
+// Each leg gets its own Cognition Log, Memo, Allocation, channels, and Memory.
+@ subsystem-definitions[] {
+  id: left-leg
+  label: Left leg
+  allocation-description = "A cautious, observant left leg for careful exploration, precise contact, and risk-sensitive manipulation."
+  memory-scope: local
+
+  @ modules[] {
+    id: subsystem-gate
+    replica-min = 1
+    replica-max = 1
+    replica-capacity = 1
+    bpm-min = 10.0
+    bpm-max = 20.0
+    initial-activation = 1.0
+  }
+
+  @ modules[] {
+    id: cognition-gate
+    replica-min = 1
+    replica-max = 1
+    replica-capacity = 1
+    bpm-min = 20.0
+    bpm-max = 30.0
+    initial-activation = 1.0
+
+    @ model-slots[]
+    key: main
+    tier: premium
+  }
+
+  @ modules[] {
+    id: allocation
+    replica-min = 1
+    replica-max = 1
+    replica-capacity = 1
+    bpm-min = 10.0
+    bpm-max = 10.0
+    initial-activation = 1.0
+  }
+
+  @ modules[] {
+    id: attention-schema
+    replica-min = 1
+    replica-max = 1
+    replica-capacity = 1
+    bpm-min = 2.0
+    bpm-max = 5.0
+    initial-activation = 0.0
+    groups = ["voluntary", "sleep-suppressed"]
+  }
+
+  @ modules[] {
+    id: interpreter
+    replica-min = 0
+    replica-max = 1
+    replica-capacity = 1
+    bpm-min = 1.0
+    bpm-max = 5.0
+    initial-activation = 0.0
+    groups = ["voluntary", "sleep-suppressed"]
+
+    @ model-slots[]
+    key: main
+    tier: premium
+  }
+
+  @ modules[] {
+    id: query-memory
+    replica-min = 1
+    replica-max = 1
+    replica-capacity = 1
+    bpm-min = 8.0
+    bpm-max = 15.0
+    initial-activation = 0.0
+    groups = ["voluntary", "sleep-suppressed"]
+
+    @ model-slots[]
+    key: main
+    tier: premium
+  }
+}
+
+@ subsystem-definitions[] {
+  id: center-leg
+  label: Center leg
+  allocation-description = "A curious, playful center leg for probing unfamiliar things, experimentation, and flexible support."
+  memory-scope: local
+
+  @ modules[] {
+    id: subsystem-gate
+    replica-min = 1
+    replica-max = 1
+    replica-capacity = 1
+    bpm-min = 10.0
+    bpm-max = 20.0
+    initial-activation = 1.0
+  }
+
+  @ modules[] {
+    id: cognition-gate
+    replica-min = 1
+    replica-max = 1
+    replica-capacity = 1
+    bpm-min = 20.0
+    bpm-max = 30.0
+    initial-activation = 1.0
+
+    @ model-slots[]
+    key: main
+    tier: premium
+  }
+
+  @ modules[] {
+    id: allocation
+    replica-min = 1
+    replica-max = 1
+    replica-capacity = 1
+    bpm-min = 10.0
+    bpm-max = 10.0
+    initial-activation = 1.0
+  }
+
+  @ modules[] {
+    id: attention-schema
+    replica-min = 1
+    replica-max = 1
+    replica-capacity = 1
+    bpm-min = 2.0
+    bpm-max = 5.0
+    initial-activation = 0.0
+    groups = ["voluntary", "sleep-suppressed"]
+  }
+
+  @ modules[] {
+    id: interpreter
+    replica-min = 0
+    replica-max = 1
+    replica-capacity = 1
+    bpm-min = 1.0
+    bpm-max = 5.0
+    initial-activation = 0.0
+    groups = ["voluntary", "sleep-suppressed"]
+
+    @ model-slots[]
+    key: main
+    tier: premium
+  }
+
+  @ modules[] {
+    id: query-memory
+    replica-min = 1
+    replica-max = 1
+    replica-capacity = 1
+    bpm-min = 8.0
+    bpm-max = 15.0
+    initial-activation = 0.0
+    groups = ["voluntary", "sleep-suppressed"]
+
+    @ model-slots[]
+    key: main
+    tier: premium
+  }
+}
+
+@ subsystem-definitions[] {
+  id: right-leg
+  label: Right leg
+  allocation-description = "A bold, decisive right leg for rapid reaching, firm grasping, and committed action."
+  memory-scope: local
+
+  @ modules[] {
+    id: subsystem-gate
+    replica-min = 1
+    replica-max = 1
+    replica-capacity = 1
+    bpm-min = 10.0
+    bpm-max = 20.0
+    initial-activation = 1.0
+  }
+
+  @ modules[] {
+    id: cognition-gate
+    replica-min = 1
+    replica-max = 1
+    replica-capacity = 1
+    bpm-min = 20.0
+    bpm-max = 30.0
+    initial-activation = 1.0
+
+    @ model-slots[]
+    key: main
+    tier: premium
+  }
+
+  @ modules[] {
+    id: allocation
+    replica-min = 1
+    replica-max = 1
+    replica-capacity = 1
+    bpm-min = 10.0
+    bpm-max = 10.0
+    initial-activation = 1.0
+  }
+
+  @ modules[] {
+    id: attention-schema
+    replica-min = 1
+    replica-max = 1
+    replica-capacity = 1
+    bpm-min = 2.0
+    bpm-max = 5.0
+    initial-activation = 0.0
+    groups = ["voluntary", "sleep-suppressed"]
+  }
+
+  @ modules[] {
+    id: interpreter
+    replica-min = 0
+    replica-max = 1
+    replica-capacity = 1
+    bpm-min = 1.0
+    bpm-max = 5.0
+    initial-activation = 0.0
+    groups = ["voluntary", "sleep-suppressed"]
+
+    @ model-slots[]
+    key: main
+    tier: premium
+  }
+
+  @ modules[] {
+    id: query-memory
+    replica-min = 1
+    replica-max = 1
+    replica-capacity = 1
+    bpm-min = 8.0
+    bpm-max = 15.0
+    initial-activation = 0.0
+    groups = ["voluntary", "sleep-suppressed"]
+
+    @ model-slots[]
+    key: main
+    tier: premium
+  }
+}
+
+@ subsystems[] {
+  subsystem: left-leg
+  replica-min = 0
+  replica-max = 1
+  replica-capacity = 1
+  initial-activation = 1.0
+  activation-table = [1.0, 0.85, 0.7, 0.5, 0.3, 0.0]
+}
+
+@ subsystems[] {
+  subsystem: center-leg
+  replica-min = 0
+  replica-max = 1
+  replica-capacity = 1
+  initial-activation = 1.0
+  activation-table = [1.0, 0.85, 0.7, 0.5, 0.3, 0.0]
+}
+
+@ subsystems[] {
+  subsystem: right-leg
+  replica-min = 0
+  replica-max = 1
+  replica-capacity = 1
+  initial-activation = 1.0
+  activation-table = [1.0, 0.85, 0.7, 0.5, 0.3, 0.0]
+}

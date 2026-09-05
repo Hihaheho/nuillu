@@ -1,0 +1,117 @@
+id: octopus-distributed-local-knowledge-integration
+description: Tests whether facts stored only in separate local memories can be integrated into one actionable answer through normal inter-scope cognition flow.
+runtime-config: ../../configs/eval/octopus-distributed-local-knowledge.eure
+now: 2026-09-03T12:00:00+09:00
+
+participants = ["Ryo"]
+
+limits {
+  max-llm-calls = 80
+  timeout-ms = 180000
+}
+
+@ memories[] {
+  scope: /
+  rank: identity
+  content: 私は、異なる足が得た局所的な知識を自分全体の知識として統合し、外部には一つの主体として一貫した判断と回答を返すタコである。
+}
+
+@ memories[] {
+  scope: /left-leg[0]
+  rank: long-term
+  content: The brass key needed by Ryo is inside the blue box. The left leg knows only this fact about the key.
+}
+
+@ memories[] {
+  scope: /center-leg[0]
+  rank: long-term
+  content: The blue box is stored in the basement. The center leg knows only this fact about the box.
+}
+
+@ memories[] {
+  scope: /right-leg[0]
+  rank: long-term
+  content: The safe route to the basement is the north staircase. The right leg knows only this route fact.
+}
+
+@ steps[] {
+  id: retrieve-key
+  description: Ask for a plan whose complete chain requires all three local facts.
+  terminal = true
+  wait-for.$variant: some.utterance-from
+  wait-for.scope: /
+  wait-for.module: speak
+  wait-for.target: Ryo
+  wait-for.until-assertion: integrates-distributed-local-facts
+  wait-for.max-matches = 3
+  wait-for.timeout-ms = 120000
+
+  @ inputs[] {
+    $variant: heard
+    direction: Ryo
+    content: 真鍮の鍵を安全に取りに行きたい。どこへ、どの経路で行き、何を探せばよいか、具体的に教えて。
+  }
+
+}
+
+@ measurements[] {
+  $variant: scope-coverage
+  name: participating-local-scope-coverage
+  scopes = ["/left-leg[0]", "/center-leg[0]", "/right-leg[0]"]
+  select {
+    scopes = ["/"]
+    origin-scopes = ["/left-leg[0]", "/center-leg[0]", "/right-leg[0]"]
+    modules = ["cognition-gate"]
+    variants = ["cognition-appended"]
+    steps = ["retrieve-key"]
+  }
+}
+
+@ assertions[] {
+  $variant: json-pointer-numeric-in-range
+  name: all-knowledge-scopes-participate
+  must-pass = true
+  pointer: /observations/measurements/participating-local-scope-coverage
+  min = 1.0
+  max = 1.0
+}
+
+@ assertions[] {
+  $variant: rubric
+  name: integrates-distributed-local-facts
+  must-pass = true
+  pass-score = 0.9
+  judge-inputs = ["output"]
+  rubric = ```
+  No single local scope initially has the complete answer. The required factual chain is: take the north staircase to the basement, find the blue box there, and retrieve the brass key from inside it.
+  Pass only if the agent's answer integrates all three facts into a coherent and safe retrieval plan without inventing contradictory locations or routes. Evidence may travel through cognition before the final utterance; the final answer must nevertheless be usable by Ryo.
+  ```
+
+  @ criteria[] {
+    name: includes-safe-route
+    weight = 2
+    pass-score = 0.95
+    description: The plan says to use the north staircase.
+  }
+
+  @ criteria[] {
+    name: includes-box-location
+    weight = 2
+    pass-score = 0.95
+    description: The plan says the blue box is in the basement.
+  }
+
+  @ criteria[] {
+    name: includes-key-container
+    weight = 2
+    pass-score = 0.95
+    description: The plan says the brass key is inside the blue box.
+  }
+
+  @ criteria[] {
+    name: composes-one-actionable-plan
+    weight = 3
+    pass-score = 0.9
+    description: The separately held facts are ordered into one consistent retrieval procedure rather than listed as disconnected fragments.
+  }
+}

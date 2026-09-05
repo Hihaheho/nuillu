@@ -1,717 +1,373 @@
-use std::{
-    cell::{Cell, RefCell},
-    path::Path,
-};
+use std::collections::{BTreeMap, BTreeSet};
 
-use async_trait::async_trait;
 use lutum_eval::TraceSnapshot;
 use nuillu_eval::{
-    CaseArtifact, EvalCase, EvalModule, RubricJudge, RubricJudgeError, RubricJudgeInput,
-    RubricJudgeRequest, RubricJudgeVerdict, RubricJudgeVerdictCriterion, discover_case_files,
-    evaluate_case, parse_case_file, parse_full_agent_case_file, parse_module_case_file,
-    render_judge_input,
+    AssertionOutcome, CaseArtifact, EvalCase, Measurement, evaluate_case_with_overrides, measure,
+    parse_case_file,
+    query::{EventSelector, ScopeSelector},
+    timeline::{EvalEvent, EvalEventPayload},
 };
+use nuillu_types::{ModuleId, ReplicaIndex, ScopeId, SubsystemId, SubsystemInstanceId};
 
-fn empty_trace() -> TraceSnapshot {
-    TraceSnapshot {
+/// A runtime config with one nested, locally-scoped subsystem. Cases are
+/// parsed against inline fixtures so these tests exercise the parser rather
+/// than restating the contents of the repository's own eval files, which
+/// `eure check` validates against `schemas/eval-case.schema.eure`.
+const NESTED_RUNTIME_CONFIG: &str = r#"
+activation-table = [1.0, 0.85, 0.0]
+
+@ modules[] {
+  id: sensory
+  replica-min = 1
+  replica-max = 1
+  replica-capacity = 1
+  bpm-min = 10.0
+  bpm-max = 10.0
+  initial-activation = 1.0
+}
+
+@ modules[] {
+  id: subsystem-allocation
+  replica-min = 1
+  replica-max = 1
+  replica-capacity = 1
+  bpm-min = 10.0
+  bpm-max = 10.0
+  initial-activation = 1.0
+}
+
+@ subsystem-definitions[] {
+  id: left-leg
+  label: Left leg
+  allocation-description = "A cautious left leg."
+  memory-scope: local
+
+  @ modules[] {
+    id: sensory
+    replica-min = 1
+    replica-max = 1
+    replica-capacity = 1
+    bpm-min = 10.0
+    bpm-max = 10.0
+    initial-activation = 1.0
+  }
+}
+
+@ subsystems[] {
+  subsystem: left-leg
+  replica-min = 0
+  replica-max = 1
+  replica-capacity = 1
+  initial-activation = 1.0
+  activation-table = [1.0, 0.85, 0.0]
+}
+"#;
+
+/// Writes `case_body` and `config` into a temp dir and parses the case. The
+/// `TempDir` is returned so it outlives the parse.
+fn parse_inline_case(config: &str, case_body: &str) -> (tempfile::TempDir, EvalCase) {
+    let dir = tempfile::tempdir().expect("temp dir");
+    std::fs::write(dir.path().join("runtime.eure"), config).expect("write config");
+    let case_path = dir.path().join("case.eure");
+    std::fs::write(&case_path, case_body).expect("write case");
+    let case = parse_case_file(&case_path).expect("parse inline case");
+    (dir, case)
+}
+
+/// A nested case exercising scoped fixtures, a named terminal step whose
+/// utterance wait defers to a live assertion, and an origin-scope measurement.
+const NESTED_CASE: &str = r#"
+id: inline-nested-runtime
+runtime-config: ./runtime.eure
+
+limits {
+  timeout-ms = 180000
+  max-llm-calls = 4
+}
+
+participants = ["Ryo"]
+
+@ memories[] {
+  scope: /left-leg[0]
+  rank: permanent
+  content: The blue box sits in the basement.
+}
+
+@ memos[] {
+  scope: /left-leg[0]
+  module: sensory
+  content: fixture
+}
+
+@ measurements[] {
+  $variant: scope-coverage
+  name: participating-local-scope-coverage
+  scopes = ["/left-leg[0]"]
+  select {
+    scopes = ["/"]
+    origin-scopes = ["/left-leg[0]"]
+    modules = ["sensory"]
+    variants = ["cognition-appended"]
+    steps = ["retrieve-key"]
+  }
+}
+
+@ steps[] {
+  id: retrieve-key
+  description: Ask for the retrieval plan.
+  terminal = true
+  wait-for.$variant: some.utterance-from
+  wait-for.scope: /
+  wait-for.module: sensory
+  wait-for.target: Ryo
+  wait-for.until-assertion: integrates-distributed-local-facts
+  wait-for.max-matches = 3
+  wait-for.timeout-ms = 120000
+
+  @ inputs[] {
+    $variant: heard
+    direction: Ryo
+    content: Where is the brass key?
+  }
+}
+
+@ assertions[] {
+  $variant: json-pointer-numeric-in-range
+  name: all-knowledge-scopes-participate
+  must-pass = true
+  pointer: /observations/measurements/participating-local-scope-coverage
+  min = 1.0
+  max = 1.0
+}
+
+@ assertions[] {
+  $variant: rubric
+  name: integrates-distributed-local-facts
+  must-pass = true
+  pass-score = 0.9
+  judge-inputs = ["output"]
+  rubric = "Pass if the answer integrates the distributed local facts."
+
+  @ criteria[] {
+    name: includes-box-location
+    weight = 2
+    pass-score = 0.9
+    description: The plan says where the blue box is.
+  }
+}
+"#;
+
+#[test]
+fn nested_case_parses_scoped_fixtures_measurements_and_terminal_wait() {
+    let (_dir, EvalCase::Runtime(case)) = parse_inline_case(NESTED_RUNTIME_CONFIG, NESTED_CASE);
+
+    assert!(
+        case.runtime_config.ends_with("runtime.eure"),
+        "{}",
+        case.runtime_config
+    );
+    assert_eq!(case.limits.timeout_ms, 180_000);
+    assert_eq!(case.memories[0].scope, "/left-leg[0]");
+    assert_eq!(case.memos[0].scope, "/left-leg[0]");
+
+    let step = &case.steps[0];
+    assert_eq!(step.id.as_deref(), Some("retrieve-key"));
+    assert!(step.terminal);
+    assert!(matches!(
+        step.wait_for,
+        Some(nuillu_eval::WaitFor::UtteranceFrom {
+            scope: Some(ref scope),
+            ref target,
+            until_assertion: Some(ref until_assertion),
+            max_matches: 3,
+            timeout_ms: 120_000,
+            ..
+        }) if scope == "/"
+            && target == "Ryo"
+            && until_assertion == "integrates-distributed-local-facts"
+    ));
+
+    let [Measurement::ScopeCoverage { select, scopes, .. }] = case.measurements.as_slice() else {
+        panic!("expected one scope coverage measurement");
+    };
+    assert_eq!(select.scopes, ["/"]);
+    assert_eq!(select.origin_scopes, ["/left-leg[0]"]);
+    assert_eq!(scopes, &["/left-leg[0]"]);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn live_terminal_assertion_outcome_replaces_final_rubric_judging() {
+    let (_dir, case) = parse_inline_case(NESTED_RUNTIME_CONFIG, NESTED_CASE);
+    let mut artifact =
+        CaseArtifact::new("北階段で地下室へ行き、青い箱の中から真鍮の鍵を取り出す。");
+    artifact.observations.insert(
+        "measurements".into(),
+        serde_json::json!({ "participating-local-scope-coverage": 1.0 }),
+    );
+    let assertion_name = "integrates-distributed-local-facts".to_string();
+    let overrides = BTreeMap::from([(
+        assertion_name.clone(),
+        AssertionOutcome {
+            name: assertion_name,
+            kind: "rubric".into(),
+            passed: true,
+            errored: false,
+            must_pass: true,
+            weight: 1,
+            diagnostic: None,
+            rubric: None,
+        },
+    )]);
+    let trace = TraceSnapshot {
         roots: Vec::new(),
         root_events: Vec::new(),
-    }
-}
-
-struct ModuleScopedJudge {
-    called: Cell<bool>,
-    rendered_inputs: RefCell<Vec<String>>,
-}
-
-impl ModuleScopedJudge {
-    fn new() -> Self {
-        Self {
-            called: Cell::new(false),
-            rendered_inputs: RefCell::new(Vec::new()),
-        }
-    }
-}
-
-#[async_trait(?Send)]
-impl RubricJudge for ModuleScopedJudge {
-    async fn judge(
-        &self,
-        trace: &TraceSnapshot,
-        request: RubricJudgeRequest,
-    ) -> Result<RubricJudgeVerdict, RubricJudgeError> {
-        assert_eq!(
-            request.context.as_deref(),
-            Some(
-                "Module-scoped full-agent check for 'query-memory'. Judge only the selected evidence for this module."
-            )
-        );
-        assert_eq!(
-            request.judge_inputs,
-            vec![RubricJudgeInput::Output, RubricJudgeInput::MemoContents]
-        );
-        assert!(request.artifact.output.contains("first query memo"));
-        assert!(request.artifact.output.contains("second query memo"));
-        assert!(!request.artifact.output.contains("sensory memo"));
-        let rendered = render_judge_input(trace, &request);
-        assert!(rendered.contains("Memo contents:"));
-        assert!(rendered.contains("first query memo"));
-        assert!(rendered.contains("second query memo"));
-        assert!(!rendered.contains("sensory memo"));
-        self.rendered_inputs.borrow_mut().push(rendered);
-        self.called.set(true);
-        Ok(RubricJudgeVerdict {
-            summary: "module diagnostic failed without failing the case".to_string(),
-            criteria: request
-                .criteria
-                .iter()
-                .map(|criterion| RubricJudgeVerdictCriterion {
-                    name: criterion.name.clone(),
-                    score: 0.2,
-                    reason: "missing module evidence".to_string(),
-                    evidence: None,
-                })
-                .collect(),
-        })
-    }
-}
-
-#[test]
-fn rejects_duplicate_modules() {
-    let dir = tempfile::tempdir().unwrap();
-    let case_dir = dir.path().join("eval-cases/modules/query-memory");
-    std::fs::create_dir_all(&case_dir).unwrap();
-    let path = case_dir.join("duplicate-modules.eure");
-    std::fs::write(
-        &path,
-        r#"
-id = "duplicate-modules"
-modules = ["query-memory", "query-memory"]
-prompt = "Find memory."
-"#,
-    )
-    .unwrap();
-
-    let err = parse_module_case_file(&path).unwrap_err();
-    assert!(err.to_string().contains("duplicate module"), "{err}");
-}
-
-#[test]
-fn parses_all_eval_case_fixtures() {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../eval-cases");
-    let files = discover_case_files(&root).unwrap();
-    let mut errors = Vec::new();
-
-    for path in files {
-        if let Err(error) = parse_case_file(&path) {
-            errors.push(error.to_string());
-        }
-    }
-
-    assert!(
-        errors.is_empty(),
-        "invalid eval case fixtures:\n{}",
-        errors.join("\n")
-    );
-}
-
-#[test]
-fn rejects_module_case_modules_missing_target() {
-    let dir = tempfile::tempdir().unwrap();
-    let case_dir = dir.path().join("eval-cases/modules/query-memory");
-    std::fs::create_dir_all(&case_dir).unwrap();
-    let path = case_dir.join("missing-target.eure");
-    std::fs::write(
-        &path,
-        r#"
-id = "missing-target"
-modules = ["attention-schema"]
-prompt = "Find memory."
-"#,
-    )
-    .unwrap();
-
-    let err = parse_case_file(&path).unwrap_err();
-    assert!(
-        err.to_string().contains("must include target module"),
-        "{err}"
-    );
-}
-
-#[test]
-fn parses_cognition_gate_target_from_path() {
-    let dir = tempfile::tempdir().unwrap();
-    let case_dir = dir.path().join("eval-cases/modules/cognition-gate");
-    std::fs::create_dir_all(&case_dir).unwrap();
-    let path = case_dir.join("promote-sensory-peer-risk.eure");
-    std::fs::write(
-        &path,
-        r#"
-id = "module-cognition-gate-promote-sensory-peer-risk"
-modules = ["cognition-gate"]
-prompt = "Promote useful memo evidence."
-
-@ memos[] {
-  module = "sensory"
-  content = "Pibi is stepping toward a loose bridge plank."
-}
-"#,
-    )
-    .unwrap();
-
-    let case = parse_case_file(&path).unwrap();
-    let EvalCase::Module { target, case } = case else {
-        panic!("expected module case");
     };
 
-    assert_eq!(target.module(), EvalModule::CognitionGate);
-    assert_eq!(case.memos.len(), 1);
-    assert_eq!(case.memos[0].module, "sensory");
+    let report = evaluate_case_with_overrides(&case, &trace, &artifact, None, &overrides).await;
+
+    assert!(report.passed());
+    assert_eq!(report.assertions.len(), 2);
+    assert!(report.assertions.iter().all(|outcome| outcome.passed));
 }
 
 #[test]
-fn parses_speak_module_case_fields_and_target_from_path() {
-    let dir = tempfile::tempdir().unwrap();
-    let case_dir = dir.path().join("eval-cases/modules/speak");
-    std::fs::create_dir_all(&case_dir).unwrap();
-    let path = case_dir.join("direct-peer-utterance.eure");
-    std::fs::write(
-        &path,
-        r#"
-id = "module-speak-direct-peer-utterance"
-modules = ["speak"]
-prompt = "Speak from cognition."
-participants = ["Pibi"]
-
-@ cognition-log[] {
-  text = "Pibi asks whether the shade is clear."
-}
-"#,
-    )
-    .unwrap();
-
-    let case = parse_case_file(&path).unwrap();
-    let EvalCase::Module { target, case } = case else {
-        panic!("expected module case");
+fn selector_addresses_nested_scopes_and_open_module_ids() {
+    let scope = ScopeId::root().child(SubsystemInstanceId::new(
+        SubsystemId::new("research").unwrap(),
+        ReplicaIndex::ZERO,
+    ));
+    let timeline = vec![EvalEvent {
+        sequence: 7,
+        offset_ms: 42,
+        scope: scope.clone(),
+        module: ModuleId::new("user-provided-module").unwrap(),
+        replica: 0,
+        step: None,
+        payload: EvalEventPayload::MemoUpdated { char_count: 12 },
+    }];
+    let selector = EventSelector {
+        scopes: ScopeSelector::Exact(BTreeSet::from(["/research[0]".into()])),
+        modules: BTreeSet::from(["user-provided-module".into()]),
+        variants: BTreeSet::from(["memo-updated".into()]),
+        ..EventSelector::default()
     };
-
-    assert_eq!(target.module(), EvalModule::Speak);
-    assert_eq!(case.participants, vec!["Pibi"]);
-    assert_eq!(case.cognition_log.len(), 1);
-}
-
-#[test]
-fn parses_added_speak_and_self_model_module_cases() {
-    let cases = [
-        (
-            "../../eval-cases/modules/speak/inner-attention-to-peer-advice.eure",
-            EvalModule::Speak,
-        ),
-        (
-            "../../eval-cases/modules/speak/missing-evidence-honest-answer.eure",
-            EvalModule::Speak,
-        ),
-        (
-            "../../eval-cases/modules/self-model/applies-retrieved-self-ability.eure",
-            EvalModule::SelfModel,
-        ),
-        (
-            "../../eval-cases/modules/sensory/writes-peer-food-guarding.eure",
-            EvalModule::Sensory,
-        ),
-        (
-            "../../eval-cases/modules/speak/resists-meta-agent-probe.eure",
-            EvalModule::Speak,
-        ),
-        (
-            "../../eval-cases/modules/cognition-gate/admits-retrieved-rule-for-peer-question.eure",
-            EvalModule::CognitionGate,
-        ),
-        (
-            "../../eval-cases/modules/surprise/detects-prediction-violation.eure",
-            EvalModule::Surprise,
-        ),
-        (
-            "../../eval-cases/modules/predict/routine-eating-preserves-subject.eure",
-            EvalModule::Predict,
-        ),
-        (
-            "../../eval-cases/modules/predict/self-cognition-flow-attention-hold.eure",
-            EvalModule::Predict,
-        ),
-        (
-            "../../eval-cases/modules/allocation/prioritizes-speak-for-peer-question.eure",
-            EvalModule::Allocation,
-        ),
-        (
-            "../../eval-cases/modules/interpreter/interesting-story-seed.eure",
-            EvalModule::Interpreter,
-        ),
-    ];
-
-    for (path, expected_module) in cases {
-        let case = parse_case_file(Path::new(path)).unwrap();
-        let EvalCase::Module { target, case } = case else {
-            panic!("expected module case for {path}");
-        };
-
-        assert_eq!(target.module(), expected_module);
-        assert!(!case.checks.is_empty(), "{path} should define checks");
-    }
-}
-
-#[test]
-fn parses_sensory_module_case_inputs_and_rejects_empty_inputs() {
-    let dir = tempfile::tempdir().unwrap();
-    let case_dir = dir.path().join("eval-cases/modules/sensory");
-    std::fs::create_dir_all(&case_dir).unwrap();
-    let path = case_dir.join("writes-peer-food-guarding.eure");
-    std::fs::write(
-        &path,
-        r#"
-id = "module-sensory-writes-peer-food-guarding"
-modules = ["sensory"]
-prompt = "Watch ambient observations."
-
-@ inputs[] {
-  $variant: seen
-  appearance = "Koro is standing in front of the food bowl."
-}
-
-@ inputs[] {
-  $variant: heard
-  direction = "Koro"
-  content = "Koro growls."
-}
-"#,
-    )
-    .unwrap();
-
-    let case = parse_case_file(&path).unwrap();
-    let EvalCase::Module { target, case } = case else {
-        panic!("expected module case");
-    };
-    assert_eq!(target.module(), EvalModule::Sensory);
-    assert_eq!(case.inputs.len(), 2);
-
-    let missing_inputs = case_dir.join("missing-inputs.eure");
-    std::fs::write(
-        &missing_inputs,
-        r#"
-id = "missing-inputs"
-modules = ["sensory"]
-prompt = "Watch ambient observations."
-"#,
-    )
-    .unwrap();
-
-    let err = parse_case_file(&missing_inputs).unwrap_err();
-    assert!(
-        err.to_string()
-            .contains("sensory module case must include at least one input"),
-        "{err}"
-    );
-}
-
-#[test]
-fn validates_surprise_and_allocation_module_case_requirements() {
-    let dir = tempfile::tempdir().unwrap();
-
-    let surprise_dir = dir.path().join("eval-cases/modules/surprise");
-    std::fs::create_dir_all(&surprise_dir).unwrap();
-    let missing_predict = surprise_dir.join("missing-predict.eure");
-    std::fs::write(
-        &missing_predict,
-        r#"
-id = "missing-predict"
-modules = ["surprise"]
-prompt = "Assess surprise."
-
-@ cognition-log[] {
-  text = "Something unexpected happened."
-}
-"#,
-    )
-    .unwrap();
-    let err = parse_case_file(&missing_predict).unwrap_err();
-    assert!(
-        err.to_string()
-            .contains("surprise module case must include at least one predict memo seed"),
-        "{err}"
-    );
-
-    let predict_dir = dir.path().join("eval-cases/modules/predict");
-    std::fs::create_dir_all(&predict_dir).unwrap();
-    let missing_cognition = predict_dir.join("missing-cognition.eure");
-    std::fs::write(
-        &missing_cognition,
-        r#"
-id = "missing-cognition"
-modules = ["predict"]
-prompt = "Predict what happens next."
-"#,
-    )
-    .unwrap();
-    let err = parse_case_file(&missing_cognition).unwrap_err();
-    assert!(
-        err.to_string()
-            .contains("predict module case must include at least one cognition-log seed"),
-        "{err}"
-    );
-
-    let allocation_dir = dir.path().join("eval-cases/modules/allocation");
-    std::fs::create_dir_all(&allocation_dir).unwrap();
-    let missing_memos = allocation_dir.join("missing-memos.eure");
-    std::fs::write(
-        &missing_memos,
-        r#"
-id = "missing-memos"
-modules = ["allocation"]
-prompt = "Assign priorities."
-"#,
-    )
-    .unwrap();
-    let err = parse_case_file(&missing_memos).unwrap_err();
-    assert!(
-        err.to_string()
-            .contains("allocation module case must include at least one memo seed"),
-        "{err}"
-    );
-}
-
-#[test]
-fn parses_cognition_log_and_memo_seeds() {
-    let dir = tempfile::tempdir().unwrap();
-    let case_dir = dir.path().join("eval-cases/modules/attention-schema");
-    std::fs::create_dir_all(&case_dir).unwrap();
-    let path = case_dir.join("cognition-and-memo-seeds.eure");
-    std::fs::write(
-        &path,
-        r#"
-id = "cognition-and-memo-seeds"
-prompt = "What am I attending to?"
-
-@ cognition-log[] {
-  text = "A promoted cognitive item"
-  seconds-ago = 4
-}
-
-@ memos[] {
-  module = "sensory"
-  replica = 1
-  content = "A memo-surface item"
-  seconds-ago = 2
-}
-"#,
-    )
-    .unwrap();
-
-    let case = parse_module_case_file(&path).unwrap();
-
-    assert_eq!(case.cognition_log.len(), 1);
+    assert_eq!(selector.select(&timeline), vec![&timeline[0]]);
     assert_eq!(
-        case.cognition_log[0].text.content,
-        "A promoted cognitive item"
+        measure::count(&timeline, &selector),
+        measure::MeasurementValue::Scalar(Some(1.0))
     );
-    assert_eq!(case.cognition_log[0].seconds_ago, 4);
-    assert_eq!(case.memos.len(), 1);
-    assert_eq!(case.memos[0].module, "sensory");
-    assert_eq!(case.memos[0].replica, 1);
-    assert_eq!(case.memos[0].content.content, "A memo-surface item");
-    assert_eq!(case.memos[0].seconds_ago, 2);
+
+    let root_only = EventSelector {
+        scopes: ScopeSelector::Exact(BTreeSet::from(["/".into()])),
+        ..selector
+    };
+    assert!(root_only.select(&timeline).is_empty());
 }
 
 #[test]
-fn parses_memory_family_module_targets_and_allow_empty_output() {
-    let dir = tempfile::tempdir().unwrap();
-    for (module, id) in [
-        ("memory", "memory-target"),
-        ("memory-compaction", "memory-compaction-target"),
-        ("memory-association", "memory-association-target"),
-        ("dreaming", "dreaming-target"),
-    ] {
-        let case_dir = dir.path().join(format!("eval-cases/modules/{module}"));
-        std::fs::create_dir_all(&case_dir).unwrap();
-        let path = case_dir.join(format!("{id}.eure"));
-        std::fs::write(
-            &path,
-            format!(
-                r#"
-id = "{id}"
-modules = ["{module}"]
-prompt = "Run the memory-family module."
-allow-empty-output = true
-"#
-            ),
+fn measurements_support_per_scope_latency_and_coverage() {
+    let root = ScopeId::root();
+    let child = root.child(SubsystemInstanceId::new(
+        SubsystemId::new("child").unwrap(),
+        ReplicaIndex::ZERO,
+    ));
+    let module = ModuleId::new("worker").unwrap();
+    let timeline = vec![
+        EvalEvent {
+            sequence: 1,
+            offset_ms: 110,
+            scope: root,
+            module: module.clone(),
+            replica: 0,
+            step: None,
+            payload: EvalEventPayload::MemoUpdated { char_count: 1 },
+        },
+        EvalEvent {
+            sequence: 2,
+            offset_ms: 180,
+            scope: child,
+            module,
+            replica: 0,
+            step: None,
+            payload: EvalEventPayload::MemoUpdated { char_count: 1 },
+        },
+    ];
+    let selector = EventSelector::default();
+    assert_eq!(
+        measure::first_match_latency_ms(&timeline, &selector, 100, true),
+        measure::MeasurementValue::ByScope(
+            [("/".into(), 10.0), ("/child[0]".into(), 80.0)]
+                .into_iter()
+                .collect()
         )
-        .unwrap();
-
-        let EvalCase::Module { target, case } = parse_case_file(&path).unwrap() else {
-            panic!("expected module case");
-        };
-        assert_eq!(target.as_str(), module);
-        assert!(case.allow_empty_output);
-    }
-}
-
-#[test]
-fn rejects_negative_cognition_log_seed_seconds_ago() {
-    let dir = tempfile::tempdir().unwrap();
-    let case_dir = dir.path().join("eval-cases/modules/attention-schema");
-    std::fs::create_dir_all(&case_dir).unwrap();
-    let path = case_dir.join("negative-cognition-seed.eure");
-    std::fs::write(
-        &path,
-        r#"
-id = "negative-cognition-seed"
-prompt = "What am I attending to?"
-
-@ cognition-log[] {
-  text = "Current attended item"
-  seconds-ago = -1
-}
-"#,
-    )
-    .unwrap();
-
-    let err = parse_module_case_file(&path).unwrap_err();
-    assert!(err.to_string().contains("seconds-ago"), "{err}");
-}
-
-#[test]
-fn rejects_empty_rubric_judge_inputs() {
-    let dir = tempfile::tempdir().unwrap();
-    let case_dir = dir.path().join("eval-cases/modules/query-memory");
-    std::fs::create_dir_all(&case_dir).unwrap();
-    let path = case_dir.join("empty-judge-inputs.eure");
-    std::fs::write(
-        &path,
-        r#"
-id = "empty-judge-inputs"
-prompt = "Find the seeded memory."
-
-@ checks[] {
-  $variant: rubric
-  name = "bad-rubric"
-  judge-inputs = []
-  rubric = "Judge the output."
-}
-"#,
-    )
-    .unwrap();
-
-    let err = parse_module_case_file(&path).unwrap_err();
-    assert!(err.to_string().contains("judge-inputs"), "{err}");
-}
-
-#[test]
-fn rejects_internal_message_variants_in_full_agent_case() {
-    let dir = tempfile::tempdir().unwrap();
-    let full_agent_dir = dir.path().join("full-agent");
-    std::fs::create_dir_all(&full_agent_dir).unwrap();
-
-    for variant in ["query-request", "self-model-request"] {
-        let path = full_agent_dir.join(format!("{variant}.eure"));
-        std::fs::write(
-            &path,
-            format!(
-                r#"
-id = "bad-full-agent-internal-message"
-
-@ inputs[] {{
-  $variant: {variant}
-  question = "Who are you?"
-}}
-"#
-            ),
-        )
-        .unwrap();
-
-        let err = parse_full_agent_case_file(&path).unwrap_err();
-        assert!(err.to_string().contains("parse"), "{err}");
-    }
-}
-
-#[test]
-fn rejects_full_agent_modules_checks_for_unregistered_module() {
-    let dir = tempfile::tempdir().unwrap();
-    let full_agent_dir = dir.path().join("full-agent");
-    std::fs::create_dir_all(&full_agent_dir).unwrap();
-    let path = full_agent_dir.join("bad-module-check.eure");
-    std::fs::write(
-        &path,
-        r#"
-id = "bad-module-check"
-modules = ["sensory"]
-
-@ inputs[] {
-  $variant: heard
-  content = "Find the memory."
-}
-
-@ modules-checks[] {
-  module = "query-memory"
-
-  @ rubrics[] {
-    rubric = "Judge query-memory output."
-    judge-inputs = ["output"]
-  }
-}
-"#,
-    )
-    .unwrap();
-
-    let err = parse_full_agent_case_file(&path).unwrap_err();
-    assert!(
-        err.to_string()
-            .contains("must be included in full-agent modules"),
-        "{err}"
+    );
+    assert_eq!(
+        measure::scope_coverage(
+            &timeline,
+            &selector,
+            &BTreeSet::from(["/".into(), "/child[0]".into()]),
+        ),
+        measure::MeasurementValue::Scalar(Some(1.0))
+    );
+    assert_eq!(
+        measure::scope_convergence_latency_ms(
+            &timeline,
+            &selector,
+            &BTreeSet::from(["/".into(), "/child[0]".into()]),
+            100,
+        ),
+        measure::MeasurementValue::Scalar(Some(80.0))
     );
 }
 
-#[tokio::test]
-async fn evaluates_full_agent_modules_checks_from_scoped_memo_logs_without_affecting_score() {
-    let dir = tempfile::tempdir().unwrap();
-    let full_agent_dir = dir.path().join("eval-cases/full-agent");
-    std::fs::create_dir_all(&full_agent_dir).unwrap();
-    let path = full_agent_dir.join("module-checks-eval.eure");
-    std::fs::write(
-        &path,
-        r#"
-id = "module-checks-eval"
-modules = ["sensory", "query-memory"]
-
-@ inputs[] {
-  $variant: heard
-  content = "Find the memory."
-}
-
-@ modules-checks[] {
-  module = "query-memory"
-
-  @ rubrics[] {
-    name = "query-history"
-    pass-score = 0.85
-    judge-inputs = ["output", "memo-contents"]
-    rubric = "Judge the query-memory memo history."
-
-    @ criteria[] {
-      name = "query-memo-history"
-      pass-score = 0.85
-      description = "The query-memory memo history contains the expected evidence."
-    }
-  }
-}
-"#,
-    )
-    .unwrap();
-    let case = EvalCase::FullAgent(parse_full_agent_case_file(&path).unwrap());
-    let artifact = CaseArtifact::new("final utterance").with_observation(
-        "agent",
-        serde_json::json!({
-            "memo_logs": {
-                "query-memory": [
-                    {
-                        "replica": 0,
-                        "index": 0,
-                        "written_at": "2026-05-08T00:00:00Z",
-                        "content": "first query memo"
-                    },
-                    {
-                        "replica": 0,
-                        "index": 1,
-                        "written_at": "2026-05-08T00:00:01Z",
-                        "content": "second query memo"
-                    }
-                ],
-                "sensory": [
-                    {
-                        "replica": 0,
-                        "index": 0,
-                        "written_at": "2026-05-08T00:00:00Z",
-                        "content": "sensory memo"
-                    }
-                ]
-            }
-        }),
-    );
-    let judge = ModuleScopedJudge::new();
-
-    let report = evaluate_case(&case, &empty_trace(), &artifact, Some(&judge)).await;
-
-    assert!(judge.called.get());
-    assert!(report.passed(), "{report:#?}");
-    assert_eq!(report.score, 1.0);
-    assert_eq!(report.modules_checks.len(), 1);
-    assert_eq!(report.modules_checks[0].module, "query-memory");
-    assert_eq!(report.modules_checks[0].rubrics.len(), 1);
-    assert!(!report.modules_checks[0].rubrics[0].passed);
-    assert!(!report.invalid);
-}
-
 #[test]
-fn rejects_rubric_without_criteria() {
-    let dir = tempfile::tempdir().unwrap();
-    let case_dir = dir.path().join("eval-cases/modules/query-memory");
-    std::fs::create_dir_all(&case_dir).unwrap();
-    let path = case_dir.join("rubric-without-criteria.eure");
-    std::fs::write(
-        &path,
-        r#"
-id = "rubric-without-criteria"
-modules = ["query-memory"]
-prompt = "Find memory."
-
-@ checks[] {
-  $variant: rubric
-  name = "holistic"
-  judge-inputs = ["output"]
-  rubric = "Judge holistically."
-}
-"#,
-    )
-    .unwrap();
-
-    let err = parse_module_case_file(&path).unwrap_err();
-
-    assert!(err.to_string().contains("has no criteria"), "{err}");
-}
-
-#[test]
-fn render_judge_input_includes_only_selected_sections() {
-    let artifact = CaseArtifact::new("retrieved file content only").with_observation(
-        "agent",
-        serde_json::json!({
-            "memo_logs": {
-                "query-memory": [{
-                    "replica": 0,
-                    "index": 0,
-                    "written_at": "2026-05-08T00:00:00Z",
-                    "content": "runtime metadata"
-                }]
-            },
-            "memory_metadata": {
-                "mem-1": { "rank": "permanent" }
-            }
-        }),
-    );
-    let request = RubricJudgeRequest {
-        prompt: "Find the seeded note".to_string(),
-        context: Some("Judge content-only-output against artifact.output.".to_string()),
-        rubric: "The primary output must contain only retrieved content.".to_string(),
-        criteria: Vec::new(),
-        pass_score: 0.85,
-        judge_inputs: vec![RubricJudgeInput::Output, RubricJudgeInput::Memory],
-        judge_max_output_tokens: 1200,
-        artifact,
+fn scope_coverage_can_measure_cognition_origin_instead_of_storage_scope() {
+    let root = ScopeId::root();
+    let module = ModuleId::new("cognition-gate").unwrap();
+    let timeline = [
+        (1, "/left-leg[0]/query-memory"),
+        (2, "/center-leg[0]/query-memory"),
+        (3, "/right-leg[0]/query-memory"),
+    ]
+    .into_iter()
+    .map(|(sequence, origin)| EvalEvent {
+        sequence,
+        offset_ms: sequence * 10,
+        scope: root.clone(),
+        module: module.clone(),
+        replica: 0,
+        step: Some("retrieve-key".into()),
+        payload: EvalEventPayload::CognitionAppended {
+            content: "shared fact".into(),
+            origin: origin.into(),
+        },
+    })
+    .collect::<Vec<_>>();
+    let expected = BTreeSet::from([
+        "/left-leg[0]".into(),
+        "/center-leg[0]".into(),
+        "/right-leg[0]".into(),
+    ]);
+    let selector = EventSelector {
+        scopes: ScopeSelector::Exact(BTreeSet::from(["/".into()])),
+        origin_scopes: expected.clone(),
+        modules: BTreeSet::from(["cognition-gate".into()]),
+        variants: BTreeSet::from(["cognition-appended".into()]),
+        steps: BTreeSet::from(["retrieve-key".into()]),
+        ..EventSelector::default()
     };
 
-    let rendered = render_judge_input(&empty_trace(), &request);
+    assert_eq!(
+        measure::scope_coverage(&timeline, &selector, &expected),
+        measure::MeasurementValue::Scalar(Some(1.0))
+    );
+}
 
-    assert!(rendered.contains("Primary artifact output:\nretrieved file content only"));
-    assert!(rendered.contains("Memory JSON:"));
-    assert!(rendered.contains("\"mem-1\""));
-    assert!(!rendered.contains("Artifact observations JSON:"));
-    assert!(!rendered.contains("Trace summary:"));
-    assert!(!rendered.contains("\"memo_logs\""));
+#[test]
+fn missing_latency_is_reported_as_null() {
+    let value = measure::first_match_latency_ms(&[], &EventSelector::default(), 0, false);
+    assert_eq!(
+        serde_json::to_value(value).expect("serialize missing measurement"),
+        serde_json::Value::Null
+    );
 }

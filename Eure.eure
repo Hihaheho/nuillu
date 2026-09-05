@@ -6,73 +6,13 @@ $schema = "https://eure.dev/v0.1.7/schemas/eure-config.schema.eure"
 globs = ["docs/devlog/**/*.eure"]
 schema = "https://eure.dev/v0.1.9/schemas/article.schema.eure"
 
-@ targets.eval-full-agent-cases
-globs = ["eval-cases/full-agent/**/*.eure"]
-schema = "schemas/eval-full-agent-case.schema.eure"
+@ targets.eval-cases
+globs = ["eval-cases/**/*.eure"]
+schema = "schemas/eval-case.schema.eure"
 
-@ targets.eval-full-agent-last-state
+@ targets.eval-last-state
 globs = [".tmp/eval/**/last-state.eure"]
-schema = "schemas/eval-full-agent-last-state.schema.eure"
-
-@ targets.eval-query-memory-cases
-globs = ["eval-cases/modules/query-memory/**/*.eure"]
-schema = "schemas/eval-query-memory-case.schema.eure"
-
-@ targets.eval-cognition-gate-cases
-globs = ["eval-cases/modules/cognition-gate/**/*.eure"]
-schema = "schemas/eval-cognition-gate-case.schema.eure"
-
-@ targets.eval-sensory-cases
-globs = ["eval-cases/modules/sensory/**/*.eure"]
-schema = "schemas/eval-sensory-case.schema.eure"
-
-@ targets.eval-speak-cases
-globs = ["eval-cases/modules/speak/**/*.eure"]
-schema = "schemas/eval-speak-case.schema.eure"
-
-@ targets.eval-memory-cases
-globs = ["eval-cases/modules/memory/**/*.eure"]
-schema = "schemas/eval-memory-case.schema.eure"
-
-@ targets.eval-memory-compaction-cases
-globs = ["eval-cases/modules/memory-compaction/**/*.eure"]
-schema = "schemas/eval-memory-case.schema.eure"
-
-@ targets.eval-memory-association-cases
-globs = ["eval-cases/modules/memory-association/**/*.eure"]
-schema = "schemas/eval-memory-case.schema.eure"
-
-@ targets.eval-dreaming-cases
-globs = ["eval-cases/modules/dreaming/**/*.eure"]
-schema = "schemas/eval-memory-case.schema.eure"
-
-@ targets.eval-attention-schema-cases
-globs = ["eval-cases/modules/attention-schema/**/*.eure"]
-schema = "schemas/eval-attention-schema-case.schema.eure"
-
-@ targets.eval-surprise-cases
-globs = ["eval-cases/modules/surprise/**/*.eure"]
-schema = "schemas/eval-surprise-case.schema.eure"
-
-@ targets.eval-predict-cases
-globs = ["eval-cases/modules/predict/**/*.eure"]
-schema = "schemas/eval-predict-case.schema.eure"
-
-@ targets.eval-allocation-cases
-globs = ["eval-cases/modules/allocation/**/*.eure"]
-schema = "schemas/eval-allocation-case.schema.eure"
-
-@ targets.eval-action-cases
-globs = ["eval-cases/modules/action/**/*.eure"]
-schema = "schemas/eval-action-case.schema.eure"
-
-@ targets.eval-policy-cases
-globs = ["eval-cases/modules/policy/**/*.eure"]
-schema = "schemas/eval-policy-case.schema.eure"
-
-@ targets.eval-policy-compaction-cases
-globs = ["eval-cases/modules/policy-compaction/**/*.eure"]
-schema = "schemas/eval-policy-compaction-case.schema.eure"
+schema = "schemas/eval-last-state.schema.eure"
 
 @ targets.eval-modelsets
 globs = ["configs/modelsets/**/*.eure"]
@@ -83,28 +23,17 @@ globs = [".tmp/**/memory-seeds/**/*.eure", "configs/agents/**/memory-seeds/**/*.
 schema = "schemas/server-memory-seeds.schema.eure"
 
 @ targets.server-config
-globs = [".tmp/**/config.eure", "configs/agents/**/config.eure"]
+globs = [
+  ".tmp/**/config.eure",
+  "configs/agents/**/config.eure",
+  "configs/eval/**/*.eure",
+]
 schema = "schemas/server-config.schema.eure"
 
 @ cli
 default-targets = [
   "devlog",
-  "eval-full-agent-cases",
-  "eval-query-memory-cases",
-  "eval-cognition-gate-cases",
-  "eval-sensory-cases",
-  "eval-speak-cases",
-  "eval-memory-cases",
-  "eval-memory-compaction-cases",
-  "eval-memory-association-cases",
-  "eval-dreaming-cases",
-  "eval-attention-schema-cases",
-  "eval-surprise-cases",
-  "eval-predict-cases",
-  "eval-allocation-cases",
-  "eval-action-cases",
-  "eval-policy-cases",
-  "eval-policy-compaction-cases",
+  "eval-cases",
   "eval-modelsets",
   "server-memory-seeds",
   "server-config",

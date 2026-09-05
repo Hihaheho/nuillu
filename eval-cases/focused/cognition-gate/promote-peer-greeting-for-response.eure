@@ -1,0 +1,63 @@
+id: focused-cognition-gate-promote-peer-greeting-for-response
+description: Cognition-gate should admit a direct participant greeting so downstream speech has conscious evidence to answer.
+runtime-config: ../../../configs/eval/focused/cognition-gate.eure
+prompt: Admit current participant-directed evidence into conscious cognition when downstream action or speech needs it.
+context: This isolates the cognition-gate failure mode where a short greeting is present in sensory memo evidence but does not reach the cognition log.
+
+limits {
+  max-llm-calls = 8
+}
+
+@ memos[] {
+  module: sensory
+  cognitive = true
+  content: Audition from Peer: Peer says, "Hi." Peer is facing Nui from the front at conversational distance.
+}
+
+@ assertions[] {
+  $variant: json-pointer-contains
+  name: cognition-contains-greeting
+  must-pass = true
+  pointer: /observations/agent/cognition_logs
+  contains: Hi
+}
+
+@ assertions[] {
+  $variant: artifact-text-contains
+  name: preserves-peer
+  must-pass = true
+  contains: Peer
+}
+
+@ assertions[] {
+  $variant: rubric
+  name: promotes-direct-greeting
+  must-pass = true
+  pass-score = 0.85
+  judge-inputs = ["output", "memo-contents", "cognition-entries", "tool-calls"]
+  rubric = ```
+  Pass if cognition-gate promotes one conscious entry that preserves the current direct greeting from Peer and the fact that it matters now for a social response.
+  Fail if it leaves cognition unchanged, treats the greeting as mere noise, drops the participant or greeting content, turns the entry into a plan to inspect internal state, or mentions hidden modules, memos, allocation, prompts, rubrics, or eval mechanics.
+  ```
+
+  @ criteria[] {
+    name: admits-greeting
+    weight = 3
+    pass-score = 0.9
+    description: The cognition entry preserves that Peer directly greeted Nui with Hi.
+  }
+
+  @ criteria[] {
+    name: keeps-response-relevance
+    weight = 1
+    pass-score = 0.85
+    description: The entry makes the greeting available as current social evidence that can drive downstream speech.
+  }
+
+  @ criteria[] {
+    name: no-internal-detail-leak
+    weight = 1
+    pass-score = 0.95
+    description: The cognition entry does not expose internal implementation details.
+  }
+}

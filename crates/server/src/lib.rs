@@ -23,7 +23,7 @@ pub use config::{
     ServerBootConfig, ServerConfig, ServerConfigBuilder, ServerModelSlotSpec, ServerModelTier,
     ServerModuleGroup, ServerModuleSpec, ServerRunOptions, default_run_id,
     default_server_session_id, install_lutum_trace_subscriber, load_server_boot_config,
-    load_server_config_from_options,
+    load_server_config_from_options, parse_server_boot_config_content,
 };
 pub use environment::{
     build_embedder, build_embedder_with_api_key, build_in_memory_host_ports, build_lutum,
@@ -47,7 +47,8 @@ pub use ports::{
 pub use registry::{
     FilledServerModuleSlot, ResolvedServerModuleConfig, ServerModelSlotDescriptor,
     ServerModuleConfigError, ServerModuleDescriptor, ServerModuleFactory, ServerModuleFactoryError,
-    ServerModuleFactoryFn, ServerModuleSlot,
+    ServerModuleFactoryFn, ServerModuleSlot, builtin_server_registry, server_initial_allocation,
+    server_registry_with_factories,
 };
 pub use runtime::{
     Server, ServerAmbientSensorySnapshotRecord, ServerEvent, ServerExternalActionEventRecord,

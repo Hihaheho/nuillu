@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use anyhow::Context as _;
 use clap::Parser;
 use nuillu_eval::{
-    EmbeddingBackendConfig, EmbeddingRole, EvalModule, RunnerConfig, default_run_id,
+    EmbeddingBackendConfig, EmbeddingRole, LiveOutput, RunnerConfig, default_run_id,
     gui::run_suite_with_visualizer, install_lutum_trace_subscriber, parse_model_set_file,
     resolve_llm_backends, resolve_token_fields, run_suite,
 };
@@ -11,13 +11,11 @@ use nuillu_module::LlmConcurrencyPool;
 use tokio::runtime::Builder;
 
 const DEFAULT_OPENAI_EMBEDDING_ENDPOINT: &str = "https://api.openai.com/v1";
-const DEFAULT_FULL_AGENT_CONCURRENCY: usize = 3;
-const DEFAULT_MODULE_CONCURRENCY: usize = 8;
 
 #[derive(Debug, Parser)]
 #[command(
     name = "nuillu-eval",
-    about = "Run data-driven nuillu eval cases against real agent/module wiring"
+    about = "Evaluate and benchmark configured Nuillu agents"
 )]
 struct Args {
     /// Eure case file or directory to load recursively.
@@ -39,6 +37,10 @@ struct Args {
     /// Model set Eure file with per-role backend config.
     #[arg(long)]
     model_set: PathBuf,
+
+    /// Override every selected case's runtime config (useful for benchmarking one agent).
+    #[arg(long, value_name = "CONFIG")]
+    runtime_config: Option<PathBuf>,
 
     /// Stop the suite after the first failed or invalid case.
     #[arg(long)]
@@ -62,23 +64,17 @@ struct Args {
     #[arg(long)]
     gui: bool,
 
-    /// Skip full-agent cases; run only module eval cases under eval-cases/modules.
-    #[arg(long, conflicts_with = "full_agent_only")]
-    no_full_agent: bool,
+    /// Maximum number of eval cases executed concurrently.
+    #[arg(long, default_value = "3")]
+    concurrency: std::num::NonZeroUsize,
 
-    /// Run only full-agent eval cases under eval-cases/full-agent.
-    #[arg(long)]
-    full_agent_only: bool,
+    /// Print every runtime event live. Detailed events are always saved to events.jsonl.
+    #[arg(long, conflicts_with = "quiet")]
+    verbose: bool,
 
-    /// Run only cases associated with these modules (repeatable).
-    #[arg(long = "module", value_enum, value_name = "MODULE")]
-    module_filter: Vec<EvalModule>,
-
-    /// Modules to drop from the full-agent wiring (repeatable). Useful for
-    /// isolating module-level effects, e.g. `--disable-module query-memory`.
-    /// Required modules (allocation, action, sensory, speak) cannot be disabled.
-    #[arg(long = "disable-module", value_enum, value_name = "MODULE")]
-    disable_module: Vec<EvalModule>,
+    /// Suppress live progress output and print only the final suite summary.
+    #[arg(long, conflicts_with = "verbose")]
+    quiet: bool,
 
     /// Optional case id/path substring patterns. When present, only matching cases run.
     #[arg(value_name = "PATTERN")]
@@ -102,10 +98,6 @@ fn main() -> anyhow::Result<()> {
     let model_concurrency = backends.model_concurrency;
 
     let embedding_backend = resolve_embedding(&model_set.embedding)?;
-    if args.gui && args.no_full_agent {
-        anyhow::bail!("--gui requires full-agent cases; do not combine with --no-full-agent");
-    }
-
     let config = RunnerConfig {
         cases_root: args.cases,
         output_root: args.output,
@@ -123,15 +115,17 @@ fn main() -> anyhow::Result<()> {
         model_concurrency,
         llm_concurrency_pool: LlmConcurrencyPool::default(),
         trials: args.trials,
-        full_agent_concurrency: std::num::NonZeroUsize::new(DEFAULT_FULL_AGENT_CONCURRENCY)
-            .expect("default full-agent concurrency is non-zero"),
-        module_concurrency: std::num::NonZeroUsize::new(DEFAULT_MODULE_CONCURRENCY)
-            .expect("default module concurrency is non-zero"),
+        case_concurrency: args.concurrency,
         case_patterns: args.patterns,
-        module_filters: args.module_filter,
-        disabled_modules: args.disable_module,
-        exclude_full_agent: args.no_full_agent,
-        full_agent_only: args.full_agent_only,
+        module_factories: Vec::new(),
+        runtime_config_override: args.runtime_config,
+        live_output: if args.quiet {
+            LiveOutput::Quiet
+        } else if args.verbose {
+            LiveOutput::Verbose
+        } else {
+            LiveOutput::Normal
+        },
     };
 
     if args.gui {

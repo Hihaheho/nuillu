@@ -548,6 +548,56 @@ pub(super) fn server_registry(
     Ok(registry.with_registration_scope(ScopeId::root()))
 }
 
+/// Builds the configured built-in runtime topology for hosts such as the eval
+/// runner. Configuration expansion and validation remain owned by the server,
+/// so alternate hosts cannot accidentally grow a second topology model.
+pub fn builtin_server_registry(
+    config_path: &Path,
+    boot_config: &ServerBootConfig,
+    memory_caps: &MemoryCapabilities,
+    policy_caps: &PolicyCapabilities,
+    utterance_sink: &Rc<dyn UtteranceSink>,
+) -> Result<ModuleRegistry, ServerModuleConfigError> {
+    let catalog = ServerModuleCatalog::new(config_path, &[])?;
+    validate_configured_modules(config_path, boot_config, &catalog)?;
+    server_registry(
+        config_path,
+        boot_config,
+        &catalog,
+        memory_caps,
+        policy_caps,
+        utterance_sink,
+    )
+}
+
+/// Builds a configured runtime topology including host-provided module
+/// implementations. Eval and other alternate hosts use the same factory
+/// contract and validation as the server runtime.
+pub fn server_registry_with_factories(
+    config_path: &Path,
+    boot_config: &ServerBootConfig,
+    factories: &[Arc<dyn ServerModuleFactory>],
+    memory_caps: &MemoryCapabilities,
+    policy_caps: &PolicyCapabilities,
+    utterance_sink: &Rc<dyn UtteranceSink>,
+) -> Result<ModuleRegistry, ServerModuleConfigError> {
+    let catalog = ServerModuleCatalog::new(config_path, factories)?;
+    validate_configured_modules(config_path, boot_config, &catalog)?;
+    server_registry(
+        config_path,
+        boot_config,
+        &catalog,
+        memory_caps,
+        policy_caps,
+        utterance_sink,
+    )
+}
+
+/// Returns the initial root allocation declared by a runtime configuration.
+pub fn server_initial_allocation(boot_config: &ServerBootConfig) -> ResourceAllocation {
+    full_agent_allocation(boot_config)
+}
+
 struct ServerModuleResources<'a> {
     memory: &'a MemoryCapabilities,
     policy: &'a PolicyCapabilities,

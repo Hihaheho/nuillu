@@ -42,8 +42,8 @@ impl IntoEure for DumpText {
 
 #[derive(Debug, Clone, PartialEq, Serialize, IntoEure)]
 #[eure(crate = ::eure::document, rename_all = "kebab-case")]
-pub struct FullAgentLastStateDump {
-    pub case: FullAgentLastStateCaseDump,
+pub struct RuntimeLastStateDump {
+    pub case: RuntimeLastStateCaseDump,
     pub blackboard: BlackboardLastStateDump,
     pub memory: MemoryLastStateDump,
     pub utterances: Vec<UtteranceDump>,
@@ -51,7 +51,7 @@ pub struct FullAgentLastStateDump {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, IntoEure)]
 #[eure(crate = ::eure::document, rename_all = "kebab-case")]
-pub struct FullAgentLastStateCaseDump {
+pub struct RuntimeLastStateCaseDump {
     pub id: String,
     pub dumped_at: String,
     pub event_count: u64,
@@ -205,8 +205,8 @@ pub enum StateDumpRenderError {
     Edit(#[from] EditError),
 }
 
-pub fn render_full_agent_last_state_eure(
-    dump: FullAgentLastStateDump,
+pub fn render_runtime_last_state_eure(
+    dump: RuntimeLastStateDump,
 ) -> Result<String, StateDumpRenderError> {
     let mut constructor = DocumentConstructor::new();
     constructor.write(dump)?;
@@ -223,8 +223,8 @@ mod tests {
 
     #[test]
     fn renders_last_state_dump_as_parseable_eure() {
-        let dump = FullAgentLastStateDump {
-            case: FullAgentLastStateCaseDump {
+        let dump = RuntimeLastStateDump {
+            case: RuntimeLastStateCaseDump {
                 id: "case-1".to_string(),
                 dumped_at: "2026-05-08T00:00:00Z".to_string(),
                 event_count: 2,
@@ -301,7 +301,7 @@ mod tests {
             }],
         };
 
-        let rendered = render_full_agent_last_state_eure(dump).unwrap();
+        let rendered = render_runtime_last_state_eure(dump).unwrap();
         assert!(rendered.contains("case"));
         assert!(rendered.contains("memory"));
         EditableDocument::parse(&rendered, "last-state.eure").unwrap();

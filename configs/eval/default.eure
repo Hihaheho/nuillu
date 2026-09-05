@@ -1,0 +1,113 @@
+// Compact conversational baseline. Keep intentional baseline changes here;
+// specialized evals should select another named variant instead of growing it.
+activation-table = [1.0, 0.85, 0.7, 0.5, 0.3, 0.0]
+
+@ modules[] {
+  id: sensory
+  replica-min = 1
+  replica-max = 1
+  replica-capacity = 2
+  bpm-min = 20.0
+  bpm-max = 30.0
+  initial-activation = 1.0
+}
+
+@ modules[] {
+  id: cognition-gate
+  replica-min = 1
+  replica-max = 1
+  replica-capacity = 2
+  bpm-min = 20.0
+  bpm-max = 30.0
+  initial-activation = 1.0
+}
+
+@ modules[] {
+  id: allocation
+  replica-min = 1
+  replica-max = 1
+  replica-capacity = 2
+  bpm-min = 10.0
+  bpm-max = 10.0
+  initial-activation = 1.0
+}
+
+@ modules[] {
+  id: action
+  replica-min = 1
+  replica-max = 1
+  replica-capacity = 2
+  bpm-min = 3.0
+  bpm-max = 9.0
+  initial-activation = 0.0
+  groups = ["voluntary", "sleep-suppressed"]
+  depends-on = ["query-memory", "interpreter", "self-model", "cognition-gate"]
+}
+
+@ modules[] {
+  id: attention-schema
+  replica-min = 0
+  replica-max = 1
+  replica-capacity = 2
+  bpm-min = 2.0
+  bpm-max = 5.0
+  initial-activation = 0.0
+  groups = ["voluntary", "sleep-suppressed"]
+}
+
+@ modules[] {
+  id: interpreter
+  replica-min = 0
+  replica-max = 1
+  replica-capacity = 2
+  bpm-min = 1.0
+  bpm-max = 5.0
+  initial-activation = 0.0
+  groups = ["voluntary", "sleep-suppressed"]
+}
+
+@ modules[] {
+  id: self-model
+  replica-min = 0
+  replica-max = 1
+  replica-capacity = 2
+  bpm-min = 1.0
+  bpm-max = 5.0
+  initial-activation = 0.0
+  groups = ["voluntary", "sleep-suppressed"]
+  depends-on = ["query-memory"]
+}
+
+@ modules[] {
+  id: query-memory
+  replica-min = 1
+  replica-max = 1
+  replica-capacity = 2
+  bpm-min = 8.0
+  bpm-max = 15.0
+  initial-activation = 0.0
+  groups = ["voluntary", "sleep-suppressed"]
+}
+
+@ modules[] {
+  id: memory
+  replica-min = 1
+  replica-max = 1
+  replica-capacity = 2
+  bpm-min = 1.0
+  bpm-max = 3.0
+  initial-activation = 0.0
+  groups = []
+}
+
+@ modules[] {
+  id: speak
+  replica-min = 0
+  replica-max = 1
+  replica-capacity = 2
+  bpm-min = 6.0
+  bpm-max = 15.0
+  initial-activation = 0.0
+  groups = ["sleep-suppressed", "action-target"]
+  depends-on = ["query-memory", "interpreter", "self-model", "cognition-gate"]
+}

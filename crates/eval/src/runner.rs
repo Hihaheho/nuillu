@@ -1,6 +1,6 @@
 use std::{
     any::Any,
-    collections::{BTreeMap, BTreeSet, HashSet, VecDeque},
+    collections::{BTreeMap, HashSet, VecDeque},
     fs::{File, OpenOptions},
     io::{self, Write},
     num::NonZeroUsize,
@@ -15,34 +15,34 @@ use std::{
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use chrono::{DateTime, Duration as ChronoDuration, FixedOffset, Utc};
-use futures::{FutureExt as _, StreamExt as _, stream::FuturesUnordered};
+use futures::{FutureExt as _, StreamExt as _, future::LocalBoxFuture, stream::FuturesUnordered};
 use lutum::{LutumHooksSet, ModelInputHookContext, OnModelInput};
 use lutum_eval::{RawTraceSnapshot, TraceSnapshot};
 use lutum_libsql_adapter::{LibsqlAgentStore, LibsqlAgentStoreConfig};
-use nuillu_agent::{AgentEventLoopConfig, run as run_agent};
+use nuillu_agent::{AgentEventLoopConfig, AgentRunController, run_controlled as run_agent};
 use nuillu_blackboard::{
     ActivationRatio, Blackboard, BlackboardCommand, BlackboardInner, Bpm, CognitionLogEntry,
     CognitionLogEntryRecord, CognitionLogOrigin, MemoLogRecord, MemoryMetadata, ModulePolicy,
-    ModuleRunStatus, PolicyMetaPatch, ResourceAllocation, ZeroReplicaWindowPolicy, linear_ratio_fn,
+    ModuleRunStatus, PolicyMetaPatch, ResourceAllocation, ZeroReplicaWindowPolicy,
 };
 use nuillu_memory::{
-    LinkedMemoryQuery, MemoryCapabilities, MemoryLinkDirection, MemoryLinkRelation, MemoryQuery,
-    MemoryRecord, MemoryStore, NewMemoryLink,
+    LinkedMemoryQuery, MemoryCapabilities, MemoryLinkDirection, MemoryLinkRelation,
+    MemoryNamespace, MemoryQuery, MemoryRecord, MemoryStore, NewMemoryLink,
 };
 use nuillu_module::ports::{Clock, CognitionLogRepository, PortError, SystemClock};
 use nuillu_module::{
     AmbientSensoryEntry, CapabilityProviderConfig, CapabilityProviderPorts,
     CapabilityProviderRuntime, CapabilityProviders, CognitionLogUpdated, ExternalActionExecutor,
     ExternalActionInvocation, ExternalActionInvocationResult, InternalHarnessIo,
-    InteroceptionRuntimePolicy, LlmConcurrencyPool, ModuleRegistry, Participant, RuntimeEvent,
-    RuntimeEventSink, RuntimePolicy, SceneRegistry, SensoryInput, SensoryInputMailbox,
-    SensoryModality, SessionCompactionPolicy, apply_standard_dependencies,
+    InteroceptionRuntimePolicy, LlmConcurrencyPool, Participant, RuntimeEvent, RuntimeEventSink,
+    RuntimePolicy, SceneRegistry, SensoryInput, SensoryInputMailbox, SensoryModality,
+    SessionCompactionPolicy,
 };
 use nuillu_reward::{IndexedPolicy, PolicyCapabilities, PolicyRecord, PolicyStore};
-use nuillu_speak::{Utterance, UtteranceDelta, UtteranceSink, UtteranceWriter};
+use nuillu_speak::{Utterance, UtteranceDelta, UtteranceSink};
 use nuillu_types::{
-    MemoryIndex, MemoryRank, ModelTier, ModuleId, ModuleInstanceId, PolicyIndex, PolicyRank,
-    ReplicaCapRange, ReplicaIndex, SignedUnitF32, UnitF32, builtin,
+    MemoryIndex, MemoryRank, ModuleId, ModuleInstanceId, PolicyIndex, PolicyRank, ReplicaCapRange,
+    ReplicaIndex, SignedUnitF32, UnitF32, builtin,
 };
 use nuillu_visualizer_protocol::{
     AllocationView, BlackboardSnapshot, CognitionEntryView, CognitionLogView, InteroceptionView,
@@ -59,35 +59,34 @@ use tokio::task::LocalSet;
 use crate::{
     artifact::CaseArtifact,
     cases::{
-        ActivateAllocation, ArtifactTextField, CaseFileError, Check, DEFAULT_FULL_AGENT_MODULES,
-        EvalCase, EvalInteroceptiveMode, EvalLimits, EvalModule, EvalStep, FullAgentCase,
-        FullAgentInput, MemoryLinkSeed, ModuleCase, ModuleEvalStep, ModuleEvalTarget, PolicySeed,
-        WaitFor, discover_case_files, is_full_agent_case_path, parse_case_file, parse_case_now,
-        parse_memory_datetime, wake_arousal_max_is_set, wake_arousal_min_is_set,
+        ActivateAllocation, ArtifactTextField, Assertion, CaseFileError, EvalCase,
+        EvalInteroceptiveMode, EvalLimits, EvalStep, MemoryLinkSeed, PolicySeed, RuntimeCase,
+        Stimulus, WaitFor, discover_case_files, parse_case_file, parse_case_now,
+        parse_memory_datetime, parse_scope_id, wake_arousal_max_is_set, wake_arousal_min_is_set,
     },
     evaluation::{
-        CaseReport, CaseSummary, CaseTiming, CaseTrialSummary, ModuleActivationRecord,
-        SuiteMetrics, SuiteModelNames, SuiteReport, SuiteRunReport, SuiteTiming,
-        aggregate_trial_timing, artifact_text, build_activation_timeline, evaluate_case,
-        field_label, normalize_text_block, numeric_range_outcome, pointer_number, pointer_text,
+        AssertionOutcome, CaseReport, CaseSummary, CaseTiming, CaseTrialSummary,
+        MeasurementStatistics, ModuleActivationRecord, SuiteMetrics, SuiteModelNames, SuiteReport,
+        SuiteRunReport, SuiteTiming, aggregate_trial_timing, artifact_text,
+        build_activation_timeline, evaluate_assertion, evaluate_case_with_overrides, field_label,
+        normalize_text_block, numeric_range_outcome, pointer_number, pointer_text,
     },
     judge::{LlmRubricJudge, RubricJudge},
     state_dump::{
         AgenticDeadlockDump, AllocationModuleDump, AllocationProposalDump, BlackboardLastStateDump,
-        CognitionEntryDump, CognitionLogDump, DumpText, FullAgentLastStateCaseDump,
-        FullAgentLastStateDump, InteroceptionDump, MemoLogDump, MemoryEntryDump,
-        MemoryLastStateDump, MemoryMetadataDump, ModuleInstanceDump, ReplicaCapDump, UtteranceDump,
-        render_full_agent_last_state_eure,
+        CognitionEntryDump, CognitionLogDump, DumpText, InteroceptionDump, MemoLogDump,
+        MemoryEntryDump, MemoryLastStateDump, MemoryMetadataDump, ModuleInstanceDump,
+        ReplicaCapDump, RuntimeLastStateCaseDump, RuntimeLastStateDump, UtteranceDump,
+        render_runtime_last_state_eure,
     },
     trace_json::{raw_trace_has_error, raw_trace_snapshot_json, trace_snapshot_json},
 };
 
 const IDLE_REPORT_INTERVAL: Duration = Duration::from_secs(30);
-const FULL_AGENT_ACTION_SILENCE_WINDOW: Duration = Duration::from_millis(200);
-const FULL_AGENT_RUNTIME_SILENCE_WINDOW: Duration = Duration::from_millis(200);
-const FULL_AGENT_IDLE_TIMEOUT: Duration = Duration::from_secs(5);
-const FULL_AGENT_STEP_SETTLE_TIMEOUT: Duration = Duration::from_secs(12);
-const EVAL_CASE_TIMEOUT: Duration = Duration::from_secs(60);
+const RUNTIME_ACTION_SILENCE_WINDOW: Duration = Duration::from_millis(200);
+const RUNTIME_SILENCE_WINDOW: Duration = Duration::from_millis(200);
+const RUNTIME_IDLE_TIMEOUT: Duration = Duration::from_secs(5);
+const RUNTIME_STEP_SETTLE_TIMEOUT: Duration = Duration::from_secs(12);
 const EVAL_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const EVAL_MEMO_RETAINED_PER_OWNER: usize = 8;
 const EVAL_COGNITION_LOG_RETAINED_ENTRIES: usize = 16;
@@ -96,7 +95,15 @@ pub use nuillu_server::{
     EmbeddingBackendConfig, LlmBackendConfig, LlmGenerationConfig, model_concurrency_from_backends,
 };
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord)]
+pub enum LiveOutput {
+    Quiet,
+    #[default]
+    Normal,
+    Verbose,
+}
+
+#[derive(Clone)]
 pub struct RunnerConfig {
     pub cases_root: PathBuf,
     pub output_root: PathBuf,
@@ -114,24 +121,13 @@ pub struct RunnerConfig {
     pub model_concurrency: BTreeMap<String, Option<NonZeroUsize>>,
     pub llm_concurrency_pool: LlmConcurrencyPool,
     pub trials: NonZeroUsize,
-    pub full_agent_concurrency: NonZeroUsize,
-    pub module_concurrency: NonZeroUsize,
+    pub case_concurrency: NonZeroUsize,
     pub case_patterns: Vec<String>,
-    pub module_filters: Vec<EvalModule>,
-    pub disabled_modules: Vec<EvalModule>,
-    pub exclude_full_agent: bool,
-    pub full_agent_only: bool,
+    /// Implementations for user-defined module ids referenced by runtime configs.
+    pub module_factories: Vec<Arc<dyn nuillu_server::ServerModuleFactory>>,
+    pub runtime_config_override: Option<PathBuf>,
+    pub live_output: LiveOutput,
 }
-
-/// Modules that may never be disabled via `RunnerConfig::disabled_modules` —
-/// removing them breaks the basic observe → cognize → act/speak pipeline that the
-/// full-agent eval cases assume.
-pub const REQUIRED_FULL_AGENT_MODULES: &[EvalModule] = &[
-    EvalModule::Allocation,
-    EvalModule::Action,
-    EvalModule::Sensory,
-    EvalModule::Speak,
-];
 
 pub struct RunnerHooks {
     pub visualizer: Option<VisualizerHook>,
@@ -330,8 +326,6 @@ pub enum RunnerError {
     TraceSubscriber { message: String },
     #[error("case patterns matched no eval cases: {patterns}")]
     NoCasesMatched { patterns: String },
-    #[error("module filters matched no eval cases: {modules}")]
-    NoModuleCasesMatched { modules: String },
     #[error("failed-only requested but no suite-report.json files were found under {path}")]
     FailedOnlyNoReference { path: PathBuf },
     #[error("failed-only reference report not found at {path}")]
@@ -358,22 +352,15 @@ pub enum RunnerError {
         "failed-only reference case is not present under current cases root: id={id} path={path}"
     )]
     FailedOnlyCaseNotFound { id: String, path: String },
-    #[error("cannot disable required module '{module}'")]
-    DisableRequiredModule { module: &'static str },
-    #[error("module cases are not supported with --gui")]
-    GuiModuleCasesUnsupported,
-    #[error("--gui requires full-agent cases; do not combine with --no-full-agent")]
-    GuiExcludeFullAgent,
     #[error("--gui does not support --trials > 1 (got {trials})")]
     GuiTrialsUnsupported { trials: usize },
-    #[error("--full-agent-only cannot be combined with --no-full-agent")]
-    ConflictingFullAgentFilters,
 }
 
 struct CaseExecution {
     artifact: CaseArtifact,
     events: Vec<RuntimeEvent>,
     activations: Vec<ModuleActivationRecord>,
+    assertion_overrides: BTreeMap<String, AssertionOutcome>,
 }
 
 struct CaseOutputContext<'a> {
@@ -399,29 +386,6 @@ struct CaseIdentity {
     id: String,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum EvalWorkKind {
-    FullAgent,
-    Module,
-}
-
-impl EvalWorkKind {
-    fn for_path(path: &Path) -> Self {
-        if is_full_agent_case_path(path) {
-            Self::FullAgent
-        } else {
-            Self::Module
-        }
-    }
-
-    fn concurrency(self, config: &RunnerConfig) -> usize {
-        match self {
-            Self::FullAgent => config.full_agent_concurrency.get(),
-            Self::Module => config.module_concurrency.get(),
-        }
-    }
-}
-
 #[derive(Debug, Clone)]
 struct EvalWorkItem {
     case_order: usize,
@@ -433,7 +397,6 @@ struct EvalWorkItem {
     runtime_id: String,
     trial_number: usize,
     trial_count: usize,
-    kind: EvalWorkKind,
 }
 
 #[derive(Debug, Clone)]
@@ -465,7 +428,7 @@ pub async fn run_suite(config: &RunnerConfig) -> Result<SuiteReport, RunnerError
 pub(crate) fn visualizer_planned_tabs(
     config: &RunnerConfig,
 ) -> Result<Vec<(VisualizerTabId, String)>, RunnerError> {
-    select_case_paths(config, true)?
+    select_case_paths(config)?
         .case_paths
         .into_iter()
         .map(|path| {
@@ -482,16 +445,12 @@ pub async fn run_suite_with_hooks(
 ) -> Result<SuiteReport, RunnerError> {
     let suite_started = Instant::now();
     install_trace_subscriber_for_runner()?;
-    validate_disabled_modules(&config.disabled_modules)?;
     if hooks.visualizer.is_some() && config.trials.get() > 1 {
         return Err(RunnerError::GuiTrialsUnsupported {
             trials: config.trials.get(),
         });
     }
-    if hooks.visualizer.is_some() && config.exclude_full_agent {
-        return Err(RunnerError::GuiExcludeFullAgent);
-    }
-    let selection = select_case_paths(config, hooks.visualizer.is_some())?;
+    let selection = select_case_paths(config)?;
     let case_paths = selection.case_paths;
     let run_dir = config.output_root.join(&config.run_id);
     let planned_case_count = case_paths.len();
@@ -506,12 +465,11 @@ pub async fn run_suite_with_hooks(
         source,
     })?;
     eprintln!(
-        "🚀 eval suite start run={} cases={} trials={} full_agent_concurrency={} module_concurrency={} output={}",
+        "🚀 eval suite start run={} cases={} trials={} concurrency={} output={}",
         config.run_id,
         case_paths.len(),
         config.trials.get(),
-        config.full_agent_concurrency.get(),
-        config.module_concurrency.get(),
+        config.case_concurrency.get(),
         run_dir.display()
     );
 
@@ -569,6 +527,10 @@ fn suite_run_report(
         cases_root: config.cases_root.display().to_string(),
         output_dir: run_dir.display().to_string(),
         case_patterns: config.case_patterns.clone(),
+        runtime_config_override: config
+            .runtime_config_override
+            .as_ref()
+            .map(|path| path.display().to_string()),
         failed_only: failed_only_requested(config),
         failed_from: failed_from.map(|path| path.display().to_string()),
         fail_fast: config.fail_fast,
@@ -578,8 +540,7 @@ fn suite_run_report(
             .map(|(model, limit)| (model.clone(), limit.map(NonZeroUsize::get)))
             .collect(),
         trials: config.trials.get(),
-        full_agent_concurrency: config.full_agent_concurrency.get(),
-        module_concurrency: config.module_concurrency.get(),
+        case_concurrency: config.case_concurrency.get(),
         planned_case_count,
         models: SuiteModelNames {
             judge: config.judge_backend.model.clone(),
@@ -588,18 +549,6 @@ fn suite_run_report(
             premium: config.premium_backend.model.clone(),
             image: config.image_backend.model.clone(),
         },
-        module_filters: config
-            .module_filters
-            .iter()
-            .map(|module| module.as_str().to_string())
-            .collect(),
-        disabled_modules: config
-            .disabled_modules
-            .iter()
-            .map(|module| module.as_str().to_string())
-            .collect(),
-        exclude_full_agent: config.exclude_full_agent,
-        full_agent_only: config.full_agent_only,
     }
 }
 
@@ -634,37 +583,18 @@ async fn run_suite_cases_parallel(
     judge: Option<&dyn RubricJudge>,
 ) -> Result<Vec<CaseSummary>, RunnerError> {
     let items = plan_eval_work_items(case_paths, config)?;
-    let mut pending_full_agent = VecDeque::new();
-    let mut pending_module = VecDeque::new();
-    for item in items {
-        match item.kind {
-            EvalWorkKind::FullAgent => pending_full_agent.push_back(item),
-            EvalWorkKind::Module => pending_module.push_back(item),
-        }
-    }
-
-    let full_agent_limit = (EvalWorkKind::FullAgent).concurrency(config);
-    let module_limit = (EvalWorkKind::Module).concurrency(config);
-    let mut running_full_agent = 0usize;
-    let mut running_module = 0usize;
+    let mut pending = VecDeque::from(items);
+    let concurrency = config.case_concurrency.get();
     let mut stop_launching = false;
     let mut running = FuturesUnordered::new();
     let mut outputs = Vec::new();
 
     loop {
         if !stop_launching {
-            while running_full_agent < full_agent_limit {
-                let Some(item) = pending_full_agent.pop_front() else {
+            while running.len() < concurrency {
+                let Some(item) = pending.pop_front() else {
                     break;
                 };
-                running_full_agent += 1;
-                running.push(run_eval_work_item(item, config, judge));
-            }
-            while running_module < module_limit {
-                let Some(item) = pending_module.pop_front() else {
-                    break;
-                };
-                running_module += 1;
                 running.push(run_eval_work_item(item, config, judge));
             }
         }
@@ -673,10 +603,6 @@ async fn run_suite_cases_parallel(
             break;
         };
         let output = output?;
-        match output.item.kind {
-            EvalWorkKind::FullAgent => running_full_agent = running_full_agent.saturating_sub(1),
-            EvalWorkKind::Module => running_module = running_module.saturating_sub(1),
-        }
         if config.fail_fast && (!output.output.summary.passed || output.output.summary.invalid) {
             stop_launching = true;
         }
@@ -692,9 +618,8 @@ async fn run_eval_work_item(
     judge: Option<&dyn RubricJudge>,
 ) -> Result<EvalWorkOutput, RunnerError> {
     let started_at = Instant::now();
-    let reporter = LiveReporter::new(&config.run_id, &item.output_dir)?;
+    let reporter = LiveReporter::new(&config.run_id, &item.output_dir, config.live_output)?;
     let mut hooks = RunnerHooks::none();
-    eprintln!("\n────────────────────────────────────────────────────────────");
     if item.trial_count == 1 {
         reporter.emit(
             Some(&item.id),
@@ -824,16 +749,11 @@ pub async fn run_case_detailed(
     judge: Option<&dyn RubricJudge>,
 ) -> Result<CaseRunOutput, RunnerError> {
     install_trace_subscriber_for_runner()?;
-    validate_disabled_modules(&config.disabled_modules)?;
     let mut hooks = RunnerHooks::none();
     run_case_detailed_sequential(case_path, config, judge, &mut hooks).await
 }
 
-fn select_case_paths(config: &RunnerConfig, gui_only: bool) -> Result<CaseSelection, RunnerError> {
-    if config.exclude_full_agent && config.full_agent_only {
-        return Err(RunnerError::ConflictingFullAgentFilters);
-    }
-
+fn select_case_paths(config: &RunnerConfig) -> Result<CaseSelection, RunnerError> {
     let failed_from = resolve_failed_only_reference(config)?;
     let failed_cases = failed_from
         .as_ref()
@@ -856,18 +776,6 @@ fn select_case_paths(config: &RunnerConfig, gui_only: bool) -> Result<CaseSelect
     }
     if !case_paths.is_empty() || failed_from.is_none() {
         case_paths = filter_case_paths(case_paths, &config.case_patterns)?;
-    }
-    if !case_paths.is_empty() || failed_from.is_none() {
-        case_paths = filter_exclude_full_agent_case_paths(case_paths, config.exclude_full_agent);
-    }
-    if !case_paths.is_empty() || failed_from.is_none() {
-        case_paths = filter_full_agent_only_case_paths(case_paths, config.full_agent_only);
-    }
-    if !case_paths.is_empty() || failed_from.is_none() {
-        case_paths = filter_module_case_paths(case_paths, &config.module_filters)?;
-    }
-    if gui_only && (!case_paths.is_empty() || failed_from.is_none()) {
-        case_paths = filter_gui_case_paths(case_paths)?;
     }
     Ok(CaseSelection {
         case_paths,
@@ -1068,79 +976,6 @@ fn filter_case_paths(
     Ok(matched)
 }
 
-fn filter_exclude_full_agent_case_paths(case_paths: Vec<PathBuf>, exclude: bool) -> Vec<PathBuf> {
-    if !exclude {
-        return case_paths;
-    }
-    case_paths
-        .into_iter()
-        .filter(|path| !is_full_agent_case_path(path))
-        .collect()
-}
-
-fn filter_full_agent_only_case_paths(
-    case_paths: Vec<PathBuf>,
-    full_agent_only: bool,
-) -> Vec<PathBuf> {
-    if !full_agent_only {
-        return case_paths;
-    }
-    case_paths
-        .into_iter()
-        .filter(|path| is_full_agent_case_path(path))
-        .collect()
-}
-
-fn filter_module_case_paths(
-    case_paths: Vec<PathBuf>,
-    modules: &[EvalModule],
-) -> Result<Vec<PathBuf>, RunnerError> {
-    if modules.is_empty() {
-        return Ok(case_paths);
-    }
-
-    let filters = modules.iter().copied().collect::<HashSet<_>>();
-    let mut matched = Vec::new();
-    for path in case_paths {
-        let case = parse_case_file(&path)?;
-        if case_matches_module_filter(&case, &filters) {
-            matched.push(path);
-        }
-    }
-
-    if matched.is_empty() {
-        return Err(RunnerError::NoModuleCasesMatched {
-            modules: modules
-                .iter()
-                .map(|module| module.as_str())
-                .collect::<Vec<_>>()
-                .join(", "),
-        });
-    }
-    Ok(matched)
-}
-
-fn case_matches_module_filter(case: &EvalCase, modules: &HashSet<EvalModule>) -> bool {
-    match case {
-        EvalCase::FullAgent(case) => case
-            .effective_modules()
-            .iter()
-            .any(|module| modules.contains(module)),
-        EvalCase::Module { target, .. } => modules.contains(&target.module()),
-    }
-}
-
-fn filter_gui_case_paths(case_paths: Vec<PathBuf>) -> Result<Vec<PathBuf>, RunnerError> {
-    let full_agent_paths = case_paths
-        .into_iter()
-        .filter(|path| is_full_agent_case_path(path))
-        .collect::<Vec<_>>();
-    if full_agent_paths.is_empty() {
-        return Err(RunnerError::GuiModuleCasesUnsupported);
-    }
-    Ok(full_agent_paths)
-}
-
 fn plan_eval_work_items(
     case_paths: Vec<PathBuf>,
     config: &RunnerConfig,
@@ -1148,13 +983,13 @@ fn plan_eval_work_items(
     let trial_count = config.trials.get();
     let mut items = Vec::with_capacity(case_paths.len().saturating_mul(trial_count));
     for (case_order, case_path) in case_paths.into_iter().enumerate() {
-        let case = parse_case_file(&case_path)?;
+        let mut case = parse_case_file(&case_path)?;
+        apply_runtime_config_override(&mut case, config);
         let id = case_id(&case_path, &case);
         let case_output_dir = config
             .output_root
             .join(&config.run_id)
             .join(sanitize_id(&id));
-        let kind = EvalWorkKind::for_path(&case_path);
         for trial_number in 1..=trial_count {
             let output_dir = if trial_count == 1 {
                 case_output_dir.clone()
@@ -1176,7 +1011,6 @@ fn plan_eval_work_items(
                 runtime_id,
                 trial_number,
                 trial_count,
-                kind,
             });
         }
     }
@@ -1200,7 +1034,8 @@ async fn run_case_detailed_sequential(
     judge: Option<&dyn RubricJudge>,
     hooks: &mut RunnerHooks,
 ) -> Result<CaseRunOutput, RunnerError> {
-    let case = parse_case_file(case_path)?;
+    let mut case = parse_case_file(case_path)?;
+    apply_runtime_config_override(&mut case, config);
     let id = case_id(case_path, &case);
     let output_dir = config
         .output_root
@@ -1210,13 +1045,12 @@ async fn run_case_detailed_sequential(
         path: output_dir.clone(),
         source,
     })?;
-    eprintln!("\n────────────────────────────────────────────────────────────");
     emit_visualizer_open_tab(hooks, &id);
 
     let trial_count = config.trials.get();
     let case_started = Instant::now();
     if trial_count == 1 {
-        let reporter = LiveReporter::new(&config.run_id, &output_dir)?;
+        let reporter = LiveReporter::new(&config.run_id, &output_dir, config.live_output)?;
         reporter.emit(
             Some(&id),
             "case_started",
@@ -1255,7 +1089,7 @@ async fn run_case_detailed_sequential(
     for trial_number in 1..=trial_count {
         let runtime_id = trial_runtime_id(&id, trial_number);
         let trial_output_dir = output_dir.join(trial_dir_name(trial_number));
-        let reporter = LiveReporter::new(&config.run_id, &trial_output_dir)?;
+        let reporter = LiveReporter::new(&config.run_id, &trial_output_dir, config.live_output)?;
         reporter.emit(
             Some(&runtime_id),
             "trial_started",
@@ -1332,6 +1166,14 @@ async fn run_case_detailed_sequential(
     })
 }
 
+fn apply_runtime_config_override(case: &mut EvalCase, config: &RunnerConfig) {
+    let Some(path) = &config.runtime_config_override else {
+        return;
+    };
+    let EvalCase::Runtime(case) = case;
+    case.runtime_config = path.display().to_string();
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_case_trial_with_timeout(
     case_path: &Path,
@@ -1351,8 +1193,9 @@ async fn run_case_trial_with_timeout(
     })?;
 
     let started = Instant::now();
+    let case_timeout = Duration::from_millis(case.limits().timeout_ms);
     let output = match tokio::time::timeout(
-        EVAL_CASE_TIMEOUT,
+        case_timeout,
         run_case_detailed_body(
             case_path,
             config,
@@ -1370,7 +1213,7 @@ async fn run_case_trial_with_timeout(
     {
         Ok(result) => result?,
         Err(_) => {
-            let message = format!("eval case timed out after {}s", EVAL_CASE_TIMEOUT.as_secs());
+            let message = format!("eval case timed out after {}ms", case_timeout.as_millis());
             emit_visualizer_error(
                 hooks,
                 runtime_id,
@@ -1430,7 +1273,7 @@ async fn run_case_detailed_body(
     let local = LocalSet::new();
     let capture = lutum_trace::capture_raw(
         AssertUnwindSafe(execute_case(
-            case, config, output_dir, runtime_id, reporter, hooks,
+            case, config, output_dir, runtime_id, reporter, hooks, judge,
         ))
         .catch_unwind(),
     );
@@ -1441,7 +1284,7 @@ async fn run_case_detailed_body(
     let execution = match collected.output {
         Ok(Ok(execution)) => execution,
         Ok(Err(error)) => {
-            let message = error.to_string();
+            let message = format!("{error:#}");
             emit_visualizer_error(
                 hooks,
                 runtime_id,
@@ -1501,7 +1344,14 @@ async fn run_case_detailed_body(
     let artifact = execution.artifact;
     let events = execution.events;
     let activations = execution.activations;
-    let report = evaluate_case(case, &trace, &artifact, judge).await;
+    let report = evaluate_case_with_overrides(
+        case,
+        &trace,
+        &artifact,
+        judge,
+        &execution.assertion_overrides,
+    )
+    .await;
     let summary = case_summary_from_report(
         case_path,
         case,
@@ -1555,8 +1405,8 @@ fn write_runtime_failure_case_output(
     let report = CaseReport {
         runtime_failure: Some(message.clone()),
         llm_log_directory: llm_log_directory.clone(),
-        checks: Vec::new(),
-        modules_checks: Vec::new(),
+        assertions: Vec::new(),
+        measurements: BTreeMap::new(),
         invalid: true,
         must_pass_ok: false,
         weighted_points_earned: 0,
@@ -1620,10 +1470,12 @@ fn case_summary_from_report(
     let invalid = report.invalid;
     let score = report.score;
     let timing = CaseTiming { elapsed_ms: 0 };
+    let measurement_statistics = measurement_statistics(std::iter::once(&report));
     let trial = CaseTrialSummary {
         trial: trial_number,
         output_dir: output_dir.display().to_string(),
         path: case_path.display().to_string(),
+        runtime_config: case.runtime().runtime_config.clone(),
         id: id.to_string(),
         description: description.clone(),
         passed,
@@ -1635,6 +1487,7 @@ fn case_summary_from_report(
 
     CaseSummary {
         path: case_path.display().to_string(),
+        runtime_config: case.runtime().runtime_config.clone(),
         id: id.to_string(),
         description,
         passed,
@@ -1644,6 +1497,7 @@ fn case_summary_from_report(
         timing,
         trial_timing: None,
         activations,
+        measurement_statistics,
         trial_count: 1,
         passed_trials: usize::from(passed),
         failed_trials: usize::from(!passed && !invalid),
@@ -1695,6 +1549,7 @@ fn aggregate_case_summary(
                     trial: index + 1,
                     output_dir: output.output_dir.display().to_string(),
                     path: output.summary.path.clone(),
+                    runtime_config: output.summary.runtime_config.clone(),
                     id: output.summary.id.clone(),
                     description: output.summary.description.clone(),
                     passed: output.summary.passed,
@@ -1709,6 +1564,7 @@ fn aggregate_case_summary(
 
     CaseSummary {
         path: case_path.display().to_string(),
+        runtime_config: case.runtime().runtime_config.clone(),
         id: id.to_string(),
         description,
         passed,
@@ -1718,6 +1574,9 @@ fn aggregate_case_summary(
         timing: CaseTiming { elapsed_ms },
         trial_timing,
         activations: Vec::new(),
+        measurement_statistics: measurement_statistics(
+            trial_outputs.iter().map(|output| &output.summary.report),
+        ),
         trial_count,
         passed_trials,
         failed_trials,
@@ -1744,14 +1603,117 @@ fn aggregate_case_report(
             )
         }),
         llm_log_directory: None,
-        checks: Vec::new(),
-        modules_checks: Vec::new(),
+        assertions: Vec::new(),
+        measurements: aggregate_measurements(trial_outputs),
         invalid,
         must_pass_ok: passed,
         weighted_points_earned: 0,
         weighted_points_total: 0,
         score,
     }
+}
+
+fn aggregate_measurements(
+    trial_outputs: &[CaseRunOutput],
+) -> BTreeMap<String, crate::measure::MeasurementValue> {
+    use crate::measure::MeasurementValue;
+
+    let mut scalar_values = BTreeMap::<String, Vec<f64>>::new();
+    let mut scoped_values = BTreeMap::<String, BTreeMap<String, Vec<f64>>>::new();
+    for output in trial_outputs {
+        for (name, value) in &output.summary.report.measurements {
+            match value {
+                MeasurementValue::Scalar(Some(value)) if value.is_finite() => {
+                    scalar_values.entry(name.clone()).or_default().push(*value);
+                }
+                MeasurementValue::ByScope(values) => {
+                    let entry = scoped_values.entry(name.clone()).or_default();
+                    for (scope, value) in values {
+                        if value.is_finite() {
+                            entry.entry(scope.clone()).or_default().push(*value);
+                        }
+                    }
+                }
+                MeasurementValue::Scalar(_) => {}
+            }
+        }
+    }
+    let mut aggregated = scalar_values
+        .into_iter()
+        .map(|(name, values)| (name, MeasurementValue::Scalar(Some(mean(&values)))))
+        .collect::<BTreeMap<_, _>>();
+    for (name, scopes) in scoped_values {
+        aggregated.insert(
+            name,
+            MeasurementValue::ByScope(
+                scopes
+                    .into_iter()
+                    .map(|(scope, values)| (scope, mean(&values)))
+                    .collect(),
+            ),
+        );
+    }
+    aggregated
+}
+
+fn mean(values: &[f64]) -> f64 {
+    values.iter().sum::<f64>() / values.len() as f64
+}
+
+fn measurement_statistics<'a>(
+    reports: impl IntoIterator<Item = &'a CaseReport>,
+) -> BTreeMap<String, MeasurementStatistics> {
+    use crate::measure::MeasurementValue;
+
+    let mut samples = BTreeMap::<String, Vec<f64>>::new();
+    for report in reports {
+        for (name, value) in &report.measurements {
+            match value {
+                MeasurementValue::Scalar(Some(value)) if value.is_finite() => {
+                    samples.entry(name.clone()).or_default().push(*value);
+                }
+                MeasurementValue::ByScope(scopes) => {
+                    for (scope, value) in scopes {
+                        if value.is_finite() {
+                            samples
+                                .entry(format!("{name}@{scope}"))
+                                .or_default()
+                                .push(*value);
+                        }
+                    }
+                }
+                MeasurementValue::Scalar(_) => {}
+            }
+        }
+    }
+    samples
+        .into_iter()
+        .map(|(name, mut values)| {
+            values.sort_by(f64::total_cmp);
+            let mean = mean(&values);
+            let variance = values
+                .iter()
+                .map(|value| (value - mean).powi(2))
+                .sum::<f64>()
+                / values.len() as f64;
+            let percentile = |fraction: f64| {
+                let index = ((values.len() - 1) as f64 * fraction).ceil() as usize;
+                values[index]
+            };
+            (
+                name,
+                MeasurementStatistics {
+                    samples: values.len(),
+                    min: values[0],
+                    max: values[values.len() - 1],
+                    mean,
+                    standard_deviation: variance.sqrt(),
+                    p50: percentile(0.50),
+                    p95: percentile(0.95),
+                },
+            )
+        })
+        .collect()
 }
 
 fn case_description(case: &EvalCase) -> Option<String> {
@@ -1940,34 +1902,65 @@ async fn execute_case(
     case_id: &str,
     reporter: &LiveReporter,
     hooks: &mut RunnerHooks,
+    judge: Option<&dyn RubricJudge>,
 ) -> Result<CaseExecution> {
-    match case {
-        EvalCase::FullAgent(case) => {
-            execute_full_agent_case(case, config, output_dir, case_id, reporter, hooks).await
-        }
-        EvalCase::Module { target, case } => {
-            execute_module_case(*target, case, config, output_dir, case_id, reporter, hooks).await
-        }
-    }
+    let EvalCase::Runtime(case) = case;
+    execute_runtime_case(case, config, output_dir, case_id, reporter, hooks, judge).await
 }
 
-async fn execute_full_agent_case(
-    case: &FullAgentCase,
+async fn execute_runtime_case(
+    case: &RuntimeCase,
     config: &RunnerConfig,
     output_dir: &Path,
     case_id: &str,
     reporter: &LiveReporter,
     hooks: &mut RunnerHooks,
+    judge: Option<&dyn RubricJudge>,
 ) -> Result<CaseExecution> {
-    let case_modules = full_agent_case_modules(case, &config.disabled_modules);
+    let runtime_config_path = PathBuf::from(&case.runtime_config);
+    let runtime_config_content = std::fs::read_to_string(&runtime_config_path)
+        .with_context(|| format!("read runtime config {}", runtime_config_path.display()))?;
+    let boot_config = nuillu_server::parse_server_boot_config_content(
+        &runtime_config_content,
+        &runtime_config_path,
+    )?;
+    let case_modules = boot_config
+        .active_modules()
+        .into_iter()
+        .chain(
+            boot_config
+                .expanded_subsystems()
+                .into_iter()
+                .flat_map(|expanded| {
+                    expanded
+                        .definition
+                        .modules
+                        .iter()
+                        .map(nuillu_server::ServerModuleSpec::module_id)
+                        .collect::<Vec<_>>()
+                }),
+        )
+        .collect::<Vec<_>>();
+    for activation in &case.activate_allocation {
+        anyhow::ensure!(
+            case_modules.contains(&activation.module.module_id()),
+            "activate-allocation module {:?} is absent from runtime config {}",
+            activation.module.as_str(),
+            runtime_config_path.display()
+        );
+    }
     let gui_deferred_start = hooks.visualizer.is_some();
     let case_now = parse_case_now(case.now.as_deref())
         .map_err(anyhow::Error::msg)
-        .context("parse full-agent case now")?;
+        .context("parse runtime case now")?;
     let mut allocation = if gui_deferred_start {
-        full_agent_gui_initial_allocation(&case.limits, &case_modules)
+        let mut allocation = nuillu_server::server_initial_allocation(&boot_config);
+        for module in &case_modules {
+            allocation.set_activation(module.clone(), ActivationRatio::ZERO);
+        }
+        allocation
     } else {
-        full_agent_allocation(&case.limits, &case_modules)
+        nuillu_server::server_initial_allocation(&boot_config)
     };
     if !gui_deferred_start && !case.activate_allocation.is_empty() {
         apply_case_activation_allocation(&mut allocation, &case.activate_allocation);
@@ -1977,19 +1970,24 @@ async fn execute_full_agent_case(
         config,
         allocation,
         &case.limits,
-        action_module_ids(&case_modules),
+        case_modules.clone(),
         case_now,
         &case.memories,
-        &[],
-        &[],
+        &case.memory_links,
+        &case.policies,
         case_id,
         reporter,
         hooks.visualizer.as_ref().map(VisualizerHook::event_sender),
     )
     .await?;
+    let timeline_runtime_origin_ms = env.events.elapsed_ms();
+    let timeline_started_at = env.clock.now();
     seed_eval_scene_participants(env.caps.scene(), &case.participants);
     let memory_baseline = memory_snapshot(env.memory.as_ref()).await?;
-    let _ = seed_memos(&env.blackboard, env.clock.as_ref(), &case.memos, false).await?;
+    let memo_seed_records =
+        seed_memos(&env.blackboard, env.clock.as_ref(), &case.memos, false).await?;
+    let cognition_seed_records =
+        seed_cognition_log(&env.blackboard, env.clock.as_ref(), &case.cognition_log).await;
     if let Some(visualizer) = hooks.visualizer.as_mut() {
         emit_visualizer_blackboard_snapshot(case_id, &env.blackboard, Some(visualizer)).await;
         emit_visualizer_memory_records(
@@ -2010,6 +2008,7 @@ async fn execute_full_agent_case(
     let sensory = host.sensory_input_mailbox();
     let inputs = case.inputs.clone();
     let steps = case.steps.clone();
+    let eval_case = EvalCase::Runtime(case.clone());
     let step_driven_case = !case.steps.is_empty();
     let activate_allocation = case.activate_allocation.clone();
     let actions = env.actions.clone();
@@ -2024,26 +2023,32 @@ async fn execute_full_agent_case(
         AllocationChangeReporter::new(case_id.to_string(), reporter.clone());
     let live_reporter = reporter.clone();
     let case_id_for_idle = case_id.to_string();
-    let modules = eval_registry(
-        &case_modules,
+    let modules = nuillu_server::server_registry_with_factories(
+        &runtime_config_path,
+        &boot_config,
+        &config.module_factories,
         &env.memory_caps,
         &env.policy_caps,
         &env.utterance_sink,
-        if gui_deferred_start {
-            ReplicaHardCap::V1Max
-        } else {
-            ReplicaHardCap::PolicyMax
-        },
-    )
+    )?
     .build(&env.caps)
     .await?;
     let mut visualizer = hooks.visualizer.as_mut();
     let step_failure: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
     let step_outcomes: Arc<Mutex<Vec<serde_json::Value>>> = Arc::new(Mutex::new(Vec::new()));
+    let assertion_overrides: Arc<Mutex<BTreeMap<String, AssertionOutcome>>> =
+        Arc::new(Mutex::new(BTreeMap::new()));
+    let terminal_output: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
     let step_failure_for_loop = step_failure.clone();
     let step_outcomes_for_loop = step_outcomes.clone();
+    let assertion_overrides_for_loop = assertion_overrides.clone();
+    let terminal_output_for_loop = terminal_output.clone();
     let live_reporter_for_loop = live_reporter.clone();
+    let harness = env.caps.internal_harness_io();
+    let setup_memos_for_loop = memo_seed_records.clone();
+    let setup_cognition_for_loop = cognition_seed_records.clone();
 
+    let (run_controller, run_control) = AgentRunController::new();
     run_agent(
         modules,
         AgentEventLoopConfig {
@@ -2052,8 +2057,15 @@ async fn execute_full_agent_case(
             dependency_idle_timeout: Duration::from_secs(2),
             dependency_hard_timeout: Duration::from_secs(10),
         },
+        run_control,
         async move {
             if !gui_deferred_start {
+                publish_setup_updates(
+                    &harness,
+                    &setup_memos_for_loop,
+                    &setup_cognition_for_loop,
+                )
+                .await;
                 let _ = allocation_reporter
                     .emit_if_changed(&allocation_blackboard)
                     .await;
@@ -2072,12 +2084,21 @@ async fn execute_full_agent_case(
                     &inputs,
                     &steps,
                     &sensory,
+                    &harness,
                     &allocation_blackboard,
                     utterances.as_ref(),
                     events.as_ref(),
                     clock.as_ref(),
                     visualizer.as_deref(),
                     &live_reporter_for_loop,
+                    &run_controller,
+                    &eval_case,
+                    judge,
+                    memory.as_ref(),
+                    timeline_runtime_origin_ms,
+                    timeline_started_at,
+                    &assertion_overrides_for_loop,
+                    &terminal_output_for_loop,
                     &step_failure_for_loop,
                     &step_outcomes_for_loop,
                 )
@@ -2086,7 +2107,7 @@ async fn execute_full_agent_case(
             }
 
             let initial_progress_count = events.progress_event_count();
-            let mut settle = FullAgentSettleTracker::new(initial_progress_count, Instant::now());
+            let mut settle = RuntimeSettleTracker::new(initial_progress_count, Instant::now());
             let mut last_progress_count = initial_progress_count;
             let mut idle_ticks = 0_u64;
             let poll_ms = duration_millis_u64(EVAL_POLL_INTERVAL);
@@ -2096,7 +2117,7 @@ async fn execute_full_agent_case(
                 let now = Instant::now();
                 settle.observe_progress_count(events.progress_event_count(), now);
                 if events.stop_requested()
-                    || full_agent_ready_to_score_at(
+                    || runtime_ready_to_score_at(
                         &actions,
                         &settle,
                         events.llm_in_flight_count(),
@@ -2139,12 +2160,21 @@ async fn execute_full_agent_case(
                             &inputs,
                             &steps,
                             &sensory,
+                            &harness,
                             &allocation_blackboard,
                             utterances.as_ref(),
                             events.as_ref(),
                             clock.as_ref(),
                             Some(visualizer),
                             &live_reporter_for_loop,
+                            &run_controller,
+                            &eval_case,
+                            judge,
+                            memory.as_ref(),
+                            timeline_runtime_origin_ms,
+                            timeline_started_at,
+                            &assertion_overrides_for_loop,
+                            &terminal_output_for_loop,
                             &step_failure_for_loop,
                             &step_outcomes_for_loop,
                         )
@@ -2204,9 +2234,9 @@ async fn execute_full_agent_case(
                                 case_id_for_idle, idle_for_ms, progress_count, llm_in_flight, event_count, active_summary
                             ),
                         )
-                        .expect("full-agent eval failed to write idle event");
+                        .expect("runtime eval failed to write idle event");
                 }
-                if idle_for_ms >= duration_millis_u64(FULL_AGENT_IDLE_TIMEOUT) {
+                if idle_for_ms >= duration_millis_u64(RUNTIME_IDLE_TIMEOUT) {
                     let seconds = idle_for_ms / 1000;
                     let event_snapshot = events.snapshot();
                     let active_modules =
@@ -2233,17 +2263,32 @@ async fn execute_full_agent_case(
         .lock()
         .expect("step outcomes mutex poisoned")
         .clone();
+    let recorded_assertion_overrides = assertion_overrides
+        .lock()
+        .expect("assertion override mutex poisoned")
+        .clone();
+    let selected_terminal_output = terminal_output
+        .lock()
+        .expect("terminal output mutex poisoned")
+        .clone();
     let steps_ok = step_driven_case && step_outcomes_all_ok(&recorded_step_outcomes);
+    let output = configured_runtime_output(
+        &env.blackboard,
+        &env.utterances,
+        selected_terminal_output.as_deref(),
+        case.steps.last().filter(|step| step.terminal),
+        &memory_baseline,
+        env.memory.as_ref(),
+        &memo_seed_records,
+        &cognition_seed_records,
+    )
+    .await;
     let mut artifact = if let Some(failure) = step_failure_message {
         let mut artifact = CaseArtifact::failed(failure);
-        if let Some(utterance) = env.utterances.last_complete() {
-            artifact.output = utterance.text;
-        }
+        artifact.output = output;
         artifact
-    } else if let Some(utterance) = env.utterances.last_complete() {
-        CaseArtifact::new(utterance.text)
-    } else if case.allow_empty_output || steps_ok {
-        CaseArtifact::new(String::new())
+    } else if !output.is_empty() || case.allow_empty_output || steps_ok {
+        CaseArtifact::new(output)
     } else if env.events.stop_requested() {
         CaseArtifact::failed("stopped after max-llm-calls")
     } else {
@@ -2258,7 +2303,25 @@ async fn execute_full_agent_case(
         );
     }
     let events = env.events.snapshot();
-    let last_state = build_full_agent_last_state_dump(
+    let timeline = build_eval_timeline(
+        &env.blackboard,
+        &env.utterances,
+        &env.events,
+        timeline_runtime_origin_ms,
+        timeline_started_at,
+    )
+    .await;
+    let measurements = crate::measure::evaluate_declared(&timeline, &case.measurements);
+    artifact.observations.insert(
+        "timeline".to_string(),
+        serde_json::to_value(&timeline).context("serialize eval timeline")?,
+    );
+    artifact.observations.insert(
+        "measurements".to_string(),
+        serde_json::to_value(&measurements).context("serialize eval measurements")?,
+    );
+    write_timeline_jsonl(output_dir, &timeline)?;
+    let last_state = build_runtime_last_state_dump(
         case_id,
         &artifact,
         &env.blackboard,
@@ -2268,7 +2331,7 @@ async fn execute_full_agent_case(
     )
     .await?;
     add_last_state_observation(&mut artifact, &last_state)?;
-    write_full_agent_last_state_eure(output_dir, last_state)?;
+    write_runtime_last_state_eure(output_dir, last_state)?;
     if let Some(visualizer) = hooks.visualizer.as_mut() {
         emit_visualizer_blackboard_snapshot(case_id, &env.blackboard, Some(visualizer)).await;
         emit_visualizer_memory_records(
@@ -2285,7 +2348,185 @@ async fn execute_full_agent_case(
         artifact,
         events,
         activations: env.events.activation_timeline(),
+        assertion_overrides: recorded_assertion_overrides,
     })
+}
+
+async fn build_eval_timeline(
+    blackboard: &Blackboard,
+    utterances: &RecordingUtteranceSink,
+    events: &RecordingRuntimeEventSink,
+    runtime_origin_ms: u64,
+    started_at: DateTime<Utc>,
+) -> Vec<crate::timeline::EvalEvent> {
+    use crate::timeline::{EvalEvent, EvalEventPayload};
+
+    let mut timeline = crate::timeline::project_runtime_timeline(&events.timed_snapshot());
+    for event in &mut timeline {
+        event.offset_ms = event.offset_ms.saturating_sub(runtime_origin_ms);
+    }
+    timeline.extend(events.eval_event_snapshot().into_iter().map(|mut event| {
+        event.offset_ms = event.offset_ms.saturating_sub(runtime_origin_ms);
+        event
+    }));
+
+    let (memos, cognition_logs) = blackboard
+        .read(|bb| {
+            (
+                bb.recent_memo_logs(),
+                bb.cognition_log_set().logs().to_vec(),
+            )
+        })
+        .await;
+    timeline.extend(memos.into_iter().map(|record| EvalEvent {
+        sequence: 0,
+        offset_ms: datetime_offset_ms(started_at, record.written_at),
+        scope: record.owner.scope,
+        module: record.owner.module,
+        replica: record.owner.replica.get(),
+        step: None,
+        payload: EvalEventPayload::MemoWritten {
+            cognitive: record.cognitive,
+            content: record.content,
+        },
+    }));
+    for log in cognition_logs {
+        for entry in log.entries {
+            timeline.push(EvalEvent {
+                sequence: 0,
+                offset_ms: datetime_offset_ms(started_at, entry.at),
+                scope: log.source.scope.clone(),
+                module: log.source.module.clone(),
+                replica: log.source.replica.get(),
+                step: None,
+                payload: EvalEventPayload::CognitionAppended {
+                    content: entry.text,
+                    origin: entry.origin.owner.to_string(),
+                },
+            });
+        }
+    }
+    for utterance in utterances.snapshot() {
+        let emitted_at = DateTime::parse_from_rfc3339(&utterance.emitted_at)
+            .map(|value| value.with_timezone(&Utc))
+            .unwrap_or(started_at);
+        timeline.push(EvalEvent {
+            sequence: 0,
+            offset_ms: datetime_offset_ms(started_at, emitted_at),
+            scope: parse_scope_id(&utterance.scope).unwrap_or_default(),
+            module: ModuleId::new(utterance.module).expect("utterance sender module is valid"),
+            replica: utterance.replica,
+            step: None,
+            payload: EvalEventPayload::UtteranceCompleted {
+                target: utterance.target,
+                content: utterance.text,
+            },
+        });
+    }
+
+    timeline.sort_by(|left, right| {
+        left.offset_ms
+            .cmp(&right.offset_ms)
+            .then_with(|| {
+                timeline_event_priority(&left.payload).cmp(&timeline_event_priority(&right.payload))
+            })
+            .then_with(|| left.sequence.cmp(&right.sequence))
+    });
+    let mut current_step = None;
+    for (index, event) in timeline.iter_mut().enumerate() {
+        if let EvalEventPayload::StimulusPublished { step_id, .. } = &event.payload {
+            current_step = Some(step_id.clone());
+        }
+        event.sequence = index as u64 + 1;
+        event.step = current_step.clone();
+    }
+    timeline
+}
+
+fn datetime_offset_ms(started_at: DateTime<Utc>, at: DateTime<Utc>) -> u64 {
+    (at - started_at).num_milliseconds().max(0) as u64
+}
+
+fn timeline_event_priority(payload: &crate::timeline::EvalEventPayload) -> u8 {
+    match payload {
+        crate::timeline::EvalEventPayload::StimulusPublished { .. } => 0,
+        crate::timeline::EvalEventPayload::CognitionAppended { .. }
+        | crate::timeline::EvalEventPayload::MemoWritten { .. }
+        | crate::timeline::EvalEventPayload::UtteranceCompleted { .. } => 2,
+        _ => 1,
+    }
+}
+
+fn write_timeline_jsonl(output_dir: &Path, timeline: &[crate::timeline::EvalEvent]) -> Result<()> {
+    let path = output_dir.join("timeline.jsonl");
+    let mut file = File::create(&path)
+        .with_context(|| format!("create normalized timeline {}", path.display()))?;
+    for event in timeline {
+        serde_json::to_writer(&mut file, event)
+            .with_context(|| format!("serialize normalized timeline {}", path.display()))?;
+        file.write_all(b"\n")
+            .with_context(|| format!("write normalized timeline {}", path.display()))?;
+    }
+    Ok(())
+}
+
+async fn configured_runtime_output(
+    blackboard: &Blackboard,
+    utterances: &RecordingUtteranceSink,
+    selected_terminal_output: Option<&str>,
+    terminal_step: Option<&EvalStep>,
+    memory_baseline: &BTreeMap<String, MemoryRecord>,
+    memory: &dyn MemoryStore,
+    seeded_memos: &[MemoLogRecord],
+    seeded_cognition: &[CognitionLogEntryRecord],
+) -> String {
+    if let Some(output) = selected_terminal_output {
+        return output.to_string();
+    }
+    if let Some(WaitFor::UtteranceFrom {
+        scope,
+        module,
+        target,
+        ..
+    }) = terminal_step.and_then(|step| step.wait_for.as_ref())
+        && let Some(utterance) = utterances.last_matching(scope.as_deref(), module.as_str(), target)
+    {
+        return utterance.text;
+    }
+    if let Some(utterance) = utterances.last_complete() {
+        return utterance.text;
+    }
+    let seeded_memo_keys = seeded_memos
+        .iter()
+        .map(|record| (record.owner.clone(), record.index))
+        .collect::<HashSet<_>>();
+    let seeded_cognition_keys = seeded_cognition
+        .iter()
+        .map(|record| (record.source.clone(), record.index))
+        .collect::<HashSet<_>>();
+    let (memo, cognition) = blackboard
+        .read(|bb| {
+            let memo = bb
+                .recent_memo_logs()
+                .into_iter()
+                .rev()
+                .find(|record| !seeded_memo_keys.contains(&(record.owner.clone(), record.index)))
+                .map(|record| record.content);
+            let cognition = bb
+                .unread_cognition_log_entries(None)
+                .into_iter()
+                .rev()
+                .find(|record| {
+                    !seeded_cognition_keys.contains(&(record.source.clone(), record.index))
+                })
+                .map(|record| record.entry.text);
+            (memo, cognition)
+        })
+        .await;
+    if let Some(output) = memo.or(cognition) {
+        return output;
+    }
+    render_memory_store_artifact(memory_baseline, memory).await
 }
 
 fn step_outcomes_all_ok(outcomes: &[serde_json::Value]) -> bool {
@@ -2293,880 +2534,6 @@ fn step_outcomes_all_ok(outcomes: &[serde_json::Value]) -> bool {
         && outcomes
             .iter()
             .all(|outcome| outcome.get("status").and_then(serde_json::Value::as_str) == Some("ok"))
-}
-
-async fn execute_module_case(
-    target: ModuleEvalTarget,
-    case: &ModuleCase,
-    config: &RunnerConfig,
-    output_dir: &Path,
-    case_id: &str,
-    reporter: &LiveReporter,
-    hooks: &mut RunnerHooks,
-) -> Result<CaseExecution> {
-    if hooks.visualizer.is_some() {
-        anyhow::bail!("module cases are not supported with --gui");
-    }
-    let case_modules = module_case_modules(target, case);
-    let case_now = parse_case_now(case.now.as_deref())
-        .map_err(anyhow::Error::msg)
-        .context("parse module case now")?;
-    let env = build_eval_environment(
-        output_dir,
-        config,
-        module_allocation(target, &case.limits, &case_modules),
-        &case.limits,
-        action_module_ids(&case_modules),
-        case_now,
-        &case.memories,
-        &case.memory_links,
-        &case.policies,
-        case_id,
-        reporter,
-        hooks.visualizer.as_ref().map(VisualizerHook::event_sender),
-    )
-    .await?;
-    seed_eval_scene_participants(env.caps.scene(), &case.participants);
-    let memory_baseline = if module_target_uses_memory_store_artifact(target) {
-        memory_snapshot(env.memory.as_ref()).await?
-    } else {
-        BTreeMap::new()
-    };
-    let policy_baseline = if module_target_uses_policy_store_artifact(target) {
-        policy_snapshot(env.policy_store.as_ref()).await?
-    } else {
-        BTreeSet::new()
-    };
-    let policy_consideration_baseline_len = if target == ModuleEvalTarget::Policy {
-        env.policy_caps.consideration_snapshots().len()
-    } else {
-        0
-    };
-    let memo_seed_records = seed_memos(
-        &env.blackboard,
-        env.clock.as_ref(),
-        &case.memos,
-        module_target_forces_cognitive_memo_seeds(target),
-    )
-    .await?;
-    let _ = seed_cognition_log(&env.blackboard, env.clock.as_ref(), &case.cognition_log).await;
-    if let Some(visualizer) = hooks.visualizer.as_mut() {
-        emit_visualizer_blackboard_snapshot(case_id, &env.blackboard, Some(visualizer)).await;
-        emit_visualizer_memory_records(
-            case_id,
-            visualizer,
-            &env.blackboard,
-            env.memory.as_ref(),
-            0,
-            25,
-        )
-        .await;
-        visualizer.offer_action(VisualizerAction::start_activation(VisualizerTabId::new(
-            case_id.to_string(),
-        )));
-    }
-
-    let gui_deferred_start = hooks.visualizer.is_some();
-    let target_module = module_id_for_target(target);
-    let cognition_baseline_for_target =
-        cognition_output_for_module(&env.blackboard, &target_module).await;
-    let shutdown_target_module = target_module.clone();
-    let run_target_module = target_module.clone();
-    let modules = eval_registry(
-        &case_modules,
-        &env.memory_caps,
-        &env.policy_caps,
-        &env.utterance_sink,
-        if gui_deferred_start {
-            ReplicaHardCap::V1Max
-        } else {
-            ReplicaHardCap::PolicyMax
-        },
-    )
-    .build(&env.caps)
-    .await?;
-    let harness = env.caps.internal_harness_io();
-    let sensory = env.caps.host_io().sensory_input_mailbox();
-    let prompt = case.prompt.content.clone();
-    let case_inputs = case.inputs.clone();
-    let module_steps = case.steps.clone();
-    let step_driven_module_case = !module_steps.is_empty();
-    let case_id_for_activation = case_id.to_string();
-    let has_cognition_log_seed = !case.cognition_log.is_empty();
-    let events = env.events.clone();
-    let blackboard = env.blackboard.clone();
-    let utterances = env.utterances.clone();
-    let memory = env.memory.clone();
-    let cognition_log_repository = env.cognition_log_repository.clone();
-    let policy_store = env.policy_store.clone();
-    let policy_caps_for_loop = env.policy_caps.clone();
-    let memory_baseline_for_loop = memory_baseline.clone();
-    let policy_baseline_for_loop = policy_baseline.clone();
-    let policy_consideration_baseline_len_for_loop = policy_consideration_baseline_len;
-    let cognition_baseline_for_loop = cognition_baseline_for_target.clone();
-    let clock = env.clock.clone();
-    let case_id_for_gui = case_id.to_string();
-    let mut visualizer = hooks.visualizer.as_mut();
-
-    run_agent(
-        modules,
-        AgentEventLoopConfig {
-            idle_threshold: Duration::from_secs(1),
-            max_activation_attempts: 3,
-            dependency_idle_timeout: Duration::from_secs(2),
-            dependency_hard_timeout: Duration::from_secs(10),
-        },
-        async move {
-            let mut started = !gui_deferred_start;
-            let mut module_step_index = 0usize;
-            let mut module_step_activation_count = 0usize;
-            if started {
-                if let Some(step) = module_steps.first() {
-                    module_step_activation_count =
-                        module_activation_completion_count(events.as_ref(), &run_target_module);
-                    activate_module_case_step(
-                        target,
-                        &blackboard,
-                        &harness,
-                        &prompt,
-                        step,
-                        &case_id_for_activation,
-                        &sensory,
-                        clock.as_ref(),
-                    )
-                    .await;
-                } else {
-                    activate_module_case_target(
-                        target,
-                        &blackboard,
-                        &harness,
-                        &prompt,
-                        &memo_seed_records,
-                        has_cognition_log_seed,
-                        &case_id_for_activation,
-                        &case_inputs,
-                        &sensory,
-                        clock.as_ref(),
-                    )
-                    .await;
-                }
-            }
-
-            loop {
-                if let Some(visualizer) = visualizer.as_deref_mut() {
-                    let command_outcome = handle_visualizer_commands(
-                        &case_id_for_gui,
-                        visualizer,
-                        None,
-                        &blackboard,
-                        memory.as_ref(),
-                        cognition_log_repository.as_ref(),
-                        clock.as_ref(),
-                    )
-                    .await;
-                    if command_outcome.shutdown {
-                        break;
-                    }
-                    if command_outcome.start_requested && !started {
-                        visualizer.revoke_action(start_activation_action_id(
-                            &VisualizerTabId::new(case_id_for_gui.clone()),
-                        ));
-                        if let Some(step) = module_steps.first() {
-                            module_step_activation_count = module_activation_completion_count(
-                                events.as_ref(),
-                                &run_target_module,
-                            );
-                            activate_module_case_step(
-                                target,
-                                &blackboard,
-                                &harness,
-                                &prompt,
-                                step,
-                                &case_id_for_activation,
-                                &sensory,
-                                clock.as_ref(),
-                            )
-                            .await;
-                        } else {
-                            activate_module_case_target(
-                                target,
-                                &blackboard,
-                                &harness,
-                                &prompt,
-                                &memo_seed_records,
-                                has_cognition_log_seed,
-                                &case_id_for_activation,
-                                &case_inputs,
-                                &sensory,
-                                clock.as_ref(),
-                            )
-                            .await;
-                        }
-                        started = true;
-                    }
-                }
-                emit_visualizer_blackboard_snapshot(
-                    &case_id_for_gui,
-                    &blackboard,
-                    visualizer.as_deref(),
-                )
-                .await;
-                if !started {
-                    tokio::task::yield_now().await;
-                    tokio::time::sleep(EVAL_POLL_INTERVAL).await;
-                    continue;
-                }
-                let target_done = if step_driven_module_case {
-                    module_activation_completion_count(events.as_ref(), &shutdown_target_module)
-                        > module_step_activation_count
-                } else {
-                    match target {
-                        ModuleEvalTarget::AttentionSchema => {
-                            last_memo_log_content_for_module(&blackboard, &shutdown_target_module)
-                                .await
-                                .is_some()
-                                || module_activation_finished(
-                                    &blackboard,
-                                    events.as_ref(),
-                                    &shutdown_target_module,
-                                )
-                                .await
-                        }
-                        ModuleEvalTarget::CognitionGate => {
-                            cognition_eval_has_new_output(
-                                &cognition_output_for_module(&blackboard, &shutdown_target_module)
-                                    .await,
-                                &cognition_baseline_for_loop,
-                            ) || module_activation_finished(
-                                &blackboard,
-                                events.as_ref(),
-                                &shutdown_target_module,
-                            )
-                            .await
-                        }
-                        ModuleEvalTarget::Interpreter => {
-                            !cognition_output_for_module(&blackboard, &shutdown_target_module)
-                                .await
-                                .is_empty()
-                                || module_activation_finished(
-                                    &blackboard,
-                                    events.as_ref(),
-                                    &shutdown_target_module,
-                                )
-                                .await
-                        }
-                        ModuleEvalTarget::Dreaming => {
-                            last_memo_log_content_for_module(&blackboard, &shutdown_target_module)
-                                .await
-                                .is_some()
-                                || module_activation_finished(
-                                    &blackboard,
-                                    events.as_ref(),
-                                    &shutdown_target_module,
-                                )
-                                .await
-                        }
-                        ModuleEvalTarget::Memory
-                        | ModuleEvalTarget::MemoryCompaction
-                        | ModuleEvalTarget::MemoryAssociation => {
-                            !memory_diff_records(&memory_baseline_for_loop, memory.as_ref())
-                                .await
-                                .is_empty()
-                                || module_activation_finished(
-                                    &blackboard,
-                                    events.as_ref(),
-                                    &shutdown_target_module,
-                                )
-                                .await
-                        }
-                        ModuleEvalTarget::PolicyCompaction => {
-                            !policy_diff_observation(
-                                &policy_baseline_for_loop,
-                                &policy_snapshot(policy_store.as_ref())
-                                    .await
-                                    .unwrap_or_default(),
-                            )
-                            .deleted
-                            .is_empty()
-                                || module_activation_finished(
-                                    &blackboard,
-                                    events.as_ref(),
-                                    &shutdown_target_module,
-                                )
-                                .await
-                        }
-                        ModuleEvalTarget::Policy => {
-                            policy_caps_for_loop.consideration_snapshots().len()
-                                > policy_consideration_baseline_len_for_loop
-                                || module_activation_finished(
-                                    &blackboard,
-                                    events.as_ref(),
-                                    &shutdown_target_module,
-                                )
-                                .await
-                        }
-                        ModuleEvalTarget::Speak => {
-                            utterances.last_complete().is_some()
-                                || module_activation_finished(
-                                    &blackboard,
-                                    events.as_ref(),
-                                    &shutdown_target_module,
-                                )
-                                .await
-                        }
-                        ModuleEvalTarget::Allocation | ModuleEvalTarget::Action => {
-                            last_memo_log_content_for_module(&blackboard, &shutdown_target_module)
-                                .await
-                                .is_some()
-                                || module_activation_finished(
-                                    &blackboard,
-                                    events.as_ref(),
-                                    &shutdown_target_module,
-                                )
-                                .await
-                        }
-                        _ => last_memo_log_content_for_module(&blackboard, &shutdown_target_module)
-                            .await
-                            .is_some(),
-                    }
-                };
-                if events.stop_requested() || target_done {
-                    if step_driven_module_case
-                        && target_done
-                        && module_step_index + 1 < module_steps.len()
-                    {
-                        module_step_index += 1;
-                        module_step_activation_count =
-                            module_activation_completion_count(events.as_ref(), &run_target_module);
-                        activate_module_case_step(
-                            target,
-                            &blackboard,
-                            &harness,
-                            &prompt,
-                            &module_steps[module_step_index],
-                            &case_id_for_activation,
-                            &sensory,
-                            clock.as_ref(),
-                        )
-                        .await;
-                        continue;
-                    }
-                    break;
-                }
-                tokio::task::yield_now().await;
-                tokio::time::sleep(EVAL_POLL_INTERVAL).await;
-            }
-        },
-    )
-    .await?;
-
-    let output = match target {
-        ModuleEvalTarget::AttentionSchema => {
-            last_memo_log_content_for_module(&env.blackboard, &target_module)
-                .await
-                .unwrap_or_default()
-        }
-        ModuleEvalTarget::CognitionGate | ModuleEvalTarget::Interpreter => {
-            cognition_output_for_module(&env.blackboard, &target_module).await
-        }
-        ModuleEvalTarget::Dreaming => {
-            last_memo_log_content_for_module(&env.blackboard, &target_module)
-                .await
-                .unwrap_or_default()
-        }
-        ModuleEvalTarget::Memory
-        | ModuleEvalTarget::MemoryCompaction
-        | ModuleEvalTarget::MemoryAssociation => {
-            render_memory_store_artifact(&memory_baseline, env.memory.as_ref()).await
-        }
-        ModuleEvalTarget::Speak => env
-            .utterances
-            .last_complete()
-            .map(|utterance| utterance.text)
-            .unwrap_or_default(),
-        ModuleEvalTarget::Allocation | ModuleEvalTarget::Action => {
-            allocation_artifact(&env.blackboard, &target_module).await
-        }
-        _ => last_memo_log_content_for_module(&env.blackboard, &target_module)
-            .await
-            .unwrap_or_default(),
-    };
-    let mut artifact = if output.is_empty() && !case.allow_empty_output {
-        if env.events.stop_requested() {
-            CaseArtifact::failed("stopped after max-llm-calls before target module produced output")
-        } else {
-            CaseArtifact::failed("target module did not produce output")
-        }
-    } else {
-        CaseArtifact::new(output)
-    };
-    add_observations(&mut artifact, &env.blackboard, &env.utterances).await;
-    if module_target_uses_memory_store_artifact(target) {
-        add_memory_diff_observation(&mut artifact, &memory_baseline, env.memory.as_ref()).await?;
-    }
-    if module_target_uses_policy_store_artifact(target) {
-        add_policy_diff_observation(&mut artifact, &policy_baseline, env.policy_store.as_ref())
-            .await?;
-    }
-    if target == ModuleEvalTarget::Policy {
-        add_policy_considerations_observation(&mut artifact, &env.policy_caps)?;
-    }
-    if let Some(visualizer) = hooks.visualizer.as_mut() {
-        emit_visualizer_blackboard_snapshot(case_id, &env.blackboard, Some(visualizer)).await;
-        emit_visualizer_memory_records(
-            case_id,
-            visualizer,
-            &env.blackboard,
-            env.memory.as_ref(),
-            0,
-            25,
-        )
-        .await;
-    }
-    Ok(CaseExecution {
-        artifact,
-        events: env.events.snapshot(),
-        activations: env.events.activation_timeline(),
-    })
-}
-
-async fn activate_module_case_target(
-    target: ModuleEvalTarget,
-    blackboard: &Blackboard,
-    harness: &InternalHarnessIo,
-    prompt: &str,
-    memo_seed_records: &[MemoLogRecord],
-    has_cognition_log_seed: bool,
-    case_id: &str,
-    inputs: &[FullAgentInput],
-    sensory: &SensoryInputMailbox,
-    clock: &dyn Clock,
-) {
-    match target {
-        ModuleEvalTarget::Sensory => {
-            publish_full_agent_inputs(case_id, inputs, sensory, clock, None).await;
-        }
-        ModuleEvalTarget::CognitionGate => {
-            for record in memo_seed_records {
-                harness
-                    .memo_updated_mailbox()
-                    .publish(nuillu_module::MemoUpdated {
-                        owner: record.owner.clone(),
-                        index: record.index,
-                    })
-                    .await
-                    .expect("module eval failed to publish MemoUpdated");
-            }
-            harness
-                .memo_updated_mailbox()
-                .publish(nuillu_module::MemoUpdated {
-                    owner: ModuleInstanceId::new(
-                        ModuleId::new("eval-harness").expect("eval-harness id is valid"),
-                        ReplicaIndex::ZERO,
-                    ),
-                    index: 0,
-                })
-                .await
-                .expect("module eval failed to publish MemoUpdated");
-        }
-        ModuleEvalTarget::QueryMemory => {
-            let source = ModuleInstanceId::new(builtin::cognition_gate(), ReplicaIndex::ZERO);
-            blackboard
-                .append_cognition_log(
-                    source.clone(),
-                    CognitionLogEntry {
-                        at: clock.now(),
-                        text: prompt.to_string(),
-                        origin: CognitionLogOrigin::direct(source.clone()),
-                    },
-                )
-                .await;
-            harness
-                .cognition_log_updated_mailbox()
-                .publish(CognitionLogUpdated::EntryAppended { source })
-                .await
-                .expect("module eval failed to publish CognitionLogUpdated");
-        }
-        ModuleEvalTarget::AttentionSchema => {
-            for record in memo_seed_records {
-                harness
-                    .memo_updated_mailbox()
-                    .publish(nuillu_module::MemoUpdated {
-                        owner: record.owner.clone(),
-                        index: record.index,
-                    })
-                    .await
-                    .expect("module eval failed to publish MemoUpdated");
-            }
-            if has_cognition_log_seed {
-                harness
-                    .cognition_log_updated_mailbox()
-                    .publish(CognitionLogUpdated::EntryAppended {
-                        source: ModuleInstanceId::new(
-                            builtin::cognition_gate(),
-                            ReplicaIndex::ZERO,
-                        ),
-                    })
-                    .await
-                    .expect("module eval failed to publish CognitionLogUpdated");
-            }
-        }
-        ModuleEvalTarget::Interpreter => {
-            if has_cognition_log_seed {
-                harness
-                    .cognition_log_updated_mailbox()
-                    .publish(CognitionLogUpdated::EntryAppended {
-                        source: ModuleInstanceId::new(
-                            builtin::cognition_gate(),
-                            ReplicaIndex::ZERO,
-                        ),
-                    })
-                    .await
-                    .expect("module eval failed to publish CognitionLogUpdated");
-            }
-        }
-        ModuleEvalTarget::SelfModel => {
-            harness
-                .cognition_log_updated_mailbox()
-                .publish(CognitionLogUpdated::EntryAppended {
-                    source: ModuleInstanceId::new(builtin::attention_schema(), ReplicaIndex::ZERO),
-                })
-                .await
-                .expect("module eval failed to publish CognitionLogUpdated");
-        }
-        ModuleEvalTarget::Memory => {
-            for record in memo_seed_records {
-                harness
-                    .memo_updated_mailbox()
-                    .publish(nuillu_module::MemoUpdated {
-                        owner: record.owner.clone(),
-                        index: record.index,
-                    })
-                    .await
-                    .expect("module eval failed to publish MemoUpdated");
-            }
-            if has_cognition_log_seed {
-                harness
-                    .cognition_log_updated_mailbox()
-                    .publish(CognitionLogUpdated::EntryAppended {
-                        source: ModuleInstanceId::new(
-                            builtin::cognition_gate(),
-                            ReplicaIndex::ZERO,
-                        ),
-                    })
-                    .await
-                    .expect("module eval failed to publish CognitionLogUpdated");
-            }
-        }
-        ModuleEvalTarget::MemoryCompaction
-        | ModuleEvalTarget::MemoryAssociation
-        | ModuleEvalTarget::Dreaming
-        | ModuleEvalTarget::PolicyCompaction => {
-            harness
-                .interoception_updated_mailbox()
-                .publish(nuillu_module::InteroceptiveUpdated)
-                .await
-                .expect("module eval failed to publish InteroceptiveUpdated");
-        }
-        ModuleEvalTarget::Policy => {
-            let source = ModuleInstanceId::new(builtin::cognition_gate(), ReplicaIndex::ZERO);
-            blackboard
-                .append_cognition_log(
-                    source.clone(),
-                    CognitionLogEntry {
-                        at: clock.now(),
-                        text: prompt.to_string(),
-                        origin: CognitionLogOrigin::direct(source.clone()),
-                    },
-                )
-                .await;
-            for record in memo_seed_records {
-                harness
-                    .memo_updated_mailbox()
-                    .publish(nuillu_module::MemoUpdated {
-                        owner: record.owner.clone(),
-                        index: record.index,
-                    })
-                    .await
-                    .expect("module eval failed to publish MemoUpdated");
-            }
-            harness
-                .cognition_log_updated_mailbox()
-                .publish(CognitionLogUpdated::EntryAppended { source })
-                .await
-                .expect("module eval failed to publish CognitionLogUpdated");
-        }
-        ModuleEvalTarget::Speak => {
-            if has_cognition_log_seed {
-                harness
-                    .cognition_log_updated_mailbox()
-                    .publish(CognitionLogUpdated::EntryAppended {
-                        source: ModuleInstanceId::new(
-                            builtin::cognition_gate(),
-                            ReplicaIndex::ZERO,
-                        ),
-                    })
-                    .await
-                    .expect("module eval failed to publish CognitionLogUpdated");
-            }
-        }
-        ModuleEvalTarget::Action => {
-            for record in memo_seed_records {
-                harness
-                    .memo_updated_mailbox()
-                    .publish(nuillu_module::MemoUpdated {
-                        owner: record.owner.clone(),
-                        index: record.index,
-                    })
-                    .await
-                    .expect("module eval failed to publish MemoUpdated");
-            }
-            if has_cognition_log_seed {
-                harness
-                    .cognition_log_updated_mailbox()
-                    .publish(CognitionLogUpdated::EntryAppended {
-                        source: ModuleInstanceId::new(
-                            builtin::cognition_gate(),
-                            ReplicaIndex::ZERO,
-                        ),
-                    })
-                    .await
-                    .expect("module eval failed to publish CognitionLogUpdated");
-            }
-            harness
-                .interoception_updated_mailbox()
-                .publish(nuillu_module::InteroceptiveUpdated)
-                .await
-                .expect("module eval failed to publish InteroceptiveUpdated");
-        }
-        ModuleEvalTarget::Predict => {
-            if has_cognition_log_seed {
-                harness
-                    .cognition_log_updated_mailbox()
-                    .publish(CognitionLogUpdated::EntryAppended {
-                        source: ModuleInstanceId::new(
-                            builtin::cognition_gate(),
-                            ReplicaIndex::ZERO,
-                        ),
-                    })
-                    .await
-                    .expect("module eval failed to publish CognitionLogUpdated");
-            }
-        }
-        ModuleEvalTarget::Surprise => {
-            if has_cognition_log_seed {
-                harness
-                    .cognition_log_updated_mailbox()
-                    .publish(CognitionLogUpdated::EntryAppended {
-                        source: ModuleInstanceId::new(
-                            builtin::cognition_gate(),
-                            ReplicaIndex::ZERO,
-                        ),
-                    })
-                    .await
-                    .expect("module eval failed to publish CognitionLogUpdated");
-            }
-        }
-        ModuleEvalTarget::Allocation => {
-            for record in memo_seed_records {
-                harness
-                    .memo_updated_mailbox()
-                    .publish(nuillu_module::MemoUpdated {
-                        owner: record.owner.clone(),
-                        index: record.index,
-                    })
-                    .await
-                    .expect("module eval failed to publish MemoUpdated");
-            }
-            harness
-                .memo_updated_mailbox()
-                .publish(nuillu_module::MemoUpdated {
-                    owner: ModuleInstanceId::new(
-                        ModuleId::new("eval-harness").expect("eval-harness id is valid"),
-                        ReplicaIndex::ZERO,
-                    ),
-                    index: 0,
-                })
-                .await
-                .expect("module eval failed to publish MemoUpdated");
-        }
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn activate_module_case_step(
-    target: ModuleEvalTarget,
-    blackboard: &Blackboard,
-    harness: &InternalHarnessIo,
-    prompt: &str,
-    step: &ModuleEvalStep,
-    case_id: &str,
-    sensory: &SensoryInputMailbox,
-    clock: &dyn Clock,
-) {
-    let memo_seed_records = seed_memos(
-        blackboard,
-        clock,
-        &step.memos,
-        module_target_forces_cognitive_memo_seeds(target),
-    )
-    .await
-    .expect("module eval step memo seeds should be valid");
-    let _ = seed_cognition_log(blackboard, clock, &step.cognition_log).await;
-    activate_module_case_target(
-        target,
-        blackboard,
-        harness,
-        prompt,
-        &memo_seed_records,
-        !step.cognition_log.is_empty(),
-        case_id,
-        &step.inputs,
-        sensory,
-        clock,
-    )
-    .await;
-}
-
-fn cognition_eval_has_new_output(current: &str, baseline: &str) -> bool {
-    current != baseline
-}
-
-async fn cognition_output_for_module(blackboard: &Blackboard, module: &ModuleId) -> String {
-    blackboard
-        .read(|bb| {
-            bb.cognition_log_set()
-                .logs()
-                .iter()
-                .filter(|record| &record.source.module == module)
-                .flat_map(|record| record.entries.iter().map(|entry| entry.text.as_str()))
-                .collect::<Vec<_>>()
-                .join("\n\n")
-        })
-        .await
-}
-
-#[cfg(test)]
-async fn attention_schema_memo_output(blackboard: &Blackboard) -> String {
-    let module = builtin::attention_schema();
-    blackboard
-        .read(|bb| {
-            bb.recent_memo_logs()
-                .into_iter()
-                .filter(|record| record.owner.module == module)
-                .map(|record| record.content)
-                .collect::<Vec<_>>()
-                .join("\n\n")
-        })
-        .await
-}
-
-async fn last_memo_log_content_for_module(
-    blackboard: &Blackboard,
-    module: &ModuleId,
-) -> Option<String> {
-    blackboard
-        .read(|bb| {
-            bb.recent_memo_logs()
-                .into_iter()
-                .filter(|record| &record.owner.module == module)
-                .max_by(|a, b| {
-                    a.written_at
-                        .cmp(&b.written_at)
-                        .then_with(|| a.owner.replica.cmp(&b.owner.replica))
-                        .then_with(|| a.index.cmp(&b.index))
-                })
-                .map(|record| record.content)
-        })
-        .await
-}
-
-async fn allocation_artifact(blackboard: &Blackboard, module: &ModuleId) -> String {
-    let memo = last_memo_log_content_for_module(blackboard, module)
-        .await
-        .unwrap_or_default();
-    let allocation = blackboard
-        .read(|bb| format_allocation_snapshot(bb.allocation()))
-        .await;
-    if memo.is_empty() {
-        allocation
-    } else {
-        format!("Controller memo:\n{memo}\n\nAllocation snapshot:\n{allocation}")
-    }
-}
-
-fn format_allocation_snapshot(allocation: &ResourceAllocation) -> String {
-    allocation_observation(allocation)
-        .into_iter()
-        .map(|(module, obs)| {
-            format!(
-                "{}: activation_ratio={:.2}, active_replicas={}",
-                module,
-                obs.activation_ratio.as_f64(),
-                obs.active_replicas
-            )
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
-fn module_target_uses_memory_store_artifact(target: ModuleEvalTarget) -> bool {
-    matches!(
-        target,
-        ModuleEvalTarget::Memory
-            | ModuleEvalTarget::MemoryCompaction
-            | ModuleEvalTarget::MemoryAssociation
-    )
-}
-
-fn module_target_uses_policy_store_artifact(target: ModuleEvalTarget) -> bool {
-    matches!(target, ModuleEvalTarget::PolicyCompaction)
-}
-
-async fn module_activation_finished(
-    blackboard: &Blackboard,
-    events: &RecordingRuntimeEventSink,
-    module: &ModuleId,
-) -> bool {
-    let saw_batch = events.snapshot().into_iter().any(|event| {
-        matches!(
-            event,
-            RuntimeEvent::ModuleBatchReady { owner, .. } if owner.module == *module
-        )
-    });
-    if !saw_batch {
-        return false;
-    }
-
-    blackboard
-        .read(|bb| {
-            bb.module_status_records()
-                .into_iter()
-                .find(|record| record.owner.module == *module)
-                .is_some_and(|record| {
-                    matches!(
-                        record.status,
-                        ModuleRunStatus::Inactive | ModuleRunStatus::AwaitingBatch
-                    )
-                })
-        })
-        .await
-}
-
-fn module_activation_completion_count(
-    events: &RecordingRuntimeEventSink,
-    module: &ModuleId,
-) -> usize {
-    events
-        .snapshot()
-        .into_iter()
-        .filter(|event| {
-            matches!(
-                event,
-                RuntimeEvent::ModuleActivationCompleted { owner, .. } if owner.module == *module
-            )
-        })
-        .count()
 }
 
 async fn memory_snapshot(memory: &dyn MemoryStore) -> Result<BTreeMap<String, MemoryRecord>> {
@@ -3371,68 +2738,6 @@ struct MemoryDiffLinkObservation {
     relation: String,
 }
 
-#[derive(Debug, Clone, Serialize)]
-struct PolicyDiffObservation {
-    deleted: Vec<String>,
-    remaining: Vec<String>,
-}
-
-async fn policy_snapshot(store: &dyn PolicyStore) -> Result<BTreeSet<String>> {
-    let mut indexes = BTreeSet::new();
-    for rank in [
-        PolicyRank::Tentative,
-        PolicyRank::Provisional,
-        PolicyRank::Established,
-        PolicyRank::Habit,
-        PolicyRank::Core,
-    ] {
-        for record in store
-            .list_by_rank(rank)
-            .await
-            .context("list policies for eval snapshot")?
-        {
-            indexes.insert(record.index.to_string());
-        }
-    }
-    Ok(indexes)
-}
-
-fn policy_diff_observation(
-    baseline: &BTreeSet<String>,
-    current: &BTreeSet<String>,
-) -> PolicyDiffObservation {
-    PolicyDiffObservation {
-        deleted: baseline.difference(current).cloned().collect::<Vec<_>>(),
-        remaining: current.iter().cloned().collect::<Vec<_>>(),
-    }
-}
-
-async fn add_policy_diff_observation(
-    artifact: &mut CaseArtifact,
-    baseline: &BTreeSet<String>,
-    store: &dyn PolicyStore,
-) -> Result<()> {
-    let current = policy_snapshot(store).await?;
-    let diff = policy_diff_observation(baseline, &current);
-    let value = serde_json::to_value(diff).context("serialize policy diff observation")?;
-    artifact
-        .observations
-        .insert("policy_diff".to_owned(), value);
-    Ok(())
-}
-
-fn add_policy_considerations_observation(
-    artifact: &mut CaseArtifact,
-    policy_caps: &PolicyCapabilities,
-) -> Result<()> {
-    let value = serde_json::to_value(policy_caps.consideration_snapshots())
-        .context("serialize policy considerations observation")?;
-    artifact
-        .observations
-        .insert("policy_considerations".to_owned(), value);
-    Ok(())
-}
-
 fn render_memory_record_artifact(record: &MemoryRecord) -> String {
     let concepts = if record.concepts.is_empty() {
         "none".to_owned()
@@ -3553,23 +2858,25 @@ fn seed_eval_scene_participants(scene: &SceneRegistry, participants: &[String]) 
     scene.set_broadcast_target_enabled(participants.len() != 1);
 }
 
-async fn publish_full_agent_inputs(
+async fn publish_stimuli(
     case_id: &str,
-    inputs: &[FullAgentInput],
+    inputs: &[Stimulus],
     sensory: &SensoryInputMailbox,
     clock: &dyn Clock,
+    events: &RecordingRuntimeEventSink,
+    step_id: &str,
     visualizer: Option<&VisualizerHook>,
 ) {
     let now = clock.now();
     for input in inputs {
         let body = match input {
-            FullAgentInput::Heard { direction, content } => SensoryInput::OneShot {
+            Stimulus::Heard { direction, content } => SensoryInput::OneShot {
                 modality: SensoryModality::Audition,
                 direction: direction.clone(),
                 content: content.content.clone(),
                 observed_at: now,
             },
-            FullAgentInput::Seen {
+            Stimulus::Seen {
                 direction,
                 appearance,
             } => SensoryInput::OneShot {
@@ -3578,7 +2885,7 @@ async fn publish_full_agent_inputs(
                 content: appearance.content.clone(),
                 observed_at: now,
             },
-            FullAgentInput::OneShot {
+            Stimulus::OneShot {
                 modality,
                 direction,
                 content,
@@ -3588,7 +2895,7 @@ async fn publish_full_agent_inputs(
                 content: content.content.clone(),
                 observed_at: now,
             },
-            FullAgentInput::AmbientSnapshot { entries } => SensoryInput::AmbientSnapshot {
+            Stimulus::AmbientSnapshot { entries } => SensoryInput::AmbientSnapshot {
                 entries: entries
                     .iter()
                     .map(|entry| AmbientSensoryEntry {
@@ -3603,7 +2910,48 @@ async fn publish_full_agent_inputs(
         sensory
             .publish(body.clone())
             .await
-            .expect("full-agent eval failed to publish SensoryInput");
+            .expect("runtime eval failed to publish SensoryInput");
+        let (modality, direction, content) = match input {
+            Stimulus::Heard { direction, content } => (
+                "audition".to_string(),
+                direction.clone(),
+                content.content.clone(),
+            ),
+            Stimulus::Seen {
+                direction,
+                appearance,
+            } => (
+                "vision".to_string(),
+                direction.clone(),
+                appearance.content.clone(),
+            ),
+            Stimulus::OneShot {
+                modality,
+                direction,
+                content,
+            } => (modality.clone(), direction.clone(), content.content.clone()),
+            Stimulus::AmbientSnapshot { entries } => (
+                "ambient-snapshot".to_string(),
+                None,
+                entries
+                    .iter()
+                    .map(|entry| entry.content.content.as_str())
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            ),
+        };
+        events.record_eval_event(
+            nuillu_types::ScopeId::root(),
+            builtin::sensory(),
+            0,
+            Some(step_id.to_string()),
+            crate::timeline::EvalEventPayload::StimulusPublished {
+                modality,
+                direction,
+                content,
+                step_id: step_id.to_string(),
+            },
+        );
         if let Some(visualizer) = visualizer {
             visualizer.send_event(VisualizerEvent::SensoryInput {
                 tab_id: VisualizerTabId::new(case_id.to_string()),
@@ -3616,20 +2964,29 @@ async fn publish_full_agent_inputs(
 #[allow(clippy::too_many_arguments)]
 async fn run_input_phase(
     case_id: &str,
-    inputs: &[FullAgentInput],
+    inputs: &[Stimulus],
     steps: &[EvalStep],
     sensory: &SensoryInputMailbox,
+    harness: &InternalHarnessIo,
     blackboard: &Blackboard,
     utterances: &RecordingUtteranceSink,
     events: &RecordingRuntimeEventSink,
     clock: &dyn Clock,
     visualizer: Option<&VisualizerHook>,
     reporter: &LiveReporter,
+    run_controller: &AgentRunController,
+    eval_case: &EvalCase,
+    judge: Option<&dyn RubricJudge>,
+    memory: &dyn MemoryStore,
+    timeline_runtime_origin_ms: u64,
+    timeline_started_at: DateTime<Utc>,
+    assertion_overrides: &Arc<Mutex<BTreeMap<String, AssertionOutcome>>>,
+    terminal_output: &Arc<Mutex<Option<String>>>,
     step_failure: &Arc<Mutex<Option<String>>>,
     step_outcomes: &Arc<Mutex<Vec<serde_json::Value>>>,
 ) {
     if steps.is_empty() {
-        publish_full_agent_inputs(case_id, inputs, sensory, clock, visualizer).await;
+        publish_stimuli(case_id, inputs, sensory, clock, events, "input", visualizer).await;
         return;
     }
     for (index, step) in steps.iter().enumerate() {
@@ -3640,7 +2997,7 @@ async fn run_input_phase(
                 blackboard,
                 events,
                 &settle_modules,
-                FULL_AGENT_STEP_SETTLE_TIMEOUT,
+                RUNTIME_STEP_SETTLE_TIMEOUT,
             )
             .await
             {
@@ -3662,20 +3019,83 @@ async fn run_input_phase(
                     return;
                 }
                 WaitOutcome::Stopped => return,
+                WaitOutcome::AssertionNotMet => {
+                    unreachable!("module settling does not evaluate assertions")
+                }
             }
         }
-        publish_full_agent_inputs(case_id, &step.inputs, sensory, clock, visualizer).await;
+        let step_memos = seed_memos(blackboard, clock, &step.memos, false)
+            .await
+            .expect("validated eval step memo seeds");
+        let step_cognition = seed_cognition_log(blackboard, clock, &step.cognition_log).await;
+        publish_setup_updates(harness, &step_memos, &step_cognition).await;
+        let memo_wait_baseline = match &step.wait_for {
+            Some(WaitFor::MemoFrom { scope, module, .. }) => {
+                let scope = scope
+                    .as_deref()
+                    .map(parse_scope_id)
+                    .transpose()
+                    .expect("validated wait-for scope");
+                Some(memo_count_for_module(blackboard, scope.as_ref(), &module.module_id()).await)
+            }
+            _ => None,
+        };
+        let utterance_wait_baseline = match &step.wait_for {
+            Some(WaitFor::UtteranceFrom {
+                scope,
+                module,
+                target,
+                ..
+            }) => Some(utterances.matching_count(scope.as_deref(), module.as_str(), target)),
+            _ => None,
+        };
+        let step_id = step
+            .id
+            .clone()
+            .unwrap_or_else(|| format!("step-{}", index + 1));
+        publish_stimuli(
+            case_id,
+            &step.inputs,
+            sensory,
+            clock,
+            events,
+            &step_id,
+            visualizer,
+        )
+        .await;
 
-        let mut wait_outcome = WaitOutcome::Met;
+        let mut wait_result = WaitConditionResult::met();
         if let Some(wait_for) = &step.wait_for {
-            wait_outcome = wait_for_condition(blackboard, events, wait_for).await;
+            wait_result = wait_for_condition(
+                case_id,
+                blackboard,
+                utterances,
+                events,
+                wait_for,
+                memo_wait_baseline,
+                utterance_wait_baseline,
+                eval_case,
+                judge,
+                memory,
+                timeline_runtime_origin_ms,
+                timeline_started_at,
+                assertion_overrides,
+                terminal_output,
+                run_controller,
+            )
+            .await;
+        }
+        let wait_outcome = wait_result.outcome;
+
+        if step.terminal && matches!(wait_outcome, WaitOutcome::Met) {
+            run_controller.pause();
         }
 
         let mut check_results: Vec<serde_json::Value> = Vec::new();
         let mut must_pass_failure: Option<String> = None;
-        if matches!(wait_outcome, WaitOutcome::Met) && !step.checks.is_empty() {
+        if matches!(wait_outcome, WaitOutcome::Met) && !step.assertions.is_empty() {
             let snapshot = build_step_snapshot(blackboard, utterances).await;
-            for check in &step.checks {
+            for check in &step.assertions {
                 let (passed, diagnostic) = evaluate_step_check(check, &snapshot);
                 let common = check.common();
                 check_results.push(serde_json::json!({
@@ -3700,6 +3120,7 @@ async fn run_input_phase(
         let status = match (&wait_outcome, &must_pass_failure) {
             (WaitOutcome::Timeout, _) => "timed-out",
             (WaitOutcome::Stopped, _) => "stopped",
+            (WaitOutcome::AssertionNotMet, _) => "assertion-not-met",
             (_, Some(_)) => "check-failed",
             _ => "ok",
         };
@@ -3716,13 +3137,24 @@ async fn run_input_phase(
             serde_json::Value::String(status.to_string()),
         );
         outcome.insert(
+            "terminal".to_string(),
+            serde_json::Value::Bool(step.terminal),
+        );
+        outcome.insert(
             "elapsed_ms".to_string(),
             serde_json::Value::from(duration_millis_u64(step_started.elapsed())),
         );
         outcome.insert(
-            "checks".to_string(),
+            "assertions".to_string(),
             serde_json::Value::Array(check_results),
         );
+        if !wait_result.assertion_attempts.is_empty() {
+            outcome.insert(
+                "until-assertion-attempts".to_string(),
+                serde_json::to_value(&wait_result.assertion_attempts)
+                    .expect("assertion outcomes serialize"),
+            );
+        }
         step_outcomes
             .lock()
             .expect("step outcomes mutex poisoned")
@@ -3734,6 +3166,7 @@ async fn run_input_phase(
             serde_json::json!({
                 "index": index,
                 "status": status,
+                "terminal": step.terminal,
                 "elapsed_ms": step_elapsed_ms,
             }),
             format!(
@@ -3753,7 +3186,19 @@ async fn run_input_phase(
                 events.request_stop("step-timeout");
                 return;
             }
-            WaitOutcome::Stopped => return,
+            WaitOutcome::Stopped => {
+                let wait_label = wait_for_label(step.wait_for.as_ref());
+                let message = format!("step {index} stopped before satisfying {wait_label}",);
+                step_failure
+                    .lock()
+                    .expect("step failure mutex poisoned")
+                    .get_or_insert(message);
+                return;
+            }
+            WaitOutcome::AssertionNotMet => {
+                events.request_stop("terminal-assertion-not-met");
+                return;
+            }
         }
 
         if let Some(message) = must_pass_failure {
@@ -3764,6 +3209,10 @@ async fn run_input_phase(
             events.request_stop("step-check-failed");
             return;
         }
+        if step.terminal {
+            events.request_stop("terminal-step-completed");
+            return;
+        }
     }
 }
 
@@ -3772,11 +3221,28 @@ enum WaitOutcome {
     Met,
     Timeout,
     Stopped,
+    AssertionNotMet,
+}
+
+struct WaitConditionResult {
+    outcome: WaitOutcome,
+    assertion_attempts: Vec<AssertionOutcome>,
+}
+
+impl WaitConditionResult {
+    fn met() -> Self {
+        Self {
+            outcome: WaitOutcome::Met,
+            assertion_attempts: Vec::new(),
+        }
+    }
 }
 
 fn step_settle_modules(wait_for: Option<&WaitFor>) -> Vec<ModuleId> {
     match wait_for {
-        Some(WaitFor::MemoFrom { module, .. }) => vec![module.module_id()],
+        Some(WaitFor::MemoFrom { module, .. } | WaitFor::UtteranceFrom { module, .. }) => {
+            vec![module.module_id()]
+        }
         Some(WaitFor::Interoception { .. }) => vec![builtin::interoception()],
         None => Vec::new(),
     }
@@ -3827,31 +3293,255 @@ async fn wait_for_step_modules_to_settle(
 }
 
 async fn wait_for_condition(
+    case_id: &str,
     blackboard: &Blackboard,
+    utterances: &RecordingUtteranceSink,
     events: &RecordingRuntimeEventSink,
     wait_for: &WaitFor,
-) -> WaitOutcome {
+    memo_baseline: Option<usize>,
+    utterance_baseline: Option<usize>,
+    eval_case: &EvalCase,
+    judge: Option<&dyn RubricJudge>,
+    memory: &dyn MemoryStore,
+    timeline_runtime_origin_ms: u64,
+    timeline_started_at: DateTime<Utc>,
+    assertion_overrides: &Arc<Mutex<BTreeMap<String, AssertionOutcome>>>,
+    terminal_output: &Arc<Mutex<Option<String>>>,
+    run_controller: &AgentRunController,
+) -> WaitConditionResult {
     match wait_for {
-        WaitFor::MemoFrom { module, timeout_ms } => {
+        WaitFor::MemoFrom {
+            scope,
+            module,
+            timeout_ms,
+        } => {
+            let scope = scope
+                .as_deref()
+                .map(parse_scope_id)
+                .transpose()
+                .expect("validated wait-for scope");
             let target = module.module_id();
-            let baseline = memo_count_for_module(blackboard, &target).await;
+            let baseline = memo_baseline
+                .unwrap_or_else(|| panic!("memo wait baseline must be captured before input"));
             let deadline = Duration::from_millis(*timeout_ms);
             let start = Instant::now();
             let poll = Duration::from_millis(50);
             loop {
-                let count = memo_count_for_module(blackboard, &target).await;
+                let count = memo_count_for_module(blackboard, scope.as_ref(), &target).await;
                 if count > baseline {
-                    return WaitOutcome::Met;
+                    return WaitConditionResult::met();
                 }
                 if events.stop_requested() {
-                    return WaitOutcome::Stopped;
+                    return WaitConditionResult {
+                        outcome: WaitOutcome::Stopped,
+                        assertion_attempts: Vec::new(),
+                    };
                 }
                 let elapsed = start.elapsed();
                 if elapsed >= deadline {
-                    return WaitOutcome::Timeout;
+                    return WaitConditionResult {
+                        outcome: WaitOutcome::Timeout,
+                        assertion_attempts: Vec::new(),
+                    };
                 }
                 let remaining = deadline.saturating_sub(elapsed);
                 tokio::time::sleep(remaining.min(poll)).await;
+            }
+        }
+        WaitFor::UtteranceFrom {
+            scope,
+            module,
+            target,
+            until_assertion,
+            max_matches,
+            timeout_ms,
+        } => {
+            let baseline = utterance_baseline
+                .unwrap_or_else(|| panic!("utterance wait baseline must be captured before input"));
+            let deadline = Duration::from_millis(*timeout_ms);
+            let start = Instant::now();
+            let poll = Duration::from_millis(50);
+            let Some(assertion_name) = until_assertion.as_deref() else {
+                loop {
+                    if let Some(candidate) =
+                        utterances.matching_at(scope.as_deref(), module.as_str(), target, baseline)
+                    {
+                        *terminal_output
+                            .lock()
+                            .expect("terminal output mutex poisoned") = Some(candidate.text);
+                        return WaitConditionResult::met();
+                    }
+                    if events.stop_requested() {
+                        return WaitConditionResult {
+                            outcome: WaitOutcome::Stopped,
+                            assertion_attempts: Vec::new(),
+                        };
+                    }
+                    let elapsed = start.elapsed();
+                    if elapsed >= deadline {
+                        return WaitConditionResult {
+                            outcome: WaitOutcome::Timeout,
+                            assertion_attempts: Vec::new(),
+                        };
+                    }
+                    tokio::time::sleep(deadline.saturating_sub(elapsed).min(poll)).await;
+                }
+            };
+            let assertion = eval_case
+                .assertions()
+                .iter()
+                .find(|assertion| assertion.display_name() == assertion_name)
+                .expect("validated until-assertion reference");
+            let mut matching_utterances = Vec::<RecordedUtterance>::new();
+            let mut cumulative_outputs = Vec::<String>::new();
+            let mut results = Vec::<Option<AssertionOutcome>>::new();
+            let mut judgments: FuturesUnordered<LocalBoxFuture<'_, (usize, AssertionOutcome)>> =
+                FuturesUnordered::new();
+            let mut closed_with = None;
+
+            loop {
+                if closed_with.is_none() {
+                    while matching_utterances.len() < *max_matches {
+                        let next_index = baseline + matching_utterances.len();
+                        let Some(candidate) = utterances.matching_at(
+                            scope.as_deref(),
+                            module.as_str(),
+                            target,
+                            next_index,
+                        ) else {
+                            break;
+                        };
+                        matching_utterances.push(candidate);
+                        let cumulative_output = matching_utterances
+                            .iter()
+                            .map(|utterance| utterance.text.as_str())
+                            .collect::<Vec<_>>()
+                            .join("\n");
+                        cumulative_outputs.push(cumulative_output.clone());
+                        results.push(None);
+                        let attempt_index = matching_utterances.len() - 1;
+                        let snapshot = build_live_assertion_snapshot(
+                            case_id,
+                            cumulative_output,
+                            &matching_utterances,
+                            blackboard,
+                            utterances,
+                            events,
+                            memory,
+                            timeline_runtime_origin_ms,
+                            timeline_started_at,
+                        )
+                        .await;
+                        let judge_timeout = deadline.saturating_sub(start.elapsed());
+                        let judge_timeout_ms = *timeout_ms;
+                        let judgment = async move {
+                            let outcome = match snapshot {
+                                Ok(snapshot) => match tokio::time::timeout(
+                                    judge_timeout,
+                                    evaluate_assertion(
+                                        eval_case,
+                                        &empty_trace_snapshot(),
+                                        &snapshot,
+                                        judge,
+                                        assertion,
+                                    ),
+                                )
+                                .await
+                                {
+                                    Ok(outcome) => outcome,
+                                    Err(_) => live_assertion_timeout(assertion, judge_timeout_ms),
+                                },
+                                Err(error) => live_assertion_error(assertion, error),
+                            };
+                            (attempt_index, outcome)
+                        }
+                        .boxed_local();
+                        judgments.push(judgment);
+                    }
+                    if matching_utterances.len() == *max_matches {
+                        run_controller.pause();
+                        closed_with = Some(WaitOutcome::AssertionNotMet);
+                    } else if events.stop_requested() {
+                        run_controller.pause();
+                        closed_with = Some(WaitOutcome::Stopped);
+                    } else if start.elapsed() >= deadline {
+                        run_controller.pause();
+                        closed_with = Some(WaitOutcome::Timeout);
+                    }
+                }
+
+                if let Some(pass_index) = results.iter().position(|result| {
+                    result
+                        .as_ref()
+                        .is_some_and(|outcome| outcome.passed && !outcome.errored)
+                }) && results[..pass_index].iter().all(Option::is_some)
+                {
+                    let outcome = results[pass_index]
+                        .clone()
+                        .expect("passing result is present");
+                    assertion_overrides
+                        .lock()
+                        .expect("assertion override mutex poisoned")
+                        .insert(assertion_name.to_string(), outcome);
+                    *terminal_output
+                        .lock()
+                        .expect("terminal output mutex poisoned") =
+                        Some(cumulative_outputs[pass_index].clone());
+                    run_controller.pause();
+                    events.request_stop("terminal-assertion-matched");
+                    let assertion_attempts = results
+                        .iter()
+                        .take(pass_index + 1)
+                        .map(|result| result.clone().expect("earlier results are complete"))
+                        .collect();
+                    return WaitConditionResult {
+                        outcome: WaitOutcome::Met,
+                        assertion_attempts,
+                    };
+                }
+
+                if let Some(outcome) = closed_with
+                    && judgments.is_empty()
+                {
+                    let assertion_attempts = results
+                        .into_iter()
+                        .flatten()
+                        .collect::<Vec<AssertionOutcome>>();
+                    if let Some(last) = assertion_attempts.last().cloned() {
+                        assertion_overrides
+                            .lock()
+                            .expect("assertion override mutex poisoned")
+                            .insert(assertion_name.to_string(), last);
+                    }
+                    if let Some(output) = cumulative_outputs.last().cloned() {
+                        *terminal_output
+                            .lock()
+                            .expect("terminal output mutex poisoned") = Some(output);
+                    }
+                    return WaitConditionResult {
+                        outcome,
+                        assertion_attempts,
+                    };
+                }
+
+                if judgments.is_empty() {
+                    let elapsed = start.elapsed();
+                    if elapsed < deadline {
+                        tokio::time::sleep(deadline.saturating_sub(elapsed).min(poll)).await;
+                    } else {
+                        tokio::task::yield_now().await;
+                    }
+                    continue;
+                }
+
+                tokio::select! {
+                    result = judgments.next() => {
+                        if let Some((attempt_index, outcome)) = result {
+                            results[attempt_index] = Some(outcome);
+                        }
+                    }
+                    () = tokio::time::sleep(poll) => {}
+                }
             }
         }
         WaitFor::Interoception {
@@ -3875,14 +3565,20 @@ async fn wait_for_condition(
                     })
                     .await;
                 if matched {
-                    return WaitOutcome::Met;
+                    return WaitConditionResult::met();
                 }
                 if events.stop_requested() {
-                    return WaitOutcome::Stopped;
+                    return WaitConditionResult {
+                        outcome: WaitOutcome::Stopped,
+                        assertion_attempts: Vec::new(),
+                    };
                 }
                 let elapsed = start.elapsed();
                 if elapsed >= deadline {
-                    return WaitOutcome::Timeout;
+                    return WaitConditionResult {
+                        outcome: WaitOutcome::Timeout,
+                        assertion_attempts: Vec::new(),
+                    };
                 }
                 let remaining = deadline.saturating_sub(elapsed);
                 tokio::time::sleep(remaining.min(poll)).await;
@@ -3893,8 +3589,35 @@ async fn wait_for_condition(
 
 fn wait_for_label(wait_for: Option<&WaitFor>) -> String {
     match wait_for {
-        Some(WaitFor::MemoFrom { module, timeout_ms }) => format!(
-            "memo from module '{module}' within {timeout_ms}ms",
+        Some(WaitFor::MemoFrom {
+            scope,
+            module,
+            timeout_ms,
+        }) => format!(
+            "memo from module '{module}'{} within {timeout_ms}ms",
+            scope
+                .as_deref()
+                .map(|scope| format!(" in scope '{scope}'"))
+                .unwrap_or_default(),
+            module = module.as_str(),
+        ),
+        Some(WaitFor::UtteranceFrom {
+            scope,
+            module,
+            target,
+            until_assertion,
+            max_matches,
+            timeout_ms,
+        }) => format!(
+            "utterance from module '{module}'{} to target '{target}'{} within {timeout_ms}ms",
+            scope
+                .as_deref()
+                .map(|scope| format!(" in scope '{scope}'"))
+                .unwrap_or_default(),
+            until_assertion
+                .as_deref()
+                .map(|name| format!(" until assertion '{name}' passes (max {max_matches} matches)"))
+                .unwrap_or_default(),
             module = module.as_str(),
         ),
         Some(WaitFor::Interoception {
@@ -3937,12 +3660,19 @@ fn eval_mode_matches(
     }
 }
 
-async fn memo_count_for_module(blackboard: &Blackboard, module: &ModuleId) -> usize {
+async fn memo_count_for_module(
+    blackboard: &Blackboard,
+    scope: Option<&nuillu_types::ScopeId>,
+    module: &ModuleId,
+) -> usize {
     blackboard
         .read(|bb| {
             bb.recent_memo_logs()
                 .into_iter()
-                .filter(|record| &record.owner.module == module)
+                .filter(|record| {
+                    &record.owner.module == module
+                        && scope.is_none_or(|scope| &record.owner.scope == scope)
+                })
                 .count()
         })
         .await
@@ -3962,9 +3692,96 @@ async fn build_step_snapshot(
     artifact
 }
 
-fn evaluate_step_check(check: &Check, artifact: &CaseArtifact) -> (bool, Option<String>) {
+#[allow(clippy::too_many_arguments)]
+async fn build_live_assertion_snapshot(
+    case_id: &str,
+    output: String,
+    matching_utterances: &[RecordedUtterance],
+    blackboard: &Blackboard,
+    utterances: &RecordingUtteranceSink,
+    events: &RecordingRuntimeEventSink,
+    memory: &dyn MemoryStore,
+    timeline_runtime_origin_ms: u64,
+    timeline_started_at: DateTime<Utc>,
+) -> Result<CaseArtifact> {
+    let mut artifact = CaseArtifact::new(output);
+    add_observations(&mut artifact, blackboard, utterances).await;
+    if let Some(agent) = artifact
+        .observations
+        .get_mut("agent")
+        .and_then(serde_json::Value::as_object_mut)
+    {
+        agent.insert(
+            "utterances".to_string(),
+            serde_json::to_value(matching_utterances)
+                .context("serialize live assertion utterances")?,
+        );
+    }
+    let mut timeline = build_eval_timeline(
+        blackboard,
+        utterances,
+        events,
+        timeline_runtime_origin_ms,
+        timeline_started_at,
+    )
+    .await;
+    if let Some(last_utterance) = matching_utterances.last()
+        && let Ok(emitted_at) = DateTime::parse_from_rfc3339(&last_utterance.emitted_at)
+    {
+        let cutoff_ms = datetime_offset_ms(timeline_started_at, emitted_at.with_timezone(&Utc));
+        timeline.retain(|event| event.offset_ms <= cutoff_ms);
+    }
+    artifact.observations.insert(
+        "timeline".to_string(),
+        serde_json::to_value(timeline).context("serialize live assertion timeline")?,
+    );
+    let mut last_state = build_runtime_last_state_dump(
+        case_id,
+        &artifact,
+        blackboard,
+        memory,
+        utterances,
+        events.event_count(),
+    )
+    .await?;
+    last_state.utterances = utterance_dumps(matching_utterances.to_vec());
+    add_last_state_observation(&mut artifact, &last_state)?;
+    Ok(artifact)
+}
+
+fn live_assertion_error(assertion: &Assertion, error: anyhow::Error) -> AssertionOutcome {
+    AssertionOutcome {
+        name: assertion.display_name(),
+        kind: assertion.kind_name().to_string(),
+        passed: false,
+        errored: true,
+        must_pass: assertion.common().must_pass,
+        weight: assertion.common().weight,
+        diagnostic: Some(format!(
+            "failed to build live assertion snapshot: {error:#}"
+        )),
+        rubric: None,
+    }
+}
+
+fn live_assertion_timeout(assertion: &Assertion, timeout_ms: u64) -> AssertionOutcome {
+    AssertionOutcome {
+        name: assertion.display_name(),
+        kind: assertion.kind_name().to_string(),
+        passed: false,
+        errored: true,
+        must_pass: assertion.common().must_pass,
+        weight: assertion.common().weight,
+        diagnostic: Some(format!(
+            "live assertion judge did not finish within the {timeout_ms}ms step deadline"
+        )),
+        rubric: None,
+    }
+}
+
+fn evaluate_step_check(check: &Assertion, artifact: &CaseArtifact) -> (bool, Option<String>) {
     match check {
-        Check::JsonPointerEquals {
+        Assertion::JsonPointerEquals {
             pointer, expected, ..
         } => {
             let json = artifact.as_json();
@@ -3978,7 +3795,7 @@ fn evaluate_step_check(check: &Check, artifact: &CaseArtifact) -> (bool, Option<
             });
             (passed, diagnostic)
         }
-        Check::JsonPointerContains {
+        Assertion::JsonPointerContains {
             pointer, contains, ..
         } => {
             let json = artifact.as_json();
@@ -3994,14 +3811,14 @@ fn evaluate_step_check(check: &Check, artifact: &CaseArtifact) -> (bool, Option<
             });
             (passed, diagnostic)
         }
-        Check::JsonPointerNumericInRange {
+        Assertion::JsonPointerNumericInRange {
             pointer, min, max, ..
         } => {
             let json = artifact.as_json();
             let actual = pointer_number(&json, pointer);
             numeric_range_outcome(pointer, actual, *min, *max)
         }
-        Check::ArtifactTextContains {
+        Assertion::ArtifactTextContains {
             field, contains, ..
         } => {
             let field = field.unwrap_or(ArtifactTextField::Output);
@@ -4015,7 +3832,7 @@ fn evaluate_step_check(check: &Check, artifact: &CaseArtifact) -> (bool, Option<
             });
             (passed, diagnostic)
         }
-        Check::ArtifactTextExact { field, exact, .. } => {
+        Assertion::ArtifactTextExact { field, exact, .. } => {
             let field = field.unwrap_or(ArtifactTextField::Output);
             let expected = normalize_text_block(&exact.content);
             let text = normalize_text_block(artifact_text(artifact, field));
@@ -4431,7 +4248,6 @@ pub(crate) struct EvalEnvironment {
     pub(crate) caps: CapabilityProviders,
     pub(crate) memory: Rc<dyn MemoryStore>,
     pub(crate) cognition_log_repository: Rc<dyn CognitionLogRepository>,
-    pub(crate) policy_store: Rc<dyn PolicyStore>,
     pub(crate) memory_caps: MemoryCapabilities,
     pub(crate) policy_caps: PolicyCapabilities,
     pub(crate) utterances: Rc<RecordingUtteranceSink>,
@@ -4602,7 +4418,6 @@ pub(crate) async fn build_eval_environment(
         caps,
         memory,
         cognition_log_repository,
-        policy_store,
         memory_caps,
         policy_caps,
         utterances,
@@ -4642,15 +4457,6 @@ fn interoception_runtime_policy(limits: &EvalLimits) -> InteroceptionRuntimePoli
     }
 }
 
-pub(crate) fn action_module_ids(modules: &[EvalModule]) -> Vec<ModuleId> {
-    modules
-        .iter()
-        .copied()
-        .filter(|module| module.is_action_module())
-        .map(EvalModule::module_id)
-        .collect()
-}
-
 async fn connect_agent_store(output_dir: &Path, config: &RunnerConfig) -> Result<LibsqlAgentStore> {
     let (memory_embedder, memory_profile, memory_dimensions) =
         build_embedder(&config.embedding_backend)?;
@@ -4673,13 +4479,22 @@ async fn connect_agent_store(output_dir: &Path, config: &RunnerConfig) -> Result
 
 async fn seed_memories(
     memory_caps: &MemoryCapabilities,
+    blackboard: &Blackboard,
     clock: &dyn Clock,
     case_now: Option<DateTime<FixedOffset>>,
     memories: &[crate::cases::MemorySeed],
 ) -> Result<Vec<MemoryIndex>> {
-    let writer = memory_caps.writer();
     let mut seeded = Vec::with_capacity(memories.len());
     for memory in memories {
+        let scope = parse_scope_id(&memory.scope)?;
+        let scoped_caps = if scope.is_root() {
+            memory_caps.with_namespace(MemoryNamespace::Global)
+        } else {
+            memory_caps
+                .with_namespace(MemoryNamespace::Local(scope.clone()))
+                .scoped(blackboard.scoped(scope))
+        };
+        let writer = scoped_caps.writer();
         let occurred_at = memory_seed_occurred_at(clock, case_now, memory)?;
         let index = if let Some(index) = memory.index.as_deref() {
             writer
@@ -4804,7 +4619,7 @@ async fn seed_and_bootstrap_eval_startup_context(
     memory_links: &[MemoryLinkSeed],
     policies: &[PolicySeed],
 ) -> Result<()> {
-    let seeded_indexes = seed_memories(memory_caps, clock, case_now, memories).await?;
+    let seeded_indexes = seed_memories(memory_caps, blackboard, clock, case_now, memories).await?;
     seed_memory_links(memory, clock, &seeded_indexes, memory_links).await?;
     seed_policies(policy_store, blackboard, policies).await?;
     memory_caps
@@ -4846,7 +4661,11 @@ async fn seed_memos(
     for memo in memos {
         let module = ModuleId::new(memo.module.clone())
             .with_context(|| format!("seed memo module id {}", memo.module))?;
-        let owner = ModuleInstanceId::new(module, ReplicaIndex::new(memo.replica));
+        let owner = ModuleInstanceId::in_scope(
+            parse_scope_id(&memo.scope)?,
+            module,
+            ReplicaIndex::new(memo.replica),
+        );
         let written_at = now - ChronoDuration::seconds(memo.seconds_ago);
         let cognitive = force_cognitive || memo.cognitive;
         let record = if cognitive {
@@ -4863,22 +4682,19 @@ async fn seed_memos(
     Ok(records)
 }
 
-fn module_target_forces_cognitive_memo_seeds(target: ModuleEvalTarget) -> bool {
-    matches!(
-        target,
-        ModuleEvalTarget::AttentionSchema | ModuleEvalTarget::Dreaming
-    )
-}
-
 async fn seed_cognition_log(
     blackboard: &Blackboard,
     clock: &dyn Clock,
     seeds: &[crate::cases::CognitionLogSeed],
 ) -> Vec<CognitionLogEntryRecord> {
-    let stream = ModuleInstanceId::new(builtin::cognition_gate(), ReplicaIndex::ZERO);
     let now = clock.now();
     let mut records = Vec::with_capacity(seeds.len());
     for seed in seeds {
+        let stream = ModuleInstanceId::in_scope(
+            parse_scope_id(&seed.scope).expect("validated cognition scope"),
+            ModuleId::new(seed.module.clone()).expect("validated cognition module"),
+            ReplicaIndex::new(seed.replica),
+        );
         let appended = blackboard
             .append_cognition_log(
                 stream.clone(),
@@ -4894,851 +4710,36 @@ async fn seed_cognition_log(
     records
 }
 
-fn full_agent_case_modules(case: &FullAgentCase, disabled: &[EvalModule]) -> Vec<EvalModule> {
-    let mut modules = case
-        .modules
-        .clone()
-        .unwrap_or_else(|| DEFAULT_FULL_AGENT_MODULES.to_vec());
-    if !disabled.is_empty() {
-        modules.retain(|module| !disabled.contains(module));
+async fn publish_setup_updates(
+    harness: &InternalHarnessIo,
+    memos: &[MemoLogRecord],
+    cognition: &[CognitionLogEntryRecord],
+) {
+    for record in memos {
+        harness
+            .memo_updated_mailbox()
+            .publish(nuillu_module::MemoUpdated {
+                owner: record.owner.clone(),
+                index: record.index,
+            })
+            .await
+            .expect("eval setup failed to publish MemoUpdated");
     }
-    modules
-}
-
-fn validate_disabled_modules(disabled: &[EvalModule]) -> Result<(), RunnerError> {
-    for module in disabled {
-        if REQUIRED_FULL_AGENT_MODULES.contains(module) {
-            return Err(RunnerError::DisableRequiredModule {
-                module: module.as_str(),
-            });
-        }
+    for record in cognition {
+        harness
+            .cognition_log_updated_mailbox()
+            .publish(CognitionLogUpdated::EntryAppended {
+                source: record.source.clone(),
+            })
+            .await
+            .expect("eval setup failed to publish CognitionLogUpdated");
     }
-    Ok(())
-}
-
-fn module_case_modules(target: ModuleEvalTarget, case: &ModuleCase) -> Vec<EvalModule> {
-    case.modules
-        .clone()
-        .unwrap_or_else(|| vec![target.module()])
-}
-
-pub(crate) fn eval_registry(
-    modules: &[EvalModule],
-    memory_caps: &MemoryCapabilities,
-    policy_caps: &PolicyCapabilities,
-    utterance_sink: &Rc<dyn UtteranceSink>,
-    replica_hard_cap: ReplicaHardCap,
-) -> ModuleRegistry {
-    let mut registry = ModuleRegistry::new();
-    for module in modules {
-        registry = register_eval_module(
-            registry,
-            *module,
-            modules,
-            memory_caps,
-            policy_caps,
-            utterance_sink,
-            replica_hard_cap,
-        );
-    }
-    apply_standard_dependencies(registry, modules.iter().copied().map(EvalModule::module_id))
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ReplicaHardCap {
-    PolicyMax,
-    V1Max,
-}
-
-trait EvalRegistryExt {
-    fn register_eval<B>(
-        self,
-        policy: ModulePolicy,
-        replica_hard_cap: ReplicaHardCap,
-        builder: B,
-    ) -> Result<ModuleRegistry, nuillu_module::ModuleRegistryError>
-    where
-        B: nuillu_module::ModuleRegisterer + 'static,
-        B::Module: nuillu_module::StaticModule;
-}
-
-impl EvalRegistryExt for ModuleRegistry {
-    fn register_eval<B>(
-        self,
-        policy: ModulePolicy,
-        replica_hard_cap: ReplicaHardCap,
-        builder: B,
-    ) -> Result<ModuleRegistry, nuillu_module::ModuleRegistryError>
-    where
-        B: nuillu_module::ModuleRegisterer + 'static,
-        B::Module: nuillu_module::StaticModule,
-    {
-        let replica_capacity = match replica_hard_cap {
-            ReplicaHardCap::PolicyMax => policy.max_active_replicas(),
-            ReplicaHardCap::V1Max => ReplicaCapRange::V1_MAX,
-        };
-        let spec = nuillu_module::ModuleRegistrationSpec::for_static::<B::Module>(
-            policy,
-            ActivationRatio::ZERO,
-        )?
-        .with_replica_capacity(replica_capacity);
-        self.register(spec, builder)
-    }
-}
-
-fn hidden_from_attention_modules() -> Vec<ModuleId> {
-    vec![
-        nuillu_types::builtin::interoception(),
-        nuillu_types::builtin::homeostasis(),
-        nuillu_types::builtin::memory_compaction(),
-        nuillu_types::builtin::memory_association(),
-        nuillu_types::builtin::policy_compaction(),
-    ]
-}
-
-fn action_target_modules(modules: &[EvalModule]) -> Vec<ModuleId> {
-    modules
-        .iter()
-        .copied()
-        .filter(|module| module.is_action_target())
-        .map(EvalModule::module_id)
-        .collect()
-}
-
-fn homeostatic_drive_modules() -> Vec<ModuleId> {
-    vec![
-        nuillu_types::builtin::memory_compaction(),
-        nuillu_types::builtin::memory_association(),
-        nuillu_types::builtin::dreaming(),
-        nuillu_types::builtin::policy_compaction(),
-    ]
-}
-
-fn sleep_suppressed_modules() -> Vec<ModuleId> {
-    vec![
-        nuillu_types::builtin::action(),
-        nuillu_types::builtin::cognition_gate(),
-        nuillu_types::builtin::attention_schema(),
-        nuillu_types::builtin::interpreter(),
-        nuillu_types::builtin::self_model(),
-        nuillu_types::builtin::query_memory(),
-        nuillu_types::builtin::memory(),
-        nuillu_types::builtin::policy(),
-        nuillu_types::builtin::reward(),
-        nuillu_types::builtin::predict(),
-        nuillu_types::builtin::surprise(),
-        nuillu_types::builtin::speak(),
-    ]
-}
-
-fn voluntary_modules(modules: &[EvalModule]) -> Vec<ModuleId> {
-    let hidden = hidden_from_attention_modules()
-        .into_iter()
-        .collect::<std::collections::HashSet<_>>();
-    let action_targets = action_target_modules(modules)
-        .into_iter()
-        .collect::<std::collections::HashSet<_>>();
-    modules
-        .iter()
-        .map(|module| module.module_id())
-        .filter(|id| {
-            *id != builtin::sensory() && !hidden.contains(id) && !action_targets.contains(id)
-        })
-        .collect()
-}
-
-fn eval_policy(
-    replicas_range: std::ops::RangeInclusive<u8>,
-    rate_limit_range: std::ops::RangeInclusive<Bpm>,
-) -> ModulePolicy {
-    ModulePolicy::new(
-        ReplicaCapRange::new(*replicas_range.start(), *replicas_range.end()).unwrap(),
-        rate_limit_range,
-        linear_ratio_fn,
-    )
-}
-
-fn register_eval_module(
-    registry: ModuleRegistry,
-    module: EvalModule,
-    all_modules: &[EvalModule],
-    memory_caps: &MemoryCapabilities,
-    policy_caps: &PolicyCapabilities,
-    utterance_sink: &Rc<dyn UtteranceSink>,
-    replica_hard_cap: ReplicaHardCap,
-) -> ModuleRegistry {
-    match module {
-        // Input-driven and bursty: bursts of inputs need a fast active pace
-        // so observations are normalized within the same tick window.
-        EvalModule::Sensory => {
-            let one_shot_tier = eval_session_tier(module, "one-shot");
-            let ambient_tier = eval_session_tier(module, "ambient");
-            registry
-                .register_eval(
-                    eval_policy(0..=1, Bpm::range(6.0, 18.0)),
-                    replica_hard_cap,
-                    move |caps| async move {
-                        Ok(nuillu_sensory::SensoryModule::new(
-                            caps.sensory_input_inbox(),
-                            caps.memo(),
-                            caps.scene_reader(),
-                            caps.clock(),
-                            caps.timer(),
-                            caps.llm("one-shot").with_tier(one_shot_tier).into(),
-                            caps.session("one-shot")
-                                .with_tier(one_shot_tier)
-                                .with_auto_compaction(
-                                    nuillu_sensory::one_shot_session_auto_compaction(),
-                                )
-                                .await?,
-                            caps.session("ambient")
-                                .with_tier(ambient_tier)
-                                .with_auto_compaction(
-                                    nuillu_sensory::ambient_session_auto_compaction(),
-                                )
-                                .await?,
-                        ))
-                    },
-                )
-                .expect("eval module registration should be unique")
-        }
-        // Must re-fire fast as memos accumulate so the cognition log is
-        // current by the time speak considers it.
-        EvalModule::CognitionGate => {
-            let main_tier = eval_session_tier(module, "main");
-            registry
-                .register_eval(
-                    eval_policy(0..=1, Bpm::range(6.0, 18.0)),
-                    replica_hard_cap,
-                    move |caps| async move {
-                        Ok(nuillu_cognition_gate::CognitionGateModule::new(
-                            caps.memo_updated_inbox(),
-                            caps.blackboard_reader(),
-                            caps.cognition_writer(),
-                            caps.llm("main").with_tier(main_tier).into(),
-                            caps.session("main")
-                                .with_tier(main_tier)
-                                .with_auto_compaction(
-                                    nuillu_cognition_gate::session_auto_compaction(),
-                                )
-                                .await?,
-                        ))
-                    },
-                )
-                .expect("eval module registration should be unique")
-        }
-        // Expensive (premium tier in default model-set), heavy reasoning.
-        // Should only fire on meaningful state shifts — slow base pace so
-        // it doesn't burn budget reacting to every memo update.
-        EvalModule::Allocation => registry
-            .register_eval(
-                eval_policy(0..=1, Bpm::range(3.0, 6.0)),
-                replica_hard_cap,
-                {
-                    let voluntary = voluntary_modules(all_modules);
-                    let main_tier = eval_session_tier(module, "main");
-                    move |caps| {
-                        let voluntary = voluntary.clone();
-                        async move {
-                            Ok(nuillu_allocation::AllocationModule::new(
-                                caps.memo_updated_inbox(),
-                                caps.attention_control_inbox(),
-                                caps.blackboard_reader(),
-                                caps.cognition_log_reader(),
-                                caps.allocation_reader(),
-                                caps.interoception_reader(),
-                                caps.allocation_writer(voluntary.clone(), Vec::new()),
-                                caps.llm("main").with_tier(main_tier).into(),
-                                caps.session("main")
-                                    .with_tier(main_tier)
-                                    .with_auto_compaction(
-                                        nuillu_allocation::session_auto_compaction(),
-                                    )
-                                    .await?,
-                                caps.timer(),
-                            ))
-                        }
-                    }
-                },
-            )
-            .expect("eval module registration should be unique"),
-        EvalModule::Action => registry
-            .register_eval(
-                eval_policy(0..=1, Bpm::range(3.0, 9.0)),
-                replica_hard_cap,
-                {
-                    let action_targets = action_target_modules(all_modules);
-                    let main_tier = eval_session_tier(module, "main");
-                    move |caps| {
-                        let action_targets = action_targets.clone();
-                        async move {
-                            Ok(nuillu_action::ActionModule::new(
-                                caps.memo_updated_inbox(),
-                                caps.cognition_log_updated_inbox(),
-                                caps.interoception_updated_inbox(),
-                                caps.action_affordances_updated_inbox(),
-                                caps.blackboard_reader(),
-                                caps.cognition_log_reader(),
-                                caps.allocation_reader(),
-                                caps.interoception_reader(),
-                                caps.action_affordance_reader(),
-                                caps.external_action_invoker(),
-                                caps.allocation_writer(action_targets.clone(), Vec::new()),
-                                caps.interoception_writer(),
-                                caps.memo(),
-                                caps.llm("main").with_tier(main_tier).into(),
-                                caps.session("main")
-                                    .with_tier(main_tier)
-                                    .with_auto_compaction(nuillu_action::session_auto_compaction())
-                                    .await?,
-                            ))
-                        }
-                    }
-                },
-            )
-            .expect("eval module registration should be unique"),
-        // Periodic first-person attention narration; not on the critical
-        // path for the speak loop.
-        EvalModule::AttentionSchema => {
-            let main_tier = eval_session_tier(module, "main");
-            registry
-                .register_eval(
-                    eval_policy(0..=1, Bpm::range(3.0, 6.0)),
-                    replica_hard_cap,
-                    move |caps| async move {
-                        Ok(nuillu_attention_schema::AttentionSchemaModule::new(
-                            caps.memo_updated_inbox(),
-                            caps.cognition_log_updated_inbox(),
-                            caps.blackboard_reader(),
-                            caps.cognition_log_reader(),
-                            caps.memo(),
-                            caps.llm("main").with_tier(main_tier).into(),
-                            caps.session("main")
-                                .with_tier(main_tier)
-                                .with_auto_compaction(
-                                    nuillu_attention_schema::session_auto_compaction(),
-                                )
-                                .await?,
-                        ))
-                    },
-                )
-                .expect("eval module registration should be unique")
-        }
-        EvalModule::Interpreter => {
-            let main_tier = eval_session_tier(module, "main");
-            registry
-                .register_eval(
-                    eval_policy(0..=1, Bpm::range(3.0, 6.0)),
-                    replica_hard_cap,
-                    move |caps| async move {
-                        Ok(nuillu_interpreter::InterpreterModule::new(
-                            caps.cognition_log_updated_inbox(),
-                            caps.cognition_log_reader(),
-                            caps.cognition_writer(),
-                            caps.llm("main").with_tier(main_tier).into(),
-                            caps.session("main")
-                                .with_tier(main_tier)
-                                .with_auto_compaction(nuillu_interpreter::session_auto_compaction())
-                                .await?,
-                        ))
-                    },
-                )
-                .expect("eval module registration should be unique")
-        }
-        // On-demand: fires on peer memo updates and reads current memo context.
-        EvalModule::SelfModel => {
-            let main_tier = eval_session_tier(module, "main");
-            registry
-                .register_eval(
-                    eval_policy(0..=1, Bpm::range(3.0, 6.0)),
-                    replica_hard_cap,
-                    move |caps| async move {
-                        Ok(nuillu_self_model::SelfModelModule::new(
-                            caps.memo_updated_inbox(),
-                            caps.blackboard_reader(),
-                            caps.memo(),
-                            caps.llm("main").with_tier(main_tier).into(),
-                            caps.session("main")
-                                .with_tier(main_tier)
-                                .with_auto_compaction(nuillu_self_model::session_auto_compaction())
-                                .await?,
-                        ))
-                    },
-                )
-                .expect("eval module registration should be unique")
-        }
-        // Memory retrieval is on the critical path between cognition-gate
-        // and speak; needs a quick active pace.
-        EvalModule::QueryMemory => registry
-            .register_eval(
-                eval_policy(1..=1, Bpm::range(12.0, 30.0)),
-                replica_hard_cap,
-                {
-                    let memory_caps = memory_caps.clone();
-                    let main_tier = eval_session_tier(module, "main");
-                    move |caps| {
-                        let memory_caps = memory_caps.clone();
-                        async move {
-                            Ok(nuillu_memory::QueryMemoryModule::new(
-                                caps.cognition_log_updated_inbox(),
-                                caps.blackboard_reader(),
-                                memory_caps.retriever(),
-                                memory_caps.content_reader(),
-                                caps.typed_memo::<nuillu_memory::QueryMemoryMemo>(),
-                                caps.llm("main").with_tier(main_tier).into(),
-                                caps.session("main")
-                                    .with_tier(main_tier)
-                                    .with_auto_compaction(
-                                        nuillu_memory::query_session_auto_compaction(),
-                                    )
-                                    .await?,
-                            ))
-                        }
-                    }
-                },
-            )
-            .expect("eval module registration should be unique"),
-        // Background durability writer. Cognition-log triggered.
-        EvalModule::Memory => registry
-            .register_eval(
-                eval_policy(1..=1, Bpm::range(6.0, 18.0)),
-                replica_hard_cap,
-                {
-                    let memory_caps = memory_caps.clone();
-                    let main_tier = eval_session_tier(module, "main");
-                    move |caps| {
-                        let memory_caps = memory_caps.clone();
-                        async move {
-                            Ok(nuillu_memory::MemoryModule::new(
-                                caps.memo_updated_inbox(),
-                                caps.cognition_log_updated_inbox(),
-                                caps.blackboard_reader(),
-                                caps.cognition_log_reader(),
-                                caps.memory_metadata_reader(),
-                                memory_caps.writer(),
-                                memory_caps.deleter(),
-                                memory_caps.retriever(),
-                                caps.llm("main").with_tier(main_tier).into(),
-                                caps.session("main")
-                                    .with_tier(main_tier)
-                                    .with_auto_compaction(nuillu_memory::session_auto_compaction())
-                                    .await?,
-                                caps.timer(),
-                            ))
-                        }
-                    }
-                },
-            )
-            .expect("eval module registration should be unique"),
-        // Rare; runs on interoceptive state changes.
-        EvalModule::MemoryCompaction => registry
-            .register_eval(
-                eval_policy(0..=1, Bpm::range(2.0, 6.0)),
-                replica_hard_cap,
-                {
-                    let memory_caps = memory_caps.clone();
-                    let main_tier = eval_session_tier(module, "main");
-                    let audit_tier = eval_session_tier(module, "audit");
-                    move |caps| {
-                        let memory_caps = memory_caps.clone();
-                        async move {
-                            Ok(nuillu_memory::MemoryCompactionModule::new(
-                                caps.interoception_updated_inbox(),
-                                caps.blackboard_reader(),
-                                memory_caps.compactor(),
-                                caps.llm("main").with_tier(main_tier).into(),
-                                caps.llm("audit").with_tier(audit_tier).into(),
-                            ))
-                        }
-                    }
-                },
-            )
-            .expect("eval module registration should be unique"),
-        EvalModule::MemoryAssociation => registry
-            .register_eval(
-                eval_policy(0..=1, Bpm::range(2.0, 6.0)),
-                replica_hard_cap,
-                {
-                    let memory_caps = memory_caps.clone();
-                    let main_tier = eval_session_tier(module, "main");
-                    move |caps| {
-                        let memory_caps = memory_caps.clone();
-                        async move {
-                            Ok(nuillu_memory::MemoryAssociationModule::new(
-                                caps.interoception_updated_inbox(),
-                                caps.blackboard_reader(),
-                                memory_caps.content_reader(),
-                                memory_caps.writer(),
-                                memory_caps.associator(),
-                                caps.llm("main").with_tier(main_tier).into(),
-                            ))
-                        }
-                    }
-                },
-            )
-            .expect("eval module registration should be unique"),
-        EvalModule::Dreaming => registry
-            .register_eval(
-                eval_policy(0..=1, Bpm::range(2.0, 6.0)),
-                replica_hard_cap,
-                {
-                    let main_tier = eval_session_tier(module, "main");
-                    move |caps| async move {
-                        Ok(nuillu_memory::DreamingModule::new(
-                            caps.interoception_updated_inbox(),
-                            caps.allocation_reader(),
-                            caps.blackboard_reader(),
-                            caps.memo(),
-                            caps.llm("main").with_tier(main_tier).into(),
-                        ))
-                    }
-                },
-            )
-            .expect("eval module registration should be unique"),
-        EvalModule::Interoception => registry
-            .register_eval(
-                eval_policy(0..=1, Bpm::range(2.0, 6.0)),
-                replica_hard_cap,
-                {
-                    let main_tier = eval_session_tier(module, "main");
-                    move |caps| async move {
-                        Ok(nuillu_interoception::InteroceptionModule::new(
-                            caps.memo_updated_inbox(),
-                            caps.cognition_log_updated_inbox(),
-                            caps.blackboard_reader(),
-                            caps.interoception_policy(),
-                            caps.interoception_writer(),
-                            caps.llm("main").with_tier(main_tier).into(),
-                            caps.session("main")
-                                .with_tier(main_tier)
-                                .with_auto_compaction(
-                                    nuillu_interoception::session_auto_compaction(),
-                                )
-                                .await?,
-                            caps.timer(),
-                        ))
-                    }
-                },
-            )
-            .expect("eval module registration should be unique"),
-        EvalModule::Homeostasis => registry
-            .register_eval(
-                eval_policy(0..=1, Bpm::range(6.0, 20.0)),
-                replica_hard_cap,
-                |caps| async move {
-                    Ok(nuillu_homeostasis::HomeostasisModule::new(
-                        caps.interoception_updated_inbox(),
-                        caps.interoception_reader(),
-                        caps.allocation_writer(
-                            homeostatic_drive_modules(),
-                            sleep_suppressed_modules(),
-                        ),
-                        caps.timer(),
-                    ))
-                },
-            )
-            .expect("eval module registration should be unique"),
-        EvalModule::Policy => registry
-            .register_eval(
-                eval_policy(1..=1, Bpm::range(2.0, 6.0)),
-                replica_hard_cap,
-                {
-                    let policy_caps = policy_caps.clone();
-                    let main_tier = eval_session_tier(module, "main");
-                    move |caps| {
-                        let policy_caps = policy_caps.clone();
-                        async move {
-                            let consideration_writer =
-                                policy_caps.consideration_writer(caps.owner().clone());
-                            Ok(nuillu_reward::PolicyModule::new(
-                                caps.memo_updated_inbox(),
-                                caps.cognition_log_updated_inbox(),
-                                caps.blackboard_reader(),
-                                caps.cognition_log_reader(),
-                                caps.interoception_reader(),
-                                policy_caps.searcher(),
-                                caps.memo(),
-                                consideration_writer,
-                                caps.llm("main").with_tier(main_tier).into(),
-                                caps.session("main")
-                                    .with_tier(main_tier)
-                                    .with_auto_compaction(
-                                        nuillu_reward::policy_session_auto_compaction(),
-                                    )
-                                    .await?,
-                            ))
-                        }
-                    }
-                },
-            )
-            .expect("eval module registration should be unique"),
-        EvalModule::PolicyCompaction => registry
-            .register_eval(
-                eval_policy(0..=1, Bpm::range(2.0, 6.0)),
-                replica_hard_cap,
-                {
-                    let policy_caps = policy_caps.clone();
-                    let main_tier = eval_session_tier(module, "main");
-                    move |caps| {
-                        let policy_caps = policy_caps.clone();
-                        async move {
-                            Ok(nuillu_reward::PolicyCompactionModule::new(
-                                caps.interoception_updated_inbox(),
-                                caps.blackboard_reader(),
-                                policy_caps.compactor(),
-                                caps.llm("main").with_tier(main_tier).into(),
-                            ))
-                        }
-                    }
-                },
-            )
-            .expect("eval module registration should be unique"),
-        EvalModule::Reward => registry
-            .register_eval(
-                eval_policy(1..=1, Bpm::range(3.0, 9.0)),
-                replica_hard_cap,
-                {
-                    let policy_caps = policy_caps.clone();
-                    let main_tier = eval_session_tier(module, "main");
-                    move |caps| {
-                        let policy_caps = policy_caps.clone();
-                        async move {
-                            Ok(nuillu_reward::RewardModule::new(
-                                policy_caps.consideration_evicted_inbox(),
-                                caps.blackboard_reader(),
-                                caps.cognition_log_reader(),
-                                caps.interoception_reader(),
-                                policy_caps.searcher(),
-                                policy_caps.upserter(),
-                                caps.memo(),
-                                caps.llm("main").with_tier(main_tier).into(),
-                                caps.session("main")
-                                    .with_tier(main_tier)
-                                    .with_auto_compaction(
-                                        nuillu_reward::reward_session_auto_compaction(),
-                                    )
-                                    .await?,
-                            ))
-                        }
-                    }
-                },
-            )
-            .expect("eval module registration should be unique"),
-        // Cognition-log triggered; not on speak critical path.
-        EvalModule::Predict => {
-            let main_tier = eval_session_tier(module, "main");
-            registry
-                .register_eval(
-                    eval_policy(1..=1, Bpm::range(6.0, 18.0)),
-                    replica_hard_cap,
-                    move |caps| async move {
-                        Ok(nuillu_predict::PredictModule::new(
-                            caps.cognition_log_updated_inbox(),
-                            caps.cognition_log_reader(),
-                            caps.memo(),
-                            caps.llm("main").with_tier(main_tier).into(),
-                            caps.session("main")
-                                .with_tier(main_tier)
-                                .with_auto_compaction(nuillu_predict::session_auto_compaction())
-                                .await?,
-                        ))
-                    },
-                )
-                .expect("eval module registration should be unique")
-        }
-        // Cognition-log triggered; should be quick enough to flag
-        // unexpected events while they're still relevant.
-        EvalModule::Surprise => {
-            let main_tier = eval_session_tier(module, "main");
-            registry
-                .register_eval(
-                    eval_policy(1..=1, Bpm::range(6.0, 18.0)),
-                    replica_hard_cap,
-                    move |caps| async move {
-                        Ok(nuillu_surprise::SurpriseModule::new(
-                            caps.cognition_log_updated_inbox(),
-                            caps.cognition_log_reader(),
-                            caps.blackboard_reader(),
-                            caps.attention_control_mailbox(),
-                            caps.memo(),
-                            caps.llm("main").with_tier(main_tier).into(),
-                            caps.session("main")
-                                .with_tier(main_tier)
-                                .with_auto_compaction(nuillu_surprise::session_auto_compaction())
-                                .await?,
-                        ))
-                    },
-                )
-                .expect("eval module registration should be unique")
-        }
-        // Reactive on cognition-log updates. The target-selection tool
-        // decides whether this activation emits speech or stays silent.
-        EvalModule::Speak => registry
-            .register_eval(
-                eval_policy(0..=1, Bpm::range(6.0, 18.0)),
-                replica_hard_cap,
-                {
-                    let utterance_sink = utterance_sink.clone();
-                    let planning_tier = eval_session_tier(module, "planning");
-                    move |caps| {
-                        let utterance_sink = utterance_sink.clone();
-                        async move {
-                            Ok(nuillu_speak::SpeakModule::new(
-                                nuillu_speak::SpeakModuleParts {
-                                    cognition_updates: caps.cognition_log_updated_inbox(),
-                                    cognition_log: caps.cognition_log_reader(),
-                                    attention_control: caps.attention_control_mailbox(),
-                                    memo: caps.memo(),
-                                    utterance: UtteranceWriter::new(
-                                        caps.owner().clone(),
-                                        caps.blackboard(),
-                                        utterance_sink.clone(),
-                                        caps.clock(),
-                                    ),
-                                    planning_llm: caps
-                                        .llm("planning")
-                                        .with_tier(planning_tier)
-                                        .into(),
-                                    scene: caps.scene_reader(),
-                                    speech_targets: nuillu_speak::SpeechTargetCatalog::default(),
-                                    clock: caps.clock(),
-                                    planning_session: caps
-                                        .session("planning")
-                                        .with_tier(planning_tier)
-                                        .with_auto_compaction(
-                                            nuillu_speak::planning_session_auto_compaction(),
-                                        )
-                                        .await?,
-                                },
-                            ))
-                        }
-                    }
-                },
-            )
-            .expect("eval module registration should be unique"),
-    }
-}
-
-pub(crate) fn full_agent_allocation(
-    _limits: &crate::cases::EvalLimits,
-    modules: &[EvalModule],
-) -> ResourceAllocation {
-    let mut allocation = ResourceAllocation::default();
-    allocation.set_activation_table(eval_activation_table());
-
-    for module in modules {
-        let activation = match module {
-            EvalModule::Sensory => 1.0,
-            EvalModule::Allocation => 1.0,
-            EvalModule::Interoception => 1.0,
-            EvalModule::Homeostasis => 1.0,
-            EvalModule::Action
-            | EvalModule::CognitionGate
-            | EvalModule::AttentionSchema
-            | EvalModule::Interpreter
-            | EvalModule::SelfModel
-            | EvalModule::QueryMemory
-            | EvalModule::Memory
-            | EvalModule::MemoryCompaction
-            | EvalModule::MemoryAssociation
-            | EvalModule::Dreaming
-            | EvalModule::Policy
-            | EvalModule::PolicyCompaction
-            | EvalModule::Reward
-            | EvalModule::Predict
-            | EvalModule::Surprise
-            | EvalModule::Speak => 0.0,
-        };
-        set_allocation_module(&mut allocation, module.module_id(), activation);
-    }
-    allocation
-}
-
-fn full_agent_gui_initial_allocation(
-    limits: &crate::cases::EvalLimits,
-    modules: &[EvalModule],
-) -> ResourceAllocation {
-    let mut allocation = full_agent_allocation(limits, modules);
-    for module in modules {
-        allocation.set_activation(module.module_id(), ActivationRatio::ZERO);
-    }
-    allocation
-}
-
-fn module_allocation(
-    target: ModuleEvalTarget,
-    _limits: &crate::cases::EvalLimits,
-    modules: &[EvalModule],
-) -> ResourceAllocation {
-    let mut allocation = ResourceAllocation::default();
-    allocation.set_activation_table(eval_activation_table());
-    let target_module = target.module();
-    for module in modules {
-        let is_target = *module == target_module;
-        let id = module.module_id();
-        allocation.set_activation(
-            id,
-            if is_target {
-                ActivationRatio::ONE
-            } else {
-                ActivationRatio::ZERO
-            },
-        );
-    }
-    allocation
-}
-
-fn set_allocation_module(allocation: &mut ResourceAllocation, id: ModuleId, activation_ratio: f64) {
-    allocation.set_activation(id, ActivationRatio::from_f64(activation_ratio));
-}
-
-fn eval_activation_table() -> Vec<ActivationRatio> {
-    [1.0, 0.85, 0.7, 0.5, 0.3, 0.0]
-        .into_iter()
-        .map(ActivationRatio::from_f64)
-        .collect()
-}
-
-fn module_id_for_target(target: ModuleEvalTarget) -> ModuleId {
-    target.module().module_id()
-}
-
-fn eval_module_tier(module: EvalModule) -> ModelTier {
-    match module {
-        EvalModule::Sensory
-        | EvalModule::CognitionGate
-        | EvalModule::QueryMemory
-        | EvalModule::Memory
-        | EvalModule::MemoryCompaction
-        | EvalModule::MemoryAssociation
-        | EvalModule::Dreaming
-        | EvalModule::Interoception
-        | EvalModule::Homeostasis
-        | EvalModule::PolicyCompaction
-        | EvalModule::Predict => ModelTier::Cheap,
-        EvalModule::Speak => ModelTier::Premium,
-        EvalModule::Allocation | EvalModule::Action => ModelTier::Default,
-        EvalModule::AttentionSchema
-        | EvalModule::Interpreter
-        | EvalModule::SelfModel
-        | EvalModule::Policy
-        | EvalModule::Reward
-        | EvalModule::Surprise => ModelTier::Default,
-    }
-}
-
-fn eval_session_tier(module: EvalModule, key: &str) -> ModelTier {
-    match (module, key) {
-        (EvalModule::Sensory, "one-shot" | "ambient") => ModelTier::Cheap,
-        (EvalModule::Speak, "planning") => ModelTier::Premium,
-        (EvalModule::Speak, "generation") => ModelTier::Default,
-        (EvalModule::MemoryCompaction, "main") => ModelTier::Cheap,
-        (EvalModule::MemoryCompaction, "audit") => ModelTier::Default,
-        (_, "main") => eval_module_tier(module),
-        _ => panic!(
-            "unknown eval session key {key:?} for module {}",
-            module.as_str()
-        ),
+    if !memos.is_empty() || !cognition.is_empty() {
+        harness
+            .interoception_updated_mailbox()
+            .publish(nuillu_module::InteroceptiveUpdated)
+            .await
+            .expect("eval setup failed to publish InteroceptiveUpdated");
     }
 }
 
@@ -5761,14 +4762,14 @@ async fn add_observations(
         .insert("agent".to_string(), observations);
 }
 
-async fn build_full_agent_last_state_dump(
+async fn build_runtime_last_state_dump(
     case_id: &str,
     artifact: &CaseArtifact,
     blackboard: &Blackboard,
     memory: &dyn MemoryStore,
     utterances: &RecordingUtteranceSink,
     event_count: usize,
-) -> Result<FullAgentLastStateDump> {
+) -> Result<RuntimeLastStateDump> {
     let (blackboard_dump, memory_metadata) = blackboard
         .read(|bb| {
             (
@@ -5778,8 +4779,8 @@ async fn build_full_agent_last_state_dump(
         })
         .await;
     let memory_dump = memory_last_state_dump(memory_metadata, memory).await?;
-    Ok(FullAgentLastStateDump {
-        case: FullAgentLastStateCaseDump {
+    Ok(RuntimeLastStateDump {
+        case: RuntimeLastStateCaseDump {
             id: case_id.to_string(),
             dumped_at: Utc::now().to_rfc3339(),
             event_count: event_count as u64,
@@ -5794,7 +4795,7 @@ async fn build_full_agent_last_state_dump(
 
 fn add_last_state_observation(
     artifact: &mut CaseArtifact,
-    last_state: &FullAgentLastStateDump,
+    last_state: &RuntimeLastStateDump,
 ) -> Result<()> {
     let value = serde_json::to_value(last_state).context("serialize last state observation")?;
     artifact
@@ -5803,15 +4804,15 @@ fn add_last_state_observation(
     Ok(())
 }
 
-fn write_full_agent_last_state_eure(
+fn write_runtime_last_state_eure(
     output_dir: &Path,
-    last_state: FullAgentLastStateDump,
+    last_state: RuntimeLastStateDump,
 ) -> Result<()> {
     let path = output_dir.join("last-state.eure");
-    let rendered = render_full_agent_last_state_eure(last_state)
-        .context("render full-agent last state Eure")?;
+    let rendered =
+        render_runtime_last_state_eure(last_state).context("render runtime last state Eure")?;
     std::fs::write(&path, rendered)
-        .with_context(|| format!("write full-agent last state dump to {}", path.display()))
+        .with_context(|| format!("write runtime last state dump to {}", path.display()))
 }
 
 fn blackboard_last_state_dump(bb: &BlackboardInner) -> BlackboardLastStateDump {
@@ -6154,6 +5155,7 @@ struct AllocationModuleObservation {
 
 #[derive(Debug, Clone, Serialize)]
 struct MemoLogObservation {
+    scope: String,
     replica: u8,
     index: u64,
     written_at: String,
@@ -6169,6 +5171,7 @@ struct CognitionLogObservation {
 
 #[derive(Debug, Clone, Serialize)]
 struct ModuleInstanceObservation {
+    scope: String,
     module: String,
     replica: u8,
 }
@@ -6183,9 +5186,10 @@ struct ActiveModuleObservation {
 fn memo_log_observations(bb: &BlackboardInner) -> BTreeMap<String, Vec<MemoLogObservation>> {
     let mut logs = BTreeMap::<String, Vec<MemoLogObservation>>::new();
     for record in bb.recent_memo_logs() {
-        logs.entry(record.owner.module.as_str().to_owned())
+        logs.entry(record.owner.to_string())
             .or_default()
             .push(MemoLogObservation {
+                scope: record.owner.scope.to_string(),
                 replica: record.owner.replica.get(),
                 index: record.index,
                 written_at: record.written_at.to_rfc3339(),
@@ -6300,6 +5304,7 @@ fn memory_metadata_observations(bb: &BlackboardInner) -> BTreeMap<String, Memory
 
 fn module_instance_observation(owner: &ModuleInstanceId) -> ModuleInstanceObservation {
     ModuleInstanceObservation {
+        scope: owner.scope.to_string(),
         module: owner.module.as_str().to_owned(),
         replica: owner.replica.get(),
     }
@@ -6551,6 +5556,7 @@ pub(crate) struct LiveReporter {
     file: Arc<Mutex<File>>,
     log_prefix: String,
     log_scope: String,
+    live_output: LiveOutput,
 }
 
 impl std::fmt::Debug for LiveReporter {
@@ -6560,13 +5566,18 @@ impl std::fmt::Debug for LiveReporter {
             .field("path", &self.path)
             .field("log_prefix", &self.log_prefix)
             .field("log_scope", &self.log_scope)
+            .field("live_output", &self.live_output)
             .finish_non_exhaustive()
     }
 }
 
 impl LiveReporter {
-    pub(crate) fn new(run_id: &str, run_dir: &Path) -> Result<Self, RunnerError> {
-        Self::new_with_log_context(run_id, run_dir, "eval", "case")
+    pub(crate) fn new(
+        run_id: &str,
+        run_dir: &Path,
+        live_output: LiveOutput,
+    ) -> Result<Self, RunnerError> {
+        Self::new_with_log_context(run_id, run_dir, "eval", "case", live_output)
     }
 
     pub(crate) fn new_with_log_context(
@@ -6574,6 +5585,7 @@ impl LiveReporter {
         run_dir: &Path,
         log_prefix: &str,
         log_scope: &str,
+        live_output: LiveOutput,
     ) -> Result<Self, RunnerError> {
         std::fs::create_dir_all(run_dir).map_err(|source| RunnerError::WriteOutput {
             path: run_dir.to_path_buf(),
@@ -6591,6 +5603,7 @@ impl LiveReporter {
             file: Arc::new(Mutex::new(file)),
             log_prefix: log_prefix.to_string(),
             log_scope: log_scope.to_string(),
+            live_output,
         })
     }
 
@@ -6636,7 +5649,35 @@ impl LiveReporter {
         data: serde_json::Value,
         live_message: String,
     ) -> io::Result<()> {
-        eprintln!("{live_message}");
+        let minimum = live_output_minimum(kind);
+        self.emit_jsonl_at(case_id, kind, data, live_message, minimum)
+    }
+
+    fn emit_port_at(
+        &self,
+        case_id: Option<&str>,
+        kind: &str,
+        data: serde_json::Value,
+        live_message: String,
+        minimum: LiveOutput,
+    ) -> Result<(), PortError> {
+        self.emit_jsonl_at(case_id, kind, data, live_message, minimum)
+            .map_err(|error| {
+                PortError::Backend(format!("write {} event: {error}", self.log_prefix))
+            })
+    }
+
+    fn emit_jsonl_at(
+        &self,
+        case_id: Option<&str>,
+        kind: &str,
+        data: serde_json::Value,
+        live_message: String,
+        minimum: LiveOutput,
+    ) -> io::Result<()> {
+        if self.live_output >= minimum {
+            eprintln!("{live_message}");
+        }
         let record = serde_json::json!({
             "ts": Utc::now().to_rfc3339(),
             "run_id": self.run_id,
@@ -6654,9 +5695,50 @@ impl LiveReporter {
     }
 }
 
+fn live_output_minimum(kind: &str) -> LiveOutput {
+    match kind {
+        "runtime_event" | "allocation_changed" => LiveOutput::Verbose,
+        _ => LiveOutput::Normal,
+    }
+}
+
+#[cfg(test)]
+mod live_output_tests {
+    use super::*;
+
+    #[test]
+    fn normal_output_suppresses_high_volume_events() {
+        assert_eq!(live_output_minimum("runtime_event"), LiveOutput::Verbose);
+        assert_eq!(
+            live_output_minimum("allocation_changed"),
+            LiveOutput::Verbose
+        );
+        assert_eq!(live_output_minimum("case_started"), LiveOutput::Normal);
+        assert_eq!(live_output_minimum("step_finished"), LiveOutput::Normal);
+        assert_eq!(
+            live_output_minimum("utterance_completed"),
+            LiveOutput::Normal
+        );
+    }
+
+    #[test]
+    fn runtime_failures_remain_notable() {
+        let owner = ModuleInstanceId::new(ModuleId::new("worker").unwrap(), ReplicaIndex::ZERO);
+        assert!(runtime_event_is_notable(&RuntimeEvent::ModuleTaskFailed {
+            sequence: 1,
+            owner,
+            phase: "activate".to_string(),
+            message: "failed".to_string(),
+        }));
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 struct RecordedUtterance {
     sender: String,
+    scope: String,
+    module: String,
+    replica: u8,
     target: String,
     text: String,
     emitted_at: String,
@@ -6750,12 +5832,12 @@ impl ExternalActionExecutor for EvalExternalActionExecutor {
 }
 
 #[derive(Debug, Clone)]
-struct FullAgentSettleTracker {
+struct RuntimeSettleTracker {
     last_progress_count: usize,
     last_progress_at: Instant,
 }
 
-impl FullAgentSettleTracker {
+impl RuntimeSettleTracker {
     fn new(progress_count: usize, now: Instant) -> Self {
         Self {
             last_progress_count: progress_count,
@@ -6784,19 +5866,19 @@ impl FullAgentSettleTracker {
     }
 }
 
-fn full_agent_ready_to_score_at(
+fn runtime_ready_to_score_at(
     actions: &ActionActivityTracker,
-    settle: &FullAgentSettleTracker,
+    settle: &RuntimeSettleTracker,
     llm_in_flight: usize,
     input_phase_finished: bool,
     allow_empty_output: bool,
     step_driven_case: bool,
     now: Instant,
 ) -> bool {
-    if !settle.runtime_silence_elapsed_at(FULL_AGENT_RUNTIME_SILENCE_WINDOW, llm_in_flight, now) {
+    if !settle.runtime_silence_elapsed_at(RUNTIME_SILENCE_WINDOW, llm_in_flight, now) {
         return false;
     }
-    actions.silence_window_elapsed_at(FULL_AGENT_ACTION_SILENCE_WINDOW, now)
+    actions.silence_window_elapsed_at(RUNTIME_ACTION_SILENCE_WINDOW, now)
         || (input_phase_finished && (allow_empty_output || step_driven_case))
 }
 
@@ -6858,6 +5940,58 @@ impl RecordingUtteranceSink {
             .expect("utterance lock poisoned")
             .clone()
     }
+
+    fn matching_count(&self, scope: Option<&str>, module: &str, target: &str) -> usize {
+        self.complete
+            .lock()
+            .expect("utterance lock poisoned")
+            .iter()
+            .filter(|utterance| {
+                scope.is_none_or(|scope| utterance.scope == scope)
+                    && utterance.module == module
+                    && utterance.target == target
+            })
+            .count()
+    }
+
+    fn matching_at(
+        &self,
+        scope: Option<&str>,
+        module: &str,
+        target: &str,
+        index: usize,
+    ) -> Option<RecordedUtterance> {
+        self.complete
+            .lock()
+            .expect("utterance lock poisoned")
+            .iter()
+            .filter(|utterance| {
+                scope.is_none_or(|scope| utterance.scope == scope)
+                    && utterance.module == module
+                    && utterance.target == target
+            })
+            .nth(index)
+            .cloned()
+    }
+
+    fn last_matching(
+        &self,
+        scope: Option<&str>,
+        module: &str,
+        target: &str,
+    ) -> Option<RecordedUtterance> {
+        self.complete
+            .lock()
+            .expect("utterance lock poisoned")
+            .iter()
+            .rev()
+            .find(|utterance| {
+                scope.is_none_or(|scope| utterance.scope == scope)
+                    && utterance.module == module
+                    && utterance.target == target
+            })
+            .cloned()
+    }
 }
 
 #[async_trait(?Send)]
@@ -6866,6 +6000,9 @@ impl UtteranceSink for RecordingUtteranceSink {
         let sender_module = utterance.sender.module.clone();
         let recorded = RecordedUtterance {
             sender: utterance.sender.to_string(),
+            scope: utterance.sender.scope.to_string(),
+            module: utterance.sender.module.as_str().to_string(),
+            replica: utterance.sender.replica.get(),
             target: utterance.target,
             text: normalize_eval_utterance_text(utterance.text),
             emitted_at: utterance.emitted_at.to_rfc3339(),
@@ -6929,6 +6066,7 @@ impl UtteranceSink for RecordingUtteranceSink {
 pub(crate) struct RecordingRuntimeEventSink {
     events: Mutex<Vec<RuntimeEvent>>,
     timed_events: Mutex<Vec<(u64, RuntimeEvent)>>,
+    eval_events: Mutex<Vec<crate::timeline::EvalEvent>>,
     case_started: Instant,
     progress_events: AtomicUsize,
     llm_in_flight: AtomicUsize,
@@ -6947,6 +6085,7 @@ impl RecordingRuntimeEventSink {
         Self {
             events: Mutex::new(Vec::new()),
             timed_events: Mutex::new(Vec::new()),
+            eval_events: Mutex::new(Vec::new()),
             case_started: Instant::now(),
             progress_events: AtomicUsize::new(0),
             llm_in_flight: AtomicUsize::new(0),
@@ -6962,6 +6101,46 @@ impl RecordingRuntimeEventSink {
             .lock()
             .expect("runtime event lock poisoned")
             .clone()
+    }
+
+    fn timed_snapshot(&self) -> Vec<(u64, RuntimeEvent)> {
+        self.timed_events
+            .lock()
+            .expect("timed runtime event lock poisoned")
+            .clone()
+    }
+
+    fn eval_event_snapshot(&self) -> Vec<crate::timeline::EvalEvent> {
+        self.eval_events
+            .lock()
+            .expect("eval event lock poisoned")
+            .clone()
+    }
+
+    fn elapsed_ms(&self) -> u64 {
+        duration_millis_u64(self.case_started.elapsed())
+    }
+
+    fn record_eval_event(
+        &self,
+        scope: nuillu_types::ScopeId,
+        module: ModuleId,
+        replica: u8,
+        step: Option<String>,
+        payload: crate::timeline::EvalEventPayload,
+    ) {
+        self.eval_events
+            .lock()
+            .expect("eval event lock poisoned")
+            .push(crate::timeline::EvalEvent {
+                sequence: 0,
+                offset_ms: self.elapsed_ms(),
+                scope,
+                module,
+                replica,
+                step,
+                payload,
+            });
     }
 
     fn activation_timeline(&self) -> Vec<ModuleActivationRecord> {
@@ -7289,11 +6468,17 @@ impl RuntimeEventSink for RecordingRuntimeEventSink {
         if runtime_event_counts_as_eval_progress(&event) {
             self.progress_events.fetch_add(1, Ordering::Relaxed);
         }
-        self.reporter.emit_port(
+        let minimum = if runtime_event_is_notable(&event) {
+            LiveOutput::Normal
+        } else {
+            LiveOutput::Verbose
+        };
+        self.reporter.emit_port_at(
             Some(&self.case_id),
             "runtime_event",
             serde_json::json!({ "event": event }),
             live_message,
+            minimum,
         )?;
         if let Some(visualizer) = &self.visualizer {
             visualizer.send(VisualizerEvent::RuntimeEvent {
@@ -7343,6 +6528,16 @@ impl RuntimeEventSink for RecordingRuntimeEventSink {
         }
         Ok(())
     }
+}
+
+fn runtime_event_is_notable(event: &RuntimeEvent) -> bool {
+    matches!(
+        event,
+        RuntimeEvent::ModuleActivationAttemptFailed { .. }
+            | RuntimeEvent::ModuleTaskFailed { .. }
+            | RuntimeEvent::ModuleWarning { .. }
+            | RuntimeEvent::SessionCompactionFailed { .. }
+    )
 }
 
 fn aggregate_suite(run: SuiteRunReport, cases: Vec<CaseSummary>) -> SuiteReport {
@@ -7417,3000 +6612,5 @@ fn panic_payload_message(payload: &(dyn Any + Send)) -> String {
         message.clone()
     } else {
         "non-string panic payload".to_string()
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use std::cell::RefCell;
-    use std::path::Path;
-    use std::sync::Arc;
-
-    use crate::evaluation::KMetricReport;
-    use chrono::TimeZone as _;
-    use lutum::{
-        FinishReason, Lutum, MockLlmAdapter, MockTextScenario, RawTextTurnEvent,
-        SharedPoolBudgetManager, SharedPoolBudgetOptions, Usage,
-    };
-    use nuillu_blackboard::{BlackboardCommand, CognitionLogEntry, MemoryMetaPatch};
-    use nuillu_memory::NoopMemoryStore;
-    use nuillu_module::ports::{NoopCognitionLogRepository, SystemClock};
-    use nuillu_module::{LlmConcurrencyPool, LutumTiers, MemoUpdated};
-    use nuillu_types::{MemoryIndex, ModuleActivationId, ModuleInstanceId, ReplicaIndex};
-
-    use super::*;
-
-    struct FixedClock(chrono::DateTime<Utc>);
-
-    #[async_trait::async_trait(?Send)]
-    impl Clock for FixedClock {
-        fn now(&self) -> chrono::DateTime<Utc> {
-            self.0
-        }
-
-        async fn sleep_until(&self, _deadline: chrono::DateTime<Utc>) {
-            // Test clock: sleeps complete immediately so test wall-clock stays
-            // independent of the registered BPM period ranges.
-        }
-    }
-
-    fn test_backend_config() -> LlmBackendConfig {
-        test_backend_config_with_model("gpt-oss:20b")
-    }
-
-    fn test_backend_config_with_model(model: &str) -> LlmBackendConfig {
-        LlmBackendConfig {
-            model_key: model.to_string(),
-            endpoint: "http://localhost:11434/v1".to_string(),
-            token: "local".to_string(),
-            model: model.to_string(),
-            reasoning: false,
-            reasoning_effort: None,
-            generation: LlmGenerationConfig::default(),
-            use_responses_api: false,
-            compaction_input_token_threshold: 16_000,
-            max_concurrent_llm_calls: None,
-            fallbacks: Vec::new(),
-        }
-    }
-
-    fn test_embedding_backend() -> EmbeddingBackendConfig {
-        EmbeddingBackendConfig {
-            endpoint: "http://localhost:11434/v1".to_string(),
-            token: "local".to_string(),
-            model: "embed".to_string(),
-            dimensions: 8,
-        }
-    }
-
-    /// Embedding config that makes `build_embedder` fail at construction, so the
-    /// agent store cannot connect. Used to exercise the harness's invalid-case
-    /// (setup failure) path deterministically without any live backend.
-    fn failing_embedding_backend() -> EmbeddingBackendConfig {
-        EmbeddingBackendConfig {
-            endpoint: "http://localhost:11434/v1".to_string(),
-            token: "local".to_string(),
-            model: String::new(),
-            dimensions: 8,
-        }
-    }
-
-    fn test_model_concurrency() -> BTreeMap<String, Option<NonZeroUsize>> {
-        BTreeMap::from([
-            ("judge-model".to_string(), None),
-            ("cheap-model".to_string(), None),
-            ("default-model".to_string(), None),
-            ("premium-model".to_string(), None),
-            ("image-model".to_string(), None),
-        ])
-    }
-
-    fn test_runner_config(dir: &Path) -> RunnerConfig {
-        RunnerConfig {
-            cases_root: dir.join("eval-cases"),
-            output_root: dir.join("out"),
-            llm_log_root: dir.join("llm-logs"),
-            run_id: "run-1".to_string(),
-            judge_backend: test_backend_config_with_model("judge-model"),
-            cheap_backend: test_backend_config_with_model("cheap-model"),
-            default_backend: test_backend_config_with_model("default-model"),
-            premium_backend: test_backend_config_with_model("premium-model"),
-            image_backend: test_backend_config_with_model("image-model"),
-            embedding_backend: test_embedding_backend(),
-            fail_fast: false,
-            failed_only: false,
-            failed_from: None,
-            model_concurrency: test_model_concurrency(),
-            llm_concurrency_pool: LlmConcurrencyPool::default(),
-            trials: NonZeroUsize::new(1).unwrap(),
-            full_agent_concurrency: NonZeroUsize::new(3).unwrap(),
-            module_concurrency: NonZeroUsize::new(8).unwrap(),
-            case_patterns: Vec::new(),
-            module_filters: Vec::new(),
-            disabled_modules: Vec::new(),
-            exclude_full_agent: false,
-            full_agent_only: false,
-        }
-    }
-
-    fn test_suite_run_report(trials: usize) -> SuiteRunReport {
-        SuiteRunReport {
-            run_id: "run".to_string(),
-            cases_root: "eval-cases".to_string(),
-            output_dir: "out/run".to_string(),
-            case_patterns: Vec::new(),
-            failed_only: false,
-            failed_from: None,
-            fail_fast: false,
-            model_concurrency: BTreeMap::new(),
-            trials,
-            full_agent_concurrency: 3,
-            module_concurrency: 8,
-            planned_case_count: 0,
-            models: SuiteModelNames {
-                judge: "judge".to_string(),
-                cheap: "cheap".to_string(),
-                default: "default".to_string(),
-                premium: "premium".to_string(),
-                image: "image".to_string(),
-            },
-            module_filters: Vec::new(),
-            disabled_modules: Vec::new(),
-            exclude_full_agent: false,
-            full_agent_only: false,
-        }
-    }
-
-    fn test_report(passed: bool, invalid: bool, score: f64) -> CaseReport {
-        CaseReport {
-            runtime_failure: invalid.then(|| "invalid".to_string()),
-            llm_log_directory: None,
-            checks: Vec::new(),
-            modules_checks: Vec::new(),
-            invalid,
-            must_pass_ok: passed,
-            weighted_points_earned: 0,
-            weighted_points_total: 0,
-            score,
-        }
-    }
-
-    fn test_case_summary(
-        id: &str,
-        trial_count: usize,
-        passed_trials: usize,
-        invalid_trials: usize,
-        score: f64,
-    ) -> CaseSummary {
-        let passed = passed_trials == trial_count;
-        let invalid = invalid_trials > 0;
-        let report = test_report(passed, invalid, score);
-        CaseSummary {
-            path: format!("{id}.eure"),
-            id: id.to_string(),
-            description: None,
-            passed,
-            invalid,
-            score,
-            report,
-            timing: CaseTiming { elapsed_ms: 0 },
-            trial_timing: None,
-            activations: Vec::new(),
-            trial_count,
-            passed_trials,
-            failed_trials: trial_count.saturating_sub(passed_trials + invalid_trials),
-            invalid_trials,
-            trials: Vec::new(),
-        }
-    }
-
-    fn test_case_run_output(
-        id: &str,
-        trial: usize,
-        passed: bool,
-        invalid: bool,
-        score: f64,
-    ) -> CaseRunOutput {
-        let report = test_report(passed, invalid, score);
-        let summary = CaseSummary {
-            path: format!("{id}.eure"),
-            id: id.to_string(),
-            description: None,
-            passed,
-            invalid,
-            score,
-            report: report.clone(),
-            timing: CaseTiming { elapsed_ms: 0 },
-            trial_timing: None,
-            activations: Vec::new(),
-            trial_count: 1,
-            passed_trials: usize::from(passed),
-            failed_trials: usize::from(!passed && !invalid),
-            invalid_trials: usize::from(invalid),
-            trials: vec![CaseTrialSummary {
-                trial,
-                output_dir: format!("out/{id}/{}", trial_dir_name(trial)),
-                path: format!("{id}.eure"),
-                id: id.to_string(),
-                description: None,
-                passed,
-                invalid,
-                score,
-                report,
-                timing: CaseTiming { elapsed_ms: 0 },
-            }],
-        };
-        CaseRunOutput {
-            case_path: PathBuf::from(format!("{id}.eure")),
-            output_dir: PathBuf::from(format!("out/{id}/{}", trial_dir_name(trial))),
-            summary,
-            artifact: CaseArtifact::new(""),
-            events: Vec::new(),
-            trace: empty_trace_snapshot(),
-            raw_trace: RawTraceSnapshot::default(),
-        }
-    }
-
-    #[test]
-    fn plan_eval_work_items_expands_trials_and_classifies_by_case_path() {
-        let dir = tempfile::tempdir().unwrap();
-        let full_dir = dir.path().join("eval-cases/full-agent");
-        let module_dir = dir.path().join("eval-cases/modules/query-memory");
-        std::fs::create_dir_all(&full_dir).unwrap();
-        std::fs::create_dir_all(&module_dir).unwrap();
-        let full_path = full_dir.join("full.eure");
-        let module_path = module_dir.join("module.eure");
-        std::fs::write(
-            &full_path,
-            r#"
-id = "full-case"
-
-@ inputs[] {
-  $variant: heard
-  content = "What changed?"
-}
-"#,
-        )
-        .unwrap();
-        std::fs::write(
-            &module_path,
-            r#"
-id = "module-case"
-prompt = "What do you remember?"
-"#,
-        )
-        .unwrap();
-        let mut config = test_runner_config(dir.path());
-        config.trials = NonZeroUsize::new(2).unwrap();
-        config.full_agent_concurrency = NonZeroUsize::new(3).unwrap();
-        config.module_concurrency = NonZeroUsize::new(5).unwrap();
-
-        let items =
-            plan_eval_work_items(vec![full_path.clone(), module_path.clone()], &config).unwrap();
-
-        assert_eq!(items.len(), 4);
-        assert_eq!(
-            items
-                .iter()
-                .filter(|item| item.kind == EvalWorkKind::FullAgent)
-                .count(),
-            2
-        );
-        assert_eq!(
-            items
-                .iter()
-                .filter(|item| item.kind == EvalWorkKind::Module)
-                .count(),
-            2
-        );
-        assert_eq!((EvalWorkKind::FullAgent).concurrency(&config), 3);
-        assert_eq!((EvalWorkKind::Module).concurrency(&config), 5);
-        assert_eq!(items[0].runtime_id, "full-case/trial-001");
-        assert_eq!(items[1].runtime_id, "full-case/trial-002");
-        assert_eq!(items[2].runtime_id, "module-case/trial-001");
-        assert_eq!(items[3].runtime_id, "module-case/trial-002");
-    }
-
-    #[test]
-    fn aggregate_parallel_case_outputs_restores_case_and_trial_order() {
-        let dir = tempfile::tempdir().unwrap();
-        let case_dir = dir.path().join("eval-cases/modules/query-memory");
-        std::fs::create_dir_all(&case_dir).unwrap();
-        let case_path = case_dir.join("aggregate-order.eure");
-        std::fs::write(
-            &case_path,
-            r#"
-id = "aggregate-order"
-prompt = "What do you remember?"
-"#,
-        )
-        .unwrap();
-        let mut config = test_runner_config(dir.path());
-        config.trials = NonZeroUsize::new(2).unwrap();
-        let items = plan_eval_work_items(vec![case_path], &config).unwrap();
-        std::fs::create_dir_all(&items[0].case_output_dir).unwrap();
-        let now = Instant::now();
-        let summaries = aggregate_parallel_case_outputs(vec![
-            EvalWorkOutput {
-                item: items[1].clone(),
-                output: test_case_run_output("aggregate-order", 2, false, true, 0.0),
-                started_at: now,
-                completed_at: now + Duration::from_millis(20),
-            },
-            EvalWorkOutput {
-                item: items[0].clone(),
-                output: test_case_run_output("aggregate-order", 1, false, true, 0.0),
-                started_at: now,
-                completed_at: now + Duration::from_millis(10),
-            },
-        ])
-        .unwrap();
-
-        assert_eq!(summaries.len(), 1);
-        assert_eq!(summaries[0].id, "aggregate-order");
-        assert_eq!(summaries[0].trials[0].trial, 1);
-        assert_eq!(summaries[0].trials[1].trial, 2);
-        let report: serde_json::Value = serde_json::from_slice(
-            &std::fs::read(items[0].case_output_dir.join("report.json")).unwrap(),
-        )
-        .unwrap();
-        assert_eq!(report["trials"][0]["trial"], serde_json::json!(1));
-        assert_eq!(report["trials"][1]["trial"], serde_json::json!(2));
-    }
-
-    #[tokio::test]
-    async fn llm_concurrency_pool_reuses_one_semaphore_for_matching_model_key() {
-        let pool = LlmConcurrencyPool::default();
-        let max = NonZeroUsize::new(1).unwrap();
-        let first = pool.limiter_for("shared-model", Some(max));
-        let second = pool.limiter_for("shared-model", Some(max));
-        let first_permit = first.acquire().await;
-        let (acquired_tx, mut acquired_rx) = tokio::sync::oneshot::channel();
-        let task = tokio::spawn(async move {
-            let _second_permit = second.acquire().await;
-            let _ = acquired_tx.send(());
-        });
-
-        assert!(
-            tokio::time::timeout(Duration::from_millis(20), &mut acquired_rx)
-                .await
-                .is_err()
-        );
-        drop(first_permit);
-        acquired_rx.await.unwrap();
-        task.await.unwrap();
-    }
-
-    fn assert_metric_values(actual: &[KMetricReport], expected: &[(usize, f64)]) {
-        assert_eq!(actual.len(), expected.len());
-        for (actual, (k, value)) in actual.iter().zip(expected.iter()) {
-            assert_eq!(actual.k, *k);
-            assert!(
-                (actual.value - value).abs() < 1e-12,
-                "k={} expected {} got {}",
-                k,
-                value,
-                actual.value
-            );
-        }
-    }
-
-    fn write_query_memory_case(root: &Path, name: &str, id: &str) -> PathBuf {
-        let case_dir = root.join("eval-cases/modules/query-memory");
-        std::fs::create_dir_all(&case_dir).unwrap();
-        let path = case_dir.join(format!("{name}.eure"));
-        std::fs::write(
-            &path,
-            format!(
-                r#"
-id = "{id}"
-prompt = "Find memory."
-"#
-            ),
-        )
-        .unwrap();
-        path
-    }
-
-    fn write_module_case(
-        root: &Path,
-        target: EvalModule,
-        name: &str,
-        id: &str,
-        modules: &[EvalModule],
-    ) -> PathBuf {
-        let case_dir = root.join("eval-cases/modules").join(target.as_str());
-        std::fs::create_dir_all(&case_dir).unwrap();
-        let path = case_dir.join(format!("{name}.eure"));
-        std::fs::write(
-            &path,
-            format!(
-                r#"
-id = "{id}"
-modules = [{modules}]
-prompt = "Run module."
-"#,
-                modules = module_list(modules),
-            ),
-        )
-        .unwrap();
-        path
-    }
-
-    fn write_full_agent_case(
-        root: &Path,
-        name: &str,
-        id: &str,
-        modules: Option<&[EvalModule]>,
-    ) -> PathBuf {
-        let case_dir = root.join("eval-cases/full-agent");
-        std::fs::create_dir_all(&case_dir).unwrap();
-        let path = case_dir.join(format!("{name}.eure"));
-        let modules = modules
-            .map(|modules| format!("modules = [{}]\n", module_list(modules)))
-            .unwrap_or_default();
-        std::fs::write(
-            &path,
-            format!(
-                r#"
-id = "{id}"
-{modules}
-@ inputs[] {{
-  $variant: heard
-  content = "Hello?"
-}}
-"#
-            ),
-        )
-        .unwrap();
-        path
-    }
-
-    fn module_list(modules: &[EvalModule]) -> String {
-        modules
-            .iter()
-            .map(|module| format!(r#""{}""#, module.as_str()))
-            .collect::<Vec<_>>()
-            .join(", ")
-    }
-
-    fn write_suite_report(path: &Path, cases: serde_json::Value) {
-        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        std::fs::write(
-            path,
-            serde_json::to_vec_pretty(&serde_json::json!({ "cases": cases })).unwrap(),
-        )
-        .unwrap();
-    }
-
-    #[test]
-    fn eval_llm_log_context_uses_run_and_case_namespace() {
-        let dir = tempfile::tempdir().unwrap();
-        let config = test_runner_config(dir.path());
-
-        let context = eval_llm_log_context(&config, "case-1");
-
-        assert_eq!(context.root, dir.path().join("llm-logs"));
-        assert_eq!(context.namespace, vec!["run-1", "case-1"]);
-        assert_eq!(
-            context.namespace_dir(),
-            dir.path().join("llm-logs").join("run-1").join("case-1")
-        );
-
-        let trial_context = eval_llm_log_context(&config, "case-1/trial-001");
-        assert_eq!(
-            trial_context.namespace_dir(),
-            dir.path()
-                .join("llm-logs")
-                .join("run-1")
-                .join("case-1-trial-001")
-        );
-    }
-
-    #[test]
-    fn aggregate_suite_computes_trial_metrics_from_case_counts() {
-        let report = aggregate_suite(
-            test_suite_run_report(3),
-            vec![
-                test_case_summary("case-one", 3, 2, 0, 0.8),
-                test_case_summary("case-two", 3, 1, 0, 0.4),
-            ],
-        );
-
-        assert_metric_values(
-            &report.metrics.pass_at,
-            &[(1, 0.5), (2, 5.0 / 6.0), (3, 1.0)],
-        );
-        assert_metric_values(
-            &report.metrics.pass_hat,
-            &[(1, 0.5), (2, 1.0 / 6.0), (3, 0.0)],
-        );
-    }
-
-    #[test]
-    fn aggregate_case_summary_requires_all_trials_to_pass() {
-        let dir = tempfile::tempdir().unwrap();
-        let case_path = write_query_memory_case(dir.path(), "case", "case-id");
-        let case = parse_case_file(&case_path).unwrap();
-
-        let all_pass = aggregate_case_summary(
-            &case_path,
-            &case,
-            "case-id",
-            &[
-                test_case_run_output("case-id", 1, true, false, 1.0),
-                test_case_run_output("case-id", 2, true, false, 0.8),
-            ],
-            0,
-        );
-        assert!(all_pass.passed);
-        assert!(!all_pass.invalid);
-        assert_eq!(all_pass.trial_count, 2);
-        assert_eq!(all_pass.passed_trials, 2);
-        assert_eq!(all_pass.failed_trials, 0);
-        assert_eq!(all_pass.invalid_trials, 0);
-        assert_eq!(all_pass.trials.len(), 2);
-
-        let some_fail = aggregate_case_summary(
-            &case_path,
-            &case,
-            "case-id",
-            &[
-                test_case_run_output("case-id", 1, true, false, 1.0),
-                test_case_run_output("case-id", 2, false, false, 0.2),
-            ],
-            0,
-        );
-        assert!(!some_fail.passed);
-        assert!(!some_fail.invalid);
-        assert_eq!(some_fail.passed_trials, 1);
-        assert_eq!(some_fail.failed_trials, 1);
-        assert_eq!(some_fail.invalid_trials, 0);
-
-        let invalid = aggregate_case_summary(
-            &case_path,
-            &case,
-            "case-id",
-            &[
-                test_case_run_output("case-id", 1, true, false, 1.0),
-                test_case_run_output("case-id", 2, false, true, 0.0),
-            ],
-            0,
-        );
-        assert!(!invalid.passed);
-        assert!(invalid.invalid);
-        assert_eq!(invalid.passed_trials, 1);
-        assert_eq!(invalid.failed_trials, 0);
-        assert_eq!(invalid.invalid_trials, 1);
-    }
-
-    #[test]
-    fn aggregate_case_summary_records_trial_timing() {
-        let dir = tempfile::tempdir().unwrap();
-        let case_path = write_query_memory_case(dir.path(), "case", "case-id");
-        let case = parse_case_file(&case_path).unwrap();
-
-        let mut first = test_case_run_output("case-id", 1, true, false, 1.0);
-        first.summary.timing = CaseTiming { elapsed_ms: 100 };
-        first.summary.trials[0].timing = CaseTiming { elapsed_ms: 100 };
-        let mut second = test_case_run_output("case-id", 2, true, false, 0.8);
-        second.summary.timing = CaseTiming { elapsed_ms: 300 };
-        second.summary.trials[0].timing = CaseTiming { elapsed_ms: 300 };
-
-        let summary = aggregate_case_summary(&case_path, &case, "case-id", &[first, second], 450);
-
-        assert_eq!(summary.timing.elapsed_ms, 450);
-        let trial_timing = summary.trial_timing.expect("trial timing");
-        assert_eq!(trial_timing.min_ms, 100);
-        assert_eq!(trial_timing.max_ms, 300);
-        assert_eq!(trial_timing.mean_ms, 200);
-    }
-
-    #[test]
-    fn visualizer_open_tab_uses_case_id_as_tab_id() {
-        let (event_tx, event_rx) = std::sync::mpsc::channel();
-        let (_command_tx, command_rx) = std::sync::mpsc::channel();
-        let hooks = RunnerHooks::with_visualizer(VisualizerHook::new(event_tx, command_rx));
-
-        emit_visualizer_open_tab(&hooks, "case-1");
-
-        let VisualizerServerMessage::Event { event } = event_rx.recv().expect("visualizer event")
-        else {
-            panic!("expected visualizer event");
-        };
-        let VisualizerEvent::OpenTab { tab_id, title } = event else {
-            panic!("expected open-tab event");
-        };
-        assert_eq!(tab_id.as_str(), "case-1");
-        assert_eq!(title, "case-1");
-    }
-
-    #[test]
-    fn visualizer_hook_serves_cached_memory_query_results() {
-        let (event_tx, event_rx) = std::sync::mpsc::channel();
-        let (command_tx, command_rx) = std::sync::mpsc::channel();
-        let mut hook = VisualizerHook::new(event_tx, command_rx);
-        hook.set_memory_cache(
-            "case-1",
-            vec![MemoryRecordView {
-                index: "m1".to_string(),
-                kind: "Statement".to_string(),
-                rank: "long-term".to_string(),
-                occurred_at: None,
-                stored_at: Utc::now(),
-                concepts: Vec::new(),
-                tags: Vec::new(),
-                affect_arousal: 0.0,
-                valence: 0.0,
-                emotion: String::new(),
-                content: "rust memory".to_string(),
-            }],
-        );
-
-        command_tx
-            .send(VisualizerClientMessage::Command {
-                command: VisualizerCommand::LoadMemoryRecords {
-                    tab_id: VisualizerTabId::new("case-1"),
-                    scope: MemoryRecordScope::Search {
-                        query: "rust".to_string(),
-                    },
-                    offset: 0,
-                    limit: 10,
-                },
-            })
-            .unwrap();
-        command_tx
-            .send(VisualizerClientMessage::Command {
-                command: VisualizerCommand::Shutdown,
-            })
-            .unwrap();
-        hook.drain_cached_commands_until_shutdown();
-
-        let VisualizerServerMessage::Event { event } = event_rx.recv().expect("memory query event")
-        else {
-            panic!("expected visualizer event");
-        };
-        let VisualizerEvent::MemoryRecordsLoaded { records, .. } = event else {
-            panic!("expected memory records chunk");
-        };
-        assert_eq!(records.len(), 1);
-        assert_eq!(records[0].content, "rust memory");
-    }
-
-    fn test_caps(blackboard: Blackboard) -> CapabilityProviders {
-        test_caps_with_adapter(blackboard, MockLlmAdapter::new())
-    }
-
-    fn test_caps_with_adapter(
-        blackboard: Blackboard,
-        adapter: MockLlmAdapter,
-    ) -> CapabilityProviders {
-        let adapter = Arc::new(adapter);
-        let budget = SharedPoolBudgetManager::new(SharedPoolBudgetOptions::default());
-        let lutum = Lutum::new(adapter, budget);
-        CapabilityProviders::new(CapabilityProviderPorts {
-            blackboard,
-            cognition_log_port: Rc::new(NoopCognitionLogRepository),
-            clock: Rc::new(SystemClock),
-            tiers: LutumTiers::from_shared_lutum(lutum),
-        })
-    }
-
-    fn attention_schema_tool_scenario(tool_call_id: &str, text: &str) -> MockTextScenario {
-        MockTextScenario::events(vec![
-            Ok(RawTextTurnEvent::Started {
-                request_id: Some("attention-schema".into()),
-                model: "mock".into(),
-            }),
-            Ok(RawTextTurnEvent::ToolCallChunk {
-                id: tool_call_id.into(),
-                name: "append_attention_experience".into(),
-                arguments_json_delta: serde_json::json!({ "plaintext": text }).to_string(),
-            }),
-            Ok(RawTextTurnEvent::Completed {
-                request_id: Some("attention-schema".into()),
-                finish_reason: FinishReason::ToolCall,
-                usage: Usage::zero(),
-            }),
-        ])
-    }
-
-    fn attention_schema_no_tool_scenario() -> MockTextScenario {
-        MockTextScenario::events(vec![
-            Ok(RawTextTurnEvent::Started {
-                request_id: Some("attention-schema-noop".into()),
-                model: "mock".into(),
-            }),
-            Ok(RawTextTurnEvent::ToolCallChunk {
-                id: "leave-attention-unchanged".into(),
-                name: "leave_attention_unchanged".into(),
-                arguments_json_delta: serde_json::json!({
-                    "reason": "no new attention experience"
-                })
-                .to_string(),
-            }),
-            Ok(RawTextTurnEvent::Completed {
-                request_id: Some("attention-schema".into()),
-                finish_reason: FinishReason::ToolCall,
-                usage: Usage::zero(),
-            }),
-        ])
-    }
-
-    #[test]
-    fn case_patterns_match_case_id_or_path_substrings() {
-        let dir = tempfile::tempdir().unwrap();
-        let case_dir = dir.path().join("eval-cases/modules/query-memory");
-        std::fs::create_dir_all(&case_dir).unwrap();
-        let first = case_dir.join("first-route.eure");
-        let second = case_dir.join("second-memory.eure");
-        std::fs::write(
-            &first,
-            r#"
-id = "module-query-memory-first-route"
-prompt = "First?"
-"#,
-        )
-        .unwrap();
-        std::fs::write(
-            &second,
-            r#"
-id = "module-query-memory-special-memory"
-prompt = "Second?"
-"#,
-        )
-        .unwrap();
-
-        let by_path = filter_case_paths(
-            vec![first.clone(), second.clone()],
-            &["first-route".to_string()],
-        )
-        .unwrap();
-        assert_eq!(by_path, vec![first.clone()]);
-
-        let by_id = filter_case_paths(vec![first, second.clone()], &["special-memory".to_string()])
-            .unwrap();
-        assert_eq!(by_id, vec![second]);
-    }
-
-    #[test]
-    fn module_filters_select_full_agent_membership_or_module_targets() {
-        let dir = tempfile::tempdir().unwrap();
-        let full_speak = write_full_agent_case(
-            dir.path(),
-            "full-speak",
-            "full-agent-speak",
-            Some(&[EvalModule::Sensory, EvalModule::Speak]),
-        );
-        let full_cognition_gate = write_full_agent_case(
-            dir.path(),
-            "full-cognition-gate",
-            "full-agent-cognition-gate",
-            Some(&[EvalModule::Sensory, EvalModule::CognitionGate]),
-        );
-        let full_default = write_full_agent_case(
-            dir.path(),
-            "full-default",
-            "full-agent-default-modules",
-            None,
-        );
-        let _full_unrelated = write_full_agent_case(
-            dir.path(),
-            "full-query-memory",
-            "full-agent-query-memory",
-            Some(&[EvalModule::Sensory, EvalModule::QueryMemory]),
-        );
-        let speak = write_module_case(
-            dir.path(),
-            EvalModule::Speak,
-            "speak-target",
-            "module-speak-target",
-            &[EvalModule::Speak],
-        );
-        let cognition_gate = write_module_case(
-            dir.path(),
-            EvalModule::CognitionGate,
-            "cognition-gate-target",
-            "module-cognition-gate-target",
-            &[EvalModule::CognitionGate],
-        );
-        let _query_memory_with_speak_support = write_module_case(
-            dir.path(),
-            EvalModule::QueryMemory,
-            "query-memory-with-speak-support",
-            "module-query-memory-with-speak-support",
-            &[EvalModule::QueryMemory, EvalModule::Speak],
-        );
-        let _memory = write_module_case(
-            dir.path(),
-            EvalModule::Memory,
-            "memory-target",
-            "module-memory-target",
-            &[EvalModule::Memory],
-        );
-        let mut config = test_runner_config(dir.path());
-        config.module_filters = vec![EvalModule::Speak, EvalModule::CognitionGate];
-
-        let selection = select_case_paths(&config, false).unwrap();
-
-        let mut expected = vec![
-            full_cognition_gate,
-            full_default,
-            full_speak,
-            cognition_gate,
-            speak,
-        ];
-        expected.sort();
-        assert_eq!(selection.case_paths, expected);
-    }
-
-    #[test]
-    fn exclude_full_agent_drops_full_agent_paths() {
-        let dir = tempfile::tempdir().unwrap();
-        let full_speak = write_full_agent_case(
-            dir.path(),
-            "full-speak",
-            "full-agent-speak",
-            Some(&[EvalModule::Sensory, EvalModule::Speak]),
-        );
-        let speak = write_module_case(
-            dir.path(),
-            EvalModule::Speak,
-            "speak-target",
-            "module-speak-target",
-            &[EvalModule::Speak],
-        );
-        let memory = write_module_case(
-            dir.path(),
-            EvalModule::Memory,
-            "memory-target",
-            "module-memory-target",
-            &[EvalModule::Memory],
-        );
-        let mut config = test_runner_config(dir.path());
-        config.exclude_full_agent = true;
-
-        let selection = select_case_paths(&config, false).unwrap();
-
-        assert_eq!(selection.case_paths, vec![memory, speak]);
-        assert!(!selection.case_paths.contains(&full_speak));
-    }
-
-    #[test]
-    fn exclude_full_agent_intersects_module_filters() {
-        let dir = tempfile::tempdir().unwrap();
-        let _full_speak = write_full_agent_case(
-            dir.path(),
-            "full-speak",
-            "full-agent-speak",
-            Some(&[EvalModule::Sensory, EvalModule::Speak]),
-        );
-        let speak = write_module_case(
-            dir.path(),
-            EvalModule::Speak,
-            "speak-target",
-            "module-speak-target",
-            &[EvalModule::Speak],
-        );
-        let _memory = write_module_case(
-            dir.path(),
-            EvalModule::Memory,
-            "memory-target",
-            "module-memory-target",
-            &[EvalModule::Memory],
-        );
-        let mut config = test_runner_config(dir.path());
-        config.exclude_full_agent = true;
-        config.module_filters = vec![EvalModule::Speak];
-
-        let selection = select_case_paths(&config, false).unwrap();
-
-        assert_eq!(selection.case_paths, vec![speak]);
-    }
-
-    #[test]
-    fn full_agent_only_drops_module_paths() {
-        let dir = tempfile::tempdir().unwrap();
-        let full_speak = write_full_agent_case(
-            dir.path(),
-            "full-speak",
-            "full-agent-speak",
-            Some(&[EvalModule::Sensory, EvalModule::Speak]),
-        );
-        let _speak = write_module_case(
-            dir.path(),
-            EvalModule::Speak,
-            "speak-target",
-            "module-speak-target",
-            &[EvalModule::Speak],
-        );
-        let _memory = write_module_case(
-            dir.path(),
-            EvalModule::Memory,
-            "memory-target",
-            "module-memory-target",
-            &[EvalModule::Memory],
-        );
-        let mut config = test_runner_config(dir.path());
-        config.full_agent_only = true;
-
-        let selection = select_case_paths(&config, false).unwrap();
-
-        assert_eq!(selection.case_paths, vec![full_speak]);
-    }
-
-    #[test]
-    fn full_agent_only_intersects_module_filters() {
-        let dir = tempfile::tempdir().unwrap();
-        let full_speak = write_full_agent_case(
-            dir.path(),
-            "full-speak",
-            "full-agent-speak",
-            Some(&[EvalModule::Sensory, EvalModule::Speak]),
-        );
-        let _full_memory = write_full_agent_case(
-            dir.path(),
-            "full-memory",
-            "full-agent-memory",
-            Some(&[EvalModule::Memory]),
-        );
-        let _speak = write_module_case(
-            dir.path(),
-            EvalModule::Speak,
-            "speak-target",
-            "module-speak-target",
-            &[EvalModule::Speak],
-        );
-        let mut config = test_runner_config(dir.path());
-        config.full_agent_only = true;
-        config.module_filters = vec![EvalModule::Speak];
-
-        let selection = select_case_paths(&config, false).unwrap();
-
-        assert_eq!(selection.case_paths, vec![full_speak]);
-    }
-
-    #[test]
-    fn full_agent_case_filters_conflict() {
-        let dir = tempfile::tempdir().unwrap();
-        let mut config = test_runner_config(dir.path());
-        config.exclude_full_agent = true;
-        config.full_agent_only = true;
-
-        let error = select_case_paths(&config, false).unwrap_err();
-
-        assert!(matches!(error, RunnerError::ConflictingFullAgentFilters));
-    }
-
-    #[test]
-    fn module_filters_intersect_case_patterns() {
-        let dir = tempfile::tempdir().unwrap();
-        let special_speak = write_module_case(
-            dir.path(),
-            EvalModule::Speak,
-            "special-speak",
-            "module-speak-special",
-            &[EvalModule::Speak],
-        );
-        let _plain_speak = write_module_case(
-            dir.path(),
-            EvalModule::Speak,
-            "plain-speak",
-            "module-speak-plain",
-            &[EvalModule::Speak],
-        );
-        let _special_memory = write_module_case(
-            dir.path(),
-            EvalModule::Memory,
-            "special-memory",
-            "module-memory-special",
-            &[EvalModule::Memory],
-        );
-        let mut config = test_runner_config(dir.path());
-        config.case_patterns = vec!["special".to_string()];
-        config.module_filters = vec![EvalModule::Speak];
-
-        let selection = select_case_paths(&config, false).unwrap();
-
-        assert_eq!(selection.case_paths, vec![special_speak]);
-    }
-
-    #[test]
-    fn visualizer_planned_tabs_use_filtered_case_ids() {
-        let dir = tempfile::tempdir().unwrap();
-        let case_dir = dir.path().join("eval-cases/full-agent");
-        std::fs::create_dir_all(&case_dir).unwrap();
-        std::fs::write(
-            case_dir.join("first-route.eure"),
-            r#"
-id = "module-query-memory-first-route"
-
-@ inputs[] {
-  $variant: heard
-  content = "First?"
-}
-"#,
-        )
-        .unwrap();
-        std::fs::write(
-            case_dir.join("second-memory.eure"),
-            r#"
-id = "module-query-memory-special-memory"
-
-@ inputs[] {
-  $variant: heard
-  content = "Second?"
-}
-"#,
-        )
-        .unwrap();
-        let config = RunnerConfig {
-            cases_root: dir.path().join("eval-cases"),
-            output_root: dir.path().join("out"),
-            llm_log_root: dir.path().join("llm-logs"),
-            run_id: "run".to_string(),
-            judge_backend: test_backend_config(),
-            cheap_backend: test_backend_config(),
-            default_backend: test_backend_config(),
-            premium_backend: test_backend_config(),
-            image_backend: test_backend_config(),
-            embedding_backend: test_embedding_backend(),
-            fail_fast: false,
-            failed_only: false,
-            failed_from: None,
-            model_concurrency: test_model_concurrency(),
-            llm_concurrency_pool: LlmConcurrencyPool::default(),
-            trials: NonZeroUsize::new(1).unwrap(),
-            full_agent_concurrency: NonZeroUsize::new(3).unwrap(),
-            module_concurrency: NonZeroUsize::new(8).unwrap(),
-            case_patterns: vec!["special-memory".to_string()],
-            module_filters: Vec::new(),
-            disabled_modules: Vec::new(),
-            exclude_full_agent: false,
-            full_agent_only: false,
-        };
-
-        let tabs = visualizer_planned_tabs(&config).unwrap();
-
-        assert_eq!(tabs.len(), 1);
-        assert_eq!(tabs[0].0.as_str(), "module-query-memory-special-memory");
-        assert_eq!(tabs[0].1, "module-query-memory-special-memory");
-    }
-
-    #[test]
-    fn failed_only_selects_latest_failed_and_invalid_cases() {
-        let dir = tempfile::tempdir().unwrap();
-        let passed = write_query_memory_case(dir.path(), "passed", "module-query-memory-passed");
-        let failed = write_query_memory_case(dir.path(), "failed", "module-query-memory-failed");
-        let invalid = write_query_memory_case(dir.path(), "invalid", "module-query-memory-invalid");
-        let output_root = dir.path().join("out");
-        let old_report = output_root.join("old-run/suite-report.json");
-        write_suite_report(
-            &old_report,
-            serde_json::json!([
-                {
-                    "path": passed.display().to_string(),
-                    "id": "module-query-memory-passed",
-                    "passed": false,
-                    "invalid": false
-                }
-            ]),
-        );
-        std::thread::sleep(std::time::Duration::from_millis(10));
-        let latest_report = output_root.join("latest-run/suite-report.json");
-        write_suite_report(
-            &latest_report,
-            serde_json::json!([
-                {
-                    "path": passed.display().to_string(),
-                    "id": "module-query-memory-passed",
-                    "passed": true,
-                    "invalid": false
-                },
-                {
-                    "path": failed.display().to_string(),
-                    "id": "module-query-memory-failed",
-                    "passed": false,
-                    "invalid": false
-                },
-                {
-                    "path": invalid.display().to_string(),
-                    "id": "module-query-memory-invalid",
-                    "passed": false,
-                    "invalid": true
-                }
-            ]),
-        );
-        let mut config = test_runner_config(dir.path());
-        config.output_root = output_root;
-        config.failed_only = true;
-
-        let selection = select_case_paths(&config, false).unwrap();
-
-        assert_eq!(selection.failed_from, Some(latest_report));
-        assert_eq!(selection.case_paths, vec![failed, invalid]);
-    }
-
-    #[test]
-    fn failed_from_resolves_run_id_run_dir_and_report_path() {
-        let dir = tempfile::tempdir().unwrap();
-        let report = dir.path().join("out/run-a/suite-report.json");
-        write_suite_report(&report, serde_json::json!([]));
-        let mut config = test_runner_config(dir.path());
-        config.output_root = dir.path().join("out");
-
-        config.failed_from = Some(PathBuf::from("run-a"));
-        assert_eq!(
-            resolve_failed_only_reference(&config).unwrap(),
-            Some(report.clone())
-        );
-
-        config.failed_from = Some(report.parent().unwrap().to_path_buf());
-        assert_eq!(
-            resolve_failed_only_reference(&config).unwrap(),
-            Some(report.clone())
-        );
-
-        config.failed_from = Some(report.clone());
-        assert_eq!(
-            resolve_failed_only_reference(&config).unwrap(),
-            Some(report)
-        );
-    }
-
-    #[test]
-    fn failed_only_patterns_intersect_reference_cases() {
-        let dir = tempfile::tempdir().unwrap();
-        let first = write_query_memory_case(dir.path(), "first", "module-query-memory-first");
-        let special = write_query_memory_case(dir.path(), "special", "module-query-memory-special");
-        let report = dir.path().join("out/run-a/suite-report.json");
-        write_suite_report(
-            &report,
-            serde_json::json!([
-                {
-                    "path": first.display().to_string(),
-                    "id": "module-query-memory-first",
-                    "passed": false,
-                    "invalid": false
-                },
-                {
-                    "path": special.display().to_string(),
-                    "id": "module-query-memory-special",
-                    "passed": false,
-                    "invalid": true
-                }
-            ]),
-        );
-        let mut config = test_runner_config(dir.path());
-        config.output_root = dir.path().join("out");
-        config.failed_from = Some(PathBuf::from("run-a"));
-        config.case_patterns = vec!["special".to_string()];
-
-        let selection = select_case_paths(&config, false).unwrap();
-
-        assert_eq!(selection.case_paths, vec![special]);
-    }
-
-    #[test]
-    fn failed_only_all_passed_reference_selects_no_cases() {
-        let dir = tempfile::tempdir().unwrap();
-        let passed = write_query_memory_case(dir.path(), "passed", "module-query-memory-passed");
-        let report = dir.path().join("out/run-a/suite-report.json");
-        write_suite_report(
-            &report,
-            serde_json::json!([
-                {
-                    "path": passed.display().to_string(),
-                    "id": "module-query-memory-passed",
-                    "passed": true,
-                    "invalid": false
-                }
-            ]),
-        );
-        let mut config = test_runner_config(dir.path());
-        config.output_root = dir.path().join("out");
-        config.failed_from = Some(PathBuf::from("run-a"));
-
-        let selection = select_case_paths(&config, false).unwrap();
-
-        assert!(selection.case_paths.is_empty());
-    }
-
-    #[test]
-    fn failed_only_reports_reference_errors() {
-        let dir = tempfile::tempdir().unwrap();
-        let mut config = test_runner_config(dir.path());
-        config.failed_only = true;
-        let error = select_case_paths(&config, false).unwrap_err();
-        assert!(matches!(error, RunnerError::FailedOnlyNoReference { .. }));
-
-        let bad_report = dir.path().join("out/bad/suite-report.json");
-        std::fs::create_dir_all(bad_report.parent().unwrap()).unwrap();
-        std::fs::write(&bad_report, "not json").unwrap();
-        config.failed_only = false;
-        config.failed_from = Some(bad_report);
-        let error = select_case_paths(&config, false).unwrap_err();
-        assert!(matches!(
-            error,
-            RunnerError::ParseFailedOnlyReference { .. }
-        ));
-
-        let missing_report = dir.path().join("out/missing-case/suite-report.json");
-        write_suite_report(
-            &missing_report,
-            serde_json::json!([
-                {
-                    "path": "eval-cases/modules/query-memory/missing.eure",
-                    "id": "module-query-memory-missing",
-                    "passed": false,
-                    "invalid": false
-                }
-            ]),
-        );
-        config.failed_from = Some(missing_report);
-        std::fs::create_dir_all(dir.path().join("eval-cases")).unwrap();
-        let error = select_case_paths(&config, false).unwrap_err();
-        assert!(matches!(error, RunnerError::FailedOnlyCaseNotFound { .. }));
-    }
-
-    #[test]
-    fn suite_run_report_records_failed_only_reference() {
-        let dir = tempfile::tempdir().unwrap();
-        let mut config = test_runner_config(dir.path());
-        config.failed_from = Some(PathBuf::from("run-a"));
-        let run_dir = dir.path().join("out/rerun");
-        let failed_from = dir.path().join("out/run-a/suite-report.json");
-
-        let report = suite_run_report(&config, &run_dir, 0, Some(&failed_from));
-        let json = serde_json::to_value(&report).unwrap();
-
-        assert_eq!(json["failed_only"], serde_json::json!(true));
-        assert_eq!(
-            json["failed_from"],
-            serde_json::json!(failed_from.display().to_string())
-        );
-    }
-
-    #[test]
-    fn eval_utterance_output_strips_balanced_outer_quotes() {
-        assert_eq!(
-            normalize_eval_utterance_text("\"short signal\"".to_string()),
-            "short signal"
-        );
-        assert_eq!(
-            normalize_eval_utterance_text("  \"short signal\"  ".to_string()),
-            "short signal"
-        );
-        assert_eq!(
-            normalize_eval_utterance_text("short signal".to_string()),
-            "short signal"
-        );
-        assert_eq!(
-            normalize_eval_utterance_text("\"an apple\" is \"red\"".to_string()),
-            "\"an apple\" is \"red\""
-        );
-        assert_eq!(
-            normalize_eval_utterance_text("\"an \\\"apple\\\"\"".to_string()),
-            "an \"apple\""
-        );
-    }
-
-    #[tokio::test]
-    async fn recording_utterance_sink_returns_last_complete() {
-        let dir = tempfile::tempdir().unwrap();
-        let reporter = LiveReporter::new("test-run", dir.path()).unwrap();
-        let actions = Rc::new(ActionActivityTracker::new(vec![builtin::speak()]));
-        let sink =
-            RecordingUtteranceSink::new("test-case".to_string(), reporter, actions.clone(), None);
-        let emitted_at = Utc.with_ymd_and_hms(2026, 5, 7, 12, 0, 0).unwrap();
-        let sender = ModuleInstanceId::new(builtin::speak(), ReplicaIndex::ZERO);
-
-        sink.on_complete(Utterance {
-            sender: sender.clone(),
-            target: "peer".to_string(),
-            generation_id: 0,
-            text: "first".to_string(),
-            emitted_at,
-        })
-        .await
-        .unwrap();
-        sink.on_complete(Utterance {
-            sender,
-            target: "peer".to_string(),
-            generation_id: 1,
-            text: "second".to_string(),
-            emitted_at,
-        })
-        .await
-        .unwrap();
-
-        assert_eq!(sink.snapshot().len(), 2);
-        assert_eq!(sink.last_complete().unwrap().text, "second");
-        assert!(
-            !actions.silence_window_elapsed_at(FULL_AGENT_ACTION_SILENCE_WINDOW, Instant::now())
-        );
-    }
-
-    #[tokio::test]
-    async fn memory_diff_observation_exposes_entries_and_links_structurally() {
-        let summary_index = MemoryIndex::new("summary");
-        let source_index = MemoryIndex::new("source");
-        let now = Utc.with_ymd_and_hms(2026, 5, 17, 0, 0, 0).unwrap();
-        let summary = MemoryRecord {
-            index: summary_index.clone(),
-            content: nuillu_types::MemoryContent::new("Koro food boundary summary."),
-            rank: MemoryRank::ShortTerm,
-            occurred_at: None,
-            stored_at: now,
-            kind: nuillu_memory::MemoryKind::Reflection,
-            concepts: Vec::new(),
-            tags: Vec::new(),
-            affect_arousal: 0.0,
-            valence: 0.0,
-            emotion: String::new(),
-        };
-        let store = StaticMemoryStore {
-            records: RefCell::new(vec![summary]),
-            links: vec![nuillu_memory::MemoryLink {
-                from_memory: summary_index,
-                to_memory: source_index,
-                relation: MemoryLinkRelation::DerivedFrom,
-                freeform_relation: None,
-                strength: 1.0,
-                confidence: 1.0,
-                updated_at: now,
-            }],
-        };
-
-        let diff = memory_diff_observation(&BTreeMap::new(), &store).await;
-        let value = serde_json::to_value(diff).unwrap();
-
-        assert_eq!(
-            pointer_text(&value, "/entries/0/kind").as_deref(),
-            Some("Reflection")
-        );
-        assert_eq!(
-            pointer_text(&value, "/links/0/relation").as_deref(),
-            Some("derived_from")
-        );
-    }
-
-    #[tokio::test]
-    async fn memory_diff_observation_exposes_deleted_baseline_records() {
-        let deleted_index = MemoryIndex::new("source");
-        let now = Utc.with_ymd_and_hms(2026, 5, 17, 0, 0, 0).unwrap();
-        let deleted = MemoryRecord {
-            index: deleted_index.clone(),
-            content: nuillu_types::MemoryContent::new("Redundant source memory."),
-            rank: MemoryRank::ShortTerm,
-            occurred_at: None,
-            stored_at: now,
-            kind: nuillu_memory::MemoryKind::Episode,
-            concepts: Vec::new(),
-            tags: Vec::new(),
-            affect_arousal: 0.0,
-            valence: 0.0,
-            emotion: String::new(),
-        };
-        let baseline = BTreeMap::from([(deleted_index.to_string(), deleted)]);
-        let store = StaticMemoryStore {
-            records: RefCell::new(Vec::new()),
-            links: Vec::new(),
-        };
-
-        let diff = memory_diff_observation(&baseline, &store).await;
-        let value = serde_json::to_value(diff).unwrap();
-
-        assert_eq!(
-            pointer_text(&value, "/deleted/0").as_deref(),
-            Some("source")
-        );
-    }
-
-    #[tokio::test]
-    async fn seed_and_bootstrap_eval_startup_context_seeds_before_identity_bootstrap() {
-        let blackboard = Blackboard::default();
-        let clock: Rc<dyn Clock> = Rc::new(FixedClock(
-            Utc.with_ymd_and_hms(2026, 5, 21, 0, 0, 0).unwrap(),
-        ));
-        let memory_store = Rc::new(StaticMemoryStore {
-            records: RefCell::new(Vec::new()),
-            links: Vec::new(),
-        });
-        let memory_caps = MemoryCapabilities::new(
-            blackboard.clone(),
-            clock.clone(),
-            memory_store.clone(),
-            Vec::new(),
-        );
-        let policy_store = Rc::new(nuillu_reward::NoopPolicyStore);
-        let policy_caps = PolicyCapabilities::new(
-            blackboard.clone(),
-            clock.clone(),
-            policy_store.clone(),
-            Vec::new(),
-        );
-        let memories = vec![
-            crate::cases::MemorySeed {
-                index: None,
-                rank: crate::cases::MemorySeedRank::Identity,
-                decay_secs: 86_400,
-                datetime: None,
-                seconds_ago: None,
-                content: eure::value::Text::plaintext("I am Nui."),
-            },
-            crate::cases::MemorySeed {
-                index: None,
-                rank: crate::cases::MemorySeedRank::ShortTerm,
-                decay_secs: 86_400,
-                datetime: None,
-                seconds_ago: None,
-                content: eure::value::Text::plaintext("Ordinary memory."),
-            },
-        ];
-
-        seed_and_bootstrap_eval_startup_context(
-            &memory_caps,
-            &policy_caps,
-            memory_store.as_ref(),
-            policy_store.as_ref(),
-            &blackboard,
-            clock.as_ref(),
-            None,
-            &memories,
-            &[],
-            &[],
-        )
-        .await
-        .unwrap();
-
-        let identity_memories = blackboard.read(|bb| bb.identity_memories().to_vec()).await;
-        assert_eq!(identity_memories.len(), 1);
-        assert_eq!(identity_memories[0].index.as_str(), "seed-1");
-        assert_eq!(identity_memories[0].content.as_str(), "I am Nui.");
-    }
-
-    struct StaticMemoryStore {
-        records: RefCell<Vec<MemoryRecord>>,
-        links: Vec<nuillu_memory::MemoryLink>,
-    }
-
-    #[async_trait::async_trait(?Send)]
-    impl MemoryStore for StaticMemoryStore {
-        async fn insert(
-            &self,
-            mem: nuillu_memory::NewMemory,
-            stored_at: DateTime<Utc>,
-        ) -> std::result::Result<MemoryRecord, PortError> {
-            let index = MemoryIndex::new(format!("seed-{}", self.records.borrow().len() + 1));
-            let record = MemoryRecord {
-                index,
-                content: mem.content,
-                rank: mem.rank,
-                occurred_at: mem.occurred_at,
-                stored_at,
-                kind: mem.kind,
-                concepts: mem.concepts,
-                tags: mem.tags,
-                affect_arousal: mem.affect_arousal,
-                valence: mem.valence,
-                emotion: mem.emotion,
-            };
-            self.records.borrow_mut().push(record.clone());
-            Ok(record)
-        }
-
-        async fn put(
-            &self,
-            _mem: nuillu_memory::IndexedMemory,
-        ) -> std::result::Result<MemoryRecord, PortError> {
-            unimplemented!("static test store does not support writes")
-        }
-
-        async fn compact(
-            &self,
-            _mem: nuillu_memory::NewMemory,
-            _sources: &[MemoryIndex],
-            _stored_at: DateTime<Utc>,
-        ) -> std::result::Result<MemoryRecord, PortError> {
-            unimplemented!("static test store does not support writes")
-        }
-
-        async fn put_compacted(
-            &self,
-            _mem: nuillu_memory::IndexedMemory,
-            _sources: &[MemoryIndex],
-        ) -> std::result::Result<MemoryRecord, PortError> {
-            unimplemented!("static test store does not support writes")
-        }
-
-        async fn get(
-            &self,
-            index: &MemoryIndex,
-        ) -> std::result::Result<Option<MemoryRecord>, PortError> {
-            Ok(self
-                .records
-                .borrow()
-                .iter()
-                .find(|record| &record.index == index)
-                .cloned())
-        }
-
-        async fn list_by_rank(
-            &self,
-            rank: MemoryRank,
-        ) -> std::result::Result<Vec<MemoryRecord>, PortError> {
-            Ok(self
-                .records
-                .borrow()
-                .iter()
-                .filter(|record| record.rank == rank)
-                .cloned()
-                .collect())
-        }
-
-        async fn search(
-            &self,
-            _q: &MemoryQuery,
-        ) -> std::result::Result<Vec<MemoryRecord>, PortError> {
-            Ok(Vec::new())
-        }
-
-        async fn linked(
-            &self,
-            q: &LinkedMemoryQuery,
-        ) -> std::result::Result<Vec<nuillu_memory::LinkedMemoryRecord>, PortError> {
-            Ok(self
-                .links
-                .iter()
-                .filter(|link| {
-                    q.memory_indexes.contains(&link.from_memory)
-                        || q.memory_indexes.contains(&link.to_memory)
-                })
-                .filter_map(|link| {
-                    self.records
-                        .borrow()
-                        .iter()
-                        .find(|record| record.index == link.from_memory)
-                        .cloned()
-                        .map(|record| nuillu_memory::LinkedMemoryRecord {
-                            record,
-                            link: link.clone(),
-                        })
-                })
-                .collect())
-        }
-
-        async fn upsert_link(
-            &self,
-            _link: nuillu_memory::NewMemoryLink,
-            _updated_at: DateTime<Utc>,
-        ) -> std::result::Result<nuillu_memory::MemoryLink, PortError> {
-            unimplemented!("static test store does not support writes")
-        }
-
-        async fn delete(&self, _index: &MemoryIndex) -> std::result::Result<(), PortError> {
-            unimplemented!("static test store does not support writes")
-        }
-    }
-
-    #[test]
-    fn action_tracker_waits_for_silence_window_after_action_completion() {
-        let tracker = ActionActivityTracker::new(vec![builtin::speak()]);
-        let now = Instant::now();
-
-        tracker.record_completed_at(&builtin::speak(), now);
-
-        assert!(!tracker.silence_window_elapsed_at(Duration::from_secs(1), now));
-        assert!(
-            !tracker.silence_window_elapsed_at(
-                Duration::from_secs(1),
-                now + Duration::from_millis(999)
-            )
-        );
-        assert!(
-            tracker.silence_window_elapsed_at(Duration::from_secs(1), now + Duration::from_secs(1))
-        );
-    }
-
-    #[test]
-    fn action_tracker_ignores_non_action_module_completion() {
-        let tracker = ActionActivityTracker::new(vec![builtin::speak()]);
-        let completed_at = Instant::now();
-        let after_window = completed_at + Duration::from_secs(2);
-
-        tracker.record_completed_at(&builtin::query_memory(), completed_at);
-        assert!(!tracker.silence_window_elapsed_at(Duration::from_secs(1), after_window));
-
-        tracker.record_completed_at(&builtin::speak(), completed_at);
-        tracker.record_completed_at(&builtin::query_memory(), after_window);
-        assert!(tracker.silence_window_elapsed_at(Duration::from_secs(1), after_window));
-    }
-
-    #[test]
-    fn full_agent_settle_waits_for_runtime_after_action_silence() {
-        let actions = ActionActivityTracker::new(vec![builtin::speak()]);
-        let now = Instant::now();
-        actions.record_completed_at(&builtin::speak(), now);
-        let mut settle = FullAgentSettleTracker::new(0, now);
-
-        let after_action_silence = now + FULL_AGENT_ACTION_SILENCE_WINDOW;
-        assert!(!full_agent_ready_to_score_at(
-            &actions,
-            &settle,
-            1,
-            true,
-            false,
-            false,
-            after_action_silence,
-        ));
-
-        let late_progress = after_action_silence + Duration::from_millis(50);
-        settle.observe_progress_count(1, late_progress);
-        assert!(!full_agent_ready_to_score_at(
-            &actions,
-            &settle,
-            0,
-            true,
-            false,
-            false,
-            late_progress + Duration::from_millis(199),
-        ));
-        assert!(full_agent_ready_to_score_at(
-            &actions,
-            &settle,
-            0,
-            true,
-            false,
-            false,
-            late_progress + FULL_AGENT_RUNTIME_SILENCE_WINDOW,
-        ));
-    }
-
-    #[test]
-    fn full_agent_settle_waits_for_runtime_silence_without_action_output() {
-        let actions = ActionActivityTracker::new(vec![builtin::speak()]);
-        let now = Instant::now();
-        let settle = FullAgentSettleTracker::new(0, now);
-
-        assert!(!full_agent_ready_to_score_at(
-            &actions,
-            &settle,
-            0,
-            true,
-            true,
-            false,
-            now + Duration::from_millis(199),
-        ));
-        assert!(full_agent_ready_to_score_at(
-            &actions,
-            &settle,
-            0,
-            true,
-            true,
-            false,
-            now + FULL_AGENT_RUNTIME_SILENCE_WINDOW,
-        ));
-    }
-
-    #[test]
-    fn max_llm_calls_requests_stop_after_lutum_model_input_hook() {
-        let dir = tempfile::tempdir().unwrap();
-        let reporter = LiveReporter::new("test-run", dir.path()).unwrap();
-        let stop = Arc::new(AtomicBool::new(false));
-        let hook = LlmCallLimitHook::new("test-case".to_string(), Some(3), stop.clone(), reporter);
-
-        hook.record_call();
-        hook.record_call();
-        assert!(!stop.load(Ordering::Relaxed));
-        hook.record_call();
-        assert!(stop.load(Ordering::Relaxed));
-        hook.record_call();
-
-        let jsonl = std::fs::read_to_string(dir.path().join("events.jsonl")).unwrap();
-        assert!(jsonl.contains("\"kind\":\"stop_requested\""));
-        assert_eq!(jsonl.matches("\"kind\":\"stop_requested\"").count(), 1);
-    }
-
-    #[test]
-    fn recording_runtime_event_sink_builds_activation_timeline() {
-        let dir = tempfile::tempdir().unwrap();
-        let reporter = LiveReporter::new("test-run", dir.path()).unwrap();
-        let sink = RecordingRuntimeEventSink::new("test-case".to_string(), reporter, None);
-        let owner = ModuleInstanceId::new(builtin::speak(), ReplicaIndex::ZERO);
-
-        sink.on_event(RuntimeEvent::ModuleBatchReady {
-            sequence: 0,
-            activation_id: ModuleActivationId::new(0),
-            activation_attempt: 1,
-            owner: owner.clone(),
-            batch_type: "cognition".to_string(),
-            batch_debug: String::new(),
-        })
-        .unwrap();
-        sink.on_event(RuntimeEvent::ModuleActivationCompleted {
-            sequence: 1,
-            activation_id: ModuleActivationId::new(0),
-            owner,
-            duration: Duration::from_millis(42),
-            succeeded: true,
-        })
-        .unwrap();
-
-        let activations = sink.activation_timeline();
-        assert_eq!(activations.len(), 1);
-        assert_eq!(activations[0].module, "speak");
-        assert_eq!(activations[0].duration_ms, 42);
-        assert!(activations[0].succeeded);
-    }
-
-    #[test]
-    fn runtime_progress_count_ignores_scheduler_noise() {
-        let dir = tempfile::tempdir().unwrap();
-        let reporter = LiveReporter::new("test-run", dir.path()).unwrap();
-        let sink = RecordingRuntimeEventSink::new("test-case".to_string(), reporter, None);
-        let owner = ModuleInstanceId::new(builtin::homeostasis(), ReplicaIndex::ZERO);
-
-        sink.on_event(RuntimeEvent::ModuleBatchThrottled {
-            sequence: 0,
-            owner: owner.clone(),
-            delayed_for: Duration::from_secs(3),
-        })
-        .unwrap();
-        sink.on_event(RuntimeEvent::ModuleBatchReady {
-            sequence: 1,
-            activation_id: ModuleActivationId::new(1),
-            activation_attempt: 1,
-            owner: owner.clone(),
-            batch_type: "()".to_string(),
-            batch_debug: "()".to_string(),
-        })
-        .unwrap();
-        assert_eq!(sink.event_count(), 2);
-        assert_eq!(sink.progress_event_count(), 0);
-
-        sink.on_event(RuntimeEvent::ModuleActivationAttemptFailed {
-            sequence: 2,
-            activation_id: ModuleActivationId::new(1),
-            owner: owner.clone(),
-            activation_attempt: 1,
-            max_attempts: 3,
-            message: "transient activation failure".to_string(),
-        })
-        .unwrap();
-
-        assert_eq!(sink.event_count(), 3);
-        assert_eq!(sink.progress_event_count(), 1);
-
-        sink.on_event(RuntimeEvent::MemoUpdated {
-            sequence: 3,
-            owner,
-            char_count: 42,
-        })
-        .unwrap();
-
-        assert_eq!(sink.event_count(), 4);
-        assert_eq!(sink.progress_event_count(), 2);
-    }
-
-    #[test]
-    fn scheduled_wait_remaining_tracks_batch_throttle_deadlines() {
-        let owner = ModuleInstanceId::new(builtin::homeostasis(), ReplicaIndex::ZERO);
-        let timed_events = vec![
-            (
-                100,
-                RuntimeEvent::ModuleBatchThrottled {
-                    sequence: 0,
-                    owner: owner.clone(),
-                    delayed_for: Duration::from_millis(1_000),
-                },
-            ),
-            (
-                450,
-                RuntimeEvent::MemoUpdated {
-                    sequence: 1,
-                    owner: ModuleInstanceId::new(builtin::sensory(), ReplicaIndex::ZERO),
-                    char_count: 12,
-                },
-            ),
-        ];
-
-        assert_eq!(
-            scheduled_wait_remaining_from_timed_events(&timed_events, Duration::from_millis(500)),
-            Some(Duration::from_millis(600))
-        );
-        assert_eq!(
-            scheduled_wait_remaining_from_timed_events(&timed_events, Duration::from_millis(1_000)),
-            Some(Duration::from_millis(100))
-        );
-        assert_eq!(
-            scheduled_wait_remaining_from_timed_events(&timed_events, Duration::from_millis(1_100)),
-            None
-        );
-    }
-
-    #[test]
-    fn llm_in_flight_tracks_access_and_completion() {
-        let dir = tempfile::tempdir().unwrap();
-        let reporter = LiveReporter::new("test-run", dir.path()).unwrap();
-        let sink = RecordingRuntimeEventSink::new("test-case".to_string(), reporter, None);
-        let owner = ModuleInstanceId::new(builtin::cognition_gate(), ReplicaIndex::ZERO);
-
-        assert_eq!(sink.llm_in_flight_count(), 0);
-
-        sink.on_event(RuntimeEvent::LlmAccessed {
-            sequence: 0,
-            call: 0,
-            owner: owner.clone(),
-            tier: ModelTier::Cheap,
-        })
-        .unwrap();
-        assert_eq!(sink.llm_in_flight_count(), 1);
-
-        sink.on_event(RuntimeEvent::LlmAccessed {
-            sequence: 1,
-            call: 1,
-            owner: owner.clone(),
-            tier: ModelTier::Cheap,
-        })
-        .unwrap();
-        assert_eq!(sink.llm_in_flight_count(), 2);
-
-        sink.on_event(RuntimeEvent::LlmCompleted {
-            sequence: 2,
-            call: 0,
-            owner: owner.clone(),
-            tier: ModelTier::Cheap,
-        })
-        .unwrap();
-        assert_eq!(sink.llm_in_flight_count(), 1);
-
-        sink.on_event(RuntimeEvent::LlmCompleted {
-            sequence: 3,
-            call: 1,
-            owner,
-            tier: ModelTier::Cheap,
-        })
-        .unwrap();
-        assert_eq!(sink.llm_in_flight_count(), 0);
-        assert_eq!(sink.progress_event_count(), 4);
-    }
-
-    #[test]
-    fn step_settle_modules_follow_next_wait_target() {
-        assert_eq!(
-            step_settle_modules(Some(&WaitFor::MemoFrom {
-                module: EvalModule::Surprise,
-                timeout_ms: 1000,
-            })),
-            vec![builtin::surprise()]
-        );
-        assert_eq!(
-            step_settle_modules(Some(&WaitFor::Interoception {
-                timeout_ms: 1000,
-                mode: None,
-                wake_arousal_at_least: f64::NEG_INFINITY,
-                wake_arousal_at_most: f64::INFINITY,
-            })),
-            vec![builtin::interoception()]
-        );
-        assert!(step_settle_modules(None).is_empty());
-    }
-
-    #[tokio::test]
-    async fn step_settle_wait_ignores_unrelated_inflight_modules() {
-        let blackboard = Blackboard::default();
-        blackboard
-            .apply(BlackboardCommand::SetModuleRunStatus {
-                owner: ModuleInstanceId::new(builtin::allocation(), ReplicaIndex::ZERO),
-                status: ModuleRunStatus::Activating,
-            })
-            .await;
-        let dir = tempfile::tempdir().unwrap();
-        let reporter = LiveReporter::new("test-run", dir.path()).unwrap();
-        let events = RecordingRuntimeEventSink::new("test-case".to_string(), reporter, None);
-
-        let outcome = wait_for_step_modules_to_settle(
-            &blackboard,
-            &events,
-            &[builtin::surprise()],
-            Duration::from_millis(1),
-        )
-        .await;
-
-        assert!(matches!(outcome, WaitOutcome::Met));
-    }
-
-    #[tokio::test]
-    async fn step_settle_wait_times_out_for_target_inflight_module() {
-        let blackboard = Blackboard::default();
-        blackboard
-            .apply(BlackboardCommand::SetModuleRunStatus {
-                owner: ModuleInstanceId::new(builtin::surprise(), ReplicaIndex::ZERO),
-                status: ModuleRunStatus::Activating,
-            })
-            .await;
-        let dir = tempfile::tempdir().unwrap();
-        let reporter = LiveReporter::new("test-run", dir.path()).unwrap();
-        let events = RecordingRuntimeEventSink::new("test-case".to_string(), reporter, None);
-
-        let outcome = wait_for_step_modules_to_settle(
-            &blackboard,
-            &events,
-            &[builtin::surprise()],
-            Duration::from_millis(1),
-        )
-        .await;
-
-        assert!(matches!(outcome, WaitOutcome::Timeout));
-    }
-
-    #[tokio::test]
-    async fn wait_for_condition_prefers_new_memo_over_later_stop() {
-        let blackboard = Blackboard::default();
-        let dir = tempfile::tempdir().unwrap();
-        let reporter = LiveReporter::new("test-run", dir.path()).unwrap();
-        let events = RecordingRuntimeEventSink::new("test-case".to_string(), reporter, None);
-        let wait_for = WaitFor::MemoFrom {
-            module: EvalModule::Surprise,
-            timeout_ms: 500,
-        };
-        let owner = ModuleInstanceId::new(builtin::surprise(), ReplicaIndex::ZERO);
-        let now = Utc.with_ymd_and_hms(2026, 5, 18, 0, 0, 0).unwrap();
-
-        let wait = wait_for_condition(&blackboard, &events, &wait_for);
-        let publish_then_stop = async {
-            tokio::time::sleep(Duration::from_millis(1)).await;
-            blackboard
-                .apply(BlackboardCommand::UpdateMemo {
-                    owner,
-                    memo: "surprise landed".to_string(),
-                    written_at: now,
-                })
-                .await;
-            events.request_stop("after-memo");
-        };
-        let (outcome, _) = tokio::join!(wait, publish_then_stop);
-
-        assert!(matches!(outcome, WaitOutcome::Met));
-    }
-
-    #[test]
-    fn step_outcomes_all_ok_requires_only_ok_statuses() {
-        assert!(step_outcomes_all_ok(&[
-            serde_json::json!({"index": 0, "status": "ok", "checks": []}),
-            serde_json::json!({"index": 1, "status": "ok", "checks": []}),
-        ]));
-        assert!(!step_outcomes_all_ok(&[]));
-        assert!(!step_outcomes_all_ok(&[
-            serde_json::json!({"index": 0, "status": "ok", "checks": []}),
-            serde_json::json!({"index": 1, "status": "stopped", "checks": []}),
-        ]));
-    }
-
-    #[tokio::test]
-    async fn run_suite_records_case_runtime_failures_and_continues() {
-        let dir = tempfile::tempdir().unwrap();
-        let case_dir = dir.path().join("eval-cases/modules/query-memory");
-        std::fs::create_dir_all(&case_dir).unwrap();
-        for id in ["runtime-failure-one", "runtime-failure-two"] {
-            std::fs::write(
-                case_dir.join(format!("{id}.eure")),
-                format!(
-                    r#"
-id = "{id}"
-prompt = "Who are you?"
-
-limits {{
-  max-llm-calls = 1
-}}
-"#
-                ),
-            )
-            .unwrap();
-        }
-
-        let output_root = dir.path().join("out");
-        let mut cheap_backend = test_backend_config_with_model("cheap-model");
-        cheap_backend.max_concurrent_llm_calls = NonZeroUsize::new(7);
-        let config = RunnerConfig {
-            cases_root: dir.path().join("eval-cases"),
-            output_root: output_root.clone(),
-            llm_log_root: dir.path().join("llm-logs"),
-            run_id: "runtime-failures".to_string(),
-            judge_backend: test_backend_config_with_model("judge-model"),
-            cheap_backend,
-            default_backend: test_backend_config_with_model("default-model"),
-            premium_backend: test_backend_config_with_model("premium-model"),
-            image_backend: test_backend_config_with_model("image-model"),
-            embedding_backend: failing_embedding_backend(),
-            fail_fast: false,
-            failed_only: false,
-            failed_from: None,
-            model_concurrency: model_concurrency_from_backends([
-                test_backend_config_with_model("judge-model"),
-                {
-                    let mut cheap = test_backend_config_with_model("cheap-model");
-                    cheap.max_concurrent_llm_calls = NonZeroUsize::new(7);
-                    cheap
-                },
-                test_backend_config_with_model("default-model"),
-                test_backend_config_with_model("premium-model"),
-                test_backend_config_with_model("image-model"),
-            ]),
-            llm_concurrency_pool: LlmConcurrencyPool::default(),
-            trials: NonZeroUsize::new(1).unwrap(),
-            full_agent_concurrency: NonZeroUsize::new(3).unwrap(),
-            module_concurrency: NonZeroUsize::new(8).unwrap(),
-            case_patterns: Vec::new(),
-            module_filters: Vec::new(),
-            disabled_modules: Vec::new(),
-            exclude_full_agent: false,
-            full_agent_only: false,
-        };
-
-        let report = run_suite(&config).await.unwrap();
-
-        let run_dir = output_root.join("runtime-failures");
-        assert_eq!(report.run.run_id, "runtime-failures");
-        assert_eq!(
-            report.run.cases_root,
-            config.cases_root.display().to_string()
-        );
-        assert_eq!(report.run.output_dir, run_dir.display().to_string());
-        assert_eq!(report.run.case_patterns, Vec::<String>::new());
-        assert!(!report.run.fail_fast);
-        assert_eq!(
-            report.run.model_concurrency.get("cheap-model"),
-            Some(&Some(7))
-        );
-        assert_eq!(report.run.trials, 1);
-        assert_eq!(report.run.full_agent_concurrency, 3);
-        assert_eq!(report.run.module_concurrency, 8);
-        assert_eq!(report.run.planned_case_count, 2);
-        assert_eq!(report.run.models.judge, "judge-model");
-        assert_eq!(report.run.models.cheap, "cheap-model");
-        assert_eq!(report.run.models.default, "default-model");
-        assert_eq!(report.run.models.premium, "premium-model");
-        assert_eq!(report.run.models.image, "image-model");
-        assert_eq!(report.run.module_filters, Vec::<String>::new());
-        assert_eq!(report.case_count, 2);
-        assert_eq!(report.passed_cases, 0);
-        assert_eq!(report.invalid_cases, 2);
-        assert!(report.cases.iter().all(|case| {
-            !case.passed
-                && case.invalid
-                && case.score == 0.0
-                && case.report.runtime_failure.is_some()
-                && case.report.checks.is_empty()
-                && case.trial_count == 1
-                && case.passed_trials == 0
-                && case.failed_trials == 0
-                && case.invalid_trials == 1
-                && case.trials.len() == 1
-        }));
-        assert_metric_values(&report.metrics.pass_at, &[(1, 0.0)]);
-        assert_metric_values(&report.metrics.pass_hat, &[(1, 0.0)]);
-
-        assert!(run_dir.join("suite-report.json").exists());
-        assert!(!run_dir.join("events.jsonl").exists());
-        let suite_json: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(run_dir.join("suite-report.json")).unwrap())
-                .unwrap();
-        assert_eq!(
-            suite_json["run"],
-            serde_json::json!({
-                "run_id": "runtime-failures",
-                "cases_root": config.cases_root.display().to_string(),
-                "output_dir": run_dir.display().to_string(),
-                "case_patterns": [],
-                "failed_only": false,
-                "failed_from": null,
-                "fail_fast": false,
-                "model_concurrency": {
-                    "cheap-model": 7,
-                    "default-model": null,
-                    "judge-model": null,
-                    "premium-model": null,
-                    "image-model": null,
-                },
-                "trials": 1,
-                "full_agent_concurrency": 3,
-                "module_concurrency": 8,
-                "planned_case_count": 2,
-                "models": {
-                    "judge": "judge-model",
-                    "cheap": "cheap-model",
-                    "default": "default-model",
-                    "premium": "premium-model",
-                    "image": "image-model",
-                },
-                "module_filters": [],
-                "disabled_modules": [],
-                "exclude_full_agent": false,
-                "full_agent_only": false,
-            })
-        );
-        for summary in &report.cases {
-            let output_dir = run_dir.join(sanitize_id(&summary.id));
-            let expected_llm_log_directory = eval_llm_log_directory(&config, &summary.id)
-                .display()
-                .to_string();
-            assert_eq!(
-                summary.report.llm_log_directory.as_deref(),
-                Some(expected_llm_log_directory.as_str())
-            );
-            assert!(output_dir.join("report.json").exists());
-            assert!(output_dir.join("artifact.json").exists());
-            assert!(output_dir.join("events.jsonl").exists());
-            assert!(output_dir.join("raw-trace.json").exists());
-            assert!(!output_dir.join("trial-001").exists());
-            let report_json: serde_json::Value =
-                serde_json::from_slice(&std::fs::read(output_dir.join("report.json")).unwrap())
-                    .unwrap();
-            assert_eq!(
-                report_json["report"]["llm_log_directory"],
-                serde_json::json!(expected_llm_log_directory.as_str())
-            );
-            let artifact_json: serde_json::Value =
-                serde_json::from_slice(&std::fs::read(output_dir.join("artifact.json")).unwrap())
-                    .unwrap();
-            assert_eq!(
-                artifact_json["observations"]["llm_log_directory"],
-                serde_json::json!(expected_llm_log_directory.as_str())
-            );
-            let events: serde_json::Value =
-                serde_json::from_slice(&std::fs::read(output_dir.join("events.json")).unwrap())
-                    .unwrap();
-            assert_eq!(events, serde_json::json!([]));
-        }
-    }
-
-    #[tokio::test]
-    async fn parallel_fail_fast_drains_running_cases_without_launching_more() {
-        let dir = tempfile::tempdir().unwrap();
-        let case_dir = dir.path().join("eval-cases/modules/query-memory");
-        std::fs::create_dir_all(&case_dir).unwrap();
-        for id in ["fail-a", "fail-b", "fail-c"] {
-            std::fs::write(
-                case_dir.join(format!("{id}.eure")),
-                format!(
-                    r#"
-id = "{id}"
-prompt = "Who are you?"
-
-limits {{
-  max-llm-calls = 1
-}}
-"#
-                ),
-            )
-            .unwrap();
-        }
-        let mut config = test_runner_config(dir.path());
-        config.run_id = "parallel-fail-fast".to_string();
-        config.fail_fast = true;
-        config.module_concurrency = NonZeroUsize::new(2).unwrap();
-
-        let report = run_suite(&config).await.unwrap();
-
-        assert_eq!(report.run.planned_case_count, 3);
-        assert_eq!(report.case_count, 2);
-        assert_eq!(
-            report
-                .cases
-                .iter()
-                .map(|case| case.id.as_str())
-                .collect::<Vec<_>>(),
-            vec!["fail-a", "fail-b"]
-        );
-        let run_dir = config.output_root.join(&config.run_id);
-        assert!(run_dir.join("fail-a/events.jsonl").exists());
-        assert!(run_dir.join("fail-b/events.jsonl").exists());
-        assert!(!run_dir.join("fail-c").exists());
-        assert!(!run_dir.join("events.jsonl").exists());
-    }
-
-    #[tokio::test]
-    async fn run_suite_records_multiple_trials_per_case() {
-        let dir = tempfile::tempdir().unwrap();
-        let case_dir = dir.path().join("eval-cases/modules/query-memory");
-        std::fs::create_dir_all(&case_dir).unwrap();
-        std::fs::write(
-            case_dir.join("runtime-failure.eure"),
-            r#"
-id = "runtime-failure"
-prompt = "Who are you?"
-
-limits {
-  max-llm-calls = 1
-}
-"#,
-        )
-        .unwrap();
-
-        let output_root = dir.path().join("out");
-        let mut config = test_runner_config(dir.path());
-        config.output_root = output_root.clone();
-        config.run_id = "multi-trial".to_string();
-        config.embedding_backend = failing_embedding_backend();
-        config.model_concurrency =
-            BTreeMap::from([("cheap-model".to_string(), NonZeroUsize::new(7))]);
-        config.trials = NonZeroUsize::new(2).unwrap();
-
-        let report = run_suite(&config).await.unwrap();
-
-        assert_eq!(report.run.trials, 2);
-        assert_eq!(report.case_count, 1);
-        assert_eq!(report.invalid_cases, 1);
-        assert_metric_values(&report.metrics.pass_at, &[(1, 0.0), (2, 0.0)]);
-        assert_metric_values(&report.metrics.pass_hat, &[(1, 0.0), (2, 0.0)]);
-
-        let summary = &report.cases[0];
-        assert_eq!(summary.trial_count, 2);
-        assert_eq!(summary.passed_trials, 0);
-        assert_eq!(summary.failed_trials, 0);
-        assert_eq!(summary.invalid_trials, 2);
-        assert_eq!(summary.trials.len(), 2);
-
-        let output_dir = output_root
-            .join("multi-trial")
-            .join(sanitize_id(&summary.id));
-        assert!(output_dir.join("report.json").exists());
-        assert!(!output_dir.parent().unwrap().join("events.jsonl").exists());
-        assert!(!output_dir.join("events.jsonl").exists());
-        assert!(!output_dir.join("artifact.json").exists());
-        for trial in ["trial-001", "trial-002"] {
-            let trial_dir = output_dir.join(trial);
-            let runtime_id = format!("{}/{trial}", summary.id);
-            let expected_llm_log_directory = eval_llm_log_directory(&config, &runtime_id)
-                .display()
-                .to_string();
-            assert!(trial_dir.join("report.json").exists());
-            assert!(trial_dir.join("artifact.json").exists());
-            assert!(trial_dir.join("events.jsonl").exists());
-            assert!(trial_dir.join("raw-trace.json").exists());
-            let report_json: serde_json::Value =
-                serde_json::from_slice(&std::fs::read(trial_dir.join("report.json")).unwrap())
-                    .unwrap();
-            assert_eq!(
-                report_json["report"]["llm_log_directory"],
-                serde_json::json!(expected_llm_log_directory.as_str())
-            );
-            let artifact_json: serde_json::Value =
-                serde_json::from_slice(&std::fs::read(trial_dir.join("artifact.json")).unwrap())
-                    .unwrap();
-            assert_eq!(
-                artifact_json["observations"]["llm_log_directory"],
-                serde_json::json!(expected_llm_log_directory.as_str())
-            );
-        }
-
-        let suite_json: serde_json::Value = serde_json::from_slice(
-            &std::fs::read(output_dir.parent().unwrap().join("suite-report.json")).unwrap(),
-        )
-        .unwrap();
-        assert_eq!(suite_json["run"]["trials"], serde_json::json!(2));
-        assert_eq!(suite_json["cases"][0]["trial_count"], serde_json::json!(2));
-        assert_eq!(
-            suite_json["metrics"]["pass_at"],
-            serde_json::json!([
-                {"k": 1, "value": 0.0},
-                {"k": 2, "value": 0.0},
-            ])
-        );
-        assert_eq!(
-            suite_json["metrics"]["pass_hat"],
-            serde_json::json!([
-                {"k": 1, "value": 0.0},
-                {"k": 2, "value": 0.0},
-            ])
-        );
-    }
-
-    #[tokio::test]
-    async fn agent_observation_serializes_string_keyed_blackboard_maps() {
-        let now = Utc.with_ymd_and_hms(2026, 5, 7, 0, 0, 0).unwrap();
-        let mut allocation = ResourceAllocation::default();
-        allocation.set_activation(builtin::query_memory(), ActivationRatio::ONE);
-        let blackboard = Blackboard::with_allocation(allocation.clone());
-        let owner = ModuleInstanceId::new(builtin::query_memory(), ReplicaIndex::ZERO);
-
-        blackboard
-            .apply(BlackboardCommand::UpdateMemo {
-                owner: owner.clone(),
-                memo: "memo".to_string(),
-                written_at: now,
-            })
-            .await;
-        blackboard
-            .apply(BlackboardCommand::AppendCognitionLog {
-                source: owner.clone(),
-                entry: CognitionLogEntry {
-                    at: now,
-                    text: "cognition".to_string(),
-                    origin: CognitionLogOrigin::direct(owner),
-                },
-            })
-            .await;
-        blackboard
-            .apply(BlackboardCommand::SetModulePolicies {
-                policies: vec![(
-                    builtin::query_memory(),
-                    nuillu_blackboard::ModulePolicy::new(
-                        ReplicaCapRange::new(0, 0).unwrap(),
-                        Bpm::from_f64(60.0)..=Bpm::from_f64(60.0),
-                        linear_ratio_fn,
-                    ),
-                )],
-            })
-            .await;
-        blackboard
-            .apply(BlackboardCommand::RecordAllocationProposal {
-                controller: ModuleInstanceId::new(builtin::allocation(), ReplicaIndex::ZERO),
-                proposal: allocation,
-            })
-            .await;
-        blackboard
-            .apply(BlackboardCommand::UpsertMemoryMetadata {
-                index: MemoryIndex::new("mem-1"),
-                rank_if_new: MemoryRank::Permanent,
-                occurred_at_if_new: None,
-                decay_if_new_secs: 0,
-                now,
-                patch: MemoryMetaPatch::default(),
-            })
-            .await;
-
-        let observation = blackboard
-            .read(|bb| AgentObservation::from_blackboard(bb, Vec::new()))
-            .await;
-        let actual = serde_json::to_value(observation).unwrap();
-        let expected = serde_json::json!({
-            "memo_logs": {
-                "query-memory": [{
-                    "replica": 0,
-                    "index": 0,
-                    "written_at": "2026-05-07T00:00:00+00:00",
-                    "content": "memo",
-                    "cognitive": false,
-                }],
-            },
-            "cognition_logs": [{
-                "source": {
-                    "module": "query-memory",
-                    "replica": 0,
-                },
-                "entries": [{
-                    "at": "2026-05-07T00:00:00Z",
-                    "origin": {
-                        "owner": {
-                            "module": "query-memory",
-                            "replica": 0,
-                        },
-                    },
-                    "text": "cognition",
-                }],
-            }],
-            "interoception": {
-                "mode": "wake",
-                "wake_arousal": 0.0,
-                "nrem_pressure": 0.0,
-                "rem_pressure": 0.0,
-                "affect_arousal": 0.0,
-                "valence": 0.0,
-                "emotion": "",
-                "last_updated": "1970-01-01T00:00:00Z",
-            },
-            "allocation": {
-                "query-memory": {
-                    "activation_ratio": 1.0,
-                    "active_replicas": 0,
-                    "period_ms": 1000,
-                },
-            },
-            "allocation_proposals": {
-                "allocation": {
-                    "query-memory": {
-                        "activation_ratio": 1.0,
-                        "active_replicas": 0,
-                        "period_ms": null,
-                    },
-                },
-            },
-            "replica_caps": {
-                "query-memory": {
-                    "min": 0,
-                    "max": 0,
-                },
-            },
-            "memory_metadata": {
-                "mem-1": {
-                    "index": "mem-1",
-                    "rank": "Permanent",
-                    "occurred_at": null,
-                    "decay_remaining_secs": 0,
-                    "remember_tokens": 0,
-                    "last_accessed": "2026-05-07T00:00:00Z",
-                    "access_count": 0,
-                    "last_used": null,
-                    "use_count": 0,
-                    "last_reinforced_at": null,
-                    "reinforcement_count": 0,
-                    "query_history": [],
-                    "use_history": [],
-                    "reinforcement_history": [],
-                },
-            },
-            "utterances": [],
-        });
-        assert_eq!(actual, expected);
-    }
-
-    #[tokio::test]
-    async fn seed_cognition_log_stamps_cognition_gate_replica_and_offsets_time() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("cognition-seed.eure");
-        std::fs::write(
-            &path,
-            r#"
-id = "cognition-seed"
-prompt = "What am I attending to?"
-
-@ cognition-log[] {
-  text = "Older cognition-log topic"
-  seconds-ago = 30
-}
-
-@ cognition-log[] {
-  text = "Current cognition-log topic"
-}
-"#,
-        )
-        .unwrap();
-        let case = crate::cases::parse_module_case_file(&path).unwrap();
-        let blackboard = Blackboard::default();
-        let now = Utc.with_ymd_and_hms(2026, 5, 7, 12, 0, 0).unwrap();
-
-        seed_cognition_log(&blackboard, &FixedClock(now), &case.cognition_log).await;
-
-        let log_set = blackboard.read(|bb| bb.cognition_log_set()).await;
-        let records = log_set.logs();
-        assert_eq!(records.len(), 1);
-        let record = &records[0];
-        assert_eq!(record.source.module, builtin::cognition_gate());
-        assert_eq!(record.source.replica, ReplicaIndex::ZERO);
-        assert_eq!(record.entries.len(), 2);
-        assert_eq!(record.entries[0].text, "Older cognition-log topic");
-        assert_eq!(record.entries[0].at, now - ChronoDuration::seconds(30));
-        assert_eq!(record.entries[1].text, "Current cognition-log topic");
-        assert_eq!(record.entries[1].at, now);
-    }
-
-    #[tokio::test]
-    async fn cognition_gate_eval_waits_for_output_beyond_seed_baseline() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("cognition-seed-baseline.eure");
-        std::fs::write(
-            &path,
-            r#"
-id = "cognition-seed-baseline"
-prompt = "Admit retrieved memory evidence only if it is load-bearing for the current situation."
-
-@ cognition-log[] {
-  text = "Pibi asks how to approach Koro while Koro is standing beside a food bowl."
-}
-"#,
-        )
-        .unwrap();
-        let case = crate::cases::parse_module_case_file(&path).unwrap();
-        let blackboard = Blackboard::default();
-        let now = Utc.with_ymd_and_hms(2026, 5, 7, 12, 0, 0).unwrap();
-
-        seed_cognition_log(&blackboard, &FixedClock(now), &case.cognition_log).await;
-
-        let baseline = cognition_output_for_module(&blackboard, &builtin::cognition_gate()).await;
-        assert!(!baseline.is_empty());
-        assert!(!cognition_eval_has_new_output(
-            &cognition_output_for_module(&blackboard, &builtin::cognition_gate()).await,
-            &baseline,
-        ));
-
-        let source = ModuleInstanceId::new(builtin::cognition_gate(), ReplicaIndex::ZERO);
-        blackboard
-            .append_cognition_log(
-                source.clone(),
-                CognitionLogEntry {
-                    at: now,
-                    text: "Approach Koro slowly from the side when he guards food.".to_string(),
-                    origin: CognitionLogOrigin::direct(source),
-                },
-            )
-            .await;
-
-        assert!(cognition_eval_has_new_output(
-            &cognition_output_for_module(&blackboard, &builtin::cognition_gate()).await,
-            &baseline,
-        ));
-    }
-
-    #[tokio::test]
-    async fn allocation_eval_bootstrap_activation_is_not_completion() {
-        let blackboard = Blackboard::default();
-        let controller = builtin::allocation();
-
-        let mut allocation = blackboard.read(|bb| bb.allocation().clone()).await;
-        allocation.set_activation(controller.clone(), ActivationRatio::ONE);
-        blackboard
-            .apply(BlackboardCommand::SetAllocation(allocation))
-            .await;
-
-        assert!(
-            last_memo_log_content_for_module(&blackboard, &controller)
-                .await
-                .is_none()
-        );
-    }
-
-    #[tokio::test]
-    async fn seed_memos_stamps_requested_module_replica_and_offsets_time() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("memo-seed.eure");
-        std::fs::write(
-            &path,
-            r#"
-id = "memo-seed"
-prompt = "What am I attending to?"
-
-@ memos[] {
-  module = "sensory"
-  replica = 1
-  content = "Koro gave a boundary signal"
-  seconds-ago = 12
-}
-"#,
-        )
-        .unwrap();
-        let case = crate::cases::parse_module_case_file(&path).unwrap();
-        let blackboard = Blackboard::default();
-        let now = Utc.with_ymd_and_hms(2026, 5, 7, 12, 0, 0).unwrap();
-
-        let records = seed_memos(&blackboard, &FixedClock(now), &case.memos, false)
-            .await
-            .unwrap();
-
-        assert_eq!(records.len(), 1);
-        assert_eq!(records[0].owner.module, builtin::sensory());
-        assert_eq!(records[0].owner.replica, ReplicaIndex::new(1));
-        assert_eq!(records[0].content, "Koro gave a boundary signal");
-        assert_eq!(records[0].written_at, now - ChronoDuration::seconds(12));
-
-        let memo_logs = blackboard.read(|bb| bb.recent_memo_logs()).await;
-        assert_eq!(memo_logs, records);
-    }
-
-    #[tokio::test]
-    async fn attention_schema_appends_attention_experience_and_skips_noop_wakes() {
-        let local = LocalSet::new();
-        local
-            .run_until(async {
-                let blackboard = Blackboard::default();
-                let first_entry = "I notice Koro's food-boundary signal.";
-                let second_entry = "I feel my attention settle on Koro relaxing.";
-                let adapter = MockLlmAdapter::new()
-                    .with_text_scenario(attention_schema_tool_scenario(
-                        "append-attention-1",
-                        first_entry,
-                    ))
-                    .with_text_scenario(attention_schema_no_tool_scenario())
-                    .with_text_scenario(attention_schema_tool_scenario(
-                        "append-attention-2",
-                        second_entry,
-                    ))
-                    .with_text_scenario(attention_schema_no_tool_scenario())
-                    .with_text_scenario(attention_schema_no_tool_scenario())
-                    .with_text_scenario(attention_schema_no_tool_scenario());
-                let caps = test_caps_with_adapter(blackboard.clone(), adapter);
-                let modules = ModuleRegistry::new()
-                    .register(
-                        nuillu_module::ModuleRegistrationSpec::for_static::<
-                            nuillu_attention_schema::AttentionSchemaModule,
-                        >(
-                            eval_policy(1..=1, Bpm::from_f64(60_000.0)..=Bpm::from_f64(60_000.0)),
-                            ActivationRatio::ONE,
-                        )
-                        .unwrap(),
-                        |caps| async move {
-                            Ok(nuillu_attention_schema::AttentionSchemaModule::new(
-                                caps.memo_updated_inbox(),
-                                caps.cognition_log_updated_inbox(),
-                                caps.blackboard_reader(),
-                                caps.cognition_log_reader(),
-                                caps.memo(),
-                                caps.llm("main").with_tier(ModelTier::Default).into(),
-                                caps.session("main")
-                                    .with_tier(ModelTier::Default)
-                                    .with_auto_compaction(
-                                        nuillu_attention_schema::session_auto_compaction(),
-                                    )
-                                    .await?,
-                            ))
-                        },
-                    )
-                    .unwrap()
-                    .build(&caps)
-                    .await
-                    .unwrap();
-                let memo_mailbox = caps.internal_harness_io().memo_updated_mailbox();
-                let cognition_mailbox = caps.internal_harness_io().cognition_log_updated_mailbox();
-                let sensory = ModuleInstanceId::new(builtin::sensory(), ReplicaIndex::ZERO);
-                let cognition_source =
-                    ModuleInstanceId::new(builtin::cognition_gate(), ReplicaIndex::ZERO);
-                let now = Utc.with_ymd_and_hms(2026, 5, 7, 12, 0, 0).unwrap();
-                let run_blackboard = blackboard.clone();
-
-                run_agent(
-                    modules,
-                    AgentEventLoopConfig {
-                        idle_threshold: Duration::from_millis(50),
-                        max_activation_attempts: 2,
-                        dependency_idle_timeout: Duration::from_secs(2),
-                        dependency_hard_timeout: Duration::from_secs(10),
-                    },
-                    async {
-                        let record = run_blackboard
-                            .update_cognitive_memo(
-                                sensory.clone(),
-                                "Koro gave a food-boundary signal".to_owned(),
-                                now,
-                            )
-                            .await;
-                        memo_mailbox
-                            .publish(MemoUpdated {
-                                owner: sensory.clone(),
-                                index: record.index,
-                            })
-                            .await
-                            .expect("attention-schema receives seeded memo update");
-
-                        for _ in 0..50 {
-                            let count = attention_schema_memo_output(&run_blackboard)
-                                .await
-                                .lines()
-                                .count();
-                            if count >= 1 {
-                                break;
-                            }
-                            tokio::task::yield_now().await;
-                            tokio::time::sleep(Duration::from_millis(1)).await;
-                        }
-
-                        run_blackboard
-                            .apply(BlackboardCommand::AppendCognitionLog {
-                                source: cognition_source.clone(),
-                                entry: CognitionLogEntry {
-                                    at: now,
-                                    text: "Koro food-boundary signal is cognitively relevant"
-                                        .to_owned(),
-                                    origin: CognitionLogOrigin::direct(cognition_source.clone()),
-                                },
-                            })
-                            .await;
-                        cognition_mailbox
-                            .publish(CognitionLogUpdated::EntryAppended {
-                                source: cognition_source.clone(),
-                            })
-                            .await
-                            .expect("attention-schema receives cognition-log update");
-
-                        for _ in 0..50 {
-                            tokio::task::yield_now().await;
-                            tokio::time::sleep(Duration::from_millis(1)).await;
-                        }
-
-                        let record = run_blackboard
-                            .update_cognitive_memo(
-                                sensory.clone(),
-                                "Koro relaxed after the boundary was respected".to_owned(),
-                                now + ChronoDuration::seconds(1),
-                            )
-                            .await;
-                        memo_mailbox
-                            .publish(MemoUpdated {
-                                owner: sensory,
-                                index: record.index,
-                            })
-                            .await
-                            .expect("attention-schema receives second memo update");
-
-                        for _ in 0..80 {
-                            let count = attention_schema_memo_output(&run_blackboard)
-                                .await
-                                .lines()
-                                .count();
-                            if count >= 2 {
-                                break;
-                            }
-                            tokio::task::yield_now().await;
-                            tokio::time::sleep(Duration::from_millis(1)).await;
-                        }
-                    },
-                )
-                .await
-                .unwrap();
-
-                assert_eq!(
-                    attention_schema_memo_output(&blackboard).await,
-                    [first_entry, second_entry].join("\n\n")
-                );
-            })
-            .await;
-    }
-
-    #[test]
-    fn full_agent_case_modules_filters_disabled() {
-        let case = FullAgentCase {
-            id: Some("x".to_string()),
-            description: None,
-            now: None,
-            modules: Some(DEFAULT_FULL_AGENT_MODULES.to_vec()),
-            inputs: Vec::new(),
-            steps: Vec::new(),
-            participants: Vec::new(),
-            allow_empty_output: false,
-            activate_allocation: Vec::new(),
-            memories: Vec::new(),
-            memos: Vec::new(),
-            limits: crate::cases::EvalLimits {
-                max_llm_calls: None,
-                ..Default::default()
-            },
-            checks: Vec::new(),
-            modules_checks: Vec::new(),
-            scoring: Default::default(),
-        };
-        let modules = full_agent_case_modules(&case, &[EvalModule::QueryMemory]);
-        assert!(!modules.contains(&EvalModule::QueryMemory));
-        assert!(modules.contains(&EvalModule::Speak));
-        assert!(modules.contains(&EvalModule::Allocation));
-    }
-
-    #[test]
-    fn validate_disabled_modules_rejects_required_modules() {
-        for required in REQUIRED_FULL_AGENT_MODULES {
-            let err = validate_disabled_modules(std::slice::from_ref(required)).unwrap_err();
-            assert!(matches!(
-                err,
-                RunnerError::DisableRequiredModule { module } if module == required.as_str()
-            ));
-        }
-        assert!(validate_disabled_modules(&[EvalModule::QueryMemory]).is_ok());
-    }
-
-    #[tokio::test]
-    async fn eval_registry_and_allocation_include_only_selected_modules() {
-        let selected = [
-            EvalModule::Sensory,
-            EvalModule::Allocation,
-            EvalModule::Speak,
-        ];
-        let allocation = full_agent_allocation(
-            &crate::cases::EvalLimits {
-                max_llm_calls: None,
-                ..Default::default()
-            },
-            &selected,
-        );
-        assert!(!allocation.has_activation(&builtin::query_memory()));
-        assert!(!allocation.has_activation(&builtin::speak_gate()));
-
-        let blackboard = Blackboard::with_allocation(allocation);
-        let caps = test_caps(blackboard.clone());
-        let clock: Rc<dyn Clock> = Rc::new(SystemClock);
-        let memory_caps = MemoryCapabilities::new(
-            blackboard.clone(),
-            clock.clone(),
-            Rc::new(NoopMemoryStore),
-            Vec::new(),
-        );
-        let policy_caps = PolicyCapabilities::new(
-            blackboard.clone(),
-            clock,
-            Rc::new(nuillu_reward::NoopPolicyStore),
-            Vec::new(),
-        );
-        let utterance_sink: Rc<dyn UtteranceSink> = Rc::new(nuillu_speak::NoopUtteranceSink);
-        let allocated = eval_registry(
-            &selected,
-            &memory_caps,
-            &policy_caps,
-            &utterance_sink,
-            ReplicaHardCap::PolicyMax,
-        )
-        .build(&caps)
-        .await
-        .unwrap();
-        assert_eq!(allocated.len(), selected.len());
-
-        let (replica_caps, allocation_modules) = blackboard
-            .read(|bb| {
-                let mut replica_caps = bb
-                    .module_policies()
-                    .keys()
-                    .map(|module| module.as_str().to_owned())
-                    .collect::<Vec<_>>();
-                replica_caps.sort();
-                let mut allocation_modules = bb
-                    .allocation()
-                    .module_ids()
-                    .into_iter()
-                    .map(|module| module.as_str().to_owned())
-                    .collect::<Vec<_>>();
-                allocation_modules.sort();
-                (replica_caps, allocation_modules)
-            })
-            .await;
-
-        assert_eq!(replica_caps, vec!["allocation", "sensory", "speak"]);
-        assert_eq!(allocation_modules, vec!["allocation", "sensory", "speak"]);
-    }
-
-    #[test]
-    fn full_agent_allocation_bootstraps_input_and_autonomic_controllers() {
-        let selected = DEFAULT_FULL_AGENT_MODULES.to_vec();
-        let allocation = full_agent_allocation(
-            &crate::cases::EvalLimits {
-                max_llm_calls: None,
-                ..Default::default()
-            },
-            &selected,
-        );
-
-        assert_eq!(
-            allocation.activation_for(&builtin::sensory()),
-            ActivationRatio::ONE
-        );
-
-        assert_eq!(
-            allocation.activation_for(&builtin::cognition_gate()),
-            ActivationRatio::ZERO
-        );
-
-        assert_eq!(
-            allocation.activation_for(&builtin::allocation()),
-            ActivationRatio::ONE
-        );
-
-        assert_eq!(
-            allocation.activation_for(&builtin::interoception()),
-            ActivationRatio::ONE
-        );
-        assert_eq!(
-            allocation.activation_for(&builtin::homeostasis()),
-            ActivationRatio::ONE
-        );
-
-        assert_eq!(
-            allocation.activation_for(&builtin::speak()),
-            ActivationRatio::ZERO
-        );
-
-        for module in [
-            builtin::attention_schema(),
-            builtin::interpreter(),
-            builtin::self_model(),
-            builtin::query_memory(),
-            builtin::memory(),
-            builtin::memory_compaction(),
-            builtin::memory_association(),
-            builtin::dreaming(),
-            builtin::predict(),
-            builtin::surprise(),
-        ] {
-            assert_eq!(allocation.activation_for(&module), ActivationRatio::ZERO);
-        }
-    }
-
-    #[tokio::test]
-    async fn full_agent_gui_initial_allocation_keeps_baseline_faculties_active() {
-        let selected = DEFAULT_FULL_AGENT_MODULES.to_vec();
-        let allocation = full_agent_gui_initial_allocation(
-            &crate::cases::EvalLimits {
-                max_llm_calls: None,
-                ..Default::default()
-            },
-            &selected,
-        );
-        let blackboard = Blackboard::with_allocation(allocation);
-        let caps = test_caps(blackboard.clone());
-        let clock: Rc<dyn Clock> = Rc::new(SystemClock);
-        let memory_caps = MemoryCapabilities::new(
-            blackboard.clone(),
-            clock.clone(),
-            Rc::new(NoopMemoryStore),
-            Vec::new(),
-        );
-        let policy_caps = PolicyCapabilities::new(
-            blackboard.clone(),
-            clock,
-            Rc::new(nuillu_reward::NoopPolicyStore),
-            Vec::new(),
-        );
-        let utterance_sink: Rc<dyn UtteranceSink> = Rc::new(nuillu_speak::NoopUtteranceSink);
-        let _allocated = eval_registry(
-            &selected,
-            &memory_caps,
-            &policy_caps,
-            &utterance_sink,
-            ReplicaHardCap::PolicyMax,
-        )
-        .build(&caps)
-        .await
-        .unwrap();
-
-        blackboard
-            .read(|bb| {
-                for module in &selected {
-                    let id = module.module_id();
-                    assert_eq!(bb.allocation().activation_for(&id), ActivationRatio::ZERO);
-                    let expected_active_replicas = match module {
-                        EvalModule::QueryMemory
-                        | EvalModule::Memory
-                        | EvalModule::Policy
-                        | EvalModule::Reward
-                        | EvalModule::Predict
-                        | EvalModule::Surprise => 1,
-                        _ => 0,
-                    };
-                    assert_eq!(
-                        bb.allocation().active_replicas(&id),
-                        expected_active_replicas
-                    );
-                }
-            })
-            .await;
-    }
-
-    #[tokio::test]
-    async fn gui_activate_applies_case_activation_allocation() {
-        let selected = DEFAULT_FULL_AGENT_MODULES.to_vec();
-        let allocation = full_agent_gui_initial_allocation(
-            &crate::cases::EvalLimits {
-                max_llm_calls: None,
-                ..Default::default()
-            },
-            &selected,
-        );
-        let blackboard = Blackboard::with_allocation(allocation);
-        let activate_allocation = vec![
-            ActivateAllocation {
-                module: EvalModule::Interoception,
-                activation_ratio: 1.0,
-            },
-            ActivateAllocation {
-                module: EvalModule::Homeostasis,
-                activation_ratio: 0.5,
-            },
-        ];
-
-        activate_gui_start_modules(&blackboard, &activate_allocation).await;
-
-        let allocation = blackboard.read(|bb| bb.allocation().clone()).await;
-        assert_eq!(
-            allocation.activation_for(&builtin::interoception()),
-            ActivationRatio::ONE
-        );
-        assert_eq!(
-            allocation.activation_for(&builtin::homeostasis()),
-            ActivationRatio::from_f64(0.5)
-        );
-        assert_eq!(
-            allocation.activation_for(&builtin::sensory()),
-            ActivationRatio::ZERO
-        );
-        assert_eq!(
-            allocation.activation_for(&builtin::allocation()),
-            ActivationRatio::ZERO
-        );
     }
 }

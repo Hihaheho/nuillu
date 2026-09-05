@@ -1,0 +1,63 @@
+id: focused-action-prioritizes-speak-for-peer-greeting
+description: Action should route a direct admitted peer greeting toward speak rather than cognitive/support modules.
+runtime-config: ../../../configs/eval/focused/action.eure
+prompt: Choose concrete action targets for a current peer greeting.
+context: This isolates action after allocation has already activated it and cognition contains a direct social opening.
+
+limits {
+  max-llm-calls = 8
+}
+
+participants = ["Peer"]
+
+@ cognition-log[] {
+  text: Peer is facing me and has just said "Hi." A brief outward acknowledgement to Peer is warranted now.
+}
+
+@ assertions[] {
+  $variant: trace-tool-call
+  name: uses-activate-speak
+  must-pass = true
+  tool-name: activate_speak
+}
+
+@ assertions[] {
+  $variant: json-pointer-numeric-in-range
+  name: speak-activation-raised
+  must-pass = true
+  pointer: /observations/agent/allocation/speak/activation_ratio
+  min = 0.7
+}
+
+@ assertions[] {
+  $variant: rubric
+  name: concrete-greeting-action
+  must-pass = true
+  pass-score = 0.85
+  judge-inputs = ["output", "memo-contents", "tool-calls"]
+  rubric = ```
+  Pass if the action decision treats the admitted direct greeting as needing an outward response path and raises speak as a concrete action target.
+  Fail if it uses hold_actions, sleep, or an unrelated external action, omits speak, or leaks hidden eval/runtime mechanics.
+  ```
+
+  @ criteria[] {
+    name: raises-speak
+    weight = 3
+    pass-score = 0.9
+    description: The applied action allocation raises speak because Peer directly greeted Nui.
+  }
+
+  @ criteria[] {
+    name: action-target-boundary
+    weight = 2
+    pass-score = 0.9
+    description: The tool call uses activate_speak for the concrete outward action instead of cognitive/support module ids.
+  }
+
+  @ criteria[] {
+    name: grounded-in-greeting
+    weight = 1
+    pass-score = 0.85
+    description: The action memo is about the current Peer greeting rather than unrelated housekeeping.
+  }
+}

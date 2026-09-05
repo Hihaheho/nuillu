@@ -1,0 +1,11 @@
+activation-table = [1.0, 0.0]
+
+@ modules[] {
+  id: memory-compaction
+  replica-min = 1
+  replica-max = 1
+  replica-capacity = 1
+  bpm-min = 10.0
+  bpm-max = 10.0
+  initial-activation = 1.0
+}

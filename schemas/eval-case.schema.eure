@@ -1,0 +1,249 @@
+/// Unified schema for every Nuillu runtime evaluation case.
+
+$import = {
+  common => "./eval-common.schema.eure"
+}
+
+$schema = "https://eure.dev/v0.1.7/schemas/eure-schema.schema.eure"
+
+id {
+  $variant: text
+  min-length = 1
+}
+id.$optional = true
+
+description = `text`
+description.$optional = true
+
+runtime-config {
+  $variant: text
+  min-length = 1
+}
+
+prompt = `text`
+prompt.$optional = true
+
+context = `text`
+context.$optional = true
+
+now = `text`
+now.$optional = true
+
+inputs = [`$types.stimulus`]
+inputs.$optional = true
+
+steps = [`$types.eval-step`]
+steps.$optional = true
+
+participants = [`text`]
+participants.$optional = true
+
+allow-empty-output = `boolean`
+allow-empty-output.$optional = true
+
+activate-allocation = [`$types.activate-allocation`]
+activate-allocation.$optional = true
+
+memories = [`$types.common.memory-seed`]
+memories.$optional = true
+
+memos = [`$types.common.memo-seed`]
+memos.$optional = true
+
+memory-links = [`$types.common.memory-link-seed`]
+memory-links.$optional = true
+
+policies = [`$types.common.policy-seed`]
+policies.$optional = true
+
+cognition-log = [`$types.common.cognition-log-seed`]
+cognition-log.$optional = true
+
+limits = `$types.eval-limits`
+limits.$optional = true
+
+assertions = [`$types.common.assertion`]
+assertions.$optional = true
+
+measurements = [`$types.measurement`]
+measurements.$optional = true
+
+scoring = `$types.common.case-scoring`
+scoring.$optional = true
+
+@ $types.stimulus
+$variant: union
+
+variants.heard {
+  direction = `text`
+  direction.$optional = true
+  content {
+    $variant: text
+    min-length = 1
+  }
+}
+
+variants.seen {
+  direction = `text`
+  direction.$optional = true
+  appearance {
+    $variant: text
+    min-length = 1
+  }
+}
+
+variants.one-shot {
+  modality {
+    $variant: text
+    min-length = 1
+  }
+  direction = `text`
+  direction.$optional = true
+  content {
+    $variant: text
+    min-length = 1
+  }
+}
+
+variants.ambient-snapshot {
+  entries = [`$types.ambient-sensory-input-entry`]
+  entries.$optional = true
+}
+
+@ $types.ambient-sensory-input-entry
+id {
+  $variant: text
+  min-length = 1
+}
+modality {
+  $variant: text
+  min-length = 1
+}
+content {
+  $variant: text
+  min-length = 1
+}
+
+@ $types.activate-allocation
+module = `$types.common.eval-module`
+activation-ratio = `float`
+
+@ $types.eval-step
+id = `text`
+id.$optional = true
+description = `text`
+description.$optional = true
+terminal = `boolean`
+terminal.$optional = true
+inputs = [`$types.stimulus`]
+inputs.$optional = true
+memos = [`$types.common.memo-seed`]
+memos.$optional = true
+cognition-log = [`$types.common.cognition-log-seed`]
+cognition-log.$optional = true
+wait-for = `$types.wait-for`
+wait-for.$optional = true
+assertions = [`$types.common.assertion`]
+assertions.$optional = true
+
+@ $types.wait-for
+$variant: union
+variants.some = `$types.wait-for-kind`
+variants.none = { = null, $variant => "literal" }
+
+@ $types.wait-for-kind
+$variant: union
+
+variants.memo-from {
+  scope = `text`
+  scope.$optional = true
+  module = `$types.common.eval-module`
+  timeout-ms = `integer`
+}
+
+variants.utterance-from {
+  scope = `text`
+  scope.$optional = true
+  module = `$types.common.eval-module`
+  target = `text`
+  until-assertion = `text`
+  until-assertion.$optional = true
+  max-matches = `integer`
+  max-matches.$optional = true
+  timeout-ms = `integer`
+}
+
+variants.interoception {
+  timeout-ms = `integer`
+  mode = `$types.eval-interoceptive-mode`
+  mode.$optional = true
+  wake-arousal-at-least = `float`
+  wake-arousal-at-least.$optional = true
+  wake-arousal-at-most = `float`
+  wake-arousal-at-most.$optional = true
+}
+
+@ $types.eval-interoceptive-mode
+$variant: union
+variants.wake = { = "wake", $variant => "literal" }
+variants.nrem-pressure = { = "nrem-pressure", $variant => "literal" }
+variants.rem-pressure = { = "rem-pressure", $variant => "literal" }
+
+@ $types.eval-limits
+$flatten = [`$types.common.eval-limits`]
+interoception = `$types.eval-interoception-limits`
+interoception.$optional = true
+
+@ $types.eval-interoception-limits
+quiet-sleep-threshold-ms = `integer`
+quiet-sleep-threshold-ms.$optional = true
+wake-arousal-change-multiplier = `float`
+wake-arousal-change-multiplier.$optional = true
+affect-arousal-change-multiplier = `float`
+affect-arousal-change-multiplier.$optional = true
+
+@ $types.event-selector
+scopes = [`text`]
+scopes.$optional = true
+origin-scopes = [`text`]
+origin-scopes.$optional = true
+modules = [`$types.common.eval-module`]
+modules.$optional = true
+variants = [`text`]
+variants.$optional = true
+steps = [`text`]
+steps.$optional = true
+replicas = [`integer`]
+replicas.$optional = true
+
+@ $types.measurement
+$variant: union
+
+variants.count {
+  name = `text`
+  select = `$types.event-selector`
+}
+
+variants.first-match-latency {
+  name = `text`
+  select = `$types.event-selector`
+  group-by-scope = `boolean`
+  group-by-scope.$optional = true
+}
+
+variants.unique-scope-count {
+  name = `text`
+  select = `$types.event-selector`
+}
+
+variants.scope-coverage {
+  name = `text`
+  select = `$types.event-selector`
+  scopes = [`text`]
+}
+
+variants.scope-convergence-latency {
+  name = `text`
+  select = `$types.event-selector`
+  scopes = [`text`]
+}

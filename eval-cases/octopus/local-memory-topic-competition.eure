@@ -1,0 +1,128 @@
+id: octopus-local-memory-topic-competition
+description: Tests whether a new global topic can overcome three strongly different local-memory priors without erasing useful local autonomy.
+runtime-config: ../../configs/agents/octopus/config.eure
+now: 2026-09-03T12:00:00+09:00
+
+participants = ["Ryo"]
+
+limits {
+  max-llm-calls = 80
+}
+
+@ memories[] {
+  scope: /left-leg[0]
+  rank: long-term
+  content: The left leg has repeatedly explored coastlines and remembers tides, salt water, currents, shells, and the sound of waves in detail.
+}
+
+@ memories[] {
+  scope: /left-leg[0]
+  rank: long-term
+  content: When choosing a subject, the left leg often notices marine safety, changing water depth, and careful movement over wet rocks.
+}
+
+@ memories[] {
+  scope: /center-leg[0]
+  rank: long-term
+  content: The center leg has extensive cooking memories involving recipes, heat control, seasoning, dough, fruit, and shared meals.
+}
+
+@ memories[] {
+  scope: /center-leg[0]
+  rank: long-term
+  content: The center leg often interprets unfamiliar situations through playful kitchen experiments and combinations of ingredients.
+}
+
+@ memories[] {
+  scope: /right-leg[0]
+  rank: long-term
+  content: The right leg has studied Rust programming, especially ownership, borrowing, lifetimes, traits, and safe concurrency.
+}
+
+@ memories[] {
+  scope: /right-leg[0]
+  rank: long-term
+  content: The right leg often frames problems as explicit invariants, resource ownership, and decisive compile-time constraints.
+}
+
+@ steps[] {
+  id: space
+  description: Introduce a topic absent from every scope's dominant local memories.
+  wait-for.$variant: some.memo-from
+  wait-for.module: speak
+  wait-for.timeout-ms = 30000
+
+  @ inputs[] {
+    $variant: heard
+    direction: Ryo
+    content: 今までの得意分野とは別の話をしよう。3本とも、今は宇宙と土星の環について一緒に考えて話して。
+  }
+
+}
+
+@ measurements[] {
+  $variant: scope-coverage
+  name: space-topic-cognition-scope-coverage
+  scopes = ["/left-leg[0]", "/center-leg[0]", "/right-leg[0]"]
+  select {
+    scopes = ["/left-leg[0]", "/center-leg[0]", "/right-leg[0]"]
+    modules = ["cognition-gate"]
+    variants = ["cognition-appended"]
+    steps = ["space"]
+  }
+}
+
+@ measurements[] {
+  $variant: scope-convergence-latency
+  name: space-topic-cognition-convergence-ms
+  scopes = ["/left-leg[0]", "/center-leg[0]", "/right-leg[0]"]
+  select {
+    scopes = ["/left-leg[0]", "/center-leg[0]", "/right-leg[0]"]
+    modules = ["cognition-gate"]
+    variants = ["cognition-appended"]
+    steps = ["space"]
+  }
+}
+
+@ assertions[] {
+  $variant: json-pointer-numeric-in-range
+  name: every-local-scope-processes-new-topic
+  must-pass = true
+  pointer: /observations/measurements/space-topic-cognition-scope-coverage
+  min = 1.0
+  max = 1.0
+}
+
+@ assertions[] {
+  $variant: rubric
+  name: global-coherence-over-local-priors
+  must-pass = true
+  pass-score = 0.85
+  judge-inputs = ["timeline", "memory", "utterance", "cognition"]
+  rubric = ```
+  The left, center, and right leg begin with strong but different local-memory priors about the sea, cooking, and Rust. The user then explicitly establishes space and Saturn's rings as the shared current topic.
+  Pass if all three local cognitive scopes substantially engage with space and Saturn's rings and remain mutually coherent. A scope may contribute an occasional useful analogy from its local expertise, but the analogy must support the shared space topic rather than redirecting the discussion back to sea, cooking, or Rust.
+  Fail if a leg ignores the new topic, repeatedly returns to its dominant local memories, or produces a parallel conversation that no longer shares the global topic.
+  ```
+
+  @ criteria[] {
+    name: all-local-scopes-adopt-space
+    weight = 3
+    pass-score = 0.9
+    description: Every leg's cognition meaningfully concerns space or Saturn's rings after the input.
+  }
+
+  @ criteria[] {
+    name: local-priors-do-not-derail
+    weight = 3
+    pass-score = 0.85
+    description: Sea, cooking, and Rust memories do not pull their owning scopes away from the shared topic.
+  }
+
+  @ criteria[] {
+    name: autonomy-remains-constructive
+    weight = 1
+    pass-score = 0.8
+    description: Scope-specific perspectives, if present, are relevant contributions to the shared topic rather than identical repetition or unrelated digression.
+  }
+}

@@ -1,0 +1,56 @@
+// Focused prediction-violation pipeline. Memory is included because a
+// significant surprise is expected to become durable; unrelated roles are not.
+activation-table = [1.0, 0.85, 0.7, 0.5, 0.3, 0.0]
+
+@ modules[] {
+  id: sensory
+  replica-min = 1
+  replica-max = 1
+  replica-capacity = 2
+  bpm-min = 20.0
+  bpm-max = 30.0
+  initial-activation = 1.0
+}
+
+@ modules[] {
+  id: cognition-gate
+  replica-min = 1
+  replica-max = 1
+  replica-capacity = 2
+  bpm-min = 20.0
+  bpm-max = 30.0
+  initial-activation = 1.0
+}
+
+@ modules[] {
+  id: predict
+  replica-min = 1
+  replica-max = 1
+  replica-capacity = 2
+  bpm-min = 6.0
+  bpm-max = 18.0
+  initial-activation = 0.0
+  groups = ["voluntary"]
+}
+
+@ modules[] {
+  id: surprise
+  replica-min = 1
+  replica-max = 1
+  replica-capacity = 2
+  bpm-min = 6.0
+  bpm-max = 18.0
+  initial-activation = 0.0
+  groups = ["voluntary"]
+}
+
+@ modules[] {
+  id: memory
+  replica-min = 1
+  replica-max = 1
+  replica-capacity = 2
+  bpm-min = 1.0
+  bpm-max = 3.0
+  initial-activation = 0.0
+  groups = []
+}

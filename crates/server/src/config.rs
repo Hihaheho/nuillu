@@ -1430,7 +1430,7 @@ pub fn load_server_boot_config(state_dir: &Path) -> anyhow::Result<ServerBootCon
     }
 }
 
-pub(crate) fn parse_server_boot_config_content(
+pub fn parse_server_boot_config_content(
     content: &str,
     path: &Path,
 ) -> anyhow::Result<ServerBootConfig> {

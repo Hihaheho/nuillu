@@ -74,6 +74,13 @@ let response = visualizer.show_with_menu_bar(ui, |ui, menu| {
 
 `nuillu-server` remains available for headless/runtime use and can be connected to by a visualizer with `--host`.
 
+## Evaluate
+
+`nuillu-eval` evaluates and benchmarks any configured Nuillu agent, including
+nested subsystem topologies and host-provided modules. Cases, runtime-config
+overrides, assertions, timeline measurements, and multi-trial reports are
+documented in [docs/eval.md](docs/eval.md).
+
 ## License
 
 Licensed under the **Mozilla Public License, version 2.0** (MPL-2.0). See [LICENSE](./LICENSE) for the full text.

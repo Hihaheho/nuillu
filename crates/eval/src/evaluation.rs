@@ -9,9 +9,10 @@ use nuillu_types::ModuleInstanceId;
 use serde::Serialize;
 use serde_json::Value;
 
+use crate::measure::MeasurementValue;
 use crate::{
     artifact::CaseArtifact,
-    cases::{ArtifactTextField, Check, EvalCase, EvalModule, ModuleChecks, ModuleRubric},
+    cases::{ArtifactTextField, Assertion, EvalCase},
     judge::{RubricJudge, RubricJudgeRequest, RubricJudgeVerdict},
 };
 
@@ -110,7 +111,7 @@ pub fn aggregate_trial_timing(trials: &[CaseTrialSummary]) -> MultiTrialTiming {
 }
 
 #[derive(Debug, Clone, Serialize)]
-pub struct CheckOutcome {
+pub struct AssertionOutcome {
     pub name: String,
     pub kind: String,
     pub passed: bool,
@@ -126,8 +127,8 @@ pub struct CaseReport {
     pub runtime_failure: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub llm_log_directory: Option<String>,
-    pub checks: Vec<CheckOutcome>,
-    pub modules_checks: Vec<ModuleChecksReport>,
+    pub assertions: Vec<AssertionOutcome>,
+    pub measurements: BTreeMap<String, MeasurementValue>,
     pub invalid: bool,
     pub must_pass_ok: bool,
     pub weighted_points_earned: u64,
@@ -136,24 +137,9 @@ pub struct CaseReport {
 }
 
 #[derive(Debug, Clone, Serialize)]
-pub struct ModuleChecksReport {
-    pub module: String,
-    pub rubrics: Vec<ModuleRubricOutcome>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub struct ModuleRubricOutcome {
-    pub name: String,
-    pub passed: bool,
-    pub errored: bool,
-    pub pass_score: f64,
-    pub diagnostic: Option<String>,
-    pub rubric: Option<RubricJudgeVerdict>,
-}
-
-#[derive(Debug, Clone, Serialize)]
 pub struct CaseSummary {
     pub path: String,
+    pub runtime_config: String,
     pub id: String,
     pub description: Option<String>,
     pub passed: bool,
@@ -164,6 +150,7 @@ pub struct CaseSummary {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub trial_timing: Option<MultiTrialTiming>,
     pub activations: Vec<ModuleActivationRecord>,
+    pub measurement_statistics: BTreeMap<String, MeasurementStatistics>,
     pub trial_count: usize,
     pub passed_trials: usize,
     pub failed_trials: usize,
@@ -171,11 +158,23 @@ pub struct CaseSummary {
     pub trials: Vec<CaseTrialSummary>,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct MeasurementStatistics {
+    pub samples: usize,
+    pub min: f64,
+    pub max: f64,
+    pub mean: f64,
+    pub standard_deviation: f64,
+    pub p50: f64,
+    pub p95: f64,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct CaseTrialSummary {
     pub trial: usize,
     pub output_dir: String,
     pub path: String,
+    pub runtime_config: String,
     pub id: String,
     pub description: Option<String>,
     pub passed: bool,
@@ -191,19 +190,15 @@ pub struct SuiteRunReport {
     pub cases_root: String,
     pub output_dir: String,
     pub case_patterns: Vec<String>,
+    pub runtime_config_override: Option<String>,
     pub failed_only: bool,
     pub failed_from: Option<String>,
     pub fail_fast: bool,
     pub model_concurrency: BTreeMap<String, Option<usize>>,
     pub trials: usize,
-    pub full_agent_concurrency: usize,
-    pub module_concurrency: usize,
+    pub case_concurrency: usize,
     pub planned_case_count: usize,
     pub models: SuiteModelNames,
-    pub module_filters: Vec<String>,
-    pub disabled_modules: Vec<String>,
-    pub exclude_full_agent: bool,
-    pub full_agent_only: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -276,12 +271,12 @@ impl CaseReport {
     }
 
     pub fn recompute(&mut self) {
-        let (weighted_points_earned, weighted_points_total) = weighted_points(&self.checks);
+        let (weighted_points_earned, weighted_points_total) = weighted_points(&self.assertions);
         self.weighted_points_earned = weighted_points_earned;
         self.weighted_points_total = weighted_points_total;
-        self.invalid = self.checks.iter().any(|outcome| outcome.errored);
+        self.invalid = self.assertions.iter().any(|outcome| outcome.errored);
         self.must_pass_ok = self
-            .checks
+            .assertions
             .iter()
             .filter(|outcome| outcome.must_pass)
             .all(outcome_satisfies_requirement);
@@ -290,13 +285,13 @@ impl CaseReport {
 }
 
 pub struct CaseEval {
-    checks: Vec<Check>,
+    assertions: Vec<Assertion>,
 }
 
 impl CaseEval {
     pub fn new(case: &EvalCase) -> Self {
         Self {
-            checks: case.checks().to_vec(),
+            assertions: case.assertions().to_vec(),
         }
     }
 }
@@ -311,12 +306,12 @@ impl PureEval for CaseEval {
         trace: &TraceSnapshot,
         artifact: &Self::Artifact,
     ) -> Result<Self::Report, Self::Error> {
-        let mut checks = Vec::with_capacity(self.checks.len());
-        for check in &self.checks {
-            if matches!(check, Check::Rubric { .. }) {
+        let mut assertions = Vec::with_capacity(self.assertions.len());
+        for check in &self.assertions {
+            if matches!(check, Assertion::Rubric { .. }) {
                 continue;
             }
-            checks.push(evaluate_deterministic_check(check, trace, artifact));
+            assertions.push(evaluate_deterministic_check(check, trace, artifact));
         }
 
         let mut report = CaseReport {
@@ -326,8 +321,13 @@ impl PureEval for CaseEval {
                 .get("llm_log_directory")
                 .and_then(|value| value.as_str())
                 .map(ToOwned::to_owned),
-            checks,
-            modules_checks: Vec::new(),
+            assertions,
+            measurements: artifact
+                .observations
+                .get("measurements")
+                .cloned()
+                .and_then(|value| serde_json::from_value(value).ok())
+                .unwrap_or_default(),
             invalid: false,
             must_pass_ok: false,
             weighted_points_earned: 0,
@@ -355,54 +355,42 @@ pub async fn evaluate_case(
     artifact: &CaseArtifact,
     judge: Option<&dyn RubricJudge>,
 ) -> CaseReport {
+    evaluate_case_with_overrides(case, trace, artifact, judge, &BTreeMap::new()).await
+}
+
+pub async fn evaluate_case_with_overrides(
+    case: &EvalCase,
+    trace: &TraceSnapshot,
+    artifact: &CaseArtifact,
+    judge: Option<&dyn RubricJudge>,
+    assertion_overrides: &BTreeMap<String, AssertionOutcome>,
+) -> CaseReport {
     let mut report = CaseEval::new(case)
         .evaluate(trace, artifact)
         .unwrap_or_else(|never| match never {});
 
-    for (index, check) in case.checks().iter().enumerate() {
-        if !matches!(check, Check::Rubric { .. }) {
+    for (index, check) in case.assertions().iter().enumerate() {
+        let check_name = check.display_name();
+        if let Some(outcome) = assertion_overrides.get(&check_name) {
+            if let Some(existing) = report
+                .assertions
+                .iter_mut()
+                .find(|existing| existing.name == check_name)
+            {
+                *existing = outcome.clone();
+            } else {
+                let insert_at = index.min(report.assertions.len());
+                report.assertions.insert(insert_at, outcome.clone());
+            }
+            continue;
+        }
+        if !matches!(check, Assertion::Rubric { .. }) {
             continue;
         }
 
-        let outcome = match check {
-            Check::Rubric {
-                rubric,
-                pass_score,
-                judge_inputs,
-                criteria,
-                ..
-            } => match judge {
-                Some(judge) => {
-                    let request = RubricJudgeRequest {
-                        prompt: normalize_text_block(&case.prompt_for_judge()),
-                        context: case
-                            .context_for_judge()
-                            .map(|text| normalize_text_block(&text)),
-                        rubric: normalize_text_block(&rubric.content),
-                        criteria: criteria.clone(),
-                        pass_score: *pass_score,
-                        judge_inputs: judge_inputs.clone(),
-                        judge_max_output_tokens: case.scoring().judge_max_output_tokens,
-                        artifact: artifact.clone(),
-                    };
-                    match judge.judge(trace, request).await {
-                        Ok(verdict) => build_rubric_outcome(check, *pass_score, verdict),
-                        Err(error) => build_error_outcome(check, error.to_string()),
-                    }
-                }
-                None => build_error_outcome(
-                    check,
-                    "rubric check requires a RubricJudge implementation".to_string(),
-                ),
-            },
-            _ => unreachable!("guarded by rubric match"),
-        };
-        let insert_at = index.min(report.checks.len());
-        report.checks.insert(insert_at, outcome);
-    }
-
-    if !case.modules_checks().is_empty() {
-        report.modules_checks = evaluate_modules_checks(case, trace, artifact, judge).await;
+        let outcome = evaluate_assertion(case, trace, artifact, judge, check).await;
+        let insert_at = index.min(report.assertions.len());
+        report.assertions.insert(insert_at, outcome);
     }
 
     report.recompute();
@@ -413,76 +401,55 @@ pub async fn evaluate_case(
     report
 }
 
-async fn evaluate_modules_checks(
+pub async fn evaluate_assertion(
     case: &EvalCase,
     trace: &TraceSnapshot,
     artifact: &CaseArtifact,
     judge: Option<&dyn RubricJudge>,
-) -> Vec<ModuleChecksReport> {
-    let mut reports = Vec::new();
-    for checks in case.modules_checks() {
-        let scoped_artifact = module_scoped_artifact(checks.module, artifact);
-        let mut rubrics = Vec::new();
-        for rubric in &checks.rubrics {
-            let outcome =
-                evaluate_module_rubric(case, checks, rubric, trace, scoped_artifact.clone(), judge)
-                    .await;
-            rubrics.push(outcome);
-        }
-        reports.push(ModuleChecksReport {
-            module: checks.module.as_str().to_string(),
-            rubrics,
-        });
-    }
-    reports
-}
+    check: &Assertion,
+) -> AssertionOutcome {
+    let Assertion::Rubric {
+        rubric,
+        pass_score,
+        judge_inputs,
+        criteria,
+        ..
+    } = check
+    else {
+        return evaluate_deterministic_check(check, trace, artifact);
+    };
 
-async fn evaluate_module_rubric(
-    case: &EvalCase,
-    checks: &ModuleChecks,
-    rubric: &ModuleRubric,
-    trace: &TraceSnapshot,
-    artifact: CaseArtifact,
-    judge: Option<&dyn RubricJudge>,
-) -> ModuleRubricOutcome {
-    let name = rubric.display_name();
     let Some(judge) = judge else {
-        return build_module_rubric_error_outcome(
-            &name,
-            rubric.pass_score,
-            "module rubric requires a RubricJudge implementation".to_string(),
+        return build_error_outcome(
+            check,
+            "rubric check requires a RubricJudge implementation".to_string(),
         );
     };
-
     let request = RubricJudgeRequest {
         prompt: normalize_text_block(&case.prompt_for_judge()),
-        context: Some(format!(
-            "Module-scoped full-agent check for '{}'. Judge only the selected evidence for this module.",
-            checks.module.as_str()
-        )),
-        rubric: normalize_text_block(&rubric.rubric.content),
-        criteria: rubric.criteria.clone(),
-        pass_score: rubric.pass_score,
-        judge_inputs: rubric.judge_inputs.clone(),
+        context: case
+            .context_for_judge()
+            .map(|text| normalize_text_block(&text)),
+        rubric: normalize_text_block(&rubric.content),
+        criteria: criteria.clone(),
+        pass_score: *pass_score,
+        judge_inputs: judge_inputs.clone(),
         judge_max_output_tokens: case.scoring().judge_max_output_tokens,
-        artifact,
+        artifact: artifact.clone(),
     };
-
     match judge.judge(trace, request).await {
-        Ok(verdict) => build_module_rubric_outcome(&name, rubric, verdict),
-        Err(error) => {
-            build_module_rubric_error_outcome(&name, rubric.pass_score, error.to_string())
-        }
+        Ok(verdict) => build_rubric_outcome(check, *pass_score, verdict),
+        Err(error) => build_error_outcome(check, error.to_string()),
     }
 }
 
 fn evaluate_deterministic_check(
-    check: &Check,
+    check: &Assertion,
     trace: &TraceSnapshot,
     artifact: &CaseArtifact,
-) -> CheckOutcome {
+) -> AssertionOutcome {
     match check {
-        Check::ArtifactTextContains {
+        Assertion::ArtifactTextContains {
             field, contains, ..
         } => {
             let text = artifact_text(artifact, field.unwrap_or(ArtifactTextField::Output));
@@ -497,7 +464,7 @@ fn evaluate_deterministic_check(
                 }),
             )
         }
-        Check::ArtifactTextExact { field, exact, .. } => {
+        Assertion::ArtifactTextExact { field, exact, .. } => {
             let expected = normalize_text_block(&exact.content);
             let text = normalize_text_block(artifact_text(
                 artifact,
@@ -514,7 +481,7 @@ fn evaluate_deterministic_check(
                 }),
             )
         }
-        Check::JsonPointerEquals {
+        Assertion::JsonPointerEquals {
             pointer, expected, ..
         } => {
             let json = artifact.as_json();
@@ -530,7 +497,7 @@ fn evaluate_deterministic_check(
                 }),
             )
         }
-        Check::JsonPointerContains {
+        Assertion::JsonPointerContains {
             pointer, contains, ..
         } => {
             let json = artifact.as_json();
@@ -551,7 +518,7 @@ fn evaluate_deterministic_check(
                 }),
             )
         }
-        Check::JsonPointerNumericInRange {
+        Assertion::JsonPointerNumericInRange {
             pointer, min, max, ..
         } => {
             let json = artifact.as_json();
@@ -559,12 +526,12 @@ fn evaluate_deterministic_check(
             let (passed, diagnostic) = numeric_range_outcome(pointer, actual, *min, *max);
             build_outcome(check, passed, diagnostic)
         }
-        Check::TraceSpan { span_name, .. } => build_outcome(
+        Assertion::TraceSpan { span_name, .. } => build_outcome(
             check,
             trace.span_exists(span_name),
             (!trace.span_exists(span_name)).then(|| format!("expected trace span {span_name:?}")),
         ),
-        Check::TraceEvent {
+        Assertion::TraceEvent {
             message_contains, ..
         } => {
             let passed =
@@ -577,7 +544,7 @@ fn evaluate_deterministic_check(
                     .then(|| format!("expected trace event containing {message_contains:?}")),
             )
         }
-        Check::TraceToolCall {
+        Assertion::TraceToolCall {
             tool_name,
             args_json_contains,
             ..
@@ -615,7 +582,7 @@ fn evaluate_deterministic_check(
                 }),
             )
         }
-        Check::TraceSpansOrdered { names, .. } => {
+        Assertion::TraceSpansOrdered { names, .. } => {
             let refs = names.iter().map(String::as_str).collect::<Vec<_>>();
             let passed = trace.spans_ordered(&refs);
             build_outcome(
@@ -624,7 +591,7 @@ fn evaluate_deterministic_check(
                 (!passed).then(|| format!("expected trace spans in order: {}", names.join(", "))),
             )
         }
-        Check::Rubric { .. } => unreachable!("rubric checks are evaluated asynchronously"),
+        Assertion::Rubric { .. } => unreachable!("rubric assertions are evaluated asynchronously"),
     }
 }
 
@@ -713,10 +680,10 @@ fn trace_field_value_str(value: &FieldValue) -> Option<&str> {
 }
 
 fn build_rubric_outcome(
-    check: &Check,
+    check: &Assertion,
     pass_score: f64,
     verdict: RubricJudgeVerdict,
-) -> CheckOutcome {
+) -> AssertionOutcome {
     let score = rubric_verdict_score(check, &verdict);
     let criteria_failures = rubric_criteria_failures(check, &verdict);
     let passed = score >= pass_score && criteria_failures.is_empty();
@@ -736,54 +703,8 @@ fn build_rubric_outcome(
     build_outcome_with_rubric(check, passed, diagnostic, false, Some(verdict))
 }
 
-fn build_module_rubric_outcome(
-    name: &str,
-    rubric: &ModuleRubric,
-    verdict: RubricJudgeVerdict,
-) -> ModuleRubricOutcome {
-    let score = rubric_verdict_score_for(&rubric.criteria, &verdict);
-    let criteria_failures = rubric_criteria_failures_for(&rubric.criteria, &verdict);
-    let passed = score >= rubric.pass_score && criteria_failures.is_empty();
-    let diagnostic = (!passed).then(|| {
-        let mut parts = Vec::new();
-        if score < rubric.pass_score {
-            parts.push(format!(
-                "judge score {:.3} below threshold {:.3}: {}",
-                score, rubric.pass_score, verdict.summary
-            ));
-        }
-        if !criteria_failures.is_empty() {
-            parts.push(format!("criteria failed: {}", criteria_failures.join(", ")));
-        }
-        parts.join("; ")
-    });
-    ModuleRubricOutcome {
-        name: name.to_string(),
-        passed,
-        errored: false,
-        pass_score: rubric.pass_score,
-        diagnostic,
-        rubric: Some(verdict),
-    }
-}
-
-fn build_module_rubric_error_outcome(
-    name: &str,
-    pass_score: f64,
-    diagnostic: String,
-) -> ModuleRubricOutcome {
-    ModuleRubricOutcome {
-        name: name.to_string(),
-        passed: false,
-        errored: true,
-        pass_score,
-        diagnostic: Some(diagnostic),
-        rubric: None,
-    }
-}
-
-fn rubric_verdict_score(check: &Check, verdict: &RubricJudgeVerdict) -> f64 {
-    let Check::Rubric { criteria, .. } = check else {
+fn rubric_verdict_score(check: &Assertion, verdict: &RubricJudgeVerdict) -> f64 {
+    let Assertion::Rubric { criteria, .. } = check else {
         return 0.0;
     };
 
@@ -827,8 +748,8 @@ fn rubric_verdict_score_for(
     }
 }
 
-fn rubric_criteria_failures(check: &Check, verdict: &RubricJudgeVerdict) -> Vec<String> {
-    let Check::Rubric { criteria, .. } = check else {
+fn rubric_criteria_failures(check: &Assertion, verdict: &RubricJudgeVerdict) -> Vec<String> {
+    let Assertion::Rubric { criteria, .. } = check else {
         return Vec::new();
     };
 
@@ -859,21 +780,25 @@ fn rubric_criteria_failures_for(
         .collect()
 }
 
-fn build_outcome(check: &Check, raw_passed: bool, diagnostic: Option<String>) -> CheckOutcome {
+fn build_outcome(
+    check: &Assertion,
+    raw_passed: bool,
+    diagnostic: Option<String>,
+) -> AssertionOutcome {
     build_outcome_with_rubric(check, raw_passed, diagnostic, false, None)
 }
 
-fn build_error_outcome(check: &Check, diagnostic: String) -> CheckOutcome {
+fn build_error_outcome(check: &Assertion, diagnostic: String) -> AssertionOutcome {
     build_outcome_with_rubric(check, false, Some(diagnostic), true, None)
 }
 
 fn build_outcome_with_rubric(
-    check: &Check,
+    check: &Assertion,
     raw_passed: bool,
     diagnostic: Option<String>,
     errored: bool,
     rubric: Option<RubricJudgeVerdict>,
-) -> CheckOutcome {
+) -> AssertionOutcome {
     let common = check.common();
     let (passed, diagnostic) = if common.weight < 0 && !errored {
         let passed = !raw_passed;
@@ -887,7 +812,7 @@ fn build_outcome_with_rubric(
         (raw_passed, diagnostic)
     };
 
-    CheckOutcome {
+    AssertionOutcome {
         name: check.display_name(),
         kind: check.kind_name().to_string(),
         passed,
@@ -915,6 +840,15 @@ pub(crate) fn field_label(field: ArtifactTextField) -> &'static str {
 
 pub(crate) fn pointer_text(value: &serde_json::Value, pointer: &str) -> Option<String> {
     value.pointer(pointer).map(json_value_text)
+}
+
+fn json_value_text(value: &serde_json::Value) -> String {
+    match value {
+        serde_json::Value::String(value) => value.clone(),
+        other => {
+            serde_json::to_string(other).unwrap_or_else(|error| format!("<json error: {error}>"))
+        }
+    }
 }
 
 pub(crate) fn pointer_number(value: &serde_json::Value, pointer: &str) -> Option<f64> {
@@ -954,367 +888,15 @@ pub(crate) fn numeric_range_outcome(
     )
 }
 
-fn module_scoped_artifact(module: EvalModule, artifact: &CaseArtifact) -> CaseArtifact {
-    let mut scoped = CaseArtifact::new(render_module_output(module, artifact));
-    scoped.failure = artifact.failure.clone();
-    scoped.observations.insert(
-        "module".to_string(),
-        serde_json::Value::String(module.as_str().to_string()),
-    );
-    for key in ["typed_memo_logs", "memory_diff"] {
-        if let Some(value) = artifact.observations.get(key).cloned() {
-            scoped.observations.insert(key.to_string(), value);
-        }
-    }
-    if let Some(agent) = scoped_agent_observation(module, artifact) {
-        scoped.observations.insert("agent".to_string(), agent);
-    }
-    if let Some(last_state) = scoped_last_state_observation(module, artifact) {
-        scoped
-            .observations
-            .insert("last_state".to_string(), last_state);
-    }
-    scoped
-}
-
-fn render_module_output(module: EvalModule, artifact: &CaseArtifact) -> String {
-    let logs = module_memo_log_values(module, artifact);
-    if !logs.is_empty() {
-        return logs
-            .iter()
-            .map(render_memo_log_value)
-            .collect::<Vec<_>>()
-            .join("\n\n");
-    }
-
-    format!("(no memo logs for module {})", module.as_str())
-}
-
-fn module_memo_log_values(module: EvalModule, artifact: &CaseArtifact) -> Vec<serde_json::Value> {
-    if let Some(logs) = observation_path_value(
-        &artifact.observations,
-        &["agent", "memo_logs", module.as_str()],
-    )
-    .and_then(serde_json::Value::as_array)
-    {
-        return logs.clone();
-    }
-
-    observation_path_value(
-        &artifact.observations,
-        &["last_state", "blackboard", "memo_logs"],
-    )
-    .and_then(serde_json::Value::as_array)
-    .map(|logs| {
-        logs.iter()
-            .filter(|log| value_field_text(log, "module").as_deref() == Some(module.as_str()))
-            .cloned()
-            .collect()
-    })
-    .unwrap_or_default()
-}
-
-fn render_memo_log_value(log: &serde_json::Value) -> String {
-    let replica = value_field_text(log, "replica").unwrap_or_else(|| "?".to_string());
-    let index = value_field_text(log, "index").unwrap_or_else(|| "?".to_string());
-    let written_at = value_field_text(log, "written_at")
-        .or_else(|| value_field_text(log, "written-at"))
-        .unwrap_or_else(|| "?".to_string());
-    let content = value_field_text(log, "content").unwrap_or_default();
-    format!("replica={replica} index={index} written_at={written_at}\n{content}")
-}
-
-fn scoped_agent_observation(
-    module: EvalModule,
-    artifact: &CaseArtifact,
-) -> Option<serde_json::Value> {
-    let agent = observation_path_value(&artifact.observations, &["agent"])?.as_object()?;
-    let mut scoped = serde_json::Map::new();
-    scoped.insert(
-        "module".to_string(),
-        serde_json::Value::String(module.as_str().to_string()),
-    );
-    insert_if_some(
-        &mut scoped,
-        "memo_logs",
-        filter_object_entry(agent.get("memo_logs"), module.as_str()),
-    );
-    insert_if_some(
-        &mut scoped,
-        "cognition_logs",
-        filter_array_by_nested_module(agent.get("cognition_logs"), &["source", "module"], module),
-    );
-    insert_if_some(
-        &mut scoped,
-        "allocation",
-        scoped_agent_allocation(agent.get("allocation"), module),
-    );
-    insert_if_some(
-        &mut scoped,
-        "allocation_proposals",
-        scoped_agent_allocation_proposals(agent.get("allocation_proposals"), module),
-    );
-    insert_if_some(
-        &mut scoped,
-        "replica_caps",
-        filter_object_entry(agent.get("replica_caps"), module.as_str()),
-    );
-    insert_if_some(
-        &mut scoped,
-        "memory_metadata",
-        agent.get("memory_metadata").cloned(),
-    );
-    if module == EvalModule::Speak {
-        insert_if_some(&mut scoped, "utterances", agent.get("utterances").cloned());
-    }
-    Some(serde_json::Value::Object(scoped))
-}
-
-fn scoped_last_state_observation(
-    module: EvalModule,
-    artifact: &CaseArtifact,
-) -> Option<serde_json::Value> {
-    let last_state =
-        observation_path_value(&artifact.observations, &["last_state"])?.as_object()?;
-    let mut scoped = serde_json::Map::new();
-    insert_if_some(&mut scoped, "case", last_state.get("case").cloned());
-    if let Some(blackboard) = last_state
-        .get("blackboard")
-        .and_then(serde_json::Value::as_object)
-    {
-        scoped.insert(
-            "blackboard".to_string(),
-            scoped_last_state_blackboard(blackboard, module),
-        );
-    }
-    insert_if_some(&mut scoped, "memory", last_state.get("memory").cloned());
-    if module == EvalModule::Speak {
-        insert_if_some(
-            &mut scoped,
-            "utterances",
-            last_state.get("utterances").cloned(),
-        );
-    }
-    Some(serde_json::Value::Object(scoped))
-}
-
-fn scoped_last_state_blackboard(
-    blackboard: &serde_json::Map<String, serde_json::Value>,
-    module: EvalModule,
-) -> serde_json::Value {
-    let mut scoped = serde_json::Map::new();
-    insert_if_some(
-        &mut scoped,
-        "memo_logs",
-        filter_array_by_field(blackboard.get("memo_logs"), "module", module.as_str()),
-    );
-    insert_if_some(
-        &mut scoped,
-        "cognition_logs",
-        filter_array_by_nested_module(
-            blackboard.get("cognition_logs"),
-            &["source", "module"],
-            module,
-        ),
-    );
-    insert_if_some(
-        &mut scoped,
-        "base_allocation",
-        scoped_allocation_array(blackboard.get("base_allocation"), module),
-    );
-    insert_if_some(
-        &mut scoped,
-        "allocation",
-        scoped_allocation_array(blackboard.get("allocation"), module),
-    );
-    insert_if_some(
-        &mut scoped,
-        "allocation_proposals",
-        scoped_last_state_allocation_proposals(blackboard.get("allocation_proposals"), module),
-    );
-    insert_if_some(
-        &mut scoped,
-        "replica_caps",
-        scoped_allocation_array(blackboard.get("replica_caps"), module),
-    );
-    serde_json::Value::Object(scoped)
-}
-
-fn insert_if_some(
-    object: &mut serde_json::Map<String, serde_json::Value>,
-    key: &str,
-    value: Option<serde_json::Value>,
-) {
-    if let Some(value) = value {
-        object.insert(key.to_string(), value);
-    }
-}
-
-fn filter_object_entry(value: Option<&serde_json::Value>, key: &str) -> Option<serde_json::Value> {
-    let object = value?.as_object()?;
-    let entry = object.get(key)?;
-    let mut filtered = serde_json::Map::new();
-    filtered.insert(key.to_string(), entry.clone());
-    Some(serde_json::Value::Object(filtered))
-}
-
-fn filter_array_by_field(
-    value: Option<&serde_json::Value>,
-    field: &str,
-    expected: &str,
-) -> Option<serde_json::Value> {
-    let filtered = value?
-        .as_array()?
-        .iter()
-        .filter(|entry| value_field_text(entry, field).as_deref() == Some(expected))
-        .cloned()
-        .collect::<Vec<_>>();
-    Some(serde_json::Value::Array(filtered))
-}
-
-fn filter_array_by_nested_module(
-    value: Option<&serde_json::Value>,
-    path: &[&str],
-    module: EvalModule,
-) -> Option<serde_json::Value> {
-    let filtered = value?
-        .as_array()?
-        .iter()
-        .filter(|entry| nested_value_text(entry, path).as_deref() == Some(module.as_str()))
-        .cloned()
-        .collect::<Vec<_>>();
-    Some(serde_json::Value::Array(filtered))
-}
-
-fn scoped_agent_allocation(
-    value: Option<&serde_json::Value>,
-    module: EvalModule,
-) -> Option<serde_json::Value> {
-    if matches!(module, EvalModule::Allocation | EvalModule::Action) {
-        return value.cloned();
-    }
-    filter_object_entry(value, module.as_str())
-}
-
-fn scoped_agent_allocation_proposals(
-    value: Option<&serde_json::Value>,
-    module: EvalModule,
-) -> Option<serde_json::Value> {
-    let proposals = value?.as_object()?;
-    let mut scoped = serde_json::Map::new();
-    for (owner, proposal) in proposals {
-        if matches!(module, EvalModule::Allocation | EvalModule::Action) {
-            if owner_matches_module(owner, module) {
-                scoped.insert(owner.clone(), proposal.clone());
-            }
-            continue;
-        }
-        let Some(filtered) = filter_object_entry(Some(proposal), module.as_str()) else {
-            continue;
-        };
-        scoped.insert(owner.clone(), filtered);
-    }
-    Some(serde_json::Value::Object(scoped))
-}
-
-fn scoped_allocation_array(
-    value: Option<&serde_json::Value>,
-    module: EvalModule,
-) -> Option<serde_json::Value> {
-    if matches!(module, EvalModule::Allocation | EvalModule::Action) {
-        return value.cloned();
-    }
-    filter_array_by_field(value, "module", module.as_str())
-}
-
-fn scoped_last_state_allocation_proposals(
-    value: Option<&serde_json::Value>,
-    module: EvalModule,
-) -> Option<serde_json::Value> {
-    let proposals = value?.as_array()?;
-    let mut scoped = Vec::new();
-    for proposal in proposals {
-        if matches!(module, EvalModule::Allocation | EvalModule::Action) {
-            if nested_value_text(proposal, &["controller", "module"]).as_deref()
-                == Some(module.as_str())
-            {
-                scoped.push(proposal.clone());
-            }
-            continue;
-        }
-        let Some(modules) = proposal
-            .get("modules")
-            .and_then(serde_json::Value::as_array)
-        else {
-            continue;
-        };
-        let modules = modules
-            .iter()
-            .filter(|entry| value_field_text(entry, "module").as_deref() == Some(module.as_str()))
-            .cloned()
-            .collect::<Vec<_>>();
-        if modules.is_empty() {
-            continue;
-        }
-        let mut filtered = serde_json::Map::new();
-        if let Some(controller) = proposal.get("controller") {
-            filtered.insert("controller".to_string(), controller.clone());
-        }
-        filtered.insert("modules".to_string(), serde_json::Value::Array(modules));
-        scoped.push(serde_json::Value::Object(filtered));
-    }
-    Some(serde_json::Value::Array(scoped))
-}
-
-fn owner_matches_module(owner: &str, module: EvalModule) -> bool {
-    owner == module.as_str()
-        || owner
-            .strip_prefix(module.as_str())
-            .is_some_and(|suffix| suffix.starts_with('['))
-}
-
-fn observation_path_value<'a>(
-    observations: &'a std::collections::BTreeMap<String, serde_json::Value>,
-    path: &[&str],
-) -> Option<&'a serde_json::Value> {
-    let (first, rest) = path.split_first()?;
-    let mut current = observations.get(*first)?;
-    for part in rest {
-        current = current.get(*part)?;
-    }
-    Some(current)
-}
-
-fn nested_value_text(value: &serde_json::Value, path: &[&str]) -> Option<String> {
-    let mut current = value;
-    for part in path {
-        current = current.get(*part)?;
-    }
-    Some(json_value_text(current))
-}
-
-fn value_field_text(value: &serde_json::Value, field: &str) -> Option<String> {
-    value.get(field).map(json_value_text)
-}
-
-pub(crate) fn json_value_text(value: &serde_json::Value) -> String {
-    match value {
-        serde_json::Value::String(value) => value.clone(),
-        other => {
-            serde_json::to_string(other).unwrap_or_else(|error| format!("<json error: {error}>"))
-        }
-    }
-}
-
-fn outcome_satisfies_requirement(outcome: &CheckOutcome) -> bool {
+fn outcome_satisfies_requirement(outcome: &AssertionOutcome) -> bool {
     outcome.passed && !outcome.errored
 }
 
-fn weighted_points(checks: &[CheckOutcome]) -> (u64, u64) {
+fn weighted_points(assertions: &[AssertionOutcome]) -> (u64, u64) {
     let mut earned = 0u64;
     let mut total = 0u64;
 
-    for outcome in checks {
+    for outcome in assertions {
         if outcome.errored || outcome.must_pass || outcome.weight == 0 {
             continue;
         }
@@ -1371,30 +953,16 @@ pub fn normalize_text_block(input: &str) -> String {
 mod tests {
     use std::time::Duration;
 
-    use eure::value::{Language, Text};
+    use lutum_eval::{EventRecord, FieldValue, SpanNode, TraceSnapshot};
     use nuillu_types::{ModuleActivationId, ModuleId, ModuleInstanceId, ReplicaIndex};
 
     use super::{
-        CaseTiming, CaseTrialSummary, ModuleActivationRecord, aggregate_trial_timing,
-        build_activation_timeline, build_rubric_outcome,
+        CaseReport, CaseTiming, CaseTrialSummary, ModuleActivationRecord, aggregate_trial_timing,
+        build_activation_timeline, evaluate_deterministic_check, json_contains,
+        trace_event_contains,
     };
-    use crate::cases::{Check, CheckCommon, RubricCriterion, RubricJudgeInput};
-    use crate::evaluation::CaseReport;
-    use crate::judge::{RubricJudgeVerdict, RubricJudgeVerdictCriterion};
-
-    fn test_report(passed: bool, invalid: bool, score: f64) -> CaseReport {
-        CaseReport {
-            runtime_failure: invalid.then(|| "invalid".to_string()),
-            llm_log_directory: None,
-            checks: Vec::new(),
-            modules_checks: Vec::new(),
-            invalid,
-            must_pass_ok: passed,
-            weighted_points_earned: 0,
-            weighted_points_total: 0,
-            score,
-        }
-    }
+    use crate::artifact::CaseArtifact;
+    use crate::cases::{Assertion, AssertionCommon};
 
     fn owner(module: &str) -> ModuleInstanceId {
         ModuleInstanceId::new(
@@ -1403,46 +971,81 @@ mod tests {
         )
     }
 
-    fn rubric_check(criteria: Vec<RubricCriterion>) -> Check {
-        Check::Rubric {
-            common: CheckCommon {
-                name: Some("rubric-check".to_string()),
-                must_pass: true,
-                weight: 1,
-            },
-            rubric: Text::new("rubric", Language::Plaintext),
-            pass_score: 0.85,
-            judge_inputs: vec![RubricJudgeInput::Output],
-            criteria,
-        }
-    }
-
-    fn criterion(name: &str, pass_score: f64) -> RubricCriterion {
-        RubricCriterion {
-            name: name.to_string(),
-            description: Text::new("criterion", Language::Plaintext),
+    fn common(name: &str) -> AssertionCommon {
+        AssertionCommon {
+            name: Some(name.to_string()),
+            must_pass: true,
             weight: 1,
-            pass_score,
         }
     }
 
-    #[test]
-    fn rubric_outcome_aggregates_score_from_criteria() {
-        let check = rubric_check(vec![criterion("specific-detail", 0.9)]);
-        let verdict = RubricJudgeVerdict {
-            summary: "The artifact satisfies the rubric.".to_string(),
-            criteria: vec![RubricJudgeVerdictCriterion {
-                name: "specific-detail".to_string(),
-                score: 0.95,
-                reason: "specific detail is present".to_string(),
-                evidence: Some("evidence".to_string()),
+    fn trial(elapsed_ms: u64) -> CaseTrialSummary {
+        CaseTrialSummary {
+            trial: 1,
+            output_dir: "out".to_string(),
+            path: "case.eure".to_string(),
+            runtime_config: "config.eure".to_string(),
+            id: "case".to_string(),
+            description: None,
+            passed: true,
+            invalid: false,
+            score: 1.0,
+            report: CaseReport {
+                runtime_failure: None,
+                llm_log_directory: None,
+                assertions: Vec::new(),
+                measurements: std::collections::BTreeMap::new(),
+                invalid: false,
+                must_pass_ok: true,
+                weighted_points_earned: 0,
+                weighted_points_total: 0,
+                score: 1.0,
+            },
+            timing: CaseTiming { elapsed_ms },
+        }
+    }
+
+    fn event(message: &str, fields: Vec<(String, FieldValue)>) -> EventRecord {
+        EventRecord {
+            target: "lutum".to_string(),
+            level: "DEBUG".to_string(),
+            message: Some(message.to_string()),
+            fields,
+        }
+    }
+
+    fn tool_call_event(tool_name: &str, args_json: &str, tool_call_id: &str) -> EventRecord {
+        event(
+            "tool_call",
+            vec![
+                (
+                    "tool_name".to_string(),
+                    FieldValue::Str(tool_name.to_string()),
+                ),
+                (
+                    "args_json".to_string(),
+                    FieldValue::Str(args_json.to_string()),
+                ),
+                (
+                    "tool_call_id".to_string(),
+                    FieldValue::Str(tool_call_id.to_string()),
+                ),
+            ],
+        )
+    }
+
+    fn trace(events: Vec<EventRecord>) -> TraceSnapshot {
+        TraceSnapshot {
+            roots: vec![SpanNode {
+                name: "llm_turn".to_string(),
+                target: "lutum".to_string(),
+                level: "INFO".to_string(),
+                fields: Vec::new(),
+                events,
+                children: Vec::new(),
             }],
-        };
-
-        let outcome = build_rubric_outcome(&check, 0.85, verdict);
-
-        assert!(outcome.passed);
-        assert!(outcome.diagnostic.is_none());
+            root_events: Vec::new(),
+        }
     }
 
     #[test]
@@ -1488,46 +1091,8 @@ mod tests {
 
     #[test]
     fn aggregate_trial_timing_computes_min_max_mean() {
-        let trials = vec![
-            CaseTrialSummary {
-                trial: 1,
-                output_dir: "a".to_string(),
-                path: "a.eure".to_string(),
-                id: "a".to_string(),
-                description: None,
-                passed: true,
-                invalid: false,
-                score: 1.0,
-                report: test_report(true, false, 1.0),
-                timing: CaseTiming { elapsed_ms: 100 },
-            },
-            CaseTrialSummary {
-                trial: 2,
-                output_dir: "b".to_string(),
-                path: "b.eure".to_string(),
-                id: "b".to_string(),
-                description: None,
-                passed: true,
-                invalid: false,
-                score: 1.0,
-                report: test_report(true, false, 1.0),
-                timing: CaseTiming { elapsed_ms: 300 },
-            },
-            CaseTrialSummary {
-                trial: 3,
-                output_dir: "c".to_string(),
-                path: "c.eure".to_string(),
-                id: "c".to_string(),
-                description: None,
-                passed: true,
-                invalid: false,
-                score: 1.0,
-                report: test_report(true, false, 1.0),
-                timing: CaseTiming { elapsed_ms: 200 },
-            },
-        ];
+        let timing = aggregate_trial_timing(&[trial(100), trial(300), trial(200)]);
 
-        let timing = aggregate_trial_timing(&trials);
         assert_eq!(timing.min_ms, 100);
         assert_eq!(timing.max_ms, 300);
         assert_eq!(timing.mean_ms, 200);
@@ -1535,68 +1100,41 @@ mod tests {
 
     #[test]
     fn trace_event_check_matches_tool_calls_in_event_fields() {
-        use lutum_eval::{EventRecord, FieldValue, SpanNode, TraceSnapshot};
+        let tool_output = event(
+            "llm_output",
+            vec![(
+                "output".to_string(),
+                FieldValue::Str(
+                    "<tool_call name=fetch_linked_memories>{\"memory_indexes\":[\"koro-approach-primary\"]}</tool_call>"
+                        .to_string(),
+                ),
+            )],
+        );
+        assert!(trace_event_contains(&tool_output, "fetch_linked_memories"));
 
-        use super::{evaluate_deterministic_check, trace_event_contains};
-        use crate::cases::Check;
-
-        let trace = TraceSnapshot {
-            roots: vec![SpanNode {
-                name: "llm_turn".to_string(),
-                target: "lutum".to_string(),
-                level: "INFO".to_string(),
-                fields: Vec::new(),
-                events: vec![EventRecord {
-                    target: "lutum".to_string(),
-                    level: "DEBUG".to_string(),
-                    message: Some("llm_output".to_string()),
-                    fields: vec![(
-                        "output".to_string(),
-                        FieldValue::Str(
-                            "<tool_call name=fetch_linked_memories>{\"memory_indexes\":[\"koro-approach-primary\"]}</tool_call>"
-                                .to_string(),
-                        ),
-                    )],
-                }],
-                children: Vec::new(),
-            }],
-            root_events: Vec::new(),
-        };
-
-        assert!(trace_event_contains(
-            &trace.roots[0].events[0],
-            "fetch_linked_memories"
-        ));
-
-        let prompt_only = EventRecord {
-            target: "lutum".to_string(),
-            level: "DEBUG".to_string(),
-            message: Some("llm_input_transcript".to_string()),
-            fields: vec![(
+        let prompt_only = event(
+            "llm_input_transcript",
+            vec![(
                 "transcript".to_string(),
                 FieldValue::Str(
                     "[System]\nUse fetch_linked_memories only after a specific search hit.\n[User]\nQuestion"
                         .to_string(),
                 ),
             )],
-        };
+        );
         assert!(!trace_event_contains(&prompt_only, "fetch_linked_memories"));
 
-        let check = Check::TraceEvent {
-            common: crate::cases::CheckCommon {
-                name: Some("calls-fetch-linked-memories".to_string()),
-                must_pass: true,
-                weight: 1,
-            },
+        let check = Assertion::TraceEvent {
+            common: common("calls-fetch-linked-memories"),
             message_contains: "fetch_linked_memories".to_string(),
         };
         let outcome =
-            evaluate_deterministic_check(&check, &trace, &crate::artifact::CaseArtifact::new(""));
+            evaluate_deterministic_check(&check, &trace(vec![tool_output]), &CaseArtifact::new(""));
         assert!(outcome.passed);
     }
 
     #[test]
-    fn trace_tool_call_json_contains_matches_object_subset_unordered_arrays_and_extra_args() {
+    fn json_contains_matches_object_subset_and_unordered_arrays() {
         let actual = serde_json::json!({
             "selected_indexes": [
                 "koro-approach-primary",
@@ -1612,11 +1150,11 @@ mod tests {
             ]
         });
 
-        assert!(super::json_contains(&actual, &expected));
+        assert!(json_contains(&actual, &expected));
     }
 
     #[test]
-    fn trace_tool_call_json_contains_rejects_wrong_scalar_value() {
+    fn json_contains_rejects_wrong_scalar_value() {
         let actual = serde_json::json!({
             "selected_indexes": ["koro-signal-drill-linked"]
         });
@@ -1624,166 +1162,69 @@ mod tests {
             "selected_indexes": ["wrong-index"]
         });
 
-        assert!(!super::json_contains(&actual, &expected));
+        assert!(!json_contains(&actual, &expected));
     }
 
     #[test]
     fn trace_tool_call_check_uses_structured_tool_events_only() {
-        use lutum_eval::{EventRecord, FieldValue, SpanNode, TraceSnapshot};
-
-        use super::evaluate_deterministic_check;
-        use crate::cases::{Check, CheckCommon};
-
-        let prompt_only_trace = TraceSnapshot {
-            roots: vec![SpanNode {
-                name: "llm_turn".to_string(),
-                target: "lutum".to_string(),
-                level: "INFO".to_string(),
-                fields: Vec::new(),
-                events: vec![EventRecord {
-                    target: "lutum".to_string(),
-                    level: "DEBUG".to_string(),
-                    message: Some("llm_input_transcript".to_string()),
-                    fields: vec![(
-                        "transcript".to_string(),
-                        FieldValue::Str(
-                            "Use write_retrieval_memo after linked retrieval.".to_string(),
-                        ),
-                    )],
-                }],
-                children: Vec::new(),
-            }],
-            root_events: Vec::new(),
-        };
-        let name_only = Check::TraceToolCall {
-            common: CheckCommon {
-                name: Some("calls-fetch-linked-memories".to_string()),
-                must_pass: true,
-                weight: 1,
-            },
+        let name_only = Assertion::TraceToolCall {
+            common: common("calls-fetch-linked-memories"),
             tool_name: "fetch_linked_memories".to_string(),
             args_json_contains: None,
         };
-        let prompt_only = evaluate_deterministic_check(
-            &name_only,
-            &prompt_only_trace,
-            &crate::artifact::CaseArtifact::new(""),
+
+        let prompt_only_trace = trace(vec![event(
+            "llm_input_transcript",
+            vec![(
+                "transcript".to_string(),
+                FieldValue::Str("Use fetch_linked_memories after linked retrieval.".to_string()),
+            )],
+        )]);
+        assert!(
+            !evaluate_deterministic_check(&name_only, &prompt_only_trace, &CaseArtifact::new(""))
+                .passed
         );
-        assert!(!prompt_only.passed);
 
-        let trace = TraceSnapshot {
-            roots: vec![SpanNode {
-                name: "module".to_string(),
-                target: "nuillu".to_string(),
-                level: "INFO".to_string(),
-                fields: Vec::new(),
-                events: vec![
-                    EventRecord {
-                        target: "lutum".to_string(),
-                        level: "DEBUG".to_string(),
-                        message: Some("tool_call".to_string()),
-                        fields: vec![
-                            (
-                                "tool_name".to_string(),
-                                FieldValue::Str("fetch_linked_memories".to_string()),
-                            ),
-                            (
-                                "args_json".to_string(),
-                                FieldValue::Str(
-                                    r#"{"memory_indexes":["koro-approach-primary"]}"#.to_string(),
-                                ),
-                            ),
-                            (
-                                "tool_call_id".to_string(),
-                                FieldValue::Str("call-fetch".to_string()),
-                            ),
-                        ],
-                    },
-                    EventRecord {
-                        target: "lutum".to_string(),
-                        level: "DEBUG".to_string(),
-                        message: Some("tool_call".to_string()),
-                        fields: vec![
-                            (
-                                "tool_name".to_string(),
-                                FieldValue::Str("write_retrieval_memo".to_string()),
-                            ),
-                            (
-                                "args_json".to_string(),
-                                FieldValue::Str(
-                                    r#"{"selected_indexes":["koro-approach-primary","koro-signal-drill-linked"]}"#
-                                        .to_string(),
-                                ),
-                            ),
-                            (
-                                "tool_call_id".to_string(),
-                                FieldValue::Str("call-write".to_string()),
-                            ),
-                        ],
-                    },
-                ],
-                children: Vec::new(),
-            }],
-            root_events: Vec::new(),
-        };
+        let trace = trace(vec![
+            tool_call_event(
+                "fetch_linked_memories",
+                r#"{"memory_indexes":["koro-approach-primary"]}"#,
+                "call-fetch",
+            ),
+            tool_call_event(
+                "write_retrieval_memo",
+                r#"{"selected_indexes":["koro-approach-primary","koro-signal-drill-linked"]}"#,
+                "call-write",
+            ),
+        ]);
 
-        let name_only = evaluate_deterministic_check(
-            &name_only,
-            &trace,
-            &crate::artifact::CaseArtifact::new(""),
-        );
-        assert!(name_only.passed);
+        assert!(evaluate_deterministic_check(&name_only, &trace, &CaseArtifact::new("")).passed);
 
-        let matching_args = Check::TraceToolCall {
-            common: CheckCommon {
-                name: Some("memos-linked-signal-index".to_string()),
-                must_pass: true,
-                weight: 1,
-            },
+        let matching_args = Assertion::TraceToolCall {
+            common: common("memos-linked-signal-index"),
             tool_name: "write_retrieval_memo".to_string(),
             args_json_contains: Some(eure::value::Text::plaintext(
                 r#"{"selected_indexes":["koro-signal-drill-linked"]}"#,
             )),
         };
-        let matching_args = evaluate_deterministic_check(
-            &matching_args,
-            &trace,
-            &crate::artifact::CaseArtifact::new(""),
+        assert!(
+            evaluate_deterministic_check(&matching_args, &trace, &CaseArtifact::new("")).passed
         );
-        assert!(matching_args.passed);
 
-        let wrong_tool = Check::TraceToolCall {
-            common: CheckCommon {
-                name: None,
-                must_pass: true,
-                weight: 1,
-            },
+        let wrong_tool = Assertion::TraceToolCall {
+            common: common("missing-tool"),
             tool_name: "missing_tool".to_string(),
             args_json_contains: None,
         };
-        let wrong_tool = evaluate_deterministic_check(
-            &wrong_tool,
-            &trace,
-            &crate::artifact::CaseArtifact::new(""),
-        );
-        assert!(!wrong_tool.passed);
+        assert!(!evaluate_deterministic_check(&wrong_tool, &trace, &CaseArtifact::new("")).passed);
 
-        let wrong_arg = Check::TraceToolCall {
-            common: CheckCommon {
-                name: None,
-                must_pass: true,
-                weight: 1,
-            },
+        let wrong_arg = Assertion::TraceToolCall {
+            common: common("wrong-arg"),
             tool_name: "write_retrieval_memo".to_string(),
             args_json_contains: Some(eure::value::Text::plaintext(
                 r#"{"selected_indexes":["wrong-index"]}"#,
             )),
         };
-        let wrong_arg = evaluate_deterministic_check(
-            &wrong_arg,
-            &trace,
-            &crate::artifact::CaseArtifact::new(""),
-        );
-        assert!(!wrong_arg.passed);
+        assert!(!evaluate_deterministic_check(&wrong_arg, &trace, &CaseArtifact::new("")).passed);
     }
 }

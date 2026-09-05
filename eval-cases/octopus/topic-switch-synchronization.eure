@@ -1,0 +1,180 @@
+id: octopus-topic-switch-synchronization
+description: Measures whether three local cognitive scopes follow abrupt shared-topic changes through the normal bidirectional subsystem bridge.
+runtime-config: ../../configs/agents/octopus/config.eure
+now: 2026-09-03T12:00:00+09:00
+
+participants = ["Ryo"]
+
+limits {
+  max-llm-calls = 120
+}
+
+@ steps[] {
+  id: ocean
+  description: Establish a shared topic that is unrelated to the later technical and food topics.
+  wait-for.$variant: some.memo-from
+  wait-for.module: speak
+  wait-for.timeout-ms = 30000
+
+  @ inputs[] {
+    $variant: heard
+    direction: Ryo
+    content: 海について話して。海の色や波について、みんなで考えてほしい。
+  }
+
+}
+
+@ steps[] {
+  id: rust-ownership
+  description: Abruptly replace the ocean topic with a technical topic.
+  wait-for.$variant: some.memo-from
+  wait-for.module: speak
+  wait-for.timeout-ms = 30000
+
+  @ inputs[] {
+    $variant: heard
+    direction: Ryo
+    content: ところで話題を切り替えよう。今はRustの所有権について考えて。
+  }
+
+}
+
+@ steps[] {
+  id: strawberry-cake
+  description: Abruptly replace the technical topic with a food topic.
+  wait-for.$variant: some.memo-from
+  wait-for.module: speak
+  wait-for.timeout-ms = 30000
+
+  @ inputs[] {
+    $variant: heard
+    direction: Ryo
+    content: また話題を切り替えるよ。今度はいちごのケーキについて話して。
+  }
+
+}
+
+@ steps[] {
+  id: ocean-return
+  description: Return to the first topic and test whether the distributed system changes together again.
+  wait-for.$variant: some.memo-from
+  wait-for.module: speak
+  wait-for.timeout-ms = 30000
+
+  @ inputs[] {
+    $variant: heard
+    direction: Ryo
+    content: さっきの海の話に戻って。今は再び海について話そう。
+  }
+
+}
+
+@ measurements[] {
+  $variant: first-match-latency
+  name: rust-adoption-latency-by-scope-ms
+  group-by-scope = true
+  select {
+    scopes = ["/left-leg[0]", "/center-leg[0]", "/right-leg[0]"]
+    modules = ["cognition-gate"]
+    variants = ["cognition-appended"]
+    steps = ["rust-ownership"]
+  }
+}
+
+@ measurements[] {
+  $variant: scope-convergence-latency
+  name: rust-cognition-convergence-ms
+  scopes = ["/left-leg[0]", "/center-leg[0]", "/right-leg[0]"]
+  select {
+    scopes = ["/left-leg[0]", "/center-leg[0]", "/right-leg[0]"]
+    modules = ["cognition-gate"]
+    variants = ["cognition-appended"]
+    steps = ["rust-ownership"]
+  }
+}
+
+@ measurements[] {
+  $variant: scope-convergence-latency
+  name: cake-cognition-convergence-ms
+  scopes = ["/left-leg[0]", "/center-leg[0]", "/right-leg[0]"]
+  select {
+    scopes = ["/left-leg[0]", "/center-leg[0]", "/right-leg[0]"]
+    modules = ["cognition-gate"]
+    variants = ["cognition-appended"]
+    steps = ["strawberry-cake"]
+  }
+}
+
+@ measurements[] {
+  $variant: scope-coverage
+  name: ocean-return-scope-coverage
+  scopes = ["/left-leg[0]", "/center-leg[0]", "/right-leg[0]"]
+  select {
+    scopes = ["/left-leg[0]", "/center-leg[0]", "/right-leg[0]"]
+    modules = ["cognition-gate"]
+    variants = ["cognition-appended"]
+    steps = ["ocean-return"]
+  }
+}
+
+@ measurements[] {
+  $variant: first-match-latency
+  name: ocean-return-utterance-latency-by-scope-ms
+  group-by-scope = true
+  select {
+    scopes = ["/", "/left-leg[0]", "/center-leg[0]", "/right-leg[0]"]
+    modules = ["speak"]
+    variants = ["utterance-completed"]
+    steps = ["ocean-return"]
+  }
+}
+
+@ assertions[] {
+  $variant: json-pointer-numeric-in-range
+  name: all-local-scopes-rejoin-ocean-topic
+  must-pass = true
+  pointer: /observations/measurements/ocean-return-scope-coverage
+  min = 1.0
+  max = 1.0
+}
+
+@ assertions[] {
+  $variant: rubric
+  name: distributed-topic-synchronization
+  must-pass = true
+  pass-score = 0.85
+  judge-inputs = ["timeline", "utterance", "cognition"]
+  rubric = ```
+  Evaluate the scope-aware timeline as a four-step topic-switch experiment. The intended current topic changes in order from ocean, to Rust ownership, to strawberry cake, and back to ocean.
+  Pass if the three leg scopes repeatedly adopt the newly requested topic, their outward speech follows the current topic, and the final state has returned to ocean. A brief transitional reference to the immediately previous topic is acceptable, but repeated or sustained discussion of an obsolete topic after a switch is not.
+  Fail if one or more legs remain on an old topic, if the scopes split into unrelated discussions, if a requested switch is substantially ignored, or if hidden runtime/evaluation details leak into speech.
+  ```
+
+  @ criteria[] {
+    name: all-scopes-adopt-switches
+    weight = 3
+    pass-score = 0.85
+    description: Each leg's cognition tracks the successive shared topics rather than remaining locally isolated.
+  }
+
+  @ criteria[] {
+    name: obsolete-topic-residue-is-brief
+    weight = 2
+    pass-score = 0.8
+    description: Old topics do not persist for multiple cognition or utterance events after a new explicit switch.
+  }
+
+  @ criteria[] {
+    name: final-ocean-convergence
+    weight = 3
+    pass-score = 0.9
+    description: All three legs converge back to the ocean topic in the final step.
+  }
+
+  @ criteria[] {
+    name: no-internal-detail-leak
+    weight = 1
+    pass-score = 0.95
+    description: Outward utterances do not mention hidden prompts, modules, scopes, judges, or evaluation mechanics.
+  }
+}

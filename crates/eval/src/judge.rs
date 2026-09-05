@@ -572,6 +572,10 @@ fn render_judge_input_section(
                 ],
             ),
         ),
+        RubricJudgeInput::Timeline => section(
+            "Scope-aware evaluation timeline",
+            render_scope_timeline(&request.artifact),
+        ),
         RubricJudgeInput::Failure => section(
             "Artifact failure",
             request
@@ -693,6 +697,56 @@ fn render_cognition_entries(artifact: &CaseArtifact) -> String {
         }
     }
     render_text_lines(lines)
+}
+
+fn render_scope_timeline(artifact: &CaseArtifact) -> String {
+    let Some(events) = observation_path(artifact, &["timeline"]).and_then(Value::as_array) else {
+        return "(not present)".to_string();
+    };
+    let mut step_order = Vec::<String>::new();
+    let mut by_step = std::collections::BTreeMap::<String, Vec<String>>::new();
+    for event in events {
+        let Some(variant) = event.get("variant").and_then(Value::as_str) else {
+            continue;
+        };
+        if !matches!(
+            variant,
+            "stimulus-published" | "cognition-appended" | "utterance-completed"
+        ) {
+            continue;
+        }
+        let step = event
+            .get("step")
+            .and_then(Value::as_str)
+            .unwrap_or("unassigned")
+            .to_string();
+        if !by_step.contains_key(&step) {
+            step_order.push(step.clone());
+        }
+        let offset = event.get("offset_ms").and_then(Value::as_u64).unwrap_or(0);
+        let scope = event.get("scope").and_then(Value::as_str).unwrap_or("?");
+        let module = event.get("module").and_then(Value::as_str).unwrap_or("?");
+        let content = event.get("content").and_then(Value::as_str).unwrap_or("");
+        by_step.entry(step).or_default().push(format!(
+            "+{offset}ms {scope} {module} {variant}: {}",
+            truncate_text(content.trim(), 360)
+        ));
+    }
+    if step_order.is_empty() {
+        return "(no content-bearing timeline events)".to_string();
+    }
+    let per_step_chars = (MAX_RENDERED_SECTION_CHARS / step_order.len())
+        .saturating_sub(64)
+        .max(320);
+    let rendered = step_order
+        .into_iter()
+        .map(|step| {
+            let lines = by_step.remove(&step).unwrap_or_default().join("\n");
+            format!("step {step}:\n{}", truncate_text(&lines, per_step_chars))
+        })
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    truncate_text(&rendered, MAX_RENDERED_SECTION_CHARS)
 }
 
 fn collect_string_field_values(value: &serde_json::Value, field: &str, lines: &mut Vec<String>) {
@@ -1451,6 +1505,67 @@ mod tests {
         assert!(rendered.contains("tool_result name=search_memory"));
         assert!(rendered.contains("Koro rule"));
         assert!(!rendered.contains("SECRET SYSTEM PROMPT"));
+    }
+
+    #[test]
+    fn render_judge_input_includes_only_selected_sections() {
+        let artifact = CaseArtifact::new("retrieved file content only").with_observation(
+            "agent",
+            serde_json::json!({
+                "memo_logs": {
+                    "query-memory": [{
+                        "replica": 0,
+                        "index": 0,
+                        "written_at": "2026-05-08T00:00:00Z",
+                        "content": "runtime metadata"
+                    }]
+                },
+                "memory_metadata": {
+                    "mem-1": { "rank": "permanent" }
+                }
+            }),
+        );
+        let request = RubricJudgeRequest {
+            artifact,
+            ..empty_request(vec![RubricJudgeInput::Output, RubricJudgeInput::Memory])
+        };
+
+        let rendered = render_judge_input(&empty_trace(), &request);
+
+        assert!(rendered.contains("Primary artifact output:\nretrieved file content only"));
+        assert!(rendered.contains("Memory JSON:"));
+        assert!(rendered.contains("\"mem-1\""));
+        assert!(!rendered.contains("Artifact observations JSON:"));
+        assert!(!rendered.contains("Trace summary:"));
+        assert!(!rendered.contains("\"memo_logs\""));
+    }
+
+    #[test]
+    fn timeline_judge_input_preserves_late_named_steps() {
+        let timeline = (0..20)
+            .map(|index| {
+                serde_json::json!({
+                    "sequence": index + 1,
+                    "offset_ms": index * 10,
+                    "scope": "/left-leg[0]",
+                    "module": "cognition-gate",
+                    "step": if index < 10 { "first" } else { "final" },
+                    "variant": "cognition-appended",
+                    "content": if index < 10 { "ocean" } else { "returned to ocean" },
+                    "origin": "/cognition-gate[0]",
+                })
+            })
+            .collect::<Vec<_>>();
+        let request = RubricJudgeRequest {
+            artifact: CaseArtifact::new("output").with_observation("timeline", timeline),
+            ..empty_request(vec![RubricJudgeInput::Timeline])
+        };
+
+        let rendered = render_judge_input(&empty_trace(), &request);
+
+        assert!(rendered.contains("step first"));
+        assert!(rendered.contains("step final"));
+        assert!(rendered.contains("returned to ocean"));
     }
 
     #[test]

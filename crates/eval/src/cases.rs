@@ -5,8 +5,14 @@ use std::{
 };
 
 use chrono::{DateTime, Datelike as _, FixedOffset, NaiveDate, TimeZone as _, Utc};
-use eure::{FromEure, value::Text};
-use nuillu_types::{MemoryRank, ModuleId, PolicyRank, builtin};
+use eure::{
+    FromEure,
+    document::parse::{ParseContext, ParseError, ParseErrorKind},
+    value::Text,
+};
+use nuillu_types::{
+    MemoryRank, ModuleId, PolicyRank, ReplicaIndex, ScopeId, SubsystemId, SubsystemInstanceId,
+};
 use thiserror::Error;
 
 fn default_weight() -> i64 {
@@ -37,6 +43,14 @@ fn default_memo_replica() -> u8 {
     0
 }
 
+fn default_scope() -> String {
+    "/".to_string()
+}
+
+fn default_cognition_module() -> String {
+    "cognition-gate".to_string()
+}
+
 fn default_pass_score() -> f64 {
     0.8
 }
@@ -47,6 +61,14 @@ fn default_judge_max_output_tokens() -> u32 {
 
 fn default_max_llm_calls() -> Option<u64> {
     Some(10)
+}
+
+fn default_case_timeout_ms() -> u64 {
+    60_000
+}
+
+fn default_wait_max_matches() -> usize {
+    1
 }
 
 fn default_quiet_sleep_threshold_ms() -> u64 {
@@ -67,24 +89,28 @@ fn default_wake_arousal_at_most() -> f64 {
 
 #[derive(Debug, Clone, FromEure)]
 #[eure(crate = ::eure::document, rename_all = "kebab-case")]
-pub struct FullAgentCaseFile {
+pub struct RuntimeCaseFile {
     #[eure(flatten)]
-    pub case: FullAgentCase,
+    pub case: RuntimeCase,
 }
 
 #[derive(Debug, Clone, FromEure)]
 #[eure(crate = ::eure::document, rename_all = "kebab-case")]
-pub struct FullAgentCase {
+pub struct RuntimeCase {
     #[eure(default)]
     pub id: Option<String>,
     #[eure(default)]
     pub description: Option<Text>,
+    /// Runtime topology to evaluate, resolved relative to this case file.
+    pub runtime_config: String,
     #[eure(default)]
     pub now: Option<String>,
     #[eure(default)]
-    pub modules: Option<Vec<EvalModule>>,
+    pub prompt: Option<Text>,
     #[eure(default)]
-    pub inputs: Vec<FullAgentInput>,
+    pub context: Option<Text>,
+    #[eure(default)]
+    pub inputs: Vec<Stimulus>,
     #[eure(default)]
     pub steps: Vec<EvalStep>,
     #[eure(default)]
@@ -96,13 +122,19 @@ pub struct FullAgentCase {
     #[eure(default)]
     pub memories: Vec<MemorySeed>,
     #[eure(default)]
+    pub memory_links: Vec<MemoryLinkSeed>,
+    #[eure(default)]
+    pub policies: Vec<PolicySeed>,
+    #[eure(default)]
     pub memos: Vec<MemoSeed>,
+    #[eure(default)]
+    pub cognition_log: Vec<CognitionLogSeed>,
     #[eure(default)]
     pub limits: EvalLimits,
     #[eure(default)]
-    pub checks: Vec<Check>,
+    pub assertions: Vec<Assertion>,
     #[eure(default)]
-    pub modules_checks: Vec<ModuleChecks>,
+    pub measurements: Vec<Measurement>,
     #[eure(default)]
     pub scoring: CaseScoring,
 }
@@ -120,7 +152,7 @@ pub struct ActivateAllocation {
     rename_all = "kebab-case",
     rename_all_fields = "kebab-case"
 )]
-pub enum FullAgentInput {
+pub enum Stimulus {
     Heard {
         #[eure(default)]
         direction: Option<String>,
@@ -155,13 +187,21 @@ pub struct AmbientSensoryInputEntry {
 #[eure(crate = ::eure::document, rename_all = "kebab-case")]
 pub struct EvalStep {
     #[eure(default)]
+    pub id: Option<String>,
+    #[eure(default)]
     pub description: Option<Text>,
     #[eure(default)]
-    pub inputs: Vec<FullAgentInput>,
+    pub terminal: bool,
+    #[eure(default)]
+    pub inputs: Vec<Stimulus>,
+    #[eure(default)]
+    pub memos: Vec<MemoSeed>,
+    #[eure(default)]
+    pub cognition_log: Vec<CognitionLogSeed>,
     #[eure(default)]
     pub wait_for: Option<WaitFor>,
     #[eure(default)]
-    pub checks: Vec<Check>,
+    pub assertions: Vec<Assertion>,
 }
 
 #[derive(Debug, Clone, FromEure)]
@@ -172,7 +212,20 @@ pub struct EvalStep {
 )]
 pub enum WaitFor {
     MemoFrom {
+        #[eure(default)]
+        scope: Option<String>,
         module: EvalModule,
+        timeout_ms: u64,
+    },
+    UtteranceFrom {
+        #[eure(default)]
+        scope: Option<String>,
+        module: EvalModule,
+        target: String,
+        #[eure(default)]
+        until_assertion: Option<String>,
+        #[eure(default = "default_wait_max_matches")]
+        max_matches: usize,
         timeout_ms: u64,
     },
     Interoception {
@@ -186,185 +239,51 @@ pub enum WaitFor {
     },
 }
 
-#[derive(Debug, Clone, FromEure)]
-#[eure(crate = ::eure::document, rename_all = "kebab-case")]
-pub struct ModuleCaseFile {
-    #[eure(flatten)]
-    pub case: ModuleCase,
-}
-
-#[derive(Debug, Clone, FromEure)]
-#[eure(crate = ::eure::document, rename_all = "kebab-case")]
-pub struct ModuleCase {
-    #[eure(default)]
-    pub id: Option<String>,
-    #[eure(default)]
-    pub description: Option<Text>,
-    #[eure(default)]
-    pub now: Option<String>,
-    #[eure(default)]
-    pub modules: Option<Vec<EvalModule>>,
-    pub prompt: Text,
-    #[eure(default)]
-    pub context: Option<Text>,
-    #[eure(default)]
-    pub allow_empty_output: bool,
-    #[eure(default)]
-    pub participants: Vec<String>,
-    #[eure(default)]
-    pub memories: Vec<MemorySeed>,
-    #[eure(default)]
-    pub memory_links: Vec<MemoryLinkSeed>,
-    #[eure(default)]
-    pub policies: Vec<PolicySeed>,
-    #[eure(default)]
-    pub memos: Vec<MemoSeed>,
-    #[eure(default)]
-    pub cognition_log: Vec<CognitionLogSeed>,
-    #[eure(default)]
-    pub inputs: Vec<FullAgentInput>,
-    #[eure(default)]
-    pub steps: Vec<ModuleEvalStep>,
-    #[eure(default)]
-    pub limits: EvalLimits,
-    #[eure(default)]
-    pub checks: Vec<Check>,
-    #[eure(default)]
-    pub scoring: CaseScoring,
-}
-
-#[derive(Debug, Clone, FromEure)]
-#[eure(crate = ::eure::document, rename_all = "kebab-case")]
-pub struct ModuleEvalStep {
-    #[eure(default)]
-    pub description: Option<Text>,
-    #[eure(default)]
-    pub memos: Vec<MemoSeed>,
-    #[eure(default)]
-    pub cognition_log: Vec<CognitionLogSeed>,
-    #[eure(default)]
-    pub inputs: Vec<FullAgentInput>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, clap::ValueEnum, FromEure)]
-#[eure(crate = ::eure::document, rename_all = "kebab-case")]
-pub enum EvalModule {
-    Sensory,
-    CognitionGate,
-    Allocation,
-    Action,
-    AttentionSchema,
-    Interpreter,
-    SelfModel,
-    QueryMemory,
-    Memory,
-    MemoryCompaction,
-    MemoryAssociation,
-    Dreaming,
-    Interoception,
-    Homeostasis,
-    Policy,
-    PolicyCompaction,
-    Reward,
-    Predict,
-    Surprise,
-    Speak,
-}
-
-pub const DEFAULT_FULL_AGENT_MODULES: &[EvalModule] = &[
-    EvalModule::Sensory,
-    EvalModule::CognitionGate,
-    EvalModule::Allocation,
-    EvalModule::Action,
-    EvalModule::AttentionSchema,
-    EvalModule::Interpreter,
-    EvalModule::SelfModel,
-    EvalModule::QueryMemory,
-    EvalModule::Memory,
-    EvalModule::MemoryCompaction,
-    EvalModule::MemoryAssociation,
-    EvalModule::Dreaming,
-    EvalModule::Interoception,
-    EvalModule::Homeostasis,
-    EvalModule::Policy,
-    EvalModule::PolicyCompaction,
-    EvalModule::Reward,
-    EvalModule::Predict,
-    EvalModule::Surprise,
-    EvalModule::Speak,
-];
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct EvalModule(ModuleId);
 
 impl EvalModule {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Sensory => "sensory",
-            Self::CognitionGate => "cognition-gate",
-            Self::Allocation => "allocation",
-            Self::Action => "action",
-            Self::AttentionSchema => "attention-schema",
-            Self::Interpreter => "interpreter",
-            Self::SelfModel => "self-model",
-            Self::QueryMemory => "query-memory",
-            Self::Memory => "memory",
-            Self::MemoryCompaction => "memory-compaction",
-            Self::MemoryAssociation => "memory-association",
-            Self::Dreaming => "dreaming",
-            Self::Interoception => "interoception",
-            Self::Homeostasis => "homeostasis",
-            Self::Policy => "policy",
-            Self::PolicyCompaction => "policy-compaction",
-            Self::Reward => "reward",
-            Self::Predict => "predict",
-            Self::Surprise => "surprise",
-            Self::Speak => "speak",
-        }
+    pub fn new(value: impl Into<String>) -> Result<Self, nuillu_types::ModuleIdParseError> {
+        ModuleId::new(value).map(Self)
     }
 
-    pub fn module_id(self) -> ModuleId {
-        match self {
-            Self::Sensory => builtin::sensory(),
-            Self::CognitionGate => builtin::cognition_gate(),
-            Self::Allocation => builtin::allocation(),
-            Self::Action => builtin::action(),
-            Self::AttentionSchema => builtin::attention_schema(),
-            Self::Interpreter => builtin::interpreter(),
-            Self::SelfModel => builtin::self_model(),
-            Self::QueryMemory => builtin::query_memory(),
-            Self::Memory => builtin::memory(),
-            Self::MemoryCompaction => builtin::memory_compaction(),
-            Self::MemoryAssociation => builtin::memory_association(),
-            Self::Dreaming => builtin::dreaming(),
-            Self::Interoception => builtin::interoception(),
-            Self::Homeostasis => builtin::homeostasis(),
-            Self::Policy => builtin::policy(),
-            Self::PolicyCompaction => builtin::policy_compaction(),
-            Self::Reward => builtin::reward(),
-            Self::Predict => builtin::predict(),
-            Self::Surprise => builtin::surprise(),
-            Self::Speak => builtin::speak(),
-        }
+    pub fn as_str(&self) -> &str {
+        self.0.as_str()
     }
 
-    pub fn is_action_module(self) -> bool {
-        matches!(self, Self::Action | Self::Speak)
-    }
-
-    pub fn is_action_target(self) -> bool {
-        matches!(self, Self::Speak)
+    pub fn module_id(&self) -> ModuleId {
+        self.0.clone()
     }
 }
 
-impl FullAgentCase {
-    pub fn effective_modules(&self) -> Vec<EvalModule> {
-        self.modules
-            .clone()
-            .unwrap_or_else(|| DEFAULT_FULL_AGENT_MODULES.to_vec())
-    }
+impl std::str::FromStr for EvalModule {
+    type Err = nuillu_types::ModuleIdParseError;
 
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Self::new(value)
+    }
+}
+
+impl eure::document::parse::FromEure<'_> for EvalModule {
+    type Error = ParseError;
+
+    fn parse(ctx: &ParseContext<'_>) -> Result<Self, Self::Error> {
+        let value: String = ctx.parse()?;
+        Self::new(value.clone()).map_err(|error| ParseError {
+            node_id: ctx.node_id(),
+            kind: ParseErrorKind::InvalidPattern {
+                kind: "module-id".to_owned(),
+                reason: format!("invalid module id {value:?}: {error}"),
+            },
+        })
+    }
+}
+
+impl RuntimeCase {
     /// Inputs flattened across steps, or the legacy `inputs` list when
     /// `steps` is empty. Used for places that need to summarize the entire
     /// sensory feed of a case (e.g. judge prompt rendering).
-    pub fn flat_inputs(&self) -> Vec<&FullAgentInput> {
+    pub fn flat_inputs(&self) -> Vec<&Stimulus> {
         if !self.steps.is_empty() {
             self.steps
                 .iter()
@@ -376,192 +295,96 @@ impl FullAgentCase {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ModuleEvalTarget {
-    Sensory,
-    CognitionGate,
-    Action,
-    QueryMemory,
-    AttentionSchema,
-    Interpreter,
-    SelfModel,
-    Memory,
-    MemoryCompaction,
-    MemoryAssociation,
-    Dreaming,
-    Policy,
-    PolicyCompaction,
-    Allocation,
-    Predict,
-    Surprise,
-    Speak,
-}
-
-impl ModuleEvalTarget {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Sensory => "sensory",
-            Self::CognitionGate => "cognition-gate",
-            Self::Action => "action",
-            Self::QueryMemory => "query-memory",
-            Self::AttentionSchema => "attention-schema",
-            Self::Interpreter => "interpreter",
-            Self::SelfModel => "self-model",
-            Self::Memory => "memory",
-            Self::MemoryCompaction => "memory-compaction",
-            Self::MemoryAssociation => "memory-association",
-            Self::Dreaming => "dreaming",
-            Self::Policy => "policy",
-            Self::PolicyCompaction => "policy-compaction",
-            Self::Allocation => "allocation",
-            Self::Predict => "predict",
-            Self::Surprise => "surprise",
-            Self::Speak => "speak",
-        }
-    }
-
-    pub fn module(self) -> EvalModule {
-        match self {
-            Self::Sensory => EvalModule::Sensory,
-            Self::CognitionGate => EvalModule::CognitionGate,
-            Self::Action => EvalModule::Action,
-            Self::QueryMemory => EvalModule::QueryMemory,
-            Self::AttentionSchema => EvalModule::AttentionSchema,
-            Self::Interpreter => EvalModule::Interpreter,
-            Self::SelfModel => EvalModule::SelfModel,
-            Self::Memory => EvalModule::Memory,
-            Self::MemoryCompaction => EvalModule::MemoryCompaction,
-            Self::MemoryAssociation => EvalModule::MemoryAssociation,
-            Self::Dreaming => EvalModule::Dreaming,
-            Self::Policy => EvalModule::Policy,
-            Self::PolicyCompaction => EvalModule::PolicyCompaction,
-            Self::Allocation => EvalModule::Allocation,
-            Self::Predict => EvalModule::Predict,
-            Self::Surprise => EvalModule::Surprise,
-            Self::Speak => EvalModule::Speak,
-        }
-    }
-
-    fn from_path(path: &Path) -> Option<Self> {
-        path.components()
-            .filter_map(|component| component.as_os_str().to_str())
-            .find_map(|part| match part {
-                "sensory" => Some(Self::Sensory),
-                "cognition-gate" => Some(Self::CognitionGate),
-                "action" => Some(Self::Action),
-                "query-memory" => Some(Self::QueryMemory),
-                "attention-schema" => Some(Self::AttentionSchema),
-                "interpreter" => Some(Self::Interpreter),
-                "self-model" => Some(Self::SelfModel),
-                "memory" => Some(Self::Memory),
-                "memory-compaction" => Some(Self::MemoryCompaction),
-                "memory-association" => Some(Self::MemoryAssociation),
-                "dreaming" => Some(Self::Dreaming),
-                "policy" => Some(Self::Policy),
-                "policy-compaction" => Some(Self::PolicyCompaction),
-                "allocation" => Some(Self::Allocation),
-                "predict" => Some(Self::Predict),
-                "surprise" => Some(Self::Surprise),
-                "speak" => Some(Self::Speak),
-                _ => None,
-            })
-    }
-}
-
 #[derive(Debug, Clone)]
 pub enum EvalCase {
-    FullAgent(FullAgentCase),
-    Module {
-        target: ModuleEvalTarget,
-        case: ModuleCase,
-    },
+    Runtime(RuntimeCase),
 }
 
 impl EvalCase {
     pub fn id(&self) -> Option<&str> {
         match self {
-            Self::FullAgent(case) => case.id.as_deref(),
-            Self::Module { case, .. } => case.id.as_deref(),
+            Self::Runtime(case) => case.id.as_deref(),
         }
     }
 
     pub fn description(&self) -> Option<&Text> {
         match self {
-            Self::FullAgent(case) => case.description.as_ref(),
-            Self::Module { case, .. } => case.description.as_ref(),
+            Self::Runtime(case) => case.description.as_ref(),
         }
     }
 
     pub fn memories(&self) -> &[MemorySeed] {
         match self {
-            Self::FullAgent(case) => &case.memories,
-            Self::Module { case, .. } => &case.memories,
+            Self::Runtime(case) => &case.memories,
         }
     }
 
     pub fn memory_links(&self) -> &[MemoryLinkSeed] {
         match self {
-            Self::FullAgent(_) => &[],
-            Self::Module { case, .. } => &case.memory_links,
+            Self::Runtime(case) => &case.memory_links,
         }
     }
 
     pub fn policies(&self) -> &[PolicySeed] {
         match self {
-            Self::FullAgent(_) => &[],
-            Self::Module { case, .. } => &case.policies,
+            Self::Runtime(case) => &case.policies,
         }
     }
 
     pub fn limits(&self) -> &EvalLimits {
         match self {
-            Self::FullAgent(case) => &case.limits,
-            Self::Module { case, .. } => &case.limits,
+            Self::Runtime(case) => &case.limits,
         }
     }
 
-    pub fn checks(&self) -> &[Check] {
+    pub fn assertions(&self) -> &[Assertion] {
         match self {
-            Self::FullAgent(case) => &case.checks,
-            Self::Module { case, .. } => &case.checks,
+            Self::Runtime(case) => &case.assertions,
         }
     }
 
-    pub fn modules_checks(&self) -> &[ModuleChecks] {
+    pub fn measurements(&self) -> &[Measurement] {
         match self {
-            Self::FullAgent(case) => &case.modules_checks,
-            Self::Module { .. } => &[],
+            Self::Runtime(case) => &case.measurements,
         }
     }
 
     pub fn scoring(&self) -> &CaseScoring {
         match self {
-            Self::FullAgent(case) => &case.scoring,
-            Self::Module { case, .. } => &case.scoring,
+            Self::Runtime(case) => &case.scoring,
         }
     }
 
     pub fn prompt_for_judge(&self) -> String {
         match self {
-            Self::FullAgent(case) => case
-                .flat_inputs()
-                .into_iter()
-                .map(FullAgentInput::as_prompt_line)
-                .collect::<Vec<_>>()
-                .join("\n"),
-            Self::Module { case, .. } => case.prompt.content.clone(),
+            Self::Runtime(case) => case
+                .prompt
+                .as_ref()
+                .map(|prompt| prompt.content.clone())
+                .unwrap_or_else(|| {
+                    case.flat_inputs()
+                        .into_iter()
+                        .map(Stimulus::as_prompt_line)
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                }),
         }
     }
 
     pub fn context_for_judge(&self) -> Option<String> {
         match self {
-            Self::FullAgent(_) => None,
-            Self::Module { case, .. } => case.context.as_ref().map(|text| text.content.clone()),
+            Self::Runtime(case) => case.context.as_ref().map(|text| text.content.clone()),
+        }
+    }
+
+    pub fn runtime(&self) -> &RuntimeCase {
+        match self {
+            Self::Runtime(case) => case,
         }
     }
 }
 
-impl FullAgentInput {
+impl Stimulus {
     pub fn as_prompt_line(&self) -> String {
         match self {
             Self::Heard { direction, content } => {
@@ -614,6 +437,8 @@ fn direction_suffix(direction: &Option<String>) -> String {
 pub struct EvalLimits {
     #[eure(default = "default_max_llm_calls")]
     pub max_llm_calls: Option<u64>,
+    #[eure(default = "default_case_timeout_ms")]
+    pub timeout_ms: u64,
     #[eure(default)]
     pub interoception: EvalInteroceptionLimits,
 }
@@ -622,6 +447,7 @@ impl Default for EvalLimits {
     fn default() -> Self {
         Self {
             max_llm_calls: default_max_llm_calls(),
+            timeout_ms: default_case_timeout_ms(),
             interoception: EvalInteroceptionLimits::default(),
         }
     }
@@ -669,6 +495,8 @@ impl EvalInteroceptiveMode {
 #[derive(Debug, Clone, FromEure)]
 #[eure(crate = ::eure::document, rename_all = "kebab-case")]
 pub struct MemorySeed {
+    #[eure(default = "default_scope")]
+    pub scope: String,
     #[eure(default)]
     pub index: Option<String>,
     #[eure(default = "default_memory_rank")]
@@ -705,6 +533,8 @@ pub struct PolicySeed {
 #[derive(Debug, Clone, FromEure)]
 #[eure(crate = ::eure::document, rename_all = "kebab-case")]
 pub struct MemoSeed {
+    #[eure(default = "default_scope")]
+    pub scope: String,
     pub module: String,
     #[eure(default = "default_memo_replica")]
     pub replica: u8,
@@ -718,6 +548,12 @@ pub struct MemoSeed {
 #[derive(Debug, Clone, FromEure)]
 #[eure(crate = ::eure::document, rename_all = "kebab-case")]
 pub struct CognitionLogSeed {
+    #[eure(default = "default_scope")]
+    pub scope: String,
+    #[eure(default = "default_cognition_module")]
+    pub module: String,
+    #[eure(default = "default_memo_replica")]
+    pub replica: u8,
     pub text: Text,
     #[eure(default = "default_seed_seconds_ago")]
     pub seconds_ago: i64,
@@ -769,7 +605,7 @@ impl From<PolicySeedRank> for PolicyRank {
 
 #[derive(Debug, Clone, Default, FromEure)]
 #[eure(crate = ::eure::document, rename_all = "kebab-case")]
-pub struct CheckCommon {
+pub struct AssertionCommon {
     #[eure(default)]
     pub name: Option<String>,
     #[eure(default)]
@@ -780,30 +616,82 @@ pub struct CheckCommon {
 
 #[derive(Debug, Clone, FromEure)]
 #[eure(crate = ::eure::document, rename_all = "kebab-case")]
-pub struct ModuleChecks {
-    pub module: EvalModule,
+pub struct EventSelectorSpec {
     #[eure(default)]
-    pub rubrics: Vec<ModuleRubric>,
+    pub scopes: Vec<String>,
+    #[eure(default)]
+    pub origin_scopes: Vec<String>,
+    #[eure(default)]
+    pub modules: Vec<EvalModule>,
+    #[eure(default)]
+    pub variants: Vec<String>,
+    #[eure(default)]
+    pub steps: Vec<String>,
+    #[eure(default)]
+    pub replicas: Vec<u8>,
 }
 
 #[derive(Debug, Clone, FromEure)]
-#[eure(crate = ::eure::document, rename_all = "kebab-case")]
-pub struct ModuleRubric {
-    #[eure(default)]
-    pub name: Option<String>,
-    pub rubric: Text,
-    #[eure(default = "default_pass_score")]
-    pub pass_score: f64,
-    pub judge_inputs: Vec<RubricJudgeInput>,
-    #[eure(default)]
-    pub criteria: Vec<RubricCriterion>,
+#[eure(
+    crate = ::eure::document,
+    rename_all = "kebab-case",
+    rename_all_fields = "kebab-case"
+)]
+pub enum Measurement {
+    Count {
+        name: String,
+        select: EventSelectorSpec,
+    },
+    FirstMatchLatency {
+        name: String,
+        select: EventSelectorSpec,
+        #[eure(default)]
+        group_by_scope: bool,
+    },
+    UniqueScopeCount {
+        name: String,
+        select: EventSelectorSpec,
+    },
+    ScopeCoverage {
+        name: String,
+        select: EventSelectorSpec,
+        scopes: Vec<String>,
+    },
+    ScopeConvergenceLatency {
+        name: String,
+        select: EventSelectorSpec,
+        scopes: Vec<String>,
+    },
 }
 
-impl ModuleRubric {
-    pub fn display_name(&self) -> String {
-        self.name
-            .clone()
-            .unwrap_or_else(|| "module-rubric".to_string())
+impl Measurement {
+    pub fn name(&self) -> &str {
+        match self {
+            Self::Count { name, .. }
+            | Self::FirstMatchLatency { name, .. }
+            | Self::UniqueScopeCount { name, .. }
+            | Self::ScopeCoverage { name, .. }
+            | Self::ScopeConvergenceLatency { name, .. } => name,
+        }
+    }
+
+    fn selector(&self) -> &EventSelectorSpec {
+        match self {
+            Self::Count { select, .. }
+            | Self::FirstMatchLatency { select, .. }
+            | Self::UniqueScopeCount { select, .. }
+            | Self::ScopeCoverage { select, .. }
+            | Self::ScopeConvergenceLatency { select, .. } => select,
+        }
+    }
+
+    fn expected_scopes(&self) -> &[String] {
+        match self {
+            Self::ScopeCoverage { scopes, .. } | Self::ScopeConvergenceLatency { scopes, .. } => {
+                scopes
+            }
+            _ => &[],
+        }
     }
 }
 
@@ -819,6 +707,7 @@ pub enum ArtifactTextField {
 pub enum RubricJudgeInput {
     Output,
     Utterance,
+    Timeline,
     Failure,
     Trace,
     Memory,
@@ -839,36 +728,36 @@ pub enum RubricJudgeInput {
     rename_all = "kebab-case",
     rename_all_fields = "kebab-case"
 )]
-pub enum Check {
+pub enum Assertion {
     ArtifactTextContains {
         #[eure(flatten)]
-        common: CheckCommon,
+        common: AssertionCommon,
         #[eure(default)]
         field: Option<ArtifactTextField>,
         contains: String,
     },
     ArtifactTextExact {
         #[eure(flatten)]
-        common: CheckCommon,
+        common: AssertionCommon,
         #[eure(default)]
         field: Option<ArtifactTextField>,
         exact: Text,
     },
     JsonPointerEquals {
         #[eure(flatten)]
-        common: CheckCommon,
+        common: AssertionCommon,
         pointer: String,
         expected: String,
     },
     JsonPointerContains {
         #[eure(flatten)]
-        common: CheckCommon,
+        common: AssertionCommon,
         pointer: String,
         contains: String,
     },
     JsonPointerNumericInRange {
         #[eure(flatten)]
-        common: CheckCommon,
+        common: AssertionCommon,
         pointer: String,
         #[eure(default)]
         min: Option<f64>,
@@ -877,7 +766,7 @@ pub enum Check {
     },
     Rubric {
         #[eure(flatten)]
-        common: CheckCommon,
+        common: AssertionCommon,
         rubric: Text,
         #[eure(default = "default_pass_score")]
         pass_score: f64,
@@ -887,24 +776,24 @@ pub enum Check {
     },
     TraceSpan {
         #[eure(flatten)]
-        common: CheckCommon,
+        common: AssertionCommon,
         span_name: String,
     },
     TraceEvent {
         #[eure(flatten)]
-        common: CheckCommon,
+        common: AssertionCommon,
         message_contains: String,
     },
     TraceToolCall {
         #[eure(flatten)]
-        common: CheckCommon,
+        common: AssertionCommon,
         tool_name: String,
         #[eure(default)]
         args_json_contains: Option<Text>,
     },
     TraceSpansOrdered {
         #[eure(flatten)]
-        common: CheckCommon,
+        common: AssertionCommon,
         names: Vec<String>,
     },
 }
@@ -935,8 +824,8 @@ impl Default for CaseScoring {
     }
 }
 
-impl Check {
-    pub fn common(&self) -> &CheckCommon {
+impl Assertion {
+    pub fn common(&self) -> &AssertionCommon {
         match self {
             Self::ArtifactTextContains { common, .. }
             | Self::ArtifactTextExact { common, .. }
@@ -989,41 +878,173 @@ pub enum CaseFileError {
 }
 
 pub fn parse_case_file(path: &Path) -> Result<EvalCase, CaseFileError> {
-    if is_full_agent_case_path(path) {
-        return parse_full_agent_case_file(path).map(EvalCase::FullAgent);
+    parse_runtime_case_file(path).map(EvalCase::Runtime)
+}
+
+pub fn parse_runtime_case_file(path: &Path) -> Result<RuntimeCase, CaseFileError> {
+    let content = read_case(path)?;
+    let mut file: RuntimeCaseFile =
+        eure::parse_content(&content, path.to_path_buf()).map_err(|message| {
+            CaseFileError::Parse {
+                path: path.to_path_buf(),
+                message,
+            }
+        })?;
+    validate_runtime_case(path, &file.case)?;
+    let config_path = path
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join(&file.case.runtime_config);
+    let config_content =
+        fs::read_to_string(&config_path).map_err(|source| CaseFileError::Read {
+            path: config_path.clone(),
+            source,
+        })?;
+    let boot_config =
+        nuillu_server::parse_server_boot_config_content(&config_content, &config_path).map_err(
+            |error| CaseFileError::Validation {
+                path: path.to_path_buf(),
+                message: format!(
+                    "invalid runtime-config {}: {error:#}",
+                    config_path.display()
+                ),
+            },
+        )?;
+    let configured_modules = boot_config
+        .modules
+        .iter()
+        .map(nuillu_server::ServerModuleSpec::module_id)
+        .chain(
+            boot_config
+                .expanded_subsystems()
+                .into_iter()
+                .flat_map(|expanded| {
+                    expanded
+                        .definition
+                        .modules
+                        .iter()
+                        .map(nuillu_server::ServerModuleSpec::module_id)
+                        .collect::<Vec<_>>()
+                }),
+        )
+        .collect::<BTreeSet<_>>();
+    let configured_scopes = std::iter::once("/".to_string())
+        .chain(
+            boot_config
+                .expanded_subsystems()
+                .into_iter()
+                .map(|expanded| expanded.scope.to_string()),
+        )
+        .collect::<BTreeSet<_>>();
+    for scope in file
+        .case
+        .memories
+        .iter()
+        .map(|seed| seed.scope.as_str())
+        .chain(file.case.memos.iter().map(|seed| seed.scope.as_str()))
+        .chain(
+            file.case
+                .cognition_log
+                .iter()
+                .map(|seed| seed.scope.as_str()),
+        )
+        .chain(
+            file.case
+                .steps
+                .iter()
+                .flat_map(|step| step.memos.iter().map(|seed| seed.scope.as_str())),
+        )
+        .chain(
+            file.case
+                .steps
+                .iter()
+                .flat_map(|step| step.cognition_log.iter().map(|seed| seed.scope.as_str())),
+        )
+        .chain(
+            file.case
+                .steps
+                .iter()
+                .filter_map(|step| match &step.wait_for {
+                    Some(
+                        WaitFor::MemoFrom {
+                            scope: Some(scope), ..
+                        }
+                        | WaitFor::UtteranceFrom {
+                            scope: Some(scope), ..
+                        },
+                    ) => Some(scope.as_str()),
+                    _ => None,
+                }),
+        )
+    {
+        let normalized = parse_scope_id(scope)
+            .expect("fixture scope validated before runtime config")
+            .to_string();
+        if !configured_scopes.contains(&normalized) {
+            return Err(CaseFileError::Validation {
+                path: path.to_path_buf(),
+                message: format!(
+                    "referenced scope {scope:?} is absent from runtime-config {}",
+                    config_path.display()
+                ),
+            });
+        }
     }
-    let target = ModuleEvalTarget::from_path(path).ok_or_else(|| CaseFileError::Validation {
-        path: path.to_path_buf(),
-        message: "module eval case path must include a supported module directory".to_string(),
-    })?;
-    let case = parse_module_case_file(path)?;
-    validate_module_case_target(path, target, &case)?;
-    Ok(EvalCase::Module { target, case })
-}
-
-pub fn parse_full_agent_case_file(path: &Path) -> Result<FullAgentCase, CaseFileError> {
-    let content = read_case(path)?;
-    let file: FullAgentCaseFile =
-        eure::parse_content(&content, path.to_path_buf()).map_err(|message| {
-            CaseFileError::Parse {
+    for activation in &file.case.activate_allocation {
+        if !configured_modules.contains(&activation.module.0) {
+            return Err(CaseFileError::Validation {
                 path: path.to_path_buf(),
-                message,
+                message: format!(
+                    "activate-allocation module {:?} is not present in runtime-config {}",
+                    activation.module.as_str(),
+                    config_path.display()
+                ),
+            });
+        }
+    }
+    for measurement in &file.case.measurements {
+        let selector = measurement.selector();
+        for module in &selector.modules {
+            if !configured_modules.contains(&module.0) {
+                return Err(CaseFileError::Validation {
+                    path: path.to_path_buf(),
+                    message: format!(
+                        "measurement {:?} selects module {:?} absent from runtime-config",
+                        measurement.name(),
+                        module.as_str()
+                    ),
+                });
             }
-        })?;
-    validate_full_agent_case(path, &file.case)?;
-    Ok(file.case)
-}
-
-pub fn parse_module_case_file(path: &Path) -> Result<ModuleCase, CaseFileError> {
-    let content = read_case(path)?;
-    let file: ModuleCaseFile =
-        eure::parse_content(&content, path.to_path_buf()).map_err(|message| {
-            CaseFileError::Parse {
-                path: path.to_path_buf(),
-                message,
+        }
+        for scope in selector
+            .scopes
+            .iter()
+            .chain(&selector.origin_scopes)
+            .chain(measurement.expected_scopes())
+        {
+            if !configured_scopes.contains(scope) {
+                return Err(CaseFileError::Validation {
+                    path: path.to_path_buf(),
+                    message: format!(
+                        "measurement {:?} selects scope {scope:?} absent from runtime-config",
+                        measurement.name()
+                    ),
+                });
             }
-        })?;
-    validate_module_case(path, &file.case)?;
+        }
+        for variant in &selector.variants {
+            if !crate::timeline::EVENT_VARIANTS.contains(&variant.as_str()) {
+                return Err(CaseFileError::Validation {
+                    path: path.to_path_buf(),
+                    message: format!(
+                        "measurement {:?} selects unknown event variant {variant:?}",
+                        measurement.name()
+                    ),
+                });
+            }
+        }
+    }
+    file.case.runtime_config = config_path.display().to_string();
     Ok(file.case)
 }
 
@@ -1115,100 +1136,213 @@ fn is_persisted_eval_output_file_name(name: &str) -> bool {
     )
 }
 
-pub(crate) fn is_full_agent_case_path(path: &Path) -> bool {
-    path.components()
-        .filter_map(|component| component.as_os_str().to_str())
-        .any(|part| part == "full-agent")
-}
-
-fn validate_full_agent_case(path: &Path, case: &FullAgentCase) -> Result<(), CaseFileError> {
+fn validate_runtime_case(path: &Path, case: &RuntimeCase) -> Result<(), CaseFileError> {
+    if case.runtime_config.trim().is_empty() {
+        return Err(CaseFileError::Validation {
+            path: path.to_path_buf(),
+            message: "runtime-config must not be empty".to_string(),
+        });
+    }
     if !case.inputs.is_empty() && !case.steps.is_empty() {
         return Err(CaseFileError::Validation {
             path: path.to_path_buf(),
-            message: "full-agent case must use either `inputs` or `steps`, not both".to_string(),
+            message: "runtime case must use either `inputs` or `steps`, not both".to_string(),
         });
     }
-    if case.inputs.is_empty() && case.steps.is_empty() {
+    if case.inputs.is_empty()
+        && case.steps.is_empty()
+        && case.memos.is_empty()
+        && case.cognition_log.is_empty()
+        && case.policies.is_empty()
+        && case.memories.is_empty()
+    {
         return Err(CaseFileError::Validation {
             path: path.to_path_buf(),
-            message: "full-agent case must have at least one input or one step".to_string(),
+            message: "eval case must have setup state, stimuli, or a scenario step".to_string(),
         });
     }
     for (index, input) in case.inputs.iter().enumerate() {
-        validate_full_agent_input(path, &format!("inputs[{index}]"), input)?;
+        validate_stimulus(path, &format!("inputs[{index}]"), input)?;
     }
+    let mut step_ids = BTreeSet::new();
     for (step_index, step) in case.steps.iter().enumerate() {
-        if step.inputs.is_empty() && step.wait_for.is_none() {
+        if step
+            .id
+            .as_deref()
+            .is_some_and(|step_id| step_id.trim().is_empty())
+        {
+            return Err(CaseFileError::Validation {
+                path: path.to_path_buf(),
+                message: format!("steps[{step_index}].id must not be empty"),
+            });
+        }
+        let effective_step_id = step
+            .id
+            .clone()
+            .unwrap_or_else(|| format!("step-{}", step_index + 1));
+        if !step_ids.insert(effective_step_id.clone()) {
+            return Err(CaseFileError::Validation {
+                path: path.to_path_buf(),
+                message: format!("duplicate step id {effective_step_id:?}"),
+            });
+        }
+        if step.terminal && step_index + 1 != case.steps.len() {
+            return Err(CaseFileError::Validation {
+                path: path.to_path_buf(),
+                message: format!("steps[{step_index}]: a terminal step must be the final step"),
+            });
+        }
+        if step.terminal && step.wait_for.is_none() {
+            return Err(CaseFileError::Validation {
+                path: path.to_path_buf(),
+                message: format!("steps[{step_index}]: a terminal step must declare wait-for"),
+            });
+        }
+        if step.inputs.is_empty()
+            && step.memos.is_empty()
+            && step.cognition_log.is_empty()
+            && step.wait_for.is_none()
+        {
             return Err(CaseFileError::Validation {
                 path: path.to_path_buf(),
                 message: format!(
-                    "steps[{step_index}].inputs must not be empty unless wait-for is set"
+                    "steps[{step_index}] must contain setup updates, stimuli, or wait-for"
                 ),
             });
         }
         for (input_index, input) in step.inputs.iter().enumerate() {
-            validate_full_agent_input(
+            validate_stimulus(
                 path,
                 &format!("steps[{step_index}].inputs[{input_index}]"),
                 input,
             )?;
         }
+        validate_memo_seeds(path, &format!("steps[{step_index}].memos"), &step.memos)?;
+        validate_cognition_log_seeds(
+            path,
+            &format!("steps[{step_index}].cognition-log"),
+            &step.cognition_log,
+        )?;
         if let Some(wait_for) = &step.wait_for {
             validate_wait_for(path, step_index, wait_for)?;
+            if let WaitFor::UtteranceFrom {
+                until_assertion: Some(assertion_name),
+                ..
+            } = wait_for
+            {
+                if !step.terminal {
+                    return Err(CaseFileError::Validation {
+                        path: path.to_path_buf(),
+                        message: format!(
+                            "steps[{step_index}].wait-for.until-assertion requires terminal = true"
+                        ),
+                    });
+                }
+                let matches = case
+                    .assertions
+                    .iter()
+                    .filter(|assertion| assertion.display_name() == *assertion_name)
+                    .collect::<Vec<_>>();
+                if matches.len() != 1 {
+                    return Err(CaseFileError::Validation {
+                        path: path.to_path_buf(),
+                        message: format!(
+                            "steps[{step_index}].wait-for.until-assertion must name exactly one case assertion, found {} named {assertion_name:?}",
+                            matches.len()
+                        ),
+                    });
+                }
+                if let Assertion::Rubric { judge_inputs, .. } = matches[0]
+                    && judge_inputs.iter().any(|input| {
+                        matches!(
+                            input,
+                            RubricJudgeInput::Trace
+                                | RubricJudgeInput::ToolCalls
+                                | RubricJudgeInput::ToolResults
+                        )
+                    })
+                {
+                    return Err(CaseFileError::Validation {
+                        path: path.to_path_buf(),
+                        message: format!(
+                            "steps[{step_index}].wait-for.until-assertion cannot use trace or tool-call judge inputs during a live runtime"
+                        ),
+                    });
+                }
+            }
         }
-        for check in &step.checks {
+        for check in &step.assertions {
             validate_check(path, check)?;
             if !is_step_compatible_check(check) {
                 return Err(CaseFileError::Validation {
                     path: path.to_path_buf(),
                     message: format!(
-                        "steps[{step_index}].checks: {kind} cannot run mid-step (use the case-level checks instead)",
+                        "steps[{step_index}].assertions: {kind} cannot run mid-step (use the case-level assertions instead)",
                         kind = check.kind_name()
                     ),
                 });
             }
         }
     }
-    validate_modules(path, case.modules.as_deref())?;
+    validate_cognition_log_seeds(path, "cognition-log", &case.cognition_log)?;
     validate_activate_allocation(path, case)?;
-    validate_module_checks(path, case)?;
+    let mut measurement_names = BTreeSet::new();
+    for measurement in &case.measurements {
+        let name = measurement.name();
+        if name.trim().is_empty() {
+            return Err(CaseFileError::Validation {
+                path: path.to_path_buf(),
+                message: "measurement name must not be empty".to_string(),
+            });
+        }
+        if !measurement_names.insert(name) {
+            return Err(CaseFileError::Validation {
+                path: path.to_path_buf(),
+                message: format!("duplicate measurement name {name:?}"),
+            });
+        }
+        for step in &measurement.selector().steps {
+            if step != "input" && !step_ids.contains(step) {
+                return Err(CaseFileError::Validation {
+                    path: path.to_path_buf(),
+                    message: format!("measurement {name:?} selects unknown step {step:?}"),
+                });
+            }
+        }
+    }
     validate_common(
         path,
         case.now.as_deref(),
         &case.memories,
-        &[],
-        &[],
+        &case.memory_links,
+        &case.policies,
         &case.memos,
         &case.limits,
-        &case.checks,
+        &case.assertions,
     )
 }
 
-fn validate_full_agent_input(
-    path: &Path,
-    label: &str,
-    input: &FullAgentInput,
-) -> Result<(), CaseFileError> {
+fn validate_stimulus(path: &Path, label: &str, input: &Stimulus) -> Result<(), CaseFileError> {
     match input {
-        FullAgentInput::Heard { content, .. } if content.content.trim().is_empty() => {
+        Stimulus::Heard { content, .. } if content.content.trim().is_empty() => {
             Err(CaseFileError::Validation {
                 path: path.to_path_buf(),
                 message: format!("{label}.content must not be empty"),
             })
         }
-        FullAgentInput::Seen { appearance, .. } if appearance.content.trim().is_empty() => {
+        Stimulus::Seen { appearance, .. } if appearance.content.trim().is_empty() => {
             Err(CaseFileError::Validation {
                 path: path.to_path_buf(),
                 message: format!("{label}.appearance must not be empty"),
             })
         }
-        FullAgentInput::OneShot { modality, .. } if modality.trim().is_empty() => {
+        Stimulus::OneShot { modality, .. } if modality.trim().is_empty() => {
             Err(CaseFileError::Validation {
                 path: path.to_path_buf(),
                 message: format!("{label}.modality must not be empty"),
             })
         }
-        FullAgentInput::OneShot { content, .. } if content.content.trim().is_empty() => {
+        Stimulus::OneShot { content, .. } if content.content.trim().is_empty() => {
             Err(CaseFileError::Validation {
                 path: path.to_path_buf(),
                 message: format!("{label}.content must not be empty"),
@@ -1223,8 +1357,22 @@ fn validate_wait_for(
     step_index: usize,
     wait_for: &WaitFor,
 ) -> Result<(), CaseFileError> {
+    if let WaitFor::MemoFrom {
+        scope: Some(scope), ..
+    }
+    | WaitFor::UtteranceFrom {
+        scope: Some(scope), ..
+    } = wait_for
+    {
+        parse_scope_id(scope).map_err(|error| CaseFileError::Validation {
+            path: path.to_path_buf(),
+            message: format!("steps[{step_index}].wait-for.scope is invalid: {error}"),
+        })?;
+    }
     match wait_for {
-        WaitFor::MemoFrom { timeout_ms, .. } | WaitFor::Interoception { timeout_ms, .. } => {
+        WaitFor::MemoFrom { timeout_ms, .. }
+        | WaitFor::UtteranceFrom { timeout_ms, .. }
+        | WaitFor::Interoception { timeout_ms, .. } => {
             if *timeout_ms == 0 {
                 return Err(CaseFileError::Validation {
                     path: path.to_path_buf(),
@@ -1233,6 +1381,36 @@ fn validate_wait_for(
                     ),
                 });
             }
+        }
+    }
+    if let WaitFor::UtteranceFrom {
+        target,
+        until_assertion,
+        max_matches,
+        ..
+    } = wait_for
+    {
+        if target.trim().is_empty() {
+            return Err(CaseFileError::Validation {
+                path: path.to_path_buf(),
+                message: format!("steps[{step_index}].wait-for.target must not be empty"),
+            });
+        }
+        if *max_matches == 0 {
+            return Err(CaseFileError::Validation {
+                path: path.to_path_buf(),
+                message: format!(
+                    "steps[{step_index}].wait-for.max-matches must be greater than zero"
+                ),
+            });
+        }
+        if until_assertion.is_none() && *max_matches != 1 {
+            return Err(CaseFileError::Validation {
+                path: path.to_path_buf(),
+                message: format!(
+                    "steps[{step_index}].wait-for.max-matches requires until-assertion"
+                ),
+            });
         }
     }
     if let WaitFor::Interoception {
@@ -1263,73 +1441,16 @@ pub(crate) fn wake_arousal_max_is_set(value: f64) -> bool {
     value <= 1.0
 }
 
-/// Mid-step checks can only consult agent observations (JSON pointers / text in
-/// the running artifact). Trace and rubric checks require a completed run.
-fn is_step_compatible_check(check: &Check) -> bool {
+/// Mid-step assertions can only consult agent observations (JSON pointers / text in
+/// the running artifact). Trace and rubric assertions require a completed run.
+fn is_step_compatible_check(check: &Assertion) -> bool {
     matches!(
         check,
-        Check::JsonPointerEquals { .. }
-            | Check::JsonPointerContains { .. }
-            | Check::JsonPointerNumericInRange { .. }
-            | Check::ArtifactTextContains { .. }
-            | Check::ArtifactTextExact { .. }
-    )
-}
-
-fn validate_module_case(path: &Path, case: &ModuleCase) -> Result<(), CaseFileError> {
-    if case.prompt.content.trim().is_empty() {
-        return Err(CaseFileError::Validation {
-            path: path.to_path_buf(),
-            message: "prompt must not be empty".to_string(),
-        });
-    }
-    if !case.steps.is_empty()
-        && (!case.memos.is_empty() || !case.cognition_log.is_empty() || !case.inputs.is_empty())
-    {
-        return Err(CaseFileError::Validation {
-            path: path.to_path_buf(),
-            message:
-                "module case must use either top-level memos/cognition-log/inputs or `steps`, not both"
-                    .to_string(),
-        });
-    }
-    for (index, participant) in case.participants.iter().enumerate() {
-        if participant.trim().is_empty() {
-            return Err(CaseFileError::Validation {
-                path: path.to_path_buf(),
-                message: format!("participants[{index}] must not be empty"),
-            });
-        }
-    }
-    validate_cognition_log_seeds(path, "cognition-log", &case.cognition_log)?;
-    for (index, input) in case.inputs.iter().enumerate() {
-        validate_full_agent_input(path, &format!("inputs[{index}]"), input)?;
-    }
-    for (step_index, step) in case.steps.iter().enumerate() {
-        validate_memo_seeds(path, &format!("steps[{step_index}].memos"), &step.memos)?;
-        validate_cognition_log_seeds(
-            path,
-            &format!("steps[{step_index}].cognition-log"),
-            &step.cognition_log,
-        )?;
-        for (input_index, input) in step.inputs.iter().enumerate() {
-            validate_full_agent_input(
-                path,
-                &format!("steps[{step_index}].inputs[{input_index}]"),
-                input,
-            )?;
-        }
-    }
-    validate_modules(path, case.modules.as_deref())?;
-    validate_common(
-        path,
-        case.now.as_deref(),
-        &case.memories,
-        &case.memory_links,
-        &case.policies,
-        &case.memos,
-        &case.limits,
-        &case.checks,
+        Assertion::JsonPointerEquals { .. }
+            | Assertion::JsonPointerContains { .. }
+            | Assertion::JsonPointerNumericInRange { .. }
+            | Assertion::ArtifactTextContains { .. }
+            | Assertion::ArtifactTextExact { .. }
     )
 }
 
@@ -1339,6 +1460,11 @@ fn validate_cognition_log_seeds(
     seeds: &[CognitionLogSeed],
 ) -> Result<(), CaseFileError> {
     for (index, seed) in seeds.iter().enumerate() {
+        validate_scope_path(path, &format!("{label}[{index}].scope"), &seed.scope)?;
+        ModuleId::new(seed.module.clone()).map_err(|error| CaseFileError::Validation {
+            path: path.to_path_buf(),
+            message: format!("{label}[{index}].module is invalid: {error}"),
+        })?;
         if seed.text.content.trim().is_empty() {
             return Err(CaseFileError::Validation {
                 path: path.to_path_buf(),
@@ -1355,151 +1481,10 @@ fn validate_cognition_log_seeds(
     Ok(())
 }
 
-fn validate_module_case_target(
-    path: &Path,
-    target: ModuleEvalTarget,
-    case: &ModuleCase,
-) -> Result<(), CaseFileError> {
-    let step_inputs_count = case
-        .steps
-        .iter()
-        .map(|step| step.inputs.len())
-        .sum::<usize>();
-    let step_memos_count = case
-        .steps
-        .iter()
-        .map(|step| step.memos.len())
-        .sum::<usize>();
-    let step_cognition_count = case
-        .steps
-        .iter()
-        .map(|step| step.cognition_log.len())
-        .sum::<usize>();
-
-    if target == ModuleEvalTarget::Sensory && case.inputs.is_empty() && step_inputs_count == 0 {
-        return Err(CaseFileError::Validation {
-            path: path.to_path_buf(),
-            message: "sensory module case must include at least one input".to_string(),
-        });
-    }
-    if target == ModuleEvalTarget::Surprise {
-        if case.cognition_log.is_empty() && step_cognition_count == 0 {
-            return Err(CaseFileError::Validation {
-                path: path.to_path_buf(),
-                message: "surprise module case must include at least one cognition-log seed"
-                    .to_string(),
-            });
-        }
-        if !case
-            .memos
-            .iter()
-            .any(|memo| memo.module.as_str() == "predict")
-            && !case.steps.iter().any(|step| {
-                step.memos
-                    .iter()
-                    .any(|memo| memo.module.as_str() == "predict")
-            })
-        {
-            return Err(CaseFileError::Validation {
-                path: path.to_path_buf(),
-                message: "surprise module case must include at least one predict memo seed"
-                    .to_string(),
-            });
-        }
-    }
-    if matches!(
-        target,
-        ModuleEvalTarget::Interpreter | ModuleEvalTarget::Predict
-    ) && case.cognition_log.is_empty()
-        && step_cognition_count == 0
-    {
-        return Err(CaseFileError::Validation {
-            path: path.to_path_buf(),
-            message: format!(
-                "{} module case must include at least one cognition-log seed",
-                target.as_str()
-            ),
-        });
-    }
-    if target == ModuleEvalTarget::Allocation && case.memos.is_empty() && step_memos_count == 0 {
-        return Err(CaseFileError::Validation {
-            path: path.to_path_buf(),
-            message: "allocation module case must include at least one memo seed".to_string(),
-        });
-    }
-    if target == ModuleEvalTarget::Policy
-        && case.memos.is_empty()
-        && step_memos_count == 0
-        && case.cognition_log.is_empty()
-        && step_cognition_count == 0
-    {
-        return Err(CaseFileError::Validation {
-            path: path.to_path_buf(),
-            message: "policy module case must include at least one memo or cognition-log seed"
-                .to_string(),
-        });
-    }
-    if target == ModuleEvalTarget::PolicyCompaction && case.policies.is_empty() {
-        return Err(CaseFileError::Validation {
-            path: path.to_path_buf(),
-            message: "policy-compaction module case must include at least one policy seed"
-                .to_string(),
-        });
-    }
-    let Some(modules) = case.modules.as_deref() else {
-        return Ok(());
-    };
-    let target_module = target.module();
-    if modules.contains(&target_module) {
-        return Ok(());
-    }
-    Err(CaseFileError::Validation {
-        path: path.to_path_buf(),
-        message: format!(
-            "modules must include target module '{}' for {} eval cases",
-            target_module.as_str(),
-            target.as_str(),
-        ),
-    })
-}
-
-fn validate_modules(path: &Path, modules: Option<&[EvalModule]>) -> Result<(), CaseFileError> {
-    let Some(modules) = modules else {
-        return Ok(());
-    };
-    if modules.is_empty() {
-        return Err(CaseFileError::Validation {
-            path: path.to_path_buf(),
-            message: "modules must not be empty when present".to_string(),
-        });
-    }
-
-    let mut seen = BTreeSet::new();
-    for module in modules {
-        if !seen.insert(*module) {
-            return Err(CaseFileError::Validation {
-                path: path.to_path_buf(),
-                message: format!("modules contains duplicate module '{}'", module.as_str()),
-            });
-        }
-    }
-    Ok(())
-}
-
-fn validate_activate_allocation(path: &Path, case: &FullAgentCase) -> Result<(), CaseFileError> {
-    let modules = case.effective_modules();
+fn validate_activate_allocation(path: &Path, case: &RuntimeCase) -> Result<(), CaseFileError> {
     let mut seen = BTreeSet::new();
     for (index, activation) in case.activate_allocation.iter().enumerate() {
-        if !modules.contains(&activation.module) {
-            return Err(CaseFileError::Validation {
-                path: path.to_path_buf(),
-                message: format!(
-                    "activate-allocation[{index}].module '{}' must be included in full-agent modules",
-                    activation.module.as_str()
-                ),
-            });
-        }
-        if !seen.insert(activation.module) {
+        if !seen.insert(activation.module.clone()) {
             return Err(CaseFileError::Validation {
                 path: path.to_path_buf(),
                 message: format!(
@@ -1522,65 +1507,6 @@ fn validate_activate_allocation(path: &Path, case: &FullAgentCase) -> Result<(),
     Ok(())
 }
 
-fn validate_module_checks(path: &Path, case: &FullAgentCase) -> Result<(), CaseFileError> {
-    let modules = case.effective_modules();
-    let mut seen = BTreeSet::new();
-    for (index, checks) in case.modules_checks.iter().enumerate() {
-        if !modules.contains(&checks.module) {
-            return Err(CaseFileError::Validation {
-                path: path.to_path_buf(),
-                message: format!(
-                    "modules-checks[{index}].module '{}' must be included in full-agent modules",
-                    checks.module.as_str()
-                ),
-            });
-        }
-        if !seen.insert(checks.module) {
-            return Err(CaseFileError::Validation {
-                path: path.to_path_buf(),
-                message: format!(
-                    "modules-checks contains duplicate module '{}'",
-                    checks.module.as_str()
-                ),
-            });
-        }
-        if checks.rubrics.is_empty() {
-            return Err(CaseFileError::Validation {
-                path: path.to_path_buf(),
-                message: format!(
-                    "modules-checks[{index}] for '{}' must contain at least one rubric",
-                    checks.module.as_str()
-                ),
-            });
-        }
-        for rubric in &checks.rubrics {
-            let name = rubric.display_name();
-            if rubric
-                .name
-                .as_deref()
-                .is_some_and(|name| name.trim().is_empty())
-            {
-                return Err(CaseFileError::Validation {
-                    path: path.to_path_buf(),
-                    message: format!(
-                        "module rubric for '{}' has an empty name",
-                        checks.module.as_str()
-                    ),
-                });
-            }
-            validate_rubric_fields(
-                path,
-                &format!("module {} rubric '{}'", checks.module.as_str(), name),
-                &rubric.rubric,
-                rubric.pass_score,
-                &rubric.judge_inputs,
-                &rubric.criteria,
-            )?;
-        }
-    }
-    Ok(())
-}
-
 fn validate_common(
     path: &Path,
     now: Option<&str>,
@@ -1589,12 +1515,18 @@ fn validate_common(
     policies: &[PolicySeed],
     memos: &[MemoSeed],
     limits: &EvalLimits,
-    checks: &[Check],
+    assertions: &[Assertion],
 ) -> Result<(), CaseFileError> {
     if matches!(limits.max_llm_calls, Some(0)) {
         return Err(CaseFileError::Validation {
             path: path.to_path_buf(),
             message: "limits.max-llm-calls must be greater than zero when present".to_string(),
+        });
+    }
+    if limits.timeout_ms == 0 {
+        return Err(CaseFileError::Validation {
+            path: path.to_path_buf(),
+            message: "limits.timeout-ms must be greater than zero".to_string(),
         });
     }
     let case_now = parse_case_now(now).map_err(|message| CaseFileError::Validation {
@@ -1603,6 +1535,7 @@ fn validate_common(
     })?;
 
     for (index, memory) in memories.iter().enumerate() {
+        validate_scope_path(path, &format!("memories[{index}].scope"), &memory.scope)?;
         if memory.content.content.trim().is_empty() {
             return Err(CaseFileError::Validation {
                 path: path.to_path_buf(),
@@ -1707,7 +1640,7 @@ fn validate_common(
 
     validate_memo_seeds(path, "memos", memos)?;
 
-    for check in checks {
+    for check in assertions {
         validate_check(path, check)?;
     }
 
@@ -1716,6 +1649,7 @@ fn validate_common(
 
 fn validate_memo_seeds(path: &Path, label: &str, memos: &[MemoSeed]) -> Result<(), CaseFileError> {
     for (index, memo) in memos.iter().enumerate() {
+        validate_scope_path(path, &format!("{label}[{index}].scope"), &memo.scope)?;
         if memo.module.trim().is_empty() {
             return Err(CaseFileError::Validation {
                 path: path.to_path_buf(),
@@ -1744,6 +1678,40 @@ fn validate_memo_seeds(path: &Path, label: &str, memos: &[MemoSeed]) -> Result<(
     Ok(())
 }
 
+fn validate_scope_path(path: &Path, label: &str, scope: &str) -> Result<(), CaseFileError> {
+    parse_scope_id(scope).map_err(|error| CaseFileError::Validation {
+        path: path.to_path_buf(),
+        message: format!("{label} is invalid: {error}"),
+    })?;
+    Ok(())
+}
+
+pub(crate) fn parse_scope_id(value: &str) -> anyhow::Result<ScopeId> {
+    if value == "/" {
+        return Ok(ScopeId::root());
+    }
+    anyhow::ensure!(value.starts_with('/'), "scope must start with '/'");
+    let mut scope = ScopeId::root();
+    for component in value[1..].split('/') {
+        let (subsystem, replica) = component
+            .strip_suffix(']')
+            .and_then(|component| component.rsplit_once('['))
+            .ok_or_else(|| {
+                anyhow::anyhow!("scope component {component:?} must be name[replica]")
+            })?;
+        let subsystem = SubsystemId::new(subsystem.to_string())
+            .map_err(|error| anyhow::anyhow!("invalid subsystem in {component:?}: {error}"))?;
+        let replica = replica
+            .parse::<u8>()
+            .map_err(|error| anyhow::anyhow!("invalid replica in {component:?}: {error}"))?;
+        scope = scope.child(SubsystemInstanceId::new(
+            subsystem,
+            ReplicaIndex::new(replica),
+        ));
+    }
+    Ok(scope)
+}
+
 fn is_valid_memory_link_relation(value: &str) -> bool {
     matches!(
         value.trim().to_ascii_lowercase().as_str(),
@@ -1757,15 +1725,15 @@ fn is_valid_memory_link_relation(value: &str) -> bool {
     )
 }
 
-fn validate_check(path: &Path, check: &Check) -> Result<(), CaseFileError> {
-    if let Check::JsonPointerEquals { pointer, .. }
-    | Check::JsonPointerContains { pointer, .. }
-    | Check::JsonPointerNumericInRange { pointer, .. } = check
+fn validate_check(path: &Path, check: &Assertion) -> Result<(), CaseFileError> {
+    if let Assertion::JsonPointerEquals { pointer, .. }
+    | Assertion::JsonPointerContains { pointer, .. }
+    | Assertion::JsonPointerNumericInRange { pointer, .. } = check
     {
         validate_json_pointer(path, pointer)?;
     }
 
-    if let Check::JsonPointerNumericInRange { min, max, .. } = check {
+    if let Assertion::JsonPointerNumericInRange { min, max, .. } = check {
         if min.is_none() && max.is_none() {
             return Err(CaseFileError::Validation {
                 path: path.to_path_buf(),
@@ -1788,7 +1756,7 @@ fn validate_check(path: &Path, check: &Check) -> Result<(), CaseFileError> {
         }
     }
 
-    if let Check::Rubric {
+    if let Assertion::Rubric {
         rubric,
         pass_score,
         judge_inputs,
@@ -1807,7 +1775,7 @@ fn validate_check(path: &Path, check: &Check) -> Result<(), CaseFileError> {
     }
 
     match check {
-        Check::TraceSpan { span_name, .. } if span_name.trim().is_empty() => {
+        Assertion::TraceSpan { span_name, .. } if span_name.trim().is_empty() => {
             return Err(CaseFileError::Validation {
                 path: path.to_path_buf(),
                 message: format!(
@@ -1816,7 +1784,7 @@ fn validate_check(path: &Path, check: &Check) -> Result<(), CaseFileError> {
                 ),
             });
         }
-        Check::TraceToolCall { tool_name, .. } if tool_name.trim().is_empty() => {
+        Assertion::TraceToolCall { tool_name, .. } if tool_name.trim().is_empty() => {
             return Err(CaseFileError::Validation {
                 path: path.to_path_buf(),
                 message: format!(
@@ -1825,7 +1793,7 @@ fn validate_check(path: &Path, check: &Check) -> Result<(), CaseFileError> {
                 ),
             });
         }
-        Check::TraceToolCall {
+        Assertion::TraceToolCall {
             args_json_contains: Some(args_json_contains),
             ..
         } => {
@@ -1841,7 +1809,7 @@ fn validate_check(path: &Path, check: &Check) -> Result<(), CaseFileError> {
                 });
             }
         }
-        Check::TraceSpansOrdered { names, .. } if names.is_empty() => {
+        Assertion::TraceSpansOrdered { names, .. } if names.is_empty() => {
             return Err(CaseFileError::Validation {
                 path: path.to_path_buf(),
                 message: format!(
@@ -1850,7 +1818,7 @@ fn validate_check(path: &Path, check: &Check) -> Result<(), CaseFileError> {
                 ),
             });
         }
-        Check::TraceSpansOrdered { names, .. }
+        Assertion::TraceSpansOrdered { names, .. }
             if names.iter().any(|name| name.trim().is_empty()) =>
         {
             return Err(CaseFileError::Validation {
@@ -1935,401 +1903,310 @@ fn validate_pass_score(path: &Path, score: f64, name: &str) -> Result<(), CaseFi
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{parse_case_file, parse_case_now, parse_memory_datetime};
+
+    const RUNTIME_CONFIG: &str = r#"
+activation-table = [1.0, 0.0]
+
+@ modules[] {
+  id: sensory
+  replica-min = 1
+  replica-max = 1
+  replica-capacity = 1
+  bpm-min = 10.0
+  bpm-max = 10.0
+  initial-activation = 1.0
+}
+"#;
+
+    /// Writes a self-contained case plus its runtime config and returns the
+    /// validation error the parser rejects it with.
+    fn rejection(case_body: &str) -> String {
+        let dir = tempfile::tempdir().expect("temp dir");
+        std::fs::write(dir.path().join("runtime.eure"), RUNTIME_CONFIG).expect("write config");
+        let case_path = dir.path().join("case.eure");
+        std::fs::write(
+            &case_path,
+            format!("id: invalid-case\nruntime-config: ./runtime.eure\n{case_body}"),
+        )
+        .expect("write case");
+
+        parse_case_file(&case_path)
+            .expect_err("case must be rejected")
+            .to_string()
+    }
+
+    #[test]
+    fn rejects_negative_cognition_log_seed_seconds_ago() {
+        let error = rejection(
+            r#"
+@ cognition-log[] {
+  text = "Current attended item"
+  seconds-ago = -1
+}
+"#,
+        );
+
+        assert!(
+            error.contains("seconds-ago must not be negative"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn rejects_empty_rubric_judge_inputs() {
+        let error = rejection(
+            r#"
+@ inputs[] {
+  $variant: heard
+  direction: Peer
+  content: Hello
+}
+
+@ assertions[] {
+  $variant: rubric
+  name: bad-rubric
+  judge-inputs = []
+  rubric = "Judge the output."
+
+  @ criteria[] {
+    name: some-criterion
+    description: A criterion.
+  }
+}
+"#,
+        );
+
+        assert!(error.contains("has empty judge-inputs"), "{error}");
+    }
+
+    #[test]
+    fn rejects_rubric_without_criteria() {
+        let error = rejection(
+            r#"
+@ inputs[] {
+  $variant: heard
+  direction: Peer
+  content: Hello
+}
+
+@ assertions[] {
+  $variant: rubric
+  name: holistic
+  judge-inputs = ["output"]
+  rubric = "Judge holistically."
+}
+"#,
+        );
+
+        assert!(error.contains("has no criteria"), "{error}");
+    }
+
+    #[test]
+    fn rejects_duplicate_activate_allocation_modules() {
+        let error = rejection(
+            r#"
+@ inputs[] {
+  $variant: heard
+  direction: Peer
+  content: Hello
+}
+
+@ activate-allocation[] {
+  module: sensory
+  activation-ratio = 1.0
+}
+
+@ activate-allocation[] {
+  module: sensory
+  activation-ratio = 0.5
+}
+"#,
+        );
+
+        assert!(
+            error.contains("activate-allocation contains duplicate module 'sensory'"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn rejects_activation_ratio_outside_unit_range() {
+        let error = rejection(
+            r#"
+@ inputs[] {
+  $variant: heard
+  direction: Peer
+  content: Hello
+}
+
+@ activate-allocation[] {
+  module: sensory
+  activation-ratio = 1.2
+}
+"#,
+        );
+
+        assert!(
+            error.contains("activation-ratio must be between"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn rejects_both_inputs_and_steps() {
+        let error = rejection(
+            r#"
+@ inputs[] {
+  $variant: heard
+  direction: Peer
+  content: Hello
+}
+
+@ steps[] {
+  description: A step.
+
+  @ inputs[] {
+    $variant: heard
+    direction: Peer
+    content: Hello again
+  }
+}
+"#,
+        );
+
+        assert!(
+            error.contains("must use either `inputs` or `steps`, not both"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn rejects_zero_wait_timeout() {
+        let error = rejection(
+            r#"
+@ steps[] {
+  description: A step that never waits.
+  wait-for.$variant: some.memo-from
+  wait-for.module: sensory
+  wait-for.timeout-ms = 0
+
+  @ inputs[] {
+    $variant: heard
+    direction: Peer
+    content: Hello
+  }
+}
+"#,
+        );
+
+        assert!(
+            error.contains("timeout-ms must be greater than zero"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn rejects_interoception_wait_without_any_condition() {
+        let error = rejection(
+            r#"
+@ steps[] {
+  description: Wait on interoception without naming a condition.
+  wait-for.$variant: some.interoception
+  wait-for.timeout-ms = 5000
+}
+"#,
+        );
+
+        assert!(
+            error.contains("wait-for.interoception must set at least one condition"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn rejects_trace_assertion_inside_a_step() {
+        let error = rejection(
+            r#"
+@ steps[] {
+  description: A step with a trace assertion.
+
+  @ inputs[] {
+    $variant: heard
+    direction: Peer
+    content: Hello
+  }
+
+  @ assertions[] {
+    $variant: trace-span
+    name: mid-step-trace
+    span-name: llm_turn
+  }
+}
+"#,
+        );
+
+        assert!(error.contains("cannot run mid-step"), "{error}");
+    }
+
+    #[test]
+    fn rejects_invalid_trace_tool_call_args_json_contains() {
+        let error = rejection(
+            r#"
+@ inputs[] {
+  $variant: heard
+  direction: Peer
+  content: Hello
+}
+
+@ assertions[] {
+  $variant: trace-tool-call
+  name: bad-tool-args
+  tool-name: write_retrieval_memo
+  args-json-contains = `{not-json`
+}
+"#,
+        );
+
+        assert!(error.contains("invalid args-json-contains JSON"), "{error}");
+    }
+
+    #[test]
+    fn rejects_memory_seed_with_both_datetime_and_seconds_ago() {
+        let error = rejection(
+            r#"
+@ memories[] {
+  rank: permanent
+  datetime: 2025-05-10
+  seconds-ago = 60
+  content: Koro walks calmly to his bowl.
+}
+"#,
+        );
+
+        assert!(
+            error.contains("must not specify both datetime and seconds-ago"),
+            "{error}"
+        );
+    }
 
     #[test]
     fn date_only_memory_datetime_uses_case_now_offset() {
         let case_now = parse_case_now(Some("2026-05-10T08:21:00+09:00"))
-            .unwrap()
-            .unwrap();
+            .expect("parse case now")
+            .expect("case now is present");
 
-        let occurred_at = parse_memory_datetime("2025-05-10", Some(case_now)).unwrap();
+        let occurred_at =
+            parse_memory_datetime("2025-05-10", Some(case_now)).expect("parse date-only datetime");
 
         assert_eq!(occurred_at.to_rfc3339(), "2025-05-09T15:00:00+00:00");
     }
 
     #[test]
     fn memory_datetime_accepts_rfc3339() {
-        let occurred_at = parse_memory_datetime("2025-05-10T08:21:00+09:00", None).unwrap();
+        let occurred_at =
+            parse_memory_datetime("2025-05-10T08:21:00+09:00", None).expect("parse rfc3339");
 
         assert_eq!(occurred_at.to_rfc3339(), "2025-05-09T23:21:00+00:00");
-    }
-
-    fn full_agent_case_with(inputs: Vec<FullAgentInput>, steps: Vec<EvalStep>) -> FullAgentCase {
-        FullAgentCase {
-            id: Some("case".to_string()),
-            description: None,
-            now: None,
-            modules: None,
-            inputs,
-            steps,
-            participants: Vec::new(),
-            allow_empty_output: false,
-            activate_allocation: Vec::new(),
-            memories: Vec::new(),
-            memos: Vec::new(),
-            limits: EvalLimits::default(),
-            checks: Vec::new(),
-            modules_checks: Vec::new(),
-            scoring: CaseScoring::default(),
-        }
-    }
-
-    fn seen_input(appearance: &str) -> FullAgentInput {
-        FullAgentInput::Seen {
-            direction: None,
-            appearance: Text::plaintext(appearance),
-        }
-    }
-
-    #[test]
-    fn validate_full_agent_case_rejects_both_inputs_and_steps() {
-        let case = full_agent_case_with(
-            vec![seen_input("input")],
-            vec![EvalStep {
-                description: None,
-                inputs: vec![seen_input("step")],
-                wait_for: None,
-                checks: Vec::new(),
-            }],
-        );
-
-        let error = validate_full_agent_case(Path::new("case.eure"), &case).unwrap_err();
-        assert!(
-            matches!(error, CaseFileError::Validation { message, .. } if message.contains("either `inputs` or `steps`"))
-        );
-    }
-
-    #[test]
-    fn validate_full_agent_case_rejects_empty_step_inputs() {
-        let case = full_agent_case_with(
-            Vec::new(),
-            vec![EvalStep {
-                description: None,
-                inputs: Vec::new(),
-                wait_for: None,
-                checks: Vec::new(),
-            }],
-        );
-
-        let error = validate_full_agent_case(Path::new("case.eure"), &case).unwrap_err();
-        assert!(
-            matches!(error, CaseFileError::Validation { message, .. } if message.contains("steps[0].inputs must not be empty"))
-        );
-    }
-
-    #[test]
-    fn validate_full_agent_case_accepts_empty_step_inputs_with_interoception_wait() {
-        let case = full_agent_case_with(
-            Vec::new(),
-            vec![EvalStep {
-                description: None,
-                inputs: Vec::new(),
-                wait_for: Some(WaitFor::Interoception {
-                    timeout_ms: 5_000,
-                    mode: Some(EvalInteroceptiveMode::NremPressure),
-                    wake_arousal_at_least: default_wake_arousal_at_least(),
-                    wake_arousal_at_most: 0.25,
-                }),
-                checks: Vec::new(),
-            }],
-        );
-
-        validate_full_agent_case(Path::new("case.eure"), &case).unwrap();
-    }
-
-    #[test]
-    fn validate_full_agent_case_rejects_empty_interoception_wait_conditions() {
-        let case = full_agent_case_with(
-            Vec::new(),
-            vec![EvalStep {
-                description: None,
-                inputs: Vec::new(),
-                wait_for: Some(WaitFor::Interoception {
-                    timeout_ms: 5_000,
-                    mode: None,
-                    wake_arousal_at_least: default_wake_arousal_at_least(),
-                    wake_arousal_at_most: default_wake_arousal_at_most(),
-                }),
-                checks: Vec::new(),
-            }],
-        );
-
-        let error = validate_full_agent_case(Path::new("case.eure"), &case).unwrap_err();
-        assert!(
-            matches!(error, CaseFileError::Validation { message, .. } if message.contains("wait-for.interoception must set at least one condition"))
-        );
-    }
-
-    #[test]
-    fn validate_full_agent_case_rejects_invalid_activate_allocation() {
-        let mut case = full_agent_case_with(vec![seen_input("input")], Vec::new());
-        case.modules = Some(vec![EvalModule::Sensory]);
-        case.activate_allocation = vec![ActivateAllocation {
-            module: EvalModule::Interoception,
-            activation_ratio: 1.0,
-        }];
-
-        let error = validate_full_agent_case(Path::new("case.eure"), &case).unwrap_err();
-        assert!(
-            matches!(error, CaseFileError::Validation { message, .. } if message.contains("activate-allocation[0].module 'interoception' must be included"))
-        );
-
-        let mut case = full_agent_case_with(vec![seen_input("input")], Vec::new());
-        case.activate_allocation = vec![ActivateAllocation {
-            module: EvalModule::Sensory,
-            activation_ratio: 1.2,
-        }];
-        let error = validate_full_agent_case(Path::new("case.eure"), &case).unwrap_err();
-        assert!(
-            matches!(error, CaseFileError::Validation { message, .. } if message.contains("activation-ratio must be between"))
-        );
-    }
-
-    #[test]
-    fn validate_full_agent_case_rejects_zero_wait_timeout() {
-        let case = full_agent_case_with(
-            Vec::new(),
-            vec![EvalStep {
-                description: None,
-                inputs: vec![seen_input("step")],
-                wait_for: Some(WaitFor::MemoFrom {
-                    module: EvalModule::Predict,
-                    timeout_ms: 0,
-                }),
-                checks: Vec::new(),
-            }],
-        );
-
-        let error = validate_full_agent_case(Path::new("case.eure"), &case).unwrap_err();
-        assert!(
-            matches!(error, CaseFileError::Validation { message, .. } if message.contains("timeout-ms must be greater than zero"))
-        );
-    }
-
-    #[test]
-    fn validate_full_agent_case_rejects_unsupported_step_check_kind() {
-        let trace_check = Check::TraceSpan {
-            common: CheckCommon::default(),
-            span_name: "x".to_string(),
-        };
-        let case = full_agent_case_with(
-            Vec::new(),
-            vec![EvalStep {
-                description: None,
-                inputs: vec![seen_input("step")],
-                wait_for: None,
-                checks: vec![trace_check],
-            }],
-        );
-
-        let error = validate_full_agent_case(Path::new("case.eure"), &case).unwrap_err();
-        assert!(
-            matches!(error, CaseFileError::Validation { message, .. } if message.contains("trace-span cannot run mid-step"))
-        );
-    }
-
-    #[test]
-    fn validate_check_rejects_invalid_trace_tool_call_args_json_contains() {
-        let check = Check::TraceToolCall {
-            common: CheckCommon {
-                name: Some("bad-tool-args".to_string()),
-                must_pass: true,
-                weight: 1,
-            },
-            tool_name: "write_retrieval_memo".to_string(),
-            args_json_contains: Some(Text::plaintext("{not-json")),
-        };
-
-        let error = validate_common(
-            Path::new("case.eure"),
-            None,
-            &[],
-            &[],
-            &[],
-            &[],
-            &EvalLimits::default(),
-            &[check],
-        )
-        .unwrap_err();
-
-        assert!(
-            matches!(error, CaseFileError::Validation { message, .. } if message.contains("invalid args-json-contains JSON"))
-        );
-    }
-
-    #[test]
-    fn parses_module_case_steps() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("module-steps.eure");
-        std::fs::write(
-            &path,
-            r#"
-id = "module-steps"
-prompt = "Admit load-bearing facts."
-
-@ steps[] {
-  description = "First activation"
-
-  @ memos[] {
-    module = "sensory"
-    content = "Pibi asked about Koro."
-  }
-}
-
-@ steps[] {
-  description = "Second activation"
-
-  @ memos[] {
-    module = "query-memory"
-    content = "Koro lunged when I turned away."
-  }
-}
-"#,
-        )
-        .unwrap();
-
-        let case = parse_module_case_file(&path).unwrap();
-
-        assert!(case.memos.is_empty());
-        assert_eq!(case.steps.len(), 2);
-        assert_eq!(
-            case.steps[0]
-                .description
-                .as_ref()
-                .map(|text| text.content.as_str()),
-            Some("First activation")
-        );
-        assert_eq!(case.steps[0].memos[0].module, "sensory");
-        assert_eq!(case.steps[1].memos[0].module, "query-memory");
-    }
-
-    #[test]
-    fn parses_surprise_on_prediction_violation_sample_case() {
-        let path = Path::new("../../eval-cases/full-agent/surprise-on-prediction-violation.eure");
-        let case = parse_full_agent_case_file(path).expect("sample case should parse");
-        assert_eq!(case.steps.len(), 2);
-        assert!(case.inputs.is_empty());
-        assert!(matches!(
-            case.steps[0].wait_for,
-            Some(WaitFor::MemoFrom {
-                module: EvalModule::Predict,
-                ..
-            })
-        ));
-        assert!(matches!(
-            case.steps[1].wait_for,
-            Some(WaitFor::MemoFrom {
-                module: EvalModule::Surprise,
-                ..
-            })
-        ));
-        assert_eq!(case.steps[0].checks.len(), 1);
-        assert!(matches!(case.checks.as_slice(), [Check::Rubric { .. }]));
-    }
-
-    #[test]
-    fn parses_sleep_wake_sample_cases() {
-        let quiet = Path::new("../../eval-cases/full-agent/sleep-after-sensory-quiet.eure");
-        let quiet = parse_full_agent_case_file(quiet).expect("sleep case should parse");
-        assert!(quiet.allow_empty_output);
-        assert_eq!(quiet.activate_allocation.len(), 4);
-        assert_eq!(
-            quiet.activate_allocation[2].module,
-            EvalModule::Interoception
-        );
-        assert_eq!(quiet.activate_allocation[2].activation_ratio, 1.0);
-        assert_eq!(quiet.limits.interoception.quiet_sleep_threshold_ms, 1_000);
-        assert_eq!(
-            quiet.limits.interoception.wake_arousal_change_multiplier,
-            8.0
-        );
-        assert!(matches!(
-            quiet.steps[0].wait_for,
-            Some(WaitFor::Interoception {
-                mode: Some(EvalInteroceptiveMode::NremPressure),
-                wake_arousal_at_most: 0.25,
-                ..
-            })
-        ));
-
-        let wake = Path::new("../../eval-cases/full-agent/wake-from-sleep-on-salient-sensory.eure");
-        let wake = parse_full_agent_case_file(wake).expect("wake case should parse");
-        assert!(wake.allow_empty_output);
-        let wake_modules = wake.modules.as_ref().expect("wake case lists modules");
-        assert!(!wake_modules.contains(&EvalModule::MemoryCompaction));
-        assert!(!wake_modules.contains(&EvalModule::MemoryAssociation));
-        assert!(!wake_modules.contains(&EvalModule::Dreaming));
-        assert!(!wake_modules.contains(&EvalModule::PolicyCompaction));
-        assert_eq!(wake.steps.len(), 2);
-        assert!(matches!(
-            wake.steps[1].wait_for,
-            Some(WaitFor::Interoception {
-                mode: Some(EvalInteroceptiveMode::Wake),
-                wake_arousal_at_least: 0.70,
-                ..
-            })
-        ));
-    }
-
-    #[test]
-    fn validate_full_agent_case_accepts_steps_with_memo_from_wait() {
-        let case = full_agent_case_with(
-            Vec::new(),
-            vec![
-                EvalStep {
-                    description: Some(Text::plaintext("step 1")),
-                    inputs: vec![seen_input("baseline")],
-                    wait_for: Some(WaitFor::MemoFrom {
-                        module: EvalModule::Predict,
-                        timeout_ms: 5_000,
-                    }),
-                    checks: vec![Check::JsonPointerContains {
-                        common: CheckCommon::default(),
-                        pointer: "/observations/agent/memo_logs/predict/0/content".to_string(),
-                        contains: "predict".to_string(),
-                    }],
-                },
-                EvalStep {
-                    description: Some(Text::plaintext("step 2")),
-                    inputs: vec![seen_input("violation")],
-                    wait_for: Some(WaitFor::MemoFrom {
-                        module: EvalModule::Surprise,
-                        timeout_ms: 5_000,
-                    }),
-                    checks: Vec::new(),
-                },
-            ],
-        );
-
-        validate_full_agent_case(Path::new("case.eure"), &case).unwrap();
-    }
-
-    #[test]
-    fn memory_seed_rejects_datetime_and_seconds_ago_together() {
-        let memory = MemorySeed {
-            index: None,
-            rank: MemorySeedRank::Permanent,
-            decay_secs: 0,
-            datetime: Some("2025-05-10".to_string()),
-            seconds_ago: Some(60),
-            content: Text::plaintext("memory"),
-        };
-
-        let error = validate_common(
-            Path::new("case.eure"),
-            Some("2026-05-10T08:21:00+09:00"),
-            &[memory],
-            &[],
-            &[],
-            &[],
-            &EvalLimits::default(),
-            &[],
-        )
-        .unwrap_err();
-
-        assert!(
-            matches!(error, CaseFileError::Validation { message, .. } if message.contains("must not specify both datetime and seconds-ago"))
-        );
     }
 }

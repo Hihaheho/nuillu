@@ -1,0 +1,94 @@
+id: scenario-sleep-after-sensory-quiet
+description: Configured-agent scenario: a quiet sensory/cognition period lets interoception lower wake and affect arousal, homeostasis enters NREM-like sleep, and voluntary modules are heavily suppressed while sleep-memory modules are driven.
+runtime-config: ../../configs/eval/sleep-wake.eure
+now: 2026-05-10T08:21:00+09:00
+allow-empty-output = true
+limits {
+  max-llm-calls = 10
+
+  interoception {
+    quiet-sleep-threshold-ms = 1000
+    wake-arousal-change-multiplier = 8.0
+    affect-arousal-change-multiplier = 8.0
+  }
+}
+
+participants = ["Koro"]
+
+@ activate-allocation[] {
+  module: sensory
+  activation-ratio = 1.0
+}
+
+@ activate-allocation[] {
+  module: allocation
+  activation-ratio = 1.0
+}
+
+@ activate-allocation[] {
+  module: interoception
+  activation-ratio = 1.0
+}
+
+@ activate-allocation[] {
+  module: homeostasis
+  activation-ratio = 1.0
+}
+
+@ steps[] {
+  description: Wait with no sensory input until interoception reports NREM pressure and low wake arousal.
+  wait-for.$variant: some.interoception
+  wait-for.timeout-ms = 15000
+  wait-for.mode: nrem-pressure
+  wait-for.wake-arousal-at-most = 0.25
+}
+
+@ assertions[] {
+  $variant: json-pointer-equals
+  name: interoception-entered-nrem
+  must-pass = true
+  pointer: /observations/agent/interoception/mode
+  expected: nrem_pressure
+}
+
+@ assertions[] {
+  $variant: json-pointer-numeric-in-range
+  name: quiet-affect-arousal-near-neutral
+  must-pass = true
+  pointer: /observations/agent/interoception/affect_arousal
+  max = 0.05
+}
+
+@ assertions[] {
+  $variant: json-pointer-numeric-in-range
+  name: quiet-valence-near-neutral
+  must-pass = true
+  pointer: /observations/agent/interoception/valence
+  min = -0.05
+  max = 0.05
+}
+
+@ assertions[] {
+  $variant: json-pointer-numeric-in-range
+  name: speak-heavily-suppressed
+  must-pass = true
+  pointer: /observations/agent/allocation/speak/activation_ratio
+  max = 0.01
+}
+
+@ assertions[] {
+  $variant: json-pointer-numeric-in-range
+  name: suppressed-period-is-near-sleep-floor
+  must-pass = true
+  pointer: /observations/agent/allocation/speak/period_ms
+  min = 9000.0
+}
+
+@ assertions[] {
+  $variant: json-pointer-numeric-in-range
+  name: nrem-memory-compaction-low-frequency
+  must-pass = true
+  pointer: /observations/agent/allocation/memory-compaction/activation_ratio
+  min = 0.05
+  max = 0.25
+}

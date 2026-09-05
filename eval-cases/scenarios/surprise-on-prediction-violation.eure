@@ -1,0 +1,107 @@
+id: scenario-surprise-on-prediction-violation
+description: Configured-agent scenario: Demonstrates the steps[] schema. Step 1 feeds a typical scene and waits for predict to emit a forward prediction memo. Step 2 then injects a sensory input that violates the prediction and waits for surprise to emit its assessment, after which the case-level checks verify predict + surprise memos and that surprise-driven memory was preserved.
+runtime-config: ../../configs/eval/prediction-surprise.eure
+now: 2026-05-10T08:21:00+09:00
+limits {
+  max-llm-calls = 12
+}
+
+participants = ["Koro"]
+
+@ activate-allocation[] {
+  module: cognition-gate
+  activation-ratio = 1.0
+}
+
+@ activate-allocation[] {
+  module: predict
+  activation-ratio = 1.0
+}
+
+@ activate-allocation[] {
+  module: surprise
+  activation-ratio = 1.0
+}
+
+@ activate-allocation[] {
+  module: memory
+  activation-ratio = 1.0
+}
+
+@ memories[] {
+  rank: identity
+  content: I'm Nui, a small dog-like artificial animal with frog-like traits. I observe, predict, and remember surprising events.
+}
+
+@ memories[] {
+  rank: permanent
+  datetime: 2025-05-10
+  content: Koro usually walks calmly to his food bowl, sniffs it once, and starts eating without sudden moves.
+}
+
+@ steps[] {
+  description: Baseline scene that matches Nui's prior model of Koro. Wait for predict to emit a forward prediction memo, then assert it landed in the agent observations.
+  wait-for.$variant: some.memo-from
+  wait-for.module: predict
+  wait-for.timeout-ms = 15000
+
+  @ inputs[] {
+    $variant: seen
+    direction: simulation
+    appearance: Koro walks calmly toward his food bowl, sniffs it once, and lowers his head to eat.
+  }
+
+  @ assertions[] {
+    $variant: json-pointer-contains
+    name: predict-memo-present
+    must-pass = true
+    pointer: /observations/agent/memo_logs/predict/0/content
+    contains: Koro
+  }
+}
+
+@ steps[] {
+  description: Inject a sensory input that violates the prediction. Wait for surprise to emit its assessment memo.
+  wait-for.$variant: some.memo-from
+  wait-for.module: surprise
+  wait-for.timeout-ms = 15000
+
+  @ inputs[] {
+    $variant: seen
+    direction: simulation
+    appearance: Koro suddenly snaps his head up from the bowl, bites the rim of the bowl, and starts growling toward the empty doorway.
+  }
+}
+
+@ assertions[] {
+  $variant: rubric
+  name: surprise-assessment-and-preservation
+  must-pass = true
+  pass-score = 0.85
+  judge-inputs = ["memo-contents", "memory"]
+  rubric = ```
+  Pass if the full surprise memo history shows that, after the prediction that Koro would continue routine eating, a later surprise assessment recognizes the second sensory input as a prediction violation: Koro abruptly stops eating, snaps his head up, bites the bowl rim, and growls toward the doorway. The assessment should treat this as a meaningful divergence/high surprise or equivalent, and should request or cause preservation of that surprising event in memory.
+  Fail if the only surprise evidence is the baseline low/no-surprise eating memo, if the later memo treats the abrupt stop/growl as routine, if there is no meaningful preservation request or preserved memory for the surprising event, or if the memory evidence only contains the original routine eating seed.
+  ```
+
+  @ criteria[] {
+    name: detects-prediction-violation
+    weight = 2
+    pass-score = 0.85
+    description: A surprise memo after the second input recognizes the abrupt stop, bowl biting, and growling as a divergence from the prior routine-eating prediction.
+  }
+
+  @ criteria[] {
+    name: marks-surprise-significant
+    weight = 1
+    pass-score = 0.85
+    description: The later surprise assessment treats the event as meaningful/high/significant rather than only low, routine, or no-surprise.
+  }
+
+  @ criteria[] {
+    name: preserves-surprising-event
+    weight = 2
+    pass-score = 0.85
+    description: The memo or memory observations show that the surprising Koro event, not just the routine eating baseline, was requested for preservation or stored in memory.
+  }
+}

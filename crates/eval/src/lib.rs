@@ -13,23 +13,27 @@ pub mod cases;
 pub mod evaluation;
 pub mod gui;
 pub mod judge;
+pub mod measure;
+pub mod query;
 pub mod runner;
 pub mod state_dump;
+pub mod timeline;
 pub mod trace_json;
 
 pub use artifact::CaseArtifact;
 pub use cases::{
-    ArtifactTextField, CaseFileError, CaseScoring, Check, CheckCommon, CognitionLogSeed, EvalCase,
-    EvalLimits, EvalModule, FullAgentCase, FullAgentCaseFile, FullAgentInput, MemoSeed,
-    MemoryLinkSeed, MemorySeed, MemorySeedRank, ModuleCase, ModuleCaseFile, ModuleChecks,
-    ModuleEvalTarget, ModuleRubric, PolicySeed, PolicySeedRank, RubricCriterion, RubricJudgeInput,
-    discover_case_files, parse_case_file, parse_full_agent_case_file, parse_module_case_file,
+    ArtifactTextField, Assertion, AssertionCommon, CaseFileError, CaseScoring, CognitionLogSeed,
+    EvalCase, EvalLimits, EvalModule, EvalStep, EventSelectorSpec, Measurement, MemoSeed,
+    MemoryLinkSeed, MemorySeed, MemorySeedRank, PolicySeed, PolicySeedRank, RubricCriterion,
+    RubricJudgeInput, RuntimeCase, RuntimeCaseFile, Stimulus, WaitFor, discover_case_files,
+    parse_case_file, parse_runtime_case_file,
 };
 pub use evaluation::{
-    CaseEval, CaseObjective, CaseReport, CaseSummary, CaseTiming, CaseTrialSummary, CheckOutcome,
-    KMetricReport, ModuleActivationRecord, ModuleChecksReport, ModuleRubricOutcome,
+    AssertionOutcome, CaseEval, CaseObjective, CaseReport, CaseSummary, CaseTiming,
+    CaseTrialSummary, KMetricReport, MeasurementStatistics, ModuleActivationRecord,
     MultiTrialTiming, SuiteMetrics, SuiteModelNames, SuiteReport, SuiteRunReport, SuiteTiming,
-    aggregate_trial_timing, build_activation_timeline, evaluate_case, normalize_text_block,
+    aggregate_trial_timing, build_activation_timeline, evaluate_assertion, evaluate_case,
+    evaluate_case_with_overrides, normalize_text_block,
 };
 pub use judge::{
     JudgeOptions, LlmRubricJudge, RubricJudge, RubricJudgeError, RubricJudgeRequest,
@@ -41,15 +45,15 @@ pub use nuillu_server::model_set::{
     resolve_llm_backends, resolve_token_fields,
 };
 pub use runner::{
-    CaseRunOutput, EmbeddingBackendConfig, LlmBackendConfig, RunnerConfig, RunnerError,
+    CaseRunOutput, EmbeddingBackendConfig, LiveOutput, LlmBackendConfig, RunnerConfig, RunnerError,
     RunnerHooks, VisualizerHook, default_run_id, install_lutum_trace_subscriber, run_case_detailed,
     run_suite, run_suite_with_hooks,
 };
 pub use state_dump::{
     AgenticDeadlockDump, AllocationModuleDump, AllocationProposalDump, BlackboardLastStateDump,
-    CognitionEntryDump, CognitionLogDump, DumpText, FullAgentLastStateCaseDump,
-    FullAgentLastStateDump, MemoLogDump, MemoryEntryDump, MemoryLastStateDump, MemoryMetadataDump,
-    ModuleInstanceDump, ReplicaCapDump, StateDumpRenderError, UtteranceDump,
-    render_full_agent_last_state_eure,
+    CognitionEntryDump, CognitionLogDump, DumpText, MemoLogDump, MemoryEntryDump,
+    MemoryLastStateDump, MemoryMetadataDump, ModuleInstanceDump, ReplicaCapDump,
+    RuntimeLastStateCaseDump, RuntimeLastStateDump, StateDumpRenderError, UtteranceDump,
+    render_runtime_last_state_eure,
 };
 pub use trace_json::{raw_trace_has_error, raw_trace_snapshot_json, trace_snapshot_json};
